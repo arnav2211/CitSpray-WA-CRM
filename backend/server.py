@@ -854,9 +854,11 @@ async def ingest_justdial(body: JustdialIngestInput):
         "raw_email_text": body.raw_email_text,
         "dedup_hash": dhash,
     }
+    existing = await db.leads.find_one({"dedup_hash": dhash}, {"_id": 0, "id": 1})
+    is_duplicate = existing is not None
     lead = await _create_lead_internal(data, by_user_id=None)
-    await db.email_logs.update_one({"id": email_doc["id"]}, {"$set": {"processed": True, "lead_id": lead["id"]}})
-    return {"ok": True, "lead_id": lead["id"], "duplicate": lead.get("dedup_hash") == dhash and False}
+    await db.email_logs.update_one({"id": email_doc["id"]}, {"$set": {"processed": True, "lead_id": lead["id"], "duplicate": is_duplicate}})
+    return {"ok": True, "lead_id": lead["id"], "duplicate": is_duplicate}
 
 # ------------- IndiaMART webhook -------------
 @api.post("/webhooks/indiamart")
