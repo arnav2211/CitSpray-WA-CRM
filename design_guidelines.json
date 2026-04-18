@@ -1,0 +1,142 @@
+{
+  "theme": "light",
+  "archetype": "4_swiss_high_contrast",
+  "brand_name": "LeadOrbit CRM",
+  "core_philosophy": "Authority, Clarity, Truth. A high-performance command center for sales. Color is used strictly for function, 95% of UI is monochrome. Sharp edges, explicit borders, high data density.",
+  "typography": {
+    "headings": {
+      "font_family": "Chivo",
+      "import_url": "@import url('https://fonts.googleapis.com/css2?family=Chivo:wght@300;400;700;900&display=swap');",
+      "classes": "font-['Chivo',_sans-serif] tracking-tight text-gray-900"
+    },
+    "body": {
+      "font_family": "IBM Plex Sans",
+      "import_url": "@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap');",
+      "classes": "font-['IBM_Plex_Sans',_sans-serif] text-gray-700"
+    },
+    "scale": {
+      "h1": "text-4xl sm:text-5xl font-bold leading-none",
+      "h2": "text-2xl sm:text-3xl font-bold leading-tight",
+      "h3": "text-xl sm:text-2xl font-bold leading-snug",
+      "h4": "text-lg font-bold leading-snug",
+      "body": "text-sm",
+      "small": "text-xs tracking-[0.05em] uppercase font-bold text-gray-500"
+    }
+  },
+  "colors": {
+    "background": {
+      "default": "#FFFFFF",
+      "subtle": "#F9FAFB",
+      "inverted": "#0A0A0A",
+      "classes": {
+        "default": "bg-white",
+        "subtle": "bg-gray-50",
+        "inverted": "bg-gray-950"
+      }
+    },
+    "surface": {
+      "card": "bg-white border border-gray-200",
+      "header": "bg-white/90 backdrop-blur-xl border-b border-gray-200",
+      "sidebar": "bg-gray-50 border-r border-gray-200"
+    },
+    "text": {
+      "primary": "text-gray-900",
+      "secondary": "text-gray-600",
+      "muted": "text-gray-400",
+      "inverted": "text-white"
+    },
+    "brand": {
+      "primary": "bg-[#002FA7] text-white hover:bg-[#002288]", 
+      "secondary": "bg-transparent border border-gray-300 text-gray-900 hover:bg-gray-100",
+      "accent": "text-[#002FA7]"
+    },
+    "semantic": {
+      "danger": "bg-[#E60000] text-white",
+      "danger_text": "text-[#E60000]",
+      "warning": "bg-[#FFCC00] text-gray-900",
+      "warning_text": "text-[#D9A400]",
+      "success": "bg-[#008A00] text-white",
+      "success_text": "text-[#008A00]",
+      "info": "bg-[#002FA7] text-white"
+    }
+  },
+  "layout_spacing": {
+    "dashboard_grid": "grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6",
+    "bento_span": {
+      "summary": "col-span-1",
+      "primary_data": "col-span-1 md:col-span-2 lg:col-span-3",
+      "feed": "col-span-1 md:col-span-1 row-span-2"
+    },
+    "padding": {
+      "card": "p-6",
+      "section": "py-12",
+      "page": "p-6 md:p-8"
+    },
+    "border_radius": "rounded-none",
+    "shadows": {
+      "default": "shadow-none",
+      "hover": "hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 ease-out"
+    }
+  },
+  "components_override": {
+    "button": "font-['IBM_Plex_Sans'] font-medium rounded-none px-4 py-2 transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#002FA7] disabled:opacity-50 flex items-center gap-2",
+    "card": "bg-white border border-gray-200 rounded-none overflow-hidden",
+    "input": "w-full border border-gray-300 rounded-none px-3 py-2 text-sm focus:ring-2 focus:ring-[#002FA7] focus:border-[#002FA7] outline-none transition-all placeholder:text-gray-400",
+    "badge": "inline-flex items-center px-2 py-0.5 border border-gray-200 text-[10px] font-bold uppercase tracking-wider",
+    "table": "w-full text-sm text-left border-collapse",
+    "table_header": "bg-gray-50 border-y border-gray-200 text-xs font-bold uppercase tracking-wider text-gray-500",
+    "table_row": "border-b border-gray-200 hover:bg-gray-50 transition-colors"
+  },
+  "icons_and_media": {
+    "icon_library": "@phosphor-icons/react",
+    "images": {
+      "avatars": [
+        {
+          "url": "https://images.unsplash.com/photo-1762522927402-f390672558d8?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDk1Nzh8MHwxfHNlYXJjaHw0fHxwcm9mZXNzaW9uYWwlMjBidXNpbmVzcyUyMGhlYWRzaG90JTIwcG9ydHJhaXR8ZW58MHx8fHwxNzc2NTQ0MTI4fDA&ixlib=rb-4.1.0&q=85",
+          "category": "user_avatar",
+          "description": "Male sales executive"
+        },
+        {
+          "url": "https://images.unsplash.com/photo-1689600944138-da3b150d9cb8?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDk1Nzh8MHwxfHNlYXJjaHwxfHxwcm9mZXNzaW9uYWwlMjBidXNpbmVzcyUyMGhlYWRzaG90JTIwcG9ydHJhaXR8ZW58MHx8fHwxNzc2NTQ0MTI4fDA&ixlib=rb-4.1.0&q=85",
+          "category": "user_avatar",
+          "description": "Female sales executive"
+        },
+        {
+          "url": "https://images.unsplash.com/photo-1655249481446-25d575f1c054?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDk1Nzh8MHwxfHNlYXJjaHwzfHxwcm9mZXNzaW9uYWwlMjBidXNpbmVzcyUyMGhlYWRzaG90JTIwcG9ydHJhaXR8ZW58MHx8fHwxNzc2NTQ0MTI4fDA&ixlib=rb-4.1.0&q=85",
+          "category": "user_avatar",
+          "description": "Female sales executive"
+        },
+        {
+          "url": "https://images.pexels.com/photos/4687575/pexels-photo-4687575.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+          "category": "admin_avatar",
+          "description": "Admin/Manager profile"
+        }
+      ],
+      "backgrounds": [
+        {
+          "url": "css_pattern",
+          "category": "login_background",
+          "description": "Use CSS grid pattern: background-image: linear-gradient(#e5e7eb 1px, transparent 1px), linear-gradient(90deg, #e5e7eb 1px, transparent 1px); background-size: 24px 24px; background-color: #FAFAFA; on the login wrapper to create an architectural, blueprint feel."
+        }
+      ]
+    }
+  },
+  "ui_specifics": {
+    "login_page": "Split layout. Left: Architect grid pattern (from background setting) with a massive, bold Chivo headline. Right: stark white login form card with heavy 1px border. No shadows.",
+    "global_navigation": "Top bar: White, 1px bottom border, sticky. Left sidebar for admin/exec navigation with a 1px right border, light gray bg (bg-gray-50), and simple bold text links (hover:bg-gray-200).",
+    "lead_list": "Use the table component overrides. Emphasize row state: Unread leads have font-bold. Overdue leads have a 2px left border in #E60000. 'Open Justdial Lead' should be an explicit outline button.",
+    "lead_detail_drawer": "Slide-in from right. High density. Split vertically: Top area for contact & status, Left column for timeline/notes, Right column for WhatsApp Conversation panel.",
+    "whatsapp_panel": "Distinct aesthetic. Dark slate (#0F172A) background to differentiate from CRM data. Chat bubbles in pure white and green (#008A00). Keep the UI looking 'technical', not consumer chat app.",
+    "kanban_board": "Columns separated by 1px solid #E5E7EB. Cards are minimal flat rectangles (no radius, no shadow, 1px border). Dragging lifts card with a sharp shadow.",
+    "charts": "Recharts. Line/Bar charts should use straight, linear lines (type='linear', not 'monotone'). Grid lines should be very faint (#F3F4F6). Primary chart color: #002FA7. Secondary: #E60000 for missed leads.",
+    "empty_states": "No cutesy vector art. Use Phosphor Icons (e.g., FileX, Inbox, Users) scaled to 64px with a 1px stroke weight (weight='light'), centered above a brief uppercase label.",
+    "modals": "Backdrop: pure black at 40% opacity (bg-black/40). Modal window: flat white rectangle, heavy 1px border, 0px radius. No shadow."
+  },
+  "technical_instructions": {
+    "css": "Use Tailwind CSS. Adhere strictly to the color scale provided. Avoid using multiple generic grays; stick to the gray-50 to gray-900 scale.",
+    "fonts": "Add fonts directly to HTML head or CSS imports. Define font-families in tailwind config extending sans.",
+    "components": "You can use Shadcn, but MUST override all `rounded-md` and `shadow` classes to `rounded-none` and `shadow-none` to match the Swiss Brutalist aesthetic. Form elements must feel structural.",
+    "icons": "Install '@phosphor-icons/react'. Use weight='regular' for standard, weight='fill' for active states.",
+    "testing": "All key interactive components (buttons, links, form fields, cards) MUST include a 'data-testid' attribute using kebab-case role-based names (e.g., 'submit-login-btn', 'lead-status-select')."
+  }
+}
