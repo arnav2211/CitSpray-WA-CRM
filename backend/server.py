@@ -890,12 +890,19 @@ async def webhook_indiamart(request: Request):
     for e in entries:
         if not isinstance(e, dict):
             continue
+        # IndiaMART real push-API keys (both common spellings supported)
         name = e.get("SENDER_NAME") or e.get("sender_name") or e.get("name") or "IndiaMART Lead"
-        phone = e.get("MOBILE") or e.get("sender_mobile") or e.get("phone")
-        email = e.get("EMAIL") or e.get("sender_email") or e.get("email")
+        phone = e.get("SENDER_MOBILE") or e.get("MOBILE") or e.get("sender_mobile") or e.get("MOBILE_ALT") or e.get("phone")
+        email = e.get("SENDER_EMAIL") or e.get("EMAIL") or e.get("SENDER_EMAIL_ALT") or e.get("sender_email") or e.get("email")
+        company = e.get("SENDER_COMPANY") or e.get("sender_company")
+        address = e.get("SENDER_ADDRESS") or e.get("sender_address")
+        area = address  # map address into area field for display
         city = e.get("SENDER_CITY") or e.get("city")
         state = e.get("SENDER_STATE") or e.get("state")
-        requirement = e.get("SUBJECT") or e.get("QUERY_PRODUCT_NAME") or e.get("MESSAGE") or e.get("subject")
+        requirement = (
+            e.get("SUBJECT") or e.get("QUERY_PRODUCT_NAME") or e.get("QUERY_MCAT_NAME")
+            or e.get("QUERY_MESSAGE") or e.get("MESSAGE") or e.get("subject")
+        )
         query_time = e.get("QUERY_TIME") or e.get("query_time") or iso(now_utc())
         unique_id = e.get("UNIQUE_QUERY_ID") or e.get("unique_query_id")
         dhash = _lead_dedup_hash(name, query_time, unique_id or (phone or ""))
@@ -904,14 +911,18 @@ async def webhook_indiamart(request: Request):
             "phone": phone,
             "email": email,
             "requirement": requirement,
+            "area": area,
             "city": city,
             "state": state,
             "source": "IndiaMART",
-            "source_data": e,
+            "source_data": {**e, **({"SENDER_COMPANY": company} if company else {})},
             "dedup_hash": dhash,
         }
-        # PNS logic: if 'CALL_RECEIVER_NUMBER' or 'call_receiver' maps to an executive phone, assign to them
-        receiver = e.get("CALL_RECEIVER_NUMBER") or e.get("call_receiver_number")
+        # PNS logic: if 'CALL_RECEIVER_NUMBER'/'RECEIVER_MOBILE' maps to an executive phone, assign to them
+        receiver = (
+            e.get("CALL_RECEIVER_NUMBER") or e.get("RECEIVER_MOBILE")
+            or e.get("call_receiver_number") or e.get("receiver_mobile")
+        )
         if receiver:
             exec_match = await db.users.find_one({"role": "executive", "active": True, "phone": receiver}, {"_id": 0})
             if exec_match:
