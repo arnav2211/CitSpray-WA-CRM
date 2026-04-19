@@ -144,7 +144,7 @@ export default function Dashboard() {
                   <Link key={l.id} to={`/leads/${l.id}`} className="block px-5 py-3 hover:bg-gray-50" data-testid={`recent-lead-${l.id}`}>
                     <div className="flex items-center justify-between">
                       <div className="font-semibold text-sm truncate">{l.customer_name}</div>
-                      <span className="text-[10px] font-mono text-gray-400">{(l.created_at || "").slice(11, 16)}</span>
+                      <span className="text-[10px] font-mono text-gray-400">{fmtISTTime(l.created_at)}</span>
                     </div>
                     <div className="text-xs text-gray-500 truncate">{l.requirement || "—"}</div>
                   </Link>

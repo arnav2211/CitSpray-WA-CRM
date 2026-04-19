@@ -2,8 +2,9 @@ import React, { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { toast } from "sonner";
-import { StatusBadge, SourceBadge } from "@/components/Badges";
+import { StatusBadge, SourceBadge, QueryTypeBadge } from "@/components/Badges";
 import { X, Phone, EnvelopeSimple, MapPin, ArrowSquareOut, PaperPlaneRight, Clock, CalendarBlank, NotePencil } from "@phosphor-icons/react";
+import { fmtIST, fmtISTTime, queryTypeInfo } from "@/lib/format";
 
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
 
@@ -116,8 +117,9 @@ export default function LeadDrawer({ leadId, onClose }) {
         {/* Header */}
         <div className="sticky top-0 bg-white border-b border-gray-200 p-5 flex items-start justify-between z-10">
           <div className="min-w-0">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <SourceBadge source={lead.source} />
+              <QueryTypeBadge code={lead.source_data?.QUERY_TYPE} />
               <StatusBadge status={lead.status} />
               {!lead.opened_at && <span className="text-[10px] uppercase tracking-widest font-bold text-[#E60000]">Unopened</span>}
             </div>
@@ -128,6 +130,17 @@ export default function LeadDrawer({ leadId, onClose }) {
               {(lead.area || lead.city || lead.state) && (
                 <span className="flex items-center gap-1"><MapPin size={12} /> {[lead.area, lead.city, lead.state].filter(Boolean).join(", ")}</span>
               )}
+              {lead.source_data?.QUERY_TYPE === "P" && lead.source_data?.RECEIVER_MOBILE && (
+                <span className="flex items-center gap-1 text-[#E60000] font-bold" data-testid="pns-receiver">
+                  <Phone size={12} weight="fill" /> PNS received on: {lead.source_data.RECEIVER_MOBILE}
+                </span>
+              )}
+              {lead.source_data?.QUERY_TYPE === "P" && lead.source_data?.CALL_DURATION && (
+                <span className="text-gray-500">Call duration: {lead.source_data.CALL_DURATION}s</span>
+              )}
+              <span className="flex items-center gap-1 text-gray-500">
+                <Clock size={12} /> {fmtIST(lead.created_at)}
+              </span>
             </div>
           </div>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-900 p-2" data-testid="lead-drawer-close">
@@ -175,7 +188,7 @@ export default function LeadDrawer({ leadId, onClose }) {
                   <div key={n.id} className="border border-gray-200 p-3 bg-white">
                     <div className="text-xs text-gray-500 flex justify-between">
                       <span className="font-bold uppercase tracking-widest text-[10px]">{n.by_name}</span>
-                      <span className="font-mono">{(n.at || "").slice(0, 16).replace("T", " ")}</span>
+                      <span className="font-mono">{fmtIST(n.at)}</span>
                     </div>
                     <div className="text-sm mt-1">{n.body}</div>
                   </div>
@@ -206,7 +219,7 @@ export default function LeadDrawer({ leadId, onClose }) {
               <div className="border-l border-gray-300 pl-4 space-y-2">
                 {activity.map((a) => (
                   <div key={a.id} className="text-xs">
-                    <span className="font-mono text-gray-500">{(a.at || "").slice(0, 16).replace("T", " ")}</span>
+                    <span className="font-mono text-gray-500">{fmtIST(a.at)}</span>
                     <span className="mx-2 text-gray-400">·</span>
                     <span className="font-bold uppercase tracking-widest">{a.action.replace(/_/g, " ")}</span>
                   </div>
@@ -228,7 +241,7 @@ export default function LeadDrawer({ leadId, onClose }) {
                   <div className={`${m.direction === "out" ? "wa-bubble-out" : "wa-bubble-in"} max-w-[75%] px-3 py-2 text-sm`} data-testid={`wa-msg-${m.id}`}>
                     {m.template_name && <div className="text-[9px] uppercase tracking-widest opacity-70 mb-1">Template · {m.template_name}</div>}
                     <div>{m.body}</div>
-                    <div className="text-[9px] opacity-70 mt-1 font-mono">{(m.at || "").slice(11, 16)}</div>
+                    <div className="text-[9px] opacity-70 mt-1 font-mono">{fmtISTTime(m.at)}</div>
                   </div>
                 </div>
               ))}

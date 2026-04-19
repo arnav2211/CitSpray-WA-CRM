@@ -2,10 +2,11 @@ import React, { useEffect, useMemo, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { Link, useSearchParams } from "react-router-dom";
-import { StatusBadge, SourceBadge } from "@/components/Badges";
+import { StatusBadge, SourceBadge, QueryTypeBadge } from "@/components/Badges";
 import { toast } from "sonner";
 import { Kanban, Table, Plus, MagnifyingGlass, FileX } from "@phosphor-icons/react";
 import LeadDrawer from "@/components/LeadDrawer";
+import { fmtIST } from "@/lib/format";
 
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
 const SOURCES = ["IndiaMART", "Justdial", "Manual", "WhatsApp"];
@@ -121,6 +122,7 @@ export default function Leads() {
                 <th className="text-left px-4 py-3">Requirement</th>
                 <th className="text-left px-4 py-3">Location</th>
                 <th className="text-left px-4 py-3">Source</th>
+                <th className="text-left px-4 py-3">Type</th>
                 <th className="text-left px-4 py-3">Status</th>
                 <th className="text-left px-4 py-3">Assigned</th>
                 <th className="text-left px-4 py-3">Created</th>
@@ -144,9 +146,17 @@ export default function Leads() {
                     <td className="px-4 py-3 max-w-[260px] truncate">{l.requirement || "—"}</td>
                     <td className="px-4 py-3 text-xs text-gray-600">{[l.area, l.city, l.state].filter(Boolean).join(", ") || "—"}</td>
                     <td className="px-4 py-3"><SourceBadge source={l.source} /></td>
+                    <td className="px-4 py-3">
+                      <QueryTypeBadge code={l.source_data?.QUERY_TYPE} compact />
+                      {l.source_data?.QUERY_TYPE === "P" && l.source_data?.RECEIVER_MOBILE && (
+                        <div className="text-[10px] font-mono text-gray-500 mt-1" title="PNS Receiver Number">
+                          Rcv: {l.source_data.RECEIVER_MOBILE}
+                        </div>
+                      )}
+                    </td>
                     <td className="px-4 py-3"><StatusBadge status={l.status} /></td>
                     <td className="px-4 py-3 text-xs">{execMap[l.assigned_to]?.name || "—"}</td>
-                    <td className="px-4 py-3 text-xs text-gray-500 font-mono">{(l.created_at || "").slice(0, 16).replace("T", " ")}</td>
+                    <td className="px-4 py-3 text-xs text-gray-500 font-mono">{fmtIST(l.created_at)}</td>
                     <td className="px-4 py-3 text-right">
                       <Link to={`/leads/${l.id}`} onClick={(e) => e.stopPropagation()} className="text-[10px] uppercase tracking-widest font-bold text-[#002FA7]" data-testid={`open-lead-${l.id}`}>
                         Open
@@ -156,7 +166,7 @@ export default function Leads() {
                 );
               })}
               {leads.length === 0 && (
-                <tr><td colSpan={8} className="px-4 py-16 text-center">
+                <tr><td colSpan={9} className="px-4 py-16 text-center">
                   <FileX size={56} weight="light" className="mx-auto text-gray-300" />
                   <div className="mt-3 text-[10px] uppercase tracking-widest text-gray-500 font-bold">No leads yet</div>
                   <div className="text-xs text-gray-400 mt-1">Create a lead or trigger the IndiaMART webhook to populate the pipeline.</div>
@@ -197,8 +207,11 @@ function Kanban_({ leads, onOpen, execMap }) {
                     <SourceBadge source={l.source} />
                   </div>
                   <div className="text-xs text-gray-500 mt-1 truncate">{l.requirement || "—"}</div>
-                  <div className="text-[10px] uppercase tracking-widest text-gray-400 mt-2 font-bold">
-                    {execMap[l.assigned_to]?.name || "Unassigned"}
+                  <div className="mt-2 flex items-center gap-2">
+                    <QueryTypeBadge code={l.source_data?.QUERY_TYPE} compact />
+                    <div className="text-[10px] uppercase tracking-widest text-gray-400 font-bold">
+                      {execMap[l.assigned_to]?.name || "Unassigned"}
+                    </div>
                   </div>
                 </button>
               ))}

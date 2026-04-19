@@ -3,6 +3,7 @@ import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
 import { Link } from "react-router-dom";
 import { CheckCircle, Clock } from "@phosphor-icons/react";
+import { fmtIST } from "@/lib/format";
 
 export default function Followups() {
   const [list, setList] = useState([]);
@@ -53,7 +54,7 @@ function Section({ title, items, accent, onDone }) {
               <Link to={`/leads/${f.lead_id}`} className="font-semibold text-sm hover:underline">Lead</Link>
               <div className="text-xs text-gray-500 truncate">{f.note || "—"}</div>
             </div>
-            <span className="text-xs font-mono text-gray-500">{(f.due_at || "").slice(0, 16).replace("T", " ")}</span>
+            <span className="text-xs font-mono text-gray-500">{fmtIST(f.due_at)}</span>
             {onDone && (
               <button onClick={() => onDone(f.id)} className="text-[10px] uppercase tracking-widest font-bold text-[#008A00] flex items-center gap-1" data-testid={`followup-done-${f.id}`}>
                 <CheckCircle size={14} /> Done

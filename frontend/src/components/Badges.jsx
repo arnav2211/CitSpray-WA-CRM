@@ -1,4 +1,5 @@
 import React from "react";
+import { queryTypeInfo } from "@/lib/format";
 
 export function StatusBadge({ status }) {
   const map = {
@@ -29,6 +30,18 @@ export function SourceBadge({ source }) {
     <span className={`inline-flex items-center px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest border ${cls} bg-white`}
       data-testid={`source-badge-${source}`}>
       {source}
+    </span>
+  );
+}
+
+export function QueryTypeBadge({ code, compact = false }) {
+  const info = queryTypeInfo(code);
+  if (!info) return null;
+  return (
+    <span className={`inline-flex items-center px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest ${info.color}`}
+      title={info.label}
+      data-testid={`query-type-badge-${code}`}>
+      {compact ? info.short : info.label}
     </span>
   );
 }
