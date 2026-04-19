@@ -6,6 +6,7 @@ load_dotenv(ROOT_DIR / '.env')
 
 import os
 import re
+import json
 import uuid
 import hashlib
 import logging
@@ -14,6 +15,7 @@ from typing import List, Optional, Literal, Any, Dict
 
 import bcrypt
 import jwt
+import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Query
 from fastapi.responses import JSONResponse
@@ -32,6 +34,104 @@ db = client[os.environ['DB_NAME']]
 
 JWT_ALGORITHM = "HS256"
 JWT_SECRET = os.environ.get("JWT_SECRET", "devsecret")
+
+# ------------- WhatsApp Cloud API config -------------
+WA_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN", "").strip()
+WA_PHONE_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+WA_API_VERSION = os.environ.get("WHATSAPP_API_VERSION", "v22.0").strip()
+WA_VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "leadorbit_meta_verify").strip()
+WA_APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET", "").strip()
+WA_DEFAULT_TPL = os.environ.get("WHATSAPP_DEFAULT_TEMPLATE", "hello_world").strip()
+WA_DEFAULT_TPL_LANG = os.environ.get("WHATSAPP_DEFAULT_TEMPLATE_LANG", "en_US").strip()
+WA_BASE_URL = "https://graph.facebook.com"
+WA_ENABLED = bool(WA_TOKEN and WA_PHONE_ID)
+
+
+def _normalize_phone(p: Optional[str]) -> str:
+    """Strip everything except digits — Meta sends numbers as digits-only without +."""
+    if not p:
+        return ""
+    return re.sub(r"\D+", "", p)
+
+
+async def wa_send_text(to_phone: str, body: str) -> Dict[str, Any]:
+    """Send a freeform text message via WhatsApp Cloud API.
+    Only allowed within a 24-hour customer-initiated window. Otherwise Meta returns error 131047."""
+    if not WA_ENABLED:
+        return {"mock": True, "status": "sent_mock", "wamid": None}
+    to = _normalize_phone(to_phone)
+    if not to:
+        return {"error": "no_phone", "status": "failed"}
+    url = f"{WA_BASE_URL}/{WA_API_VERSION}/{WA_PHONE_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "text",
+        "text": {"preview_url": False, "body": body},
+    }
+    async with httpx.AsyncClient(timeout=20.0) as cli:
+        r = await cli.post(url, json=payload, headers={
+            "Authorization": f"Bearer {WA_TOKEN}",
+            "Content-Type": "application/json",
+        })
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+    if r.status_code >= 400:
+        err = (data.get("error") or {}) if isinstance(data, dict) else {}
+        return {"status": "failed", "http": r.status_code, "error": err.get("message") or str(data), "code": err.get("code"), "raw": data}
+    wamid = None
+    try:
+        wamid = data["messages"][0]["id"]
+    except Exception:
+        pass
+    return {"status": "sent", "wamid": wamid, "raw": data}
+
+
+async def wa_send_template(to_phone: str, template_name: str, lang_code: str = "en_US", body_params: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Send a pre-approved template message. Required for first-touch / outside the 24-hour window."""
+    if not WA_ENABLED:
+        return {"mock": True, "status": "sent_mock", "wamid": None}
+    to = _normalize_phone(to_phone)
+    if not to:
+        return {"error": "no_phone", "status": "failed"}
+    url = f"{WA_BASE_URL}/{WA_API_VERSION}/{WA_PHONE_ID}/messages"
+    template_block: Dict[str, Any] = {
+        "name": template_name,
+        "language": {"code": lang_code},
+    }
+    if body_params:
+        template_block["components"] = [{
+            "type": "body",
+            "parameters": [{"type": "text", "text": str(p)} for p in body_params],
+        }]
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "template",
+        "template": template_block,
+    }
+    async with httpx.AsyncClient(timeout=20.0) as cli:
+        r = await cli.post(url, json=payload, headers={
+            "Authorization": f"Bearer {WA_TOKEN}",
+            "Content-Type": "application/json",
+        })
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+    if r.status_code >= 400:
+        err = (data.get("error") or {}) if isinstance(data, dict) else {}
+        return {"status": "failed", "http": r.status_code, "error": err.get("message") or str(data), "code": err.get("code"), "raw": data}
+    wamid = None
+    try:
+        wamid = data["messages"][0]["id"]
+    except Exception:
+        pass
+    return {"status": "sent", "wamid": wamid, "raw": data}
 
 app = FastAPI(title="LeadOrbit CRM API")
 api = APIRouter(prefix="/api")
@@ -361,18 +461,27 @@ async def auto_send_whatsapp_on_create(lead: dict):
     rules = await get_routing_rules()
     if not rules.get("auto_whatsapp_on_create", True):
         return
-    tpl = await db.whatsapp_templates.find_one({"name": "welcome_lead"}, {"_id": 0})
-    if tpl:
-        body = tpl["body"].replace("{{name}}", lead.get("customer_name", ""))
-    else:
-        body = f"Hi {lead.get('customer_name','')}, thanks for your interest. Our team will connect with you shortly. — LeadOrbit"
+    if not lead.get("phone"):
+        return  # cannot send without a recipient
+    tpl_name = WA_DEFAULT_TPL or "hello_world"
+    # Try sending real template via Meta Cloud API. First-touch must use a template.
+    api_result = await wa_send_template(
+        to_phone=lead["phone"],
+        template_name=tpl_name,
+        lang_code=WA_DEFAULT_TPL_LANG or "en_US",
+        body_params=[lead.get("customer_name", "there")],
+    )
+    body_preview = f"[Template: {tpl_name}] sent to {lead['phone']}"
     msg = {
         "id": str(uuid.uuid4()),
         "lead_id": lead["id"],
         "direction": "out",
-        "body": body,
-        "template_name": "welcome_lead",
-        "status": "sent_mock",
+        "body": body_preview,
+        "template_name": tpl_name,
+        "status": api_result.get("status", "failed"),
+        "wamid": api_result.get("wamid"),
+        "error": api_result.get("error"),
+        "error_code": api_result.get("code"),
         "at": iso(now_utc()),
         "by_user_id": None,
     }
@@ -570,19 +679,41 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
         raise HTTPException(status_code=404, detail="Lead not found")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
+    if not lead.get("phone"):
+        raise HTTPException(status_code=400, detail="Lead has no phone number")
+
+    # If a template_name is given, send as template; else send freeform text.
+    if body.template_name:
+        # Replace {{name}} in body if present (so executive sees what they sent),
+        # but Meta uses template body params positional substitution.
+        api_result = await wa_send_template(
+            to_phone=lead["phone"],
+            template_name=body.template_name,
+            lang_code=WA_DEFAULT_TPL_LANG or "en_US",
+            body_params=[lead.get("customer_name", "there")],
+        )
+    else:
+        api_result = await wa_send_text(to_phone=lead["phone"], body=body.body)
+
     msg = {
         "id": str(uuid.uuid4()),
         "lead_id": body.lead_id,
         "direction": "out",
         "body": body.body,
         "template_name": body.template_name,
-        "status": "sent_mock",
+        "status": api_result.get("status", "failed"),
+        "wamid": api_result.get("wamid"),
+        "error": api_result.get("error"),
+        "error_code": api_result.get("code"),
         "at": iso(now_utc()),
         "by_user_id": user["id"],
     }
     await db.messages.insert_one(msg.copy())
     await db.leads.update_one({"id": body.lead_id}, {"$set": {"last_action_at": iso(now_utc())}})
-    await log_activity(user["id"], "whatsapp_sent", body.lead_id, {"len": len(body.body)})
+    await log_activity(user["id"], "whatsapp_sent", body.lead_id, {"status": msg["status"], "wamid": msg["wamid"], "error": msg["error"]})
+    if msg["status"] == "failed":
+        # Surface the Meta error so the executive sees what to fix
+        raise HTTPException(status_code=400, detail=msg["error"] or "WhatsApp send failed")
     return strip_mongo(msg)
 
 @api.get("/whatsapp/templates")
@@ -608,6 +739,78 @@ async def create_template(body: TemplateCreate, admin: dict = Depends(require_ad
 async def delete_template(tpl_id: str, admin: dict = Depends(require_admin)):
     await db.whatsapp_templates.delete_one({"id": tpl_id})
     return {"ok": True}
+
+
+# ------------- WhatsApp Cloud API status & template sync -------------
+@api.get("/whatsapp/status")
+async def whatsapp_status(user: dict = Depends(get_current_user)):
+    """Live health of the configured Meta WhatsApp Business account."""
+    if not WA_ENABLED:
+        return {"enabled": False, "reason": "WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID not set"}
+    out: Dict[str, Any] = {"enabled": True, "phone_number_id": WA_PHONE_ID, "api_version": WA_API_VERSION,
+                           "verify_token": WA_VERIFY_TOKEN}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as cli:
+            r = await cli.get(
+                f"{WA_BASE_URL}/{WA_API_VERSION}/{WA_PHONE_ID}",
+                params={"fields": "verified_name,display_phone_number,quality_rating,code_verification_status,name_status"},
+                headers={"Authorization": f"Bearer {WA_TOKEN}"},
+            )
+            if r.status_code < 400:
+                out["phone"] = r.json()
+            else:
+                out["phone_error"] = r.json()
+    except Exception as e:
+        out["phone_error"] = str(e)
+    return out
+
+
+@api.post("/whatsapp/templates/sync")
+async def sync_templates(admin: dict = Depends(require_admin)):
+    """Pull approved templates from Meta into our local DB so executives can pick them in the UI."""
+    waba_id = os.environ.get("WHATSAPP_WABA_ID", "").strip()
+    if not (WA_ENABLED and waba_id):
+        raise HTTPException(status_code=400, detail="WhatsApp not configured (need ACCESS_TOKEN + PHONE_NUMBER_ID + WABA_ID)")
+    async with httpx.AsyncClient(timeout=20.0) as cli:
+        r = await cli.get(
+            f"{WA_BASE_URL}/{WA_API_VERSION}/{waba_id}/message_templates",
+            params={"fields": "name,status,language,category,components", "limit": 200},
+            headers={"Authorization": f"Bearer {WA_TOKEN}"},
+        )
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Meta error: {r.text}")
+    data = r.json()
+    upserted = 0
+    for t in data.get("data", []):
+        body = ""
+        try:
+            for c in (t.get("components") or []):
+                if c.get("type") == "BODY":
+                    body = c.get("text") or ""
+                    break
+        except Exception:
+            pass
+        doc = {
+            "id": str(uuid.uuid4()),
+            "name": t.get("name"),
+            "category": (t.get("category") or "utility").lower(),
+            "language": t.get("language"),
+            "status": t.get("status"),
+            "body": body,
+            "synced_from_meta": True,
+            "synced_at": iso(now_utc()),
+        }
+        # upsert by name+language (Meta uniqueness key)
+        existing = await db.whatsapp_templates.find_one({"name": doc["name"], "language": doc["language"]}, {"_id": 0})
+        if existing:
+            await db.whatsapp_templates.update_one(
+                {"name": doc["name"], "language": doc["language"]},
+                {"$set": {k: v for k, v in doc.items() if k != "id"}},
+            )
+        else:
+            await db.whatsapp_templates.insert_one(doc.copy())
+        upserted += 1
+    return {"ok": True, "synced": upserted, "templates": [t.get("name") for t in data.get("data", [])]}
 
 # ------------- Followups -------------
 @api.get("/followups")
@@ -961,18 +1164,40 @@ async def webhook_indiamart_recent(admin: dict = Depends(require_admin), limit: 
     ).sort("received_at", -1).to_list(limit)
     return docs
 
-# ------------- WhatsApp webhook (MOCK) -------------
+# ------------- WhatsApp webhook (Meta Cloud API) -------------
 @api.get("/webhooks/whatsapp")
 async def whatsapp_verify(request: Request):
-    # Meta verification endpoint style
+    """Meta sends GET with hub.mode/hub.verify_token/hub.challenge during webhook setup.
+    Configure 'verify token' in Meta dashboard to match WHATSAPP_VERIFY_TOKEN in .env."""
     params = request.query_params
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
     challenge = params.get("hub.challenge")
-    if challenge:
+    if mode == "subscribe" and token == WA_VERIFY_TOKEN and challenge:
         return Response(content=challenge, media_type="text/plain")
-    return {"ok": True}
+    if challenge and not token:
+        # Older test tools sometimes ping with just challenge — keep echo for compat
+        return Response(content=challenge, media_type="text/plain")
+    raise HTTPException(status_code=403, detail="Verify token mismatch")
+
+
+async def _find_lead_by_phone(phone_digits: str) -> Optional[dict]:
+    """Best-effort lookup: leads store phone in original format; normalize for compare.
+    Tries exact suffix match (last 10 digits) for Indian numbers."""
+    if not phone_digits:
+        return None
+    suffix = phone_digits[-10:] if len(phone_digits) >= 10 else phone_digits
+    # Use regex to match any stored phone whose digits-only suffix equals our suffix
+    cursor = db.leads.find({"phone": {"$regex": suffix}}, {"_id": 0})
+    async for lead in cursor:
+        if _normalize_phone(lead.get("phone"))[-10:] == suffix:
+            return lead
+    return None
+
 
 @api.post("/webhooks/whatsapp")
 async def webhook_whatsapp(request: Request):
+    """Receive incoming WhatsApp messages and delivery status updates from Meta."""
     try:
         payload = await request.json()
     except Exception:
@@ -985,22 +1210,97 @@ async def webhook_whatsapp(request: Request):
         "processed": False,
     }
     await db.webhook_payloads.insert_one(raw.copy())
-    # Simplified: expect { lead_id, from, body } for our mock
-    lead_id = payload.get("lead_id")
-    body = payload.get("body") or payload.get("text")
-    if lead_id and body:
-        msg = {
-            "id": str(uuid.uuid4()),
-            "lead_id": lead_id,
-            "direction": "in",
-            "body": body,
-            "status": "received",
-            "at": iso(now_utc()),
-            "by_user_id": None,
-        }
-        await db.messages.insert_one(msg.copy())
-        await db.leads.update_one({"id": lead_id}, {"$set": {"last_action_at": iso(now_utc())}})
-    await db.webhook_payloads.update_one({"id": raw["id"]}, {"$set": {"processed": True}})
+
+    created_msgs = 0
+    status_updates = 0
+    try:
+        for entry in (payload.get("entry") or []):
+            for change in (entry.get("changes") or []):
+                value = change.get("value") or {}
+                # ---- Incoming messages ----
+                for m in (value.get("messages") or []):
+                    from_phone = m.get("from")  # digits, e.g. "919876543210"
+                    msg_type = m.get("type")
+                    wamid = m.get("id")
+                    body_text = ""
+                    if msg_type == "text":
+                        body_text = ((m.get("text") or {}).get("body")) or ""
+                    elif msg_type == "image":
+                        img = m.get("image") or {}
+                        body_text = f"[image] {img.get('caption','')}".strip()
+                    elif msg_type == "document":
+                        doc = m.get("document") or {}
+                        body_text = f"[document: {doc.get('filename','file')}] {doc.get('caption','')}".strip()
+                    elif msg_type == "audio":
+                        body_text = "[audio message]"
+                    elif msg_type == "video":
+                        body_text = f"[video] {(m.get('video') or {}).get('caption','')}".strip()
+                    elif msg_type == "location":
+                        loc = m.get("location") or {}
+                        body_text = f"[location: {loc.get('latitude')},{loc.get('longitude')}]"
+                    elif msg_type == "button":
+                        body_text = f"[button reply] {(m.get('button') or {}).get('text','')}"
+                    elif msg_type == "interactive":
+                        ia = m.get("interactive") or {}
+                        body_text = f"[interactive] {json.dumps(ia)[:200]}"
+                    else:
+                        body_text = f"[{msg_type}]"
+
+                    lead = await _find_lead_by_phone(from_phone or "")
+                    if not lead:
+                        # Auto-create a lead so we don't lose the inbound enquiry
+                        sender_name = ""
+                        try:
+                            sender_name = ((value.get("contacts") or [{}])[0].get("profile") or {}).get("name") or ""
+                        except Exception:
+                            pass
+                        data = {
+                            "customer_name": sender_name or f"WhatsApp +{from_phone}",
+                            "phone": from_phone,
+                            "requirement": body_text[:200],
+                            "source": "WhatsApp",
+                            "source_data": {"channel": "whatsapp_inbound", "wamid": wamid},
+                            "dedup_hash": _lead_dedup_hash(sender_name or "wa", from_phone or "", wamid or ""),
+                        }
+                        lead = await _create_lead_internal(data, by_user_id=None)
+                    msg_doc = {
+                        "id": str(uuid.uuid4()),
+                        "lead_id": lead["id"],
+                        "direction": "in",
+                        "body": body_text,
+                        "wamid": wamid,
+                        "msg_type": msg_type,
+                        "status": "received",
+                        "at": iso(now_utc()),
+                        "by_user_id": None,
+                    }
+                    await db.messages.insert_one(msg_doc.copy())
+                    await db.leads.update_one({"id": lead["id"]}, {"$set": {"last_action_at": iso(now_utc())}})
+                    created_msgs += 1
+
+                # ---- Delivery status updates ----
+                for s in (value.get("statuses") or []):
+                    wamid = s.get("id")
+                    status = s.get("status")  # sent | delivered | read | failed
+                    err = None
+                    if s.get("errors"):
+                        try:
+                            err = s["errors"][0].get("title") or s["errors"][0].get("message")
+                        except Exception:
+                            pass
+                    upd = {"status": status}
+                    if err:
+                        upd["error"] = err
+                    if wamid:
+                        await db.messages.update_one({"wamid": wamid}, {"$set": upd})
+                        status_updates += 1
+    except Exception as e:
+        logger.exception(f"WA webhook processing error: {e}")
+    finally:
+        await db.webhook_payloads.update_one(
+            {"id": raw["id"]},
+            {"$set": {"processed": True, "messages_created": created_msgs, "status_updates": status_updates}},
+        )
     return {"ok": True}
 
 # ------------- Auto-reassignment task -------------
