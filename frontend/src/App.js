@@ -14,6 +14,7 @@ import UsersPage from "@/pages/Users";
 import RoutingRules from "@/pages/RoutingRules";
 import Templates from "@/pages/Templates";
 import Reports from "@/pages/Reports";
+import Integrations from "@/pages/Integrations";
 
 export default function App() {
   return (
@@ -31,6 +32,7 @@ export default function App() {
               <Route path="/followups" element={<Followups />} />
               <Route path="/users" element={<AdminOnly><UsersPage /></AdminOnly>} />
               <Route path="/routing" element={<AdminOnly><RoutingRules /></AdminOnly>} />
+              <Route path="/integrations" element={<AdminOnly><Integrations /></AdminOnly>} />
               <Route path="/templates" element={<AdminOnly><Templates /></AdminOnly>} />
               <Route path="/reports" element={<AdminOnly><Reports /></AdminOnly>} />
             </Route>

@@ -1352,6 +1352,310 @@ async def auto_reassign_task():
     except Exception as e:
         logger.exception(f"auto_reassign_task failed: {e}")
 
+# ------------- Gmail / Justdial integration -------------
+import base64
+from email.utils import parseaddr
+
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "").strip()
+FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "").strip().rstrip("/")
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "openid",
+]
+GMAIL_POLL_MINUTES = max(1, int(os.environ.get("GMAIL_POLL_INTERVAL_MINUTES", "2")))
+GMAIL_QUERY = os.environ.get("GMAIL_JUSTDIAL_QUERY", "from:instantemail@justdial.com is:unread newer_than:7d")
+GMAIL_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI)
+
+def _google_client_config() -> dict:
+    return {
+        "web": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [GOOGLE_REDIRECT_URI],
+        }
+    }
+
+@api.get("/integrations/gmail/status")
+async def gmail_status(user: dict = Depends(get_current_user)):
+    if not GMAIL_ENABLED:
+        return {"enabled": False, "reason": "GOOGLE_CLIENT_ID/SECRET/REDIRECT_URI not configured"}
+    cfg = await db.gmail_connections.find_one({"key": "default"}, {"_id": 0, "access_token": 0, "refresh_token": 0})
+    if not cfg:
+        return {"enabled": True, "connected": False, "redirect_uri": GOOGLE_REDIRECT_URI}
+    last_poll = await db.gmail_polls.find_one({"key": "last"}, {"_id": 0})
+    return {
+        "enabled": True,
+        "connected": True,
+        "email": cfg.get("email"),
+        "connected_at": cfg.get("connected_at"),
+        "connected_by_user_id": cfg.get("connected_by"),
+        "scopes": cfg.get("scopes"),
+        "expires_at": cfg.get("expires_at"),
+        "last_poll": last_poll,
+        "poll_interval_minutes": GMAIL_POLL_MINUTES,
+        "query": GMAIL_QUERY,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+    }
+
+@api.get("/integrations/gmail/auth/init")
+async def gmail_auth_init(admin: dict = Depends(require_admin)):
+    if not GMAIL_ENABLED:
+        raise HTTPException(status_code=400, detail="Gmail integration not configured")
+    from google_auth_oauthlib.flow import Flow
+    flow = Flow.from_client_config(_google_client_config(), scopes=GMAIL_SCOPES, redirect_uri=GOOGLE_REDIRECT_URI)
+    auth_url, state = flow.authorization_url(
+        access_type="offline", prompt="consent", include_granted_scopes="true",
+    )
+    await db.oauth_states.insert_one({
+        "state": state,
+        "user_id": admin["id"],
+        "created_at": iso(now_utc()),
+        "expires_at": iso(now_utc() + timedelta(minutes=10)),
+    })
+    return {"auth_url": auth_url}
+
+@api.get("/integrations/gmail/auth/callback")
+async def gmail_auth_callback(request: Request):
+    """Browser is redirected here by Google after consent."""
+    params = request.query_params
+    code = params.get("code")
+    state = params.get("state")
+    err = params.get("error")
+    redirect_target = f"{FRONTEND_BASE_URL or ''}/integrations"
+    if err:
+        return Response(
+            status_code=302,
+            headers={"Location": f"{redirect_target}?gmail_status=error&reason={err}"},
+        )
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="Missing code or state")
+    state_doc = await db.oauth_states.find_one({"state": state}, {"_id": 0})
+    if not state_doc:
+        raise HTTPException(status_code=400, detail="Invalid or expired state")
+    await db.oauth_states.delete_one({"state": state})
+    try:
+        from google_auth_oauthlib.flow import Flow
+        import warnings
+        flow = Flow.from_client_config(_google_client_config(), scopes=GMAIL_SCOPES, redirect_uri=GOOGLE_REDIRECT_URI)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            flow.fetch_token(code=code)
+        creds = flow.credentials
+        # Get the email address of the connected account
+        async with httpx.AsyncClient(timeout=15.0) as cli:
+            r = await cli.get(
+                "https://www.googleapis.com/oauth2/v2/userinfo",
+                headers={"Authorization": f"Bearer {creds.token}"},
+            )
+            email_addr = (r.json() or {}).get("email", "") if r.status_code < 400 else ""
+        doc = {
+            "key": "default",
+            "email": email_addr,
+            "access_token": creds.token,
+            "refresh_token": creds.refresh_token,
+            "token_uri": creds.token_uri,
+            "scopes": list(creds.scopes or []),
+            "expires_at": iso(creds.expiry.replace(tzinfo=timezone.utc)) if creds.expiry else None,
+            "connected_by": state_doc.get("user_id"),
+            "connected_at": iso(now_utc()),
+        }
+        await db.gmail_connections.update_one({"key": "default"}, {"$set": doc}, upsert=True)
+        return Response(
+            status_code=302,
+            headers={"Location": f"{redirect_target}?gmail_status=connected&email={email_addr}"},
+        )
+    except Exception as e:
+        logger.exception(f"Gmail OAuth callback failed: {e}")
+        return Response(
+            status_code=302,
+            headers={"Location": f"{redirect_target}?gmail_status=error&reason={str(e)[:120]}"},
+        )
+
+@api.post("/integrations/gmail/disconnect")
+async def gmail_disconnect(admin: dict = Depends(require_admin)):
+    cfg = await db.gmail_connections.find_one({"key": "default"}, {"_id": 0})
+    if cfg and cfg.get("access_token"):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as cli:
+                await cli.post("https://oauth2.googleapis.com/revoke", params={"token": cfg["access_token"]})
+        except Exception:
+            pass
+    await db.gmail_connections.delete_one({"key": "default"})
+    return {"ok": True}
+
+async def _get_gmail_service():
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request as GoogleRequest
+    from googleapiclient.discovery import build
+    cfg = await db.gmail_connections.find_one({"key": "default"}, {"_id": 0})
+    if not cfg:
+        return None, None
+    creds = Credentials(
+        token=cfg["access_token"],
+        refresh_token=cfg.get("refresh_token"),
+        token_uri=cfg.get("token_uri") or "https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=cfg.get("scopes") or GMAIL_SCOPES,
+    )
+    expires_at = cfg.get("expires_at")
+    needs_refresh = True
+    if expires_at:
+        try:
+            exp_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+            needs_refresh = now_utc() >= (exp_dt - timedelta(minutes=2))
+        except Exception:
+            pass
+    if needs_refresh and creds.refresh_token:
+        try:
+            creds.refresh(GoogleRequest())
+            await db.gmail_connections.update_one(
+                {"key": "default"},
+                {"$set": {
+                    "access_token": creds.token,
+                    "expires_at": iso(creds.expiry.replace(tzinfo=timezone.utc)) if creds.expiry else None,
+                }},
+            )
+        except Exception as e:
+            logger.warning(f"Gmail token refresh failed: {e}")
+            return None, cfg
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    return service, cfg
+
+def _decode_b64url(s: str) -> bytes:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+def _walk_parts(payload: dict) -> List[dict]:
+    out: List[dict] = []
+    if not payload:
+        return out
+    out.append(payload)
+    for p in (payload.get("parts") or []):
+        out.extend(_walk_parts(p))
+    return out
+
+def _extract_email_bodies(message: dict) -> Dict[str, str]:
+    """Return {'text': ..., 'html': ...} from a Gmail message resource (format=full)."""
+    text, html = "", ""
+    payload = message.get("payload") or {}
+    for part in _walk_parts(payload):
+        mime = part.get("mimeType") or ""
+        body = part.get("body") or {}
+        data = body.get("data")
+        if not data:
+            continue
+        try:
+            raw = _decode_b64url(data).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        if mime == "text/plain" and not text:
+            text = raw
+        elif mime == "text/html" and not html:
+            html = raw
+    return {"text": text, "html": html}
+
+def _header(message: dict, name: str) -> str:
+    for h in (message.get("payload", {}).get("headers") or []):
+        if h.get("name", "").lower() == name.lower():
+            return h.get("value", "")
+    return ""
+
+async def gmail_poll_task():
+    """Poll Gmail for new Justdial enquiries and ingest them."""
+    if not GMAIL_ENABLED:
+        return
+    service, cfg = await _get_gmail_service()
+    if not service:
+        return
+    summary = {"key": "last", "ran_at": iso(now_utc()), "fetched": 0, "ingested": 0, "errors": 0}
+    try:
+        resp = service.users().messages().list(userId="me", q=GMAIL_QUERY, maxResults=20).execute()
+        ids = [m["id"] for m in (resp.get("messages") or [])]
+        summary["fetched"] = len(ids)
+        for mid in ids:
+            try:
+                full = service.users().messages().get(userId="me", id=mid, format="full").execute()
+                bodies = _extract_email_bodies(full)
+                subject = _header(full, "Subject")
+                from_h = _header(full, "From")
+                from_email = parseaddr(from_h)[1] or "instantemail@justdial.com"
+                # Hand off to existing parser by reusing its core logic
+                parsed = parse_justdial_email(bodies.get("text", ""), bodies.get("html", ""))
+                if not parsed.get("customer_name") and not parsed.get("requirement"):
+                    summary["errors"] += 1
+                    await db.email_logs.insert_one({
+                        "id": str(uuid.uuid4()),
+                        "from": from_email,
+                        "subject": subject,
+                        "raw_html": bodies.get("html"),
+                        "raw_text": bodies.get("text"),
+                        "received_at": iso(now_utc()),
+                        "processed": True,
+                        "error": "unparseable",
+                        "gmail_id": mid,
+                    })
+                else:
+                    name = parsed.get("customer_name") or "Justdial Lead"
+                    ts = parsed.get("timestamp") or iso(now_utc())
+                    content_hash = hashlib.sha256(((bodies.get("text") or "") + (bodies.get("html") or "")).encode("utf-8")).hexdigest()
+                    dhash = _lead_dedup_hash(name, ts, content_hash[:16])
+                    data = {
+                        "customer_name": name,
+                        "requirement": parsed.get("requirement"),
+                        "area": parsed.get("area"),
+                        "city": parsed.get("city"),
+                        "state": parsed.get("state"),
+                        "phone": parsed.get("phone"),
+                        "source": "Justdial",
+                        "contact_link": parsed.get("contact_link"),
+                        "source_data": {"timestamp": ts, "subject": subject, "from": from_email, "gmail_id": mid},
+                        "raw_email_html": bodies.get("html"),
+                        "raw_email_text": bodies.get("text"),
+                        "dedup_hash": dhash,
+                    }
+                    lead = await _create_lead_internal(data, by_user_id=None)
+                    await db.email_logs.insert_one({
+                        "id": str(uuid.uuid4()),
+                        "from": from_email,
+                        "subject": subject,
+                        "raw_html": bodies.get("html"),
+                        "raw_text": bodies.get("text"),
+                        "received_at": iso(now_utc()),
+                        "processed": True,
+                        "lead_id": lead["id"],
+                        "gmail_id": mid,
+                    })
+                    summary["ingested"] += 1
+                # Mark as read so we don't re-process
+                try:
+                    service.users().messages().modify(userId="me", id=mid, body={"removeLabelIds": ["UNREAD"]}).execute()
+                except Exception as e:
+                    logger.warning(f"Could not mark Gmail msg {mid} read: {e}")
+            except Exception as e:
+                summary["errors"] += 1
+                logger.exception(f"Gmail message processing failed for {mid}: {e}")
+    except Exception as e:
+        summary["errors"] += 1
+        summary["fatal"] = str(e)[:200]
+        logger.exception(f"Gmail poll task failed: {e}")
+    await db.gmail_polls.update_one({"key": "last"}, {"$set": summary}, upsert=True)
+
+@api.post("/integrations/gmail/sync-now")
+async def gmail_sync_now(admin: dict = Depends(require_admin)):
+    await gmail_poll_task()
+    last = await db.gmail_polls.find_one({"key": "last"}, {"_id": 0})
+    return {"ok": True, "last_poll": last}
+
+
 # ------------- Seed -------------
 async def seed_data():
     # admin
@@ -1431,8 +1735,13 @@ async def on_startup():
     await seed_data()
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(auto_reassign_task, "interval", minutes=1, id="auto_reassign", max_instances=1, coalesce=True)
+    if GMAIL_ENABLED:
+        scheduler.add_job(
+            gmail_poll_task, "interval", minutes=GMAIL_POLL_MINUTES,
+            id="gmail_poll", max_instances=1, coalesce=True,
+        )
     scheduler.start()
-    logger.info("Startup complete; scheduler running")
+    logger.info(f"Startup complete; scheduler running (gmail_enabled={GMAIL_ENABLED})")
 
 @app.on_event("shutdown")
 async def on_shutdown():

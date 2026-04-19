@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug,
 } from "@phosphor-icons/react";
 
 const navBase = "flex items-center gap-3 px-4 py-2.5 text-sm border-l-2 border-transparent hover:bg-gray-100 transition-colors";
@@ -47,6 +47,7 @@ export default function Sidebar() {
             <div className="px-5 pt-4 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Admin</div>
             <Item to="/users" icon={Users} testId="nav-users">Executives</Item>
             <Item to="/routing" icon={Gear} testId="nav-routing">Routing Rules</Item>
+            <Item to="/integrations" icon={Plug} testId="nav-integrations">Integrations</Item>
             <Item to="/templates" icon={ChatCircleDots} testId="nav-templates">WA Templates</Item>
             <Item to="/reports" icon={PaperPlaneTilt} testId="nav-reports">Reports</Item>
           </>
