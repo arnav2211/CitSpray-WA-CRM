@@ -7,6 +7,7 @@ import {
 } from "recharts";
 import { ArrowRight, Lightning, Warning, CheckCircle, Clock } from "@phosphor-icons/react";
 import { toast } from "sonner";
+import { fmtISTTime } from "@/lib/format";
 
 function Stat({ label, value, accent, testId }) {
   return (
