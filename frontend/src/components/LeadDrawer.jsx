@@ -181,6 +181,44 @@ export default function LeadDrawer({ leadId, onClose }) {
               <div className="border border-gray-200 p-3 text-sm bg-gray-50">{lead.requirement || "—"}</div>
             </section>
 
+            {lead.source === "IndiaMART" && lead.source_data && (
+              <section data-testid="indiamart-details-section">
+                <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2">IndiaMART Details</div>
+                <div className="border border-gray-200 bg-white divide-y divide-gray-200">
+                  {lead.source_data.QUERY_PRODUCT_NAME && (
+                    <DetailRow k="Product" v={lead.source_data.QUERY_PRODUCT_NAME} testId="im-product" />
+                  )}
+                  {lead.source_data.QUERY_MCAT_NAME && lead.source_data.QUERY_MCAT_NAME !== lead.source_data.QUERY_PRODUCT_NAME && (
+                    <DetailRow k="Category" v={lead.source_data.QUERY_MCAT_NAME} />
+                  )}
+                  {lead.source_data.QUERY_MESSAGE && (
+                    <div className="px-3 py-2" data-testid="im-query-message">
+                      <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Buyer's message</div>
+                      <div className="text-sm mt-1 whitespace-pre-wrap leading-relaxed">{lead.source_data.QUERY_MESSAGE}</div>
+                    </div>
+                  )}
+                  {lead.source_data.SENDER_COMPANY && (
+                    <DetailRow k="Company" v={lead.source_data.SENDER_COMPANY} />
+                  )}
+                  {(lead.source_data.SENDER_MOBILE_ALT || lead.source_data.SENDER_PHONE || lead.source_data.SENDER_PHONE_ALT) && (
+                    <DetailRow k="Alt numbers" v={[lead.source_data.SENDER_MOBILE_ALT, lead.source_data.SENDER_PHONE, lead.source_data.SENDER_PHONE_ALT].filter(Boolean).join(" · ")} mono />
+                  )}
+                  {lead.source_data.SENDER_EMAIL_ALT && (
+                    <DetailRow k="Alt email" v={lead.source_data.SENDER_EMAIL_ALT} mono />
+                  )}
+                  {lead.source_data.SENDER_PINCODE && (
+                    <DetailRow k="Pincode" v={lead.source_data.SENDER_PINCODE} mono />
+                  )}
+                  {lead.source_data.QUERY_TIME && (
+                    <DetailRow k="IndiaMART query time" v={lead.source_data.QUERY_TIME} mono />
+                  )}
+                  {lead.source_data.UNIQUE_QUERY_ID && (
+                    <DetailRow k="IndiaMART ID" v={lead.source_data.UNIQUE_QUERY_ID} mono />
+                  )}
+                </div>
+              </section>
+            )}
+
             <section>
               <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2">Notes</div>
               <div className="space-y-2 mb-3">
@@ -269,3 +307,13 @@ export default function LeadDrawer({ leadId, onClose }) {
     </div>
   );
 }
+
+function DetailRow({ k, v, mono, testId }) {
+  return (
+    <div className="px-3 py-2 flex items-baseline gap-4" data-testid={testId}>
+      <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold w-32 shrink-0">{k}</div>
+      <div className={`text-sm ${mono ? "font-mono" : ""} break-words`}>{v}</div>
+    </div>
+  );
+}
+
