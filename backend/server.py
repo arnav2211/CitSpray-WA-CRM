@@ -861,16 +861,12 @@ async def ingest_justdial(body: JustdialIngestInput):
     return {"ok": True, "lead_id": lead["id"], "duplicate": is_duplicate}
 
 # ------------- IndiaMART webhook -------------
-@api.post("/webhooks/indiamart")
-async def webhook_indiamart(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
+async def _handle_indiamart_payload(payload: Any, identifier: Optional[str] = None) -> dict:
     # store raw
     raw = {
         "id": str(uuid.uuid4()),
         "source": "IndiaMART",
+        "identifier": identifier,
         "payload": payload,
         "received_at": iso(now_utc()),
         "processed": False,
@@ -879,8 +875,11 @@ async def webhook_indiamart(request: Request):
 
     entries: List[dict] = []
     if isinstance(payload, dict):
-        if "RESPONSE" in payload and isinstance(payload["RESPONSE"], list):
-            entries = payload["RESPONSE"]
+        resp = payload.get("RESPONSE")
+        if isinstance(resp, list):
+            entries = resp
+        elif isinstance(resp, dict):
+            entries = [resp]
         else:
             entries = [payload]
     elif isinstance(payload, list):
@@ -890,13 +889,15 @@ async def webhook_indiamart(request: Request):
     for e in entries:
         if not isinstance(e, dict):
             continue
-        # IndiaMART real push-API keys (both common spellings supported)
-        name = e.get("SENDER_NAME") or e.get("sender_name") or e.get("name") or "IndiaMART Lead"
-        phone = e.get("SENDER_MOBILE") or e.get("MOBILE") or e.get("sender_mobile") or e.get("MOBILE_ALT") or e.get("phone")
+        name = e.get("SENDER_NAME") or e.get("sender_name") or e.get("name") or "IndiaMART Buyer"
+        phone = (
+            e.get("SENDER_MOBILE") or e.get("MOBILE") or e.get("sender_mobile")
+            or e.get("SENDER_MOBILE_ALT") or e.get("SENDER_PHONE") or e.get("SENDER_PHONE_ALT")
+            or e.get("phone")
+        )
         email = e.get("SENDER_EMAIL") or e.get("EMAIL") or e.get("SENDER_EMAIL_ALT") or e.get("sender_email") or e.get("email")
         company = e.get("SENDER_COMPANY") or e.get("sender_company")
         address = e.get("SENDER_ADDRESS") or e.get("sender_address")
-        area = address  # map address into area field for display
         city = e.get("SENDER_CITY") or e.get("city")
         state = e.get("SENDER_STATE") or e.get("state")
         requirement = (
@@ -911,17 +912,16 @@ async def webhook_indiamart(request: Request):
             "phone": phone,
             "email": email,
             "requirement": requirement,
-            "area": area,
+            "area": address,
             "city": city,
             "state": state,
             "source": "IndiaMART",
             "source_data": {**e, **({"SENDER_COMPANY": company} if company else {})},
             "dedup_hash": dhash,
         }
-        # PNS logic: if 'CALL_RECEIVER_NUMBER'/'RECEIVER_MOBILE' maps to an executive phone, assign to them
         receiver = (
-            e.get("CALL_RECEIVER_NUMBER") or e.get("RECEIVER_MOBILE")
-            or e.get("call_receiver_number") or e.get("receiver_mobile")
+            e.get("RECEIVER_MOBILE") or e.get("CALL_RECEIVER_NUMBER")
+            or e.get("receiver_mobile") or e.get("call_receiver_number")
         )
         if receiver:
             exec_match = await db.users.find_one({"role": "executive", "active": True, "phone": receiver}, {"_id": 0})
@@ -929,8 +929,37 @@ async def webhook_indiamart(request: Request):
                 data["assigned_to"] = exec_match["id"]
         lead = await _create_lead_internal(data, by_user_id=None)
         created_ids.append(lead["id"])
-    await db.webhook_payloads.update_one({"id": raw["id"]}, {"$set": {"processed": True, "lead_ids": created_ids}})
-    return {"ok": True, "created": created_ids}
+    await db.webhook_payloads.update_one(
+        {"id": raw["id"]},
+        {"$set": {"processed": True, "lead_ids": created_ids, "entry_count": len(entries)}},
+    )
+    # IndiaMART expects HTTP 200; echoing CODE/STATUS is a safe acknowledgement pattern
+    return {"CODE": 200, "STATUS": "SUCCESS", "ok": True, "created": created_ids, "received": len(entries)}
+
+@api.post("/webhooks/indiamart")
+async def webhook_indiamart(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    return await _handle_indiamart_payload(payload, identifier=None)
+
+@api.post("/webhooks/indiamart/{identifier}")
+async def webhook_indiamart_tenant(identifier: str, request: Request):
+    """Tenant-identifier variant per IndiaMART docs: https://{host}/indiamart/{identifier}"""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    return await _handle_indiamart_payload(payload, identifier=identifier)
+
+@api.get("/webhooks/indiamart/_debug/recent")
+async def webhook_indiamart_recent(admin: dict = Depends(require_admin), limit: int = 20):
+    """Admin-only: inspect last N raw IndiaMART webhook payloads (useful for debugging activations)."""
+    docs = await db.webhook_payloads.find(
+        {"source": "IndiaMART"}, {"_id": 0}
+    ).sort("received_at", -1).to_list(limit)
+    return docs
 
 # ------------- WhatsApp webhook (MOCK) -------------
 @api.get("/webhooks/whatsapp")
