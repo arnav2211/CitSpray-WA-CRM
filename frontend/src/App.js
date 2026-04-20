@@ -15,6 +15,7 @@ import RoutingRules from "@/pages/RoutingRules";
 import Templates from "@/pages/Templates";
 import Reports from "@/pages/Reports";
 import Integrations from "@/pages/Integrations";
+import Settings from "@/pages/Settings";
 
 export default function App() {
   return (
@@ -34,6 +35,7 @@ export default function App() {
               <Route path="/routing" element={<AdminOnly><RoutingRules /></AdminOnly>} />
               <Route path="/integrations" element={<AdminOnly><Integrations /></AdminOnly>} />
               <Route path="/templates" element={<AdminOnly><Templates /></AdminOnly>} />
+              <Route path="/settings" element={<AdminOnly><Settings /></AdminOnly>} />
               <Route path="/reports" element={<AdminOnly><Reports /></AdminOnly>} />
             </Route>
             <Route path="*" element={<Navigate to="/dashboard" replace />} />

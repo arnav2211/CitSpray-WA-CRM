@@ -36,33 +36,50 @@ JWT_ALGORITHM = "HS256"
 JWT_SECRET = os.environ.get("JWT_SECRET", "devsecret")
 
 # ------------- WhatsApp Cloud API config -------------
-WA_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN", "").strip()
-WA_PHONE_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "").strip()
-WA_API_VERSION = os.environ.get("WHATSAPP_API_VERSION", "v22.0").strip()
-WA_VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "leadorbit_meta_verify").strip()
-WA_APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET", "").strip()
-WA_DEFAULT_TPL = os.environ.get("WHATSAPP_DEFAULT_TEMPLATE", "hello_world").strip()
-WA_DEFAULT_TPL_LANG = os.environ.get("WHATSAPP_DEFAULT_TEMPLATE_LANG", "en_US").strip()
+# Fallback defaults come from .env; the effective config can be overridden at
+# runtime by writing to the `system_settings` collection (key="whatsapp") via
+# /api/settings/whatsapp. This lets admins rotate phone numbers / tokens from
+# inside the app without a redeploy.
 WA_BASE_URL = "https://graph.facebook.com"
-WA_ENABLED = bool(WA_TOKEN and WA_PHONE_ID)
+
+_WA_ENV_DEFAULTS = {
+    "access_token": os.environ.get("WHATSAPP_ACCESS_TOKEN", "").strip(),
+    "phone_number_id": os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "").strip(),
+    "waba_id": os.environ.get("WHATSAPP_WABA_ID", "").strip(),
+    "api_version": os.environ.get("WHATSAPP_API_VERSION", "v22.0").strip() or "v22.0",
+    "verify_token": os.environ.get("WHATSAPP_VERIFY_TOKEN", "leadorbit_meta_verify").strip(),
+    "app_secret": os.environ.get("WHATSAPP_APP_SECRET", "").strip(),
+    "default_template": os.environ.get("WHATSAPP_DEFAULT_TEMPLATE", "hello_world").strip() or "hello_world",
+    "default_template_lang": os.environ.get("WHATSAPP_DEFAULT_TEMPLATE_LANG", "en_US").strip() or "en_US",
+}
+
+_WA_EDITABLE_FIELDS = list(_WA_ENV_DEFAULTS.keys())
+
+async def get_wa_config() -> Dict[str, Any]:
+    """Effective WhatsApp config = DB overrides > env defaults."""
+    doc = await db.system_settings.find_one({"key": "whatsapp"}, {"_id": 0}) or {}
+    out: Dict[str, Any] = {}
+    for k, v in _WA_ENV_DEFAULTS.items():
+        override = (doc.get(k) or "").strip() if isinstance(doc.get(k), str) else doc.get(k)
+        out[k] = override if override else v
+    out["enabled"] = bool(out["access_token"] and out["phone_number_id"])
+    return out
 
 
 def _normalize_phone(p: Optional[str]) -> str:
-    """Strip everything except digits — Meta sends numbers as digits-only without +."""
     if not p:
         return ""
     return re.sub(r"\D+", "", p)
 
 
 async def wa_send_text(to_phone: str, body: str) -> Dict[str, Any]:
-    """Send a freeform text message via WhatsApp Cloud API.
-    Only allowed within a 24-hour customer-initiated window. Otherwise Meta returns error 131047."""
-    if not WA_ENABLED:
+    cfg = await get_wa_config()
+    if not cfg["enabled"]:
         return {"mock": True, "status": "sent_mock", "wamid": None}
     to = _normalize_phone(to_phone)
     if not to:
         return {"error": "no_phone", "status": "failed"}
-    url = f"{WA_BASE_URL}/{WA_API_VERSION}/{WA_PHONE_ID}/messages"
+    url = f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['phone_number_id']}/messages"
     payload = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
@@ -72,7 +89,7 @@ async def wa_send_text(to_phone: str, body: str) -> Dict[str, Any]:
     }
     async with httpx.AsyncClient(timeout=20.0) as cli:
         r = await cli.post(url, json=payload, headers={
-            "Authorization": f"Bearer {WA_TOKEN}",
+            "Authorization": f"Bearer {cfg['access_token']}",
             "Content-Type": "application/json",
         })
     try:
@@ -90,17 +107,17 @@ async def wa_send_text(to_phone: str, body: str) -> Dict[str, Any]:
     return {"status": "sent", "wamid": wamid, "raw": data}
 
 
-async def wa_send_template(to_phone: str, template_name: str, lang_code: str = "en_US", body_params: Optional[List[str]] = None) -> Dict[str, Any]:
-    """Send a pre-approved template message. Required for first-touch / outside the 24-hour window."""
-    if not WA_ENABLED:
+async def wa_send_template(to_phone: str, template_name: str, lang_code: Optional[str] = None, body_params: Optional[List[str]] = None) -> Dict[str, Any]:
+    cfg = await get_wa_config()
+    if not cfg["enabled"]:
         return {"mock": True, "status": "sent_mock", "wamid": None}
     to = _normalize_phone(to_phone)
     if not to:
         return {"error": "no_phone", "status": "failed"}
-    url = f"{WA_BASE_URL}/{WA_API_VERSION}/{WA_PHONE_ID}/messages"
+    url = f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['phone_number_id']}/messages"
     template_block: Dict[str, Any] = {
         "name": template_name,
-        "language": {"code": lang_code},
+        "language": {"code": lang_code or cfg["default_template_lang"]},
     }
     if body_params:
         template_block["components"] = [{
@@ -116,7 +133,7 @@ async def wa_send_template(to_phone: str, template_name: str, lang_code: str = "
     }
     async with httpx.AsyncClient(timeout=20.0) as cli:
         r = await cli.post(url, json=payload, headers={
-            "Authorization": f"Bearer {WA_TOKEN}",
+            "Authorization": f"Bearer {cfg['access_token']}",
             "Content-Type": "application/json",
         })
     try:
@@ -468,12 +485,12 @@ async def auto_send_whatsapp_on_create(lead: dict):
         return
     if not lead.get("phone"):
         return  # cannot send without a recipient
-    tpl_name = WA_DEFAULT_TPL or "hello_world"
-    # Try sending real template via Meta Cloud API. First-touch must use a template.
+    cfg = await get_wa_config()
+    tpl_name = cfg["default_template"]
     api_result = await wa_send_template(
         to_phone=lead["phone"],
         template_name=tpl_name,
-        lang_code=WA_DEFAULT_TPL_LANG or "en_US",
+        lang_code=cfg["default_template_lang"],
         body_params=[lead.get("customer_name", "there")],
     )
     body_preview = f"[Template: {tpl_name}] sent to {lead['phone']}"
@@ -740,12 +757,11 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
 
     # If a template_name is given, send as template; else send freeform text.
     if body.template_name:
-        # Replace {{name}} in body if present (so executive sees what they sent),
-        # but Meta uses template body params positional substitution.
+        cfg = await get_wa_config()
         api_result = await wa_send_template(
             to_phone=lead["phone"],
             template_name=body.template_name,
-            lang_code=WA_DEFAULT_TPL_LANG or "en_US",
+            lang_code=cfg["default_template_lang"],
             body_params=[lead.get("customer_name", "there")],
         )
     else:
@@ -800,17 +816,24 @@ async def delete_template(tpl_id: str, admin: dict = Depends(require_admin)):
 # ------------- WhatsApp Cloud API status & template sync -------------
 @api.get("/whatsapp/status")
 async def whatsapp_status(user: dict = Depends(get_current_user)):
-    """Live health of the configured Meta WhatsApp Business account."""
-    if not WA_ENABLED:
-        return {"enabled": False, "reason": "WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID not set"}
-    out: Dict[str, Any] = {"enabled": True, "phone_number_id": WA_PHONE_ID, "api_version": WA_API_VERSION,
-                           "verify_token": WA_VERIFY_TOKEN}
+    cfg = await get_wa_config()
+    if not cfg["enabled"]:
+        return {"enabled": False, "reason": "WhatsApp access_token or phone_number_id not configured"}
+    out: Dict[str, Any] = {
+        "enabled": True,
+        "phone_number_id": cfg["phone_number_id"],
+        "waba_id": cfg["waba_id"],
+        "api_version": cfg["api_version"],
+        "verify_token": cfg["verify_token"],
+        "default_template": cfg["default_template"],
+        "default_template_lang": cfg["default_template_lang"],
+    }
     try:
         async with httpx.AsyncClient(timeout=15.0) as cli:
             r = await cli.get(
-                f"{WA_BASE_URL}/{WA_API_VERSION}/{WA_PHONE_ID}",
+                f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['phone_number_id']}",
                 params={"fields": "verified_name,display_phone_number,quality_rating,code_verification_status,name_status"},
-                headers={"Authorization": f"Bearer {WA_TOKEN}"},
+                headers={"Authorization": f"Bearer {cfg['access_token']}"},
             )
             if r.status_code < 400:
                 out["phone"] = r.json()
@@ -823,15 +846,14 @@ async def whatsapp_status(user: dict = Depends(get_current_user)):
 
 @api.post("/whatsapp/templates/sync")
 async def sync_templates(admin: dict = Depends(require_admin)):
-    """Pull approved templates from Meta into our local DB so executives can pick them in the UI."""
-    waba_id = os.environ.get("WHATSAPP_WABA_ID", "").strip()
-    if not (WA_ENABLED and waba_id):
-        raise HTTPException(status_code=400, detail="WhatsApp not configured (need ACCESS_TOKEN + PHONE_NUMBER_ID + WABA_ID)")
+    cfg = await get_wa_config()
+    if not (cfg["enabled"] and cfg["waba_id"]):
+        raise HTTPException(status_code=400, detail="WhatsApp not configured (need access_token + phone_number_id + waba_id)")
     async with httpx.AsyncClient(timeout=20.0) as cli:
         r = await cli.get(
-            f"{WA_BASE_URL}/{WA_API_VERSION}/{waba_id}/message_templates",
+            f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['waba_id']}/message_templates",
             params={"fields": "name,status,language,category,components", "limit": 200},
-            headers={"Authorization": f"Bearer {WA_TOKEN}"},
+            headers={"Authorization": f"Bearer {cfg['access_token']}"},
         )
     if r.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"Meta error: {r.text}")
@@ -1290,16 +1312,14 @@ async def webhook_indiamart_recent(admin: dict = Depends(require_admin), limit: 
 # ------------- WhatsApp webhook (Meta Cloud API) -------------
 @api.get("/webhooks/whatsapp")
 async def whatsapp_verify(request: Request):
-    """Meta sends GET with hub.mode/hub.verify_token/hub.challenge during webhook setup.
-    Configure 'verify token' in Meta dashboard to match WHATSAPP_VERIFY_TOKEN in .env."""
+    cfg = await get_wa_config()
     params = request.query_params
     mode = params.get("hub.mode")
     token = params.get("hub.verify_token")
     challenge = params.get("hub.challenge")
-    if mode == "subscribe" and token == WA_VERIFY_TOKEN and challenge:
+    if mode == "subscribe" and token == cfg["verify_token"] and challenge:
         return Response(content=challenge, media_type="text/plain")
     if challenge and not token:
-        # Older test tools sometimes ping with just challenge — keep echo for compat
         return Response(content=challenge, media_type="text/plain")
     raise HTTPException(status_code=403, detail="Verify token mismatch")
 
@@ -1474,6 +1494,82 @@ async def auto_reassign_task():
         )
     except Exception as e:
         logger.exception(f"auto_reassign_task failed: {e}")
+
+# ------------- System settings (WhatsApp runtime overrides) -------------
+def _mask_token(t: str) -> str:
+    if not t or len(t) < 12:
+        return t or ""
+    return t[:6] + "…" + t[-4:] + f" ({len(t)} chars)"
+
+class WhatsAppSettingsInput(BaseModel):
+    access_token: Optional[str] = None
+    phone_number_id: Optional[str] = None
+    waba_id: Optional[str] = None
+    api_version: Optional[str] = None
+    verify_token: Optional[str] = None
+    app_secret: Optional[str] = None
+    default_template: Optional[str] = None
+    default_template_lang: Optional[str] = None
+
+@api.get("/settings/whatsapp")
+async def get_whatsapp_settings(admin: dict = Depends(require_admin)):
+    """Returns effective WhatsApp config (access_token masked) + env defaults and DB overrides
+    so the admin UI can show what's coming from where."""
+    effective = await get_wa_config()
+    db_doc = await db.system_settings.find_one({"key": "whatsapp"}, {"_id": 0}) or {}
+    # Mask any token fields before returning
+    safe_effective = dict(effective)
+    safe_effective["access_token_masked"] = _mask_token(effective.get("access_token") or "")
+    safe_effective.pop("access_token", None)
+    safe_effective["app_secret_masked"] = _mask_token(effective.get("app_secret") or "")
+    safe_effective.pop("app_secret", None)
+    safe_overrides = {k: v for k, v in db_doc.items() if k != "key"}
+    if "access_token" in safe_overrides:
+        safe_overrides["access_token_masked"] = _mask_token(safe_overrides.pop("access_token") or "")
+    if "app_secret" in safe_overrides:
+        safe_overrides["app_secret_masked"] = _mask_token(safe_overrides.pop("app_secret") or "")
+    env_defaults = dict(_WA_ENV_DEFAULTS)
+    env_defaults["access_token_masked"] = _mask_token(env_defaults.pop("access_token") or "")
+    env_defaults["app_secret_masked"] = _mask_token(env_defaults.pop("app_secret") or "")
+    return {
+        "effective": safe_effective,
+        "overrides": safe_overrides,
+        "env_defaults": env_defaults,
+        "editable_fields": _WA_EDITABLE_FIELDS,
+    }
+
+
+@api.put("/settings/whatsapp")
+async def update_whatsapp_settings(body: WhatsAppSettingsInput, admin: dict = Depends(require_admin)):
+    """Update WhatsApp runtime overrides. Empty string clears an override so the .env default
+    takes back over. Any field not provided in the request is left untouched."""
+    patch: Dict[str, Any] = {}
+    unset: Dict[str, Any] = {}
+    for f in _WA_EDITABLE_FIELDS:
+        v = getattr(body, f)
+        if v is None:
+            continue  # field not in request body
+        if isinstance(v, str):
+            v = v.strip()
+        if v == "":
+            unset[f] = ""
+        else:
+            patch[f] = v
+    if not patch and not unset:
+        raise HTTPException(status_code=400, detail="No changes supplied")
+    update_ops: Dict[str, Any] = {}
+    if patch:
+        update_ops["$set"] = {"key": "whatsapp", **patch, "updated_by": admin["id"], "updated_at": iso(now_utc())}
+    if unset:
+        update_ops["$unset"] = unset
+        update_ops.setdefault("$set", {}).update({"updated_by": admin["id"], "updated_at": iso(now_utc()), "key": "whatsapp"})
+    await db.system_settings.update_one({"key": "whatsapp"}, update_ops, upsert=True)
+    await log_activity(admin["id"], "whatsapp_settings_updated", None, {"changed": list(patch.keys()), "cleared": list(unset.keys())})
+    # return fresh effective config
+    effective = await get_wa_config()
+    safe = {k: (_mask_token(v) if k in ("access_token", "app_secret") and isinstance(v, str) else v) for k, v in effective.items()}
+    return {"ok": True, "effective": safe}
+
 
 # ------------- Gmail / Justdial integration -------------
 import base64

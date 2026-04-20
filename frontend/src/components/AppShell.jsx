@@ -32,6 +32,7 @@ function pageTitle(path) {
   if (path.startsWith("/routing")) return "Routing Rules";
   if (path.startsWith("/templates")) return "WhatsApp Templates";
   if (path.startsWith("/integrations")) return "Integrations";
+  if (path.startsWith("/settings")) return "Settings";
   if (path.startsWith("/reports")) return "Reports";
   return "Dashboard";
 }
