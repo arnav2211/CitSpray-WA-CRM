@@ -205,6 +205,7 @@ class UserUpdate(BaseModel):
 class LeadCreate(BaseModel):
     customer_name: str
     phone: Optional[str] = None
+    phones: Optional[List[str]] = None
     email: Optional[str] = None
     requirement: Optional[str] = None
     area: Optional[str] = None
@@ -218,6 +219,7 @@ class LeadCreate(BaseModel):
 class LeadUpdate(BaseModel):
     customer_name: Optional[str] = None
     phone: Optional[str] = None
+    phones: Optional[List[str]] = None
     email: Optional[str] = None
     requirement: Optional[str] = None
     area: Optional[str] = None
@@ -225,6 +227,9 @@ class LeadUpdate(BaseModel):
     state: Optional[str] = None
     status: Optional[Literal["new", "contacted", "qualified", "converted", "lost"]] = None
     assigned_to: Optional[str] = None
+
+class PhoneInput(BaseModel):
+    phone: str
 
 class NoteInput(BaseModel):
     body: str
@@ -503,6 +508,7 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         "id": str(uuid.uuid4()),
         "customer_name": data.get("customer_name", "Unknown"),
         "phone": data.get("phone"),
+        "phones": data.get("phones") or [],
         "email": data.get("email"),
         "requirement": data.get("requirement"),
         "area": data.get("area"),
@@ -520,7 +526,7 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         "notes": [],
         "opened_at": None,
         "last_action_at": iso(now_utc()),
-        "created_at": iso(now_utc()),
+        "created_at": data.get("_created_at_override") or iso(now_utc()),
     }
     await db.leads.insert_one(lead.copy())
     # auto-assign if no explicit assignee
@@ -605,7 +611,7 @@ async def update_lead(lead_id: str, body: LeadUpdate, user: dict = Depends(get_c
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     updates: Dict[str, Any] = {}
-    for f in ["customer_name", "phone", "email", "requirement", "area", "city", "state", "status"]:
+    for f in ["customer_name", "phone", "phones", "email", "requirement", "area", "city", "state", "status"]:
         v = getattr(body, f)
         if v is not None:
             updates[f] = v
@@ -637,6 +643,56 @@ async def add_note(lead_id: str, body: NoteInput, user: dict = Depends(get_curre
     )
     await log_activity(user["id"], "note_added", lead_id)
     return note
+
+
+@api.post("/leads/{lead_id}/phones")
+async def add_phone(lead_id: str, body: PhoneInput, user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    new_phone = (body.phone or "").strip()
+    if not new_phone:
+        raise HTTPException(status_code=400, detail="Phone required")
+    existing_phones = list(lead.get("phones") or [])
+    if lead.get("phone") and lead["phone"] not in existing_phones:
+        pass  # primary kept separately
+    if new_phone == lead.get("phone") or new_phone in existing_phones:
+        raise HTTPException(status_code=409, detail="Phone already on this lead")
+    update: Dict[str, Any] = {"last_action_at": iso(now_utc())}
+    if not lead.get("phone"):
+        update["phone"] = new_phone  # first-ever phone → becomes primary
+    else:
+        existing_phones.append(new_phone)
+        update["phones"] = existing_phones
+    await db.leads.update_one({"id": lead_id}, {"$set": update})
+    await log_activity(user["id"], "phone_added", lead_id, {"phone": new_phone})
+    return await db.leads.find_one({"id": lead_id}, {"_id": 0})
+
+
+@api.delete("/leads/{lead_id}/phones")
+async def remove_phone(lead_id: str, phone: str = Query(...), user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    updates: Dict[str, Any] = {"last_action_at": iso(now_utc())}
+    existing_phones = [p for p in (lead.get("phones") or []) if p != phone]
+    if phone == lead.get("phone"):
+        # Removing the primary — promote next alt if available
+        if existing_phones:
+            updates["phone"] = existing_phones[0]
+            updates["phones"] = existing_phones[1:]
+        else:
+            updates["phone"] = None
+            updates["phones"] = []
+    else:
+        updates["phones"] = existing_phones
+    await db.leads.update_one({"id": lead_id}, {"$set": updates})
+    await log_activity(user["id"], "phone_removed", lead_id, {"phone": phone})
+    return await db.leads.find_one({"id": lead_id}, {"_id": 0})
 
 @api.post("/leads/{lead_id}/reassign")
 async def reassign_lead(lead_id: str, body: ReassignInput, admin: dict = Depends(require_admin)):
@@ -962,41 +1018,99 @@ async def reports_my(user: dict = Depends(get_current_user)):
     }
 
 # ------------- Justdial email parser -------------
-JD_REQ_REGEX = re.compile(r"^\s*(?P<name>[A-Za-z][A-Za-z0-9 .'_-]{0,80}?)\s+(?:enquired|inquired)\s+for\s+(?P<req>.+?)\s*$", re.IGNORECASE | re.MULTILINE)
 JD_FIELD = {
-    "area": re.compile(r"User\s*Area\s*:\s*(.+)", re.IGNORECASE),
-    "city": re.compile(r"User\s*City\s*:\s*(.+)", re.IGNORECASE),
-    "state": re.compile(r"User\s*State\s*:\s*(.+)", re.IGNORECASE),
-    "timestamp": re.compile(r"Search\s*Date\s*&?\s*Time\s*:\s*(.+)", re.IGNORECASE),
-    "phone": re.compile(r"(?:Mobile|Phone|Mobile No|Contact)\s*:\s*([+\d\- ]{6,})", re.IGNORECASE),
+    "area": re.compile(r"User\s*Area\s*:?\s*(.+)", re.IGNORECASE),
+    "city": re.compile(r"User\s*City\s*:?\s*(.+)", re.IGNORECASE),
+    "state": re.compile(r"User\s*State\s*:?\s*(.+)", re.IGNORECASE),
+    "timestamp": re.compile(r"Search\s*Date\s*&?\s*Time\s*:?\s*(.+)", re.IGNORECASE),
+    "phone": re.compile(r"(?:Mobile(?:\s*No)?|Phone|Contact)\s*:?\s*([+\d][\d\- ]{5,})", re.IGNORECASE),
 }
 
+_JD_FIELD_STOPPERS = re.compile(
+    r"\s+(?=User\s+(?:Area|City|State)|Search\s+Date|View\s+Contact|Dear\s)",
+    re.IGNORECASE,
+)
+
+
 def parse_justdial_email(raw_text: str, raw_html: str) -> dict:
-    text = (raw_text or "").strip()
-    if not text and raw_html:
-        try:
-            text = BeautifulSoup(raw_html, "html.parser").get_text("\n")
-        except Exception:
-            text = ""
+    """Extract name / requirement / area / city / state / timestamp / phone / contact_link
+    from a Justdial enquiry notification email. HTML-first, with text fallback."""
     out: Dict[str, Any] = {}
-    m = JD_REQ_REGEX.search(text)
-    if m:
-        out["customer_name"] = m.group("name").strip()
-        out["requirement"] = m.group("req").strip()
-    else:
-        # fallback — try to capture first line
-        first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
-        if first:
-            out["requirement"] = first[:200]
-    for key, rx in JD_FIELD.items():
-        m2 = rx.search(text)
-        if m2:
-            out[key] = m2.group(1).strip()
-    # Contact link from HTML
-    contact_link = None
+    soup = None
     if raw_html:
         try:
             soup = BeautifulSoup(raw_html, "html.parser")
+        except Exception:
+            soup = None
+
+    # Build a clean newline-separated text from HTML so block boundaries survive
+    text = (raw_text or "").strip()
+    if soup:
+        for tag in soup.find_all(["br", "tr", "p", "div", "li"]):
+            tag.append("\n")
+        html_text = soup.get_text("\n")
+        html_text = re.sub(r"[ \t]+", " ", html_text)
+        html_text = re.sub(r"\n+", "\n", html_text).strip()
+        if not text or len(html_text) > len(text):
+            text = html_text
+
+    # 1. NAME — primary: <strong> tag whose text is followed shortly by "enquired for"
+    if soup:
+        try:
+            flat = soup.get_text(" ")
+            for s in soup.find_all("strong"):
+                name = (s.get_text() or "").strip()
+                if not name or len(name) > 40:
+                    continue
+                if re.search(r"\b(dear|mr|mrs|ms|owner|sir|madam|you|hi|hello)\b", name, re.IGNORECASE):
+                    continue
+                pos = flat.find(name)
+                if pos >= 0 and re.search(r"enquired\s+for", flat[pos:pos + 120], re.IGNORECASE):
+                    out["customer_name"] = name
+                    break
+        except Exception:
+            pass
+
+    # 2. REQUIREMENT — everything between "enquired for" and the next label/period/newline
+    m = re.search(
+        r"(?:enquired|inquired)\s+for\s+(?P<req>[^\n\r.]+?)(?=\s*(?:User\s+(?:Area|City|State)|Search\s+Date|View\s+Contact|Dear\s|\.\s|\n|$))",
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        req = m.group("req").strip().rstrip(",.;").strip()
+        out["requirement"] = req
+        # Text-fallback NAME: the last simple word/s before "enquired"
+        if "customer_name" not in out:
+            before = text[:m.start()].rstrip()
+            tokens = before.split()
+            cand: List[str] = []
+            for w in reversed(tokens):
+                if w.startswith("(") or w.endswith(")"):
+                    break
+                if re.fullmatch(r"[A-Za-z][A-Za-z.'\-]*", w):
+                    cand.insert(0, w)
+                else:
+                    break
+                if len(cand) >= 2:
+                    break
+            if cand:
+                out["customer_name"] = " ".join(cand[-1:])  # usually just the first name
+
+    # 3. Structured fields — clip at next known label so we don't swallow neighbours
+    for key, rx in JD_FIELD.items():
+        m2 = rx.search(text)
+        if m2:
+            val = m2.group(1).strip()
+            val = _JD_FIELD_STOPPERS.split(val, maxsplit=1)[0].strip()
+            val = val.rstrip(".,;").strip()
+            if val:
+                out[key] = val
+
+    # 4. Contact link
+    if soup:
+        try:
+            contact_link = None
             for a in soup.find_all("a"):
                 label = (a.get_text() or "").strip().lower()
                 href = a.get("href") or ""
@@ -1004,16 +1118,16 @@ def parse_justdial_email(raw_text: str, raw_html: str) -> dict:
                     contact_link = href
                     break
             if not contact_link:
-                # fallback: first justdial.com link
                 for a in soup.find_all("a"):
                     href = a.get("href") or ""
-                    if "justdial.com" in href:
+                    if "justdial.com" in href.lower():
                         contact_link = href
                         break
+            if contact_link:
+                out["contact_link"] = contact_link
         except Exception:
             pass
-    if contact_link:
-        out["contact_link"] = contact_link
+
     return out
 
 @api.post("/ingest/justdial")
@@ -1042,6 +1156,14 @@ async def ingest_justdial(body: JustdialIngestInput):
     ts = parsed.get("timestamp") or iso(now_utc())
     content_hash = hashlib.sha256(((body.raw_email_text or "") + (body.raw_email_html or "")).encode("utf-8")).hexdigest()
     dhash = _lead_dedup_hash(name, ts, content_hash[:16])
+    created_override = None
+    if parsed.get("timestamp"):
+        try:
+            from zoneinfo import ZoneInfo
+            dt = datetime.strptime(parsed["timestamp"].strip(), "%Y-%m-%d %H:%M:%S")
+            created_override = iso(dt.replace(tzinfo=ZoneInfo("Asia/Kolkata")))
+        except Exception:
+            created_override = None
 
     data = {
         "customer_name": name,
@@ -1056,6 +1178,7 @@ async def ingest_justdial(body: JustdialIngestInput):
         "raw_email_html": body.raw_email_html,
         "raw_email_text": body.raw_email_text,
         "dedup_hash": dhash,
+        "_created_at_override": created_override,
     }
     existing = await db.leads.find_one({"dedup_hash": dhash}, {"_id": 0, "id": 1})
     is_duplicate = existing is not None
@@ -1611,6 +1734,23 @@ async def gmail_poll_task():
                     ts = parsed.get("timestamp") or iso(now_utc())
                     content_hash = hashlib.sha256(((bodies.get("text") or "") + (bodies.get("html") or "")).encode("utf-8")).hexdigest()
                     dhash = _lead_dedup_hash(name, ts, content_hash[:16])
+                    # Use Justdial's "Search Date & Time" (IST) as the lead's created_at.
+                    # Fallback to Gmail's internalDate (the moment the email arrived).
+                    created_override = None
+                    if parsed.get("timestamp"):
+                        try:
+                            from zoneinfo import ZoneInfo
+                            dt = datetime.strptime(parsed["timestamp"].strip(), "%Y-%m-%d %H:%M:%S")
+                            created_override = iso(dt.replace(tzinfo=ZoneInfo("Asia/Kolkata")))
+                        except Exception:
+                            created_override = None
+                    if not created_override:
+                        idate = full.get("internalDate")
+                        if idate:
+                            try:
+                                created_override = iso(datetime.fromtimestamp(int(idate) / 1000, tz=timezone.utc))
+                            except Exception:
+                                pass
                     data = {
                         "customer_name": name,
                         "requirement": parsed.get("requirement"),
@@ -1624,6 +1764,7 @@ async def gmail_poll_task():
                         "raw_email_html": bodies.get("html"),
                         "raw_email_text": bodies.get("text"),
                         "dedup_hash": dhash,
+                        "_created_at_override": created_override,
                     }
                     lead = await _create_lead_internal(data, by_user_id=None)
                     await db.email_logs.insert_one({

@@ -3,7 +3,7 @@ import { api, errMsg } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { toast } from "sonner";
 import { StatusBadge, SourceBadge, QueryTypeBadge } from "@/components/Badges";
-import { X, Phone, EnvelopeSimple, MapPin, ArrowSquareOut, PaperPlaneRight, Clock, CalendarBlank, NotePencil } from "@phosphor-icons/react";
+import { X, Phone, EnvelopeSimple, MapPin, ArrowSquareOut, PaperPlaneRight, Clock, CalendarBlank, NotePencil, Plus, Trash } from "@phosphor-icons/react";
 import { fmtIST, fmtISTTime, queryTypeInfo } from "@/lib/format";
 
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
@@ -125,7 +125,6 @@ export default function LeadDrawer({ leadId, onClose }) {
             </div>
             <h2 className="font-chivo font-black text-3xl mt-2 leading-tight">{lead.customer_name}</h2>
             <div className="text-xs text-gray-500 mt-1 flex flex-wrap gap-x-4 gap-y-1">
-              {lead.phone && <span className="flex items-center gap-1"><Phone size={12} /> {lead.phone}</span>}
               {lead.email && <span className="flex items-center gap-1"><EnvelopeSimple size={12} /> {lead.email}</span>}
               {(lead.area || lead.city || lead.state) && (
                 <span className="flex items-center gap-1"><MapPin size={12} /> {[lead.area, lead.city, lead.state].filter(Boolean).join(", ")}</span>
@@ -142,6 +141,7 @@ export default function LeadDrawer({ leadId, onClose }) {
                 <Clock size={12} /> {fmtIST(lead.created_at)}
               </span>
             </div>
+            <PhonesRow lead={lead} canEdit={isAdmin || lead.assigned_to === user.id} onChanged={loadAll} />
           </div>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-900 p-2" data-testid="lead-drawer-close">
             <X size={20} />
@@ -317,3 +317,70 @@ function DetailRow({ k, v, mono, testId }) {
   );
 }
 
+function PhonesRow({ lead, canEdit, onChanged }) {
+  const [adding, setAdding] = React.useState(false);
+  const [val, setVal] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+
+  const allPhones = [lead.phone, ...(lead.phones || [])].filter(Boolean);
+
+  const add = async () => {
+    const trimmed = val.trim();
+    if (!trimmed) return;
+    setBusy(true);
+    try {
+      await api.post(`/leads/${lead.id}/phones`, { phone: trimmed });
+      toast.success("Phone added");
+      setVal("");
+      setAdding(false);
+      onChanged?.();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setBusy(false); }
+  };
+
+  const remove = async (p) => {
+    if (!window.confirm(`Remove ${p} from this lead?`)) return;
+    setBusy(true);
+    try {
+      await api.delete(`/leads/${lead.id}/phones`, { params: { phone: p } });
+      toast.success("Phone removed");
+      onChanged?.();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setBusy(false); }
+  };
+
+  if (allPhones.length === 0 && !canEdit) return null;
+
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1" data-testid="lead-phones-row">
+      {allPhones.map((p, i) => (
+        <span key={p} className="flex items-center gap-1 text-xs text-gray-700" data-testid={`lead-phone-${p}`}>
+          <Phone size={12} weight={i === 0 ? "fill" : "regular"} className={i === 0 ? "text-[#002FA7]" : "text-gray-400"} />
+          <span className={i === 0 ? "font-semibold" : ""}>{p}</span>
+          {i === 0 && <span className="text-[9px] uppercase tracking-widest text-gray-400 font-bold">Primary</span>}
+          {canEdit && (
+            <button onClick={() => remove(p)} className="text-gray-400 hover:text-[#E60000]" title="Remove" data-testid={`remove-phone-${p}`}>
+              <Trash size={12} />
+            </button>
+          )}
+        </span>
+      ))}
+      {canEdit && !adding && (
+        <button onClick={() => setAdding(true)} className="text-[10px] uppercase tracking-widest font-bold text-[#002FA7] hover:underline flex items-center gap-1" data-testid="add-phone-btn">
+          <Plus size={12} weight="bold" /> {allPhones.length === 0 ? "Add phone" : "Add another"}
+        </button>
+      )}
+      {canEdit && adding && (
+        <span className="flex items-center gap-1">
+          <input autoFocus value={val} onChange={(e) => setVal(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()}
+            placeholder="+91 98765 43210"
+            className="border border-gray-300 px-2 py-1 text-xs" data-testid="add-phone-input" />
+          <button onClick={add} disabled={busy} className="bg-[#002FA7] hover:bg-[#002288] text-white px-2 py-1 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50" data-testid="add-phone-save-btn">
+            Add
+          </button>
+          <button onClick={() => { setAdding(false); setVal(""); }} className="text-gray-400 hover:text-gray-900 p-1"><X size={12} /></button>
+        </span>
+      )}
+    </div>
+  );
+}

@@ -141,7 +141,16 @@ export default function Leads() {
                   >
                     <td className="px-4 py-3">
                       <div className={`${unread ? "font-bold" : ""}`}>{l.customer_name}</div>
-                      {l.phone && <div className="text-xs text-gray-500 font-mono">{l.phone}</div>}
+                      {l.phone && (
+                        <div className="text-xs text-gray-500 font-mono flex items-center gap-1">
+                          <span>{l.phone}</span>
+                          {l.phones?.length > 0 && (
+                            <span className="text-[10px] uppercase tracking-widest text-[#002FA7] font-bold">
+                              +{l.phones.length}
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </td>
                     <td className="px-4 py-3 max-w-[260px] truncate">{l.requirement || "—"}</td>
                     <td className="px-4 py-3 text-xs text-gray-600">{[l.area, l.city, l.state].filter(Boolean).join(", ") || "—"}</td>
