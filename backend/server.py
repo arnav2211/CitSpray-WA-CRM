@@ -1370,17 +1370,6 @@ GMAIL_POLL_MINUTES = max(1, int(os.environ.get("GMAIL_POLL_INTERVAL_MINUTES", "2
 GMAIL_QUERY = os.environ.get("GMAIL_JUSTDIAL_QUERY", "from:instantemail@justdial.com is:unread newer_than:7d")
 GMAIL_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI)
 
-def _google_client_config() -> dict:
-    return {
-        "web": {
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [GOOGLE_REDIRECT_URI],
-        }
-    }
-
 @api.get("/integrations/gmail/status")
 async def gmail_status(user: dict = Depends(get_current_user)):
     if not GMAIL_ENABLED:
@@ -1407,11 +1396,20 @@ async def gmail_status(user: dict = Depends(get_current_user)):
 async def gmail_auth_init(admin: dict = Depends(require_admin)):
     if not GMAIL_ENABLED:
         raise HTTPException(status_code=400, detail="Gmail integration not configured")
-    from google_auth_oauthlib.flow import Flow
-    flow = Flow.from_client_config(_google_client_config(), scopes=GMAIL_SCOPES, redirect_uri=GOOGLE_REDIRECT_URI)
-    auth_url, state = flow.authorization_url(
-        access_type="offline", prompt="consent", include_granted_scopes="true",
-    )
+    # Plain server-side OAuth 2.0 authorization_code — NO PKCE.
+    state = str(uuid.uuid4())
+    from urllib.parse import urlencode
+    params = {
+        "response_type": "code",
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "scope": " ".join(GMAIL_SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+        "state": state,
+    }
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
     await db.oauth_states.insert_one({
         "state": state,
         "user_id": admin["id"],
@@ -1420,19 +1418,18 @@ async def gmail_auth_init(admin: dict = Depends(require_admin)):
     })
     return {"auth_url": auth_url}
 
+
 @api.get("/integrations/gmail/auth/callback")
 async def gmail_auth_callback(request: Request):
-    """Browser is redirected here by Google after consent."""
+    """Browser is redirected here by Google after consent.
+    Confidential-client token exchange — server POSTs client_secret, no PKCE."""
     params = request.query_params
     code = params.get("code")
     state = params.get("state")
     err = params.get("error")
     redirect_target = f"{FRONTEND_BASE_URL or ''}/integrations"
     if err:
-        return Response(
-            status_code=302,
-            headers={"Location": f"{redirect_target}?gmail_status=error&reason={err}"},
-        )
+        return Response(status_code=302, headers={"Location": f"{redirect_target}?gmail_status=error&reason={err}"})
     if not code or not state:
         raise HTTPException(status_code=400, detail="Missing code or state")
     state_doc = await db.oauth_states.find_one({"state": state}, {"_id": 0})
@@ -1440,42 +1437,48 @@ async def gmail_auth_callback(request: Request):
         raise HTTPException(status_code=400, detail="Invalid or expired state")
     await db.oauth_states.delete_one({"state": state})
     try:
-        from google_auth_oauthlib.flow import Flow
-        import warnings
-        flow = Flow.from_client_config(_google_client_config(), scopes=GMAIL_SCOPES, redirect_uri=GOOGLE_REDIRECT_URI)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            flow.fetch_token(code=code)
-        creds = flow.credentials
-        # Get the email address of the connected account
-        async with httpx.AsyncClient(timeout=15.0) as cli:
+        # Exchange authorization code for tokens (standard server-side OAuth)
+        async with httpx.AsyncClient(timeout=20.0) as cli:
+            tok = await cli.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "redirect_uri": GOOGLE_REDIRECT_URI,
+                    "grant_type": "authorization_code",
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            if tok.status_code >= 400:
+                raise RuntimeError(f"Google token exchange failed: {tok.status_code} {tok.text[:300]}")
+            tdata = tok.json()
+            access_token = tdata.get("access_token")
+            refresh_token = tdata.get("refresh_token")
+            expires_in = int(tdata.get("expires_in") or 3600)
+            scope = tdata.get("scope") or " ".join(GMAIL_SCOPES)
+            # Fetch the connected email address
             r = await cli.get(
                 "https://www.googleapis.com/oauth2/v2/userinfo",
-                headers={"Authorization": f"Bearer {creds.token}"},
+                headers={"Authorization": f"Bearer {access_token}"},
             )
             email_addr = (r.json() or {}).get("email", "") if r.status_code < 400 else ""
         doc = {
             "key": "default",
             "email": email_addr,
-            "access_token": creds.token,
-            "refresh_token": creds.refresh_token,
-            "token_uri": creds.token_uri,
-            "scopes": list(creds.scopes or []),
-            "expires_at": iso(creds.expiry.replace(tzinfo=timezone.utc)) if creds.expiry else None,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "scopes": scope.split(" "),
+            "expires_at": iso(now_utc() + timedelta(seconds=expires_in)),
             "connected_by": state_doc.get("user_id"),
             "connected_at": iso(now_utc()),
         }
         await db.gmail_connections.update_one({"key": "default"}, {"$set": doc}, upsert=True)
-        return Response(
-            status_code=302,
-            headers={"Location": f"{redirect_target}?gmail_status=connected&email={email_addr}"},
-        )
+        return Response(status_code=302, headers={"Location": f"{redirect_target}?gmail_status=connected&email={email_addr}"})
     except Exception as e:
         logger.exception(f"Gmail OAuth callback failed: {e}")
-        return Response(
-            status_code=302,
-            headers={"Location": f"{redirect_target}?gmail_status=error&reason={str(e)[:120]}"},
-        )
+        return Response(status_code=302, headers={"Location": f"{redirect_target}?gmail_status=error&reason={str(e)[:140]}"})
 
 @api.post("/integrations/gmail/disconnect")
 async def gmail_disconnect(admin: dict = Depends(require_admin)):
