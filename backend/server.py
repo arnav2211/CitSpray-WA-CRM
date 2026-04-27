@@ -765,6 +765,22 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
             body_params=[lead.get("customer_name", "there")],
         )
     else:
+        # Free-text: enforce WhatsApp's 24-hour customer-care window
+        last_in = lead.get("last_user_message_at")
+        within = False
+        if last_in:
+            try:
+                d = datetime.fromisoformat(last_in.replace("Z", "+00:00"))
+                if d.tzinfo is None:
+                    d = d.replace(tzinfo=timezone.utc)
+                within = (now_utc() - d) < timedelta(hours=24)
+            except Exception:
+                within = False
+        if not within:
+            raise HTTPException(
+                status_code=400,
+                detail="Outside the 24-hour customer service window — please use a template message",
+            )
         api_result = await wa_send_text(to_phone=lead["phone"], body=body.body)
 
     msg = {
@@ -1038,6 +1054,287 @@ async def reports_my(user: dict = Depends(get_current_user)):
         "pending_followups": pending_fu,
         "overdue_followups": overdue_fu,
     }
+
+# ------------- Inbox / Conversations / Quick Replies -------------
+class QuickReplyInput(BaseModel):
+    title: str
+    text: str
+
+class StartChatInput(BaseModel):
+    phone: str
+    customer_name: Optional[str] = None
+    requirement: Optional[str] = None
+    assigned_to: Optional[str] = None  # admin can pre-assign, else current user
+
+class TransferRequestInput(BaseModel):
+    lead_id: str
+    reason: Optional[str] = ""
+
+@api.get("/inbox/conversations")
+async def list_conversations(
+    user: dict = Depends(get_current_user),
+    q: Optional[str] = None,
+    only_unread: bool = False,
+    only_unreplied: bool = False,
+    status: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+):
+    """Returns a list of leads optimized for the chat inbox: each row carries last_msg preview,
+    unread count, last_user_message_at and within_24h flag."""
+    query: Dict[str, Any] = {}
+    if user["role"] == "executive":
+        query["assigned_to"] = user["id"]
+    elif assigned_to:
+        query["assigned_to"] = assigned_to
+    if status:
+        query["status"] = status
+    if q:
+        query["$or"] = [
+            {"customer_name": {"$regex": q, "$options": "i"}},
+            {"phone": {"$regex": q, "$options": "i"}},
+            {"requirement": {"$regex": q, "$options": "i"}},
+        ]
+    leads = await db.leads.find(query, {
+        "_id": 0, "raw_email_html": 0, "raw_email_text": 0,
+    }).sort("last_action_at", -1).to_list(500)
+    if not leads:
+        return []
+    lead_ids = [ld["id"] for ld in leads]
+    # Aggregate last message + unread count per lead in one pass
+    pipeline = [
+        {"$match": {"lead_id": {"$in": lead_ids}}},
+        {"$sort": {"at": -1}},
+        {"$group": {
+            "_id": "$lead_id",
+            "last": {"$first": "$$ROOT"},
+            "unread": {"$sum": {"$cond": [
+                {"$and": [
+                    {"$eq": ["$direction", "in"]},
+                    {"$ne": ["$read_by_agent", True]},
+                ]}, 1, 0]}},
+            "last_in_at": {"$max": {"$cond": [{"$eq": ["$direction", "in"]}, "$at", None]}},
+            "last_out_at": {"$max": {"$cond": [{"$eq": ["$direction", "out"]}, "$at", None]}},
+        }},
+    ]
+    msg_map: Dict[str, dict] = {}
+    async for doc in db.messages.aggregate(pipeline):
+        msg_map[doc["_id"]] = doc
+    now = now_utc()
+    out: List[dict] = []
+    for ld in leads:
+        m = msg_map.get(ld["id"]) or {}
+        last = m.get("last") or {}
+        last_in_at = m.get("last_in_at")
+        last_out_at = m.get("last_out_at")
+        within_24h = False
+        if last_in_at:
+            try:
+                last_in_dt = datetime.fromisoformat((last_in_at).replace("Z", "+00:00"))
+                if last_in_dt.tzinfo is None:
+                    last_in_dt = last_in_dt.replace(tzinfo=timezone.utc)
+                within_24h = (now - last_in_dt) < timedelta(hours=24)
+            except Exception:
+                pass
+        # unreplied = last message is inbound and we never sent after it
+        last_dir = last.get("direction")
+        unreplied = last_dir == "in"
+        if only_unread and (m.get("unread") or 0) == 0:
+            continue
+        if only_unreplied and not unreplied:
+            continue
+        out.append({
+            **{k: ld.get(k) for k in [
+                "id", "customer_name", "phone", "phones", "email", "requirement",
+                "area", "city", "state", "source", "source_data", "status",
+                "assigned_to", "contact_link", "created_at", "opened_at", "last_action_at",
+            ]},
+            "last_message": {
+                "body": last.get("body"),
+                "direction": last.get("direction"),
+                "at": last.get("at"),
+                "status": last.get("status"),
+                "msg_type": last.get("msg_type"),
+                "template_name": last.get("template_name"),
+            } if last else None,
+            "unread": m.get("unread") or 0,
+            "last_in_at": last_in_at,
+            "last_out_at": last_out_at,
+            "within_24h": within_24h,
+            "unreplied": unreplied,
+        })
+    return out
+
+
+@api.post("/inbox/leads/{lead_id}/mark-read")
+async def mark_thread_read(lead_id: str, user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    res = await db.messages.update_many(
+        {"lead_id": lead_id, "direction": "in", "read_by_agent": {"$ne": True}},
+        {"$set": {"read_by_agent": True, "read_by_agent_at": iso(now_utc())}},
+    )
+    return {"ok": True, "marked": res.modified_count}
+
+
+@api.post("/inbox/start-chat")
+async def start_chat(body: StartChatInput, user: dict = Depends(get_current_user)):
+    phone = (body.phone or "").strip()
+    if not phone:
+        raise HTTPException(status_code=400, detail="Phone is required")
+    digits = _normalize_phone(phone)
+    if len(digits) < 10:
+        raise HTTPException(status_code=400, detail="Phone must contain at least 10 digits")
+    # Try to find an existing lead by phone-suffix match (last 10 digits)
+    suffix = digits[-10:]
+    existing = await _find_lead_by_phone(digits)
+    if existing:
+        # If executive, must be assigned to them
+        if user["role"] == "executive" and existing.get("assigned_to") != user["id"]:
+            raise HTTPException(status_code=409, detail="Lead already exists and is assigned to another executive — request transfer from admin")
+        return existing
+    # Decide who this lead goes to
+    target_assignee = body.assigned_to if (user["role"] == "admin" and body.assigned_to) else (
+        body.assigned_to if user["role"] == "admin" else user["id"]
+    )
+    data = {
+        "customer_name": (body.customer_name or "").strip() or f"+{suffix}",
+        "phone": phone,
+        "requirement": body.requirement or "",
+        "source": "Manual",
+        "dedup_hash": _lead_dedup_hash(body.customer_name or "manual", iso(now_utc()), suffix),
+        "assigned_to": target_assignee,
+    }
+    lead = await _create_lead_internal(data, by_user_id=user["id"])
+    return lead
+
+
+@api.post("/inbox/transfer-request")
+async def transfer_request(body: TransferRequestInput, user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": body.lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "lead_id": body.lead_id,
+        "from_user_id": user["id"],
+        "from_user_name": user["name"],
+        "current_assignee_id": lead.get("assigned_to"),
+        "reason": body.reason or "",
+        "status": "pending",  # pending | approved | rejected
+        "created_at": iso(now_utc()),
+    }
+    await db.transfer_requests.insert_one(doc.copy())
+    await log_activity(user["id"], "transfer_requested", body.lead_id, {"reason": body.reason})
+    return strip_mongo(doc)
+
+
+@api.get("/inbox/transfer-requests")
+async def list_transfer_requests(user: dict = Depends(get_current_user), status: str = "pending"):
+    query: Dict[str, Any] = {"status": status}
+    if user["role"] == "executive":
+        query["from_user_id"] = user["id"]
+    docs = await db.transfer_requests.find(query, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return docs
+
+
+@api.post("/inbox/transfer-requests/{req_id}/approve")
+async def approve_transfer(req_id: str, admin: dict = Depends(require_admin)):
+    req = await db.transfer_requests.find_one({"id": req_id}, {"_id": 0})
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if req["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Already processed")
+    await assign_lead(req["lead_id"], target_user_id=req["from_user_id"], by_user_id=admin["id"])
+    await db.transfer_requests.update_one(
+        {"id": req_id},
+        {"$set": {"status": "approved", "decided_at": iso(now_utc()), "decided_by": admin["id"]}},
+    )
+    return {"ok": True}
+
+
+@api.post("/inbox/transfer-requests/{req_id}/reject")
+async def reject_transfer(req_id: str, admin: dict = Depends(require_admin)):
+    await db.transfer_requests.update_one(
+        {"id": req_id},
+        {"$set": {"status": "rejected", "decided_at": iso(now_utc()), "decided_by": admin["id"]}},
+    )
+    return {"ok": True}
+
+
+# Quick Replies
+@api.get("/quick-replies")
+async def list_quick_replies(user: dict = Depends(get_current_user)):
+    return await db.quick_replies.find({}, {"_id": 0}).sort("title", 1).to_list(200)
+
+
+@api.post("/quick-replies")
+async def create_quick_reply(body: QuickReplyInput, admin: dict = Depends(require_admin)):
+    doc = {
+        "id": str(uuid.uuid4()),
+        "title": body.title.strip(),
+        "text": body.text,
+        "created_by": admin["id"],
+        "created_at": iso(now_utc()),
+    }
+    await db.quick_replies.insert_one(doc.copy())
+    return strip_mongo(doc)
+
+
+@api.put("/quick-replies/{qr_id}")
+async def update_quick_reply(qr_id: str, body: QuickReplyInput, admin: dict = Depends(require_admin)):
+    res = await db.quick_replies.update_one(
+        {"id": qr_id},
+        {"$set": {"title": body.title.strip(), "text": body.text, "updated_at": iso(now_utc())}},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Quick reply not found")
+    return await db.quick_replies.find_one({"id": qr_id}, {"_id": 0})
+
+
+@api.delete("/quick-replies/{qr_id}")
+async def delete_quick_reply(qr_id: str, admin: dict = Depends(require_admin)):
+    await db.quick_replies.delete_one({"id": qr_id})
+    return {"ok": True}
+
+
+# Webhook URLs panel (admin)
+@api.get("/settings/webhooks-info")
+async def webhooks_info(admin: dict = Depends(require_admin)):
+    base = (FRONTEND_BASE_URL or os.environ.get("FRONTEND_BASE_URL") or "").rstrip("/")
+    cfg = await get_wa_config()
+    return {
+        "indiamart": {
+            "label": "IndiaMART Push API",
+            "url": f"{base}/api/webhooks/indiamart",
+            "method": "POST",
+            "where_to_paste": "IndiaMART Lead Manager → Push API → Webhook URL",
+            "auth": "none (public endpoint)",
+        },
+        "whatsapp": {
+            "label": "WhatsApp Cloud API",
+            "url": f"{base}/api/webhooks/whatsapp",
+            "method": "POST",
+            "verify_token": cfg["verify_token"],
+            "where_to_paste": "Meta App Dashboard → WhatsApp → Configuration → Webhooks → Callback URL + Verify Token",
+            "subscribe_fields": ["messages"],
+        },
+        "gmail": {
+            "label": "Gmail OAuth callback",
+            "url": GOOGLE_REDIRECT_URI or f"{base}/api/integrations/gmail/auth/callback",
+            "method": "GET",
+            "where_to_paste": "Google Cloud Console → APIs & Services → Credentials → OAuth client → Authorized redirect URIs",
+        },
+        "justdial_manual_ingest": {
+            "label": "Justdial manual ingest (testing)",
+            "url": f"{base}/api/ingest/justdial",
+            "method": "POST",
+            "where_to_paste": "Optional — direct POST endpoint for raw email payloads (Gmail OAuth poll is the primary path).",
+        },
+    }
+
 
 # ------------- Justdial email parser -------------
 JD_FIELD = {
@@ -1418,7 +1715,13 @@ async def webhook_whatsapp(request: Request):
                         "by_user_id": None,
                     }
                     await db.messages.insert_one(msg_doc.copy())
-                    await db.leads.update_one({"id": lead["id"]}, {"$set": {"last_action_at": iso(now_utc())}})
+                    await db.leads.update_one(
+                        {"id": lead["id"]},
+                        {"$set": {
+                            "last_action_at": iso(now_utc()),
+                            "last_user_message_at": iso(now_utc()),
+                        }},
+                    )
                     created_msgs += 1
 
                 # ---- Delivery status updates ----
@@ -1956,16 +2259,38 @@ async def seed_data():
         })
     # default routing rules
     await get_routing_rules()
+    # default quick replies
+    if not await db.quick_replies.find_one({}):
+        defaults = [
+            ("Greeting", "Hi {{name}}, thanks for reaching out — how can we help you today?"),
+            ("Will call shortly", "Thanks for your enquiry! Our team will call you in the next 30 minutes."),
+            ("Price request", "Could you please share the quantity and delivery location so we can share an accurate quote?"),
+            ("Send brochure", "Here's our brochure with pricing and specifications. Let me know if any product catches your eye."),
+            ("Follow-up", "Just checking in on our previous conversation — is now a good time to discuss next steps?"),
+        ]
+        for title, text in defaults:
+            await db.quick_replies.insert_one({
+                "id": str(uuid.uuid4()),
+                "title": title,
+                "text": text,
+                "created_by": None,
+                "created_at": iso(now_utc()),
+            })
     # indexes
     await db.users.create_index("username", unique=True)
     await db.leads.create_index("dedup_hash")
     await db.leads.create_index("assigned_to")
     await db.leads.create_index("status")
     await db.leads.create_index("created_at")
+    await db.leads.create_index("last_action_at")
     await db.messages.create_index("lead_id")
+    await db.messages.create_index([("lead_id", 1), ("at", -1)])
+    await db.messages.create_index("wamid")
     await db.followups.create_index("executive_id")
     await db.followups.create_index("due_at")
     await db.activity_logs.create_index("lead_id")
+    await db.transfer_requests.create_index([("status", 1), ("created_at", -1)])
+    await db.quick_replies.create_index("title")
 
 scheduler: Optional[AsyncIOScheduler] = None
 

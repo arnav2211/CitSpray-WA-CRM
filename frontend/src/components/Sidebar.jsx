@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning,
 } from "@phosphor-icons/react";
 
 const navBase = "flex items-center gap-3 px-4 py-2.5 text-sm border-l-2 border-transparent hover:bg-gray-100 transition-colors";
@@ -40,6 +40,7 @@ export default function Sidebar() {
       <nav className="flex-1 py-3 space-y-0.5">
         <div className="px-5 pt-2 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Workspace</div>
         <Item to="/dashboard" icon={ChartBar} testId="nav-dashboard">Dashboard</Item>
+        <Item to="/chat" icon={ChatTeardropDots} testId="nav-chat">WhatsApp</Item>
         <Item to="/leads" icon={Kanban} testId="nav-leads">Leads</Item>
         <Item to="/followups" icon={Bell} testId="nav-followups">Follow-ups</Item>
         {isAdmin && (
@@ -49,6 +50,7 @@ export default function Sidebar() {
             <Item to="/routing" icon={Gear} testId="nav-routing">Routing Rules</Item>
             <Item to="/integrations" icon={Plug} testId="nav-integrations">Integrations</Item>
             <Item to="/templates" icon={ChatCircleDots} testId="nav-templates">WA Templates</Item>
+            <Item to="/quick-replies" icon={Lightning} testId="nav-quick-replies">Quick Replies</Item>
             <Item to="/settings" icon={Sliders} testId="nav-settings">Settings</Item>
             <Item to="/reports" icon={PaperPlaneTilt} testId="nav-reports">Reports</Item>
           </>

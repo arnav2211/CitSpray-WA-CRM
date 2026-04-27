@@ -16,6 +16,8 @@ import Templates from "@/pages/Templates";
 import Reports from "@/pages/Reports";
 import Integrations from "@/pages/Integrations";
 import Settings from "@/pages/Settings";
+import Chat from "@/pages/Chat";
+import QuickReplies from "@/pages/QuickReplies";
 
 export default function App() {
   return (
@@ -28,6 +30,7 @@ export default function App() {
             <Route element={<ProtectedRoute><AppShell /></ProtectedRoute>}>
               <Route path="/" element={<Navigate to="/dashboard" replace />} />
               <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/chat" element={<Chat />} />
               <Route path="/leads" element={<Leads />} />
               <Route path="/leads/:id" element={<><Leads /><LeadDetail /></>} />
               <Route path="/followups" element={<Followups />} />
@@ -35,6 +38,7 @@ export default function App() {
               <Route path="/routing" element={<AdminOnly><RoutingRules /></AdminOnly>} />
               <Route path="/integrations" element={<AdminOnly><Integrations /></AdminOnly>} />
               <Route path="/templates" element={<AdminOnly><Templates /></AdminOnly>} />
+              <Route path="/quick-replies" element={<AdminOnly><QuickReplies /></AdminOnly>} />
               <Route path="/settings" element={<AdminOnly><Settings /></AdminOnly>} />
               <Route path="/reports" element={<AdminOnly><Reports /></AdminOnly>} />
             </Route>

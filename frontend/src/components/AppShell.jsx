@@ -26,11 +26,13 @@ export default function AppShell() {
 }
 
 function pageTitle(path) {
+  if (path.startsWith("/chat")) return "WhatsApp";
   if (path.startsWith("/leads")) return "Leads";
   if (path.startsWith("/followups")) return "Follow-ups";
   if (path.startsWith("/users")) return "Executives";
   if (path.startsWith("/routing")) return "Routing Rules";
   if (path.startsWith("/templates")) return "WhatsApp Templates";
+  if (path.startsWith("/quick-replies")) return "Quick Replies";
   if (path.startsWith("/integrations")) return "Integrations";
   if (path.startsWith("/settings")) return "Settings";
   if (path.startsWith("/reports")) return "Reports";

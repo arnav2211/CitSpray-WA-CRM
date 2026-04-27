@@ -1,0 +1,552 @@
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { api, errMsg } from "@/lib/api";
+import { useAuth } from "@/context/AuthContext";
+import { toast } from "sonner";
+import { useSearchParams } from "react-router-dom";
+import {
+  MagnifyingGlass, PaperPlaneRight, ChatCircleDots, Phone, ArrowsClockwise, Plus, ArrowLeft,
+  CheckCircle, Funnel, Lightning, ArrowsLeftRight, X, Tag,
+} from "@phosphor-icons/react";
+import { fmtIST, fmtISTTime } from "@/lib/format";
+import { StatusBadge, SourceBadge } from "@/components/Badges";
+
+const POLL_MS = 4000;
+const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
+
+// ---------------- Helpers ----------------
+function tickFor(status) {
+  if (!status) return "";
+  if (status === "read") return "✓✓";
+  if (status === "delivered") return "✓✓";
+  if (status === "sent") return "✓";
+  if (status === "received") return "";
+  if (status === "failed") return "!";
+  return "✓";
+}
+function tickColor(status) {
+  if (status === "read") return "text-[#34B7F1]";
+  if (status === "failed") return "text-[#E60000]";
+  return "text-gray-400";
+}
+function previewText(m) {
+  if (!m) return "—";
+  const prefix = m.direction === "out" ? "" : "";
+  return `${prefix}${(m.body || m.template_name || "(message)").slice(0, 80)}`;
+}
+
+// ---------------- Page ----------------
+export default function Chat() {
+  const { user } = useAuth();
+  const [params, setParams] = useSearchParams();
+  const [convs, setConvs] = useState([]);
+  const [activeId, setActiveId] = useState(params.get("lead") || null);
+  const [search, setSearch] = useState("");
+  const [filterUnread, setFilterUnread] = useState(false);
+  const [filterUnreplied, setFilterUnreplied] = useState(false);
+  const [filterStatus, setFilterStatus] = useState("");
+  const [filterAssignee, setFilterAssignee] = useState("");
+  const [execs, setExecs] = useState([]);
+  const [showNewChat, setShowNewChat] = useState(false);
+
+  const isAdmin = user.role === "admin";
+
+  const fetchConvs = useCallback(async () => {
+    try {
+      const { data } = await api.get("/inbox/conversations", {
+        params: {
+          q: search || undefined,
+          only_unread: filterUnread || undefined,
+          only_unreplied: filterUnreplied || undefined,
+          status: filterStatus || undefined,
+          assigned_to: filterAssignee || undefined,
+        },
+      });
+      setConvs(data);
+    } catch (e) {
+      // silent; toast on hard fail
+      const msg = errMsg(e, "");
+      if (msg && !msg.toLowerCase().includes("network")) toast.error(msg);
+    }
+  }, [search, filterUnread, filterUnreplied, filterStatus, filterAssignee]);
+
+  // Initial + filter changes
+  useEffect(() => { fetchConvs(); }, [fetchConvs]);
+  // Poll
+  useEffect(() => {
+    const id = setInterval(fetchConvs, POLL_MS);
+    return () => clearInterval(id);
+  }, [fetchConvs]);
+
+  // Load execs for admin filter
+  useEffect(() => {
+    if (!isAdmin) return;
+    api.get("/users").then(({ data }) => setExecs(data.filter(u => u.role === "executive"))).catch(() => {});
+  }, [isAdmin]);
+
+  // Sync active lead id to URL
+  useEffect(() => {
+    const p = {};
+    if (activeId) p.lead = activeId;
+    setParams(p, { replace: true });
+  }, [activeId, setParams]);
+
+  const activeConv = useMemo(() => convs.find(c => c.id === activeId), [convs, activeId]);
+  const totalUnread = convs.reduce((s, c) => s + (c.unread || 0), 0);
+
+  return (
+    <div className="h-[calc(100vh-57px)] flex bg-[#EFEAE2]" data-testid="chat-page">
+      {/* LEFT SIDEBAR */}
+      <aside
+        className={`${activeId ? "hidden md:flex" : "flex"} w-full md:w-[380px] shrink-0 flex-col bg-white border-r border-gray-200`}
+        data-testid="conv-sidebar"
+      >
+        <div className="border-b border-gray-200 px-4 py-3 flex items-center justify-between">
+          <div>
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Inbox</div>
+            <div className="font-chivo font-bold text-lg leading-none mt-0.5">
+              Chats {totalUnread > 0 && <span className="ml-1 inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 bg-[#25D366] text-white text-xs font-bold">{totalUnread}</span>}
+            </div>
+          </div>
+          <div className="flex items-center gap-1">
+            <button onClick={fetchConvs} className="p-2 hover:bg-gray-100" title="Refresh" data-testid="refresh-conv-btn">
+              <ArrowsClockwise size={16} />
+            </button>
+            <button onClick={() => setShowNewChat(true)} className="bg-[#25D366] hover:bg-[#1da851] text-white p-2" title="Start new chat" data-testid="new-chat-btn">
+              <Plus size={16} weight="bold" />
+            </button>
+          </div>
+        </div>
+        <div className="px-3 py-2 border-b border-gray-200 space-y-2">
+          <div className="relative">
+            <MagnifyingGlass className="absolute left-2 top-2.5 text-gray-400" size={14} />
+            <input value={search} onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search by name, phone…"
+              className="w-full border border-gray-300 pl-7 pr-3 py-2 text-sm outline-none focus:border-[#25D366] focus:ring-2 focus:ring-[#25D366]"
+              data-testid="conv-search-input" />
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <FilterChip active={filterUnread} onClick={() => setFilterUnread(v => !v)} testId="filter-unread">Unread</FilterChip>
+            <FilterChip active={filterUnreplied} onClick={() => setFilterUnreplied(v => !v)} testId="filter-unreplied">Not replied</FilterChip>
+            <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)} className="border border-gray-300 px-2 py-1 text-xs" data-testid="filter-status">
+              <option value="">All status</option>
+              {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+            {isAdmin && (
+              <select value={filterAssignee} onChange={(e) => setFilterAssignee(e.target.value)} className="border border-gray-300 px-2 py-1 text-xs" data-testid="filter-agent">
+                <option value="">All agents</option>
+                {execs.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
+              </select>
+            )}
+          </div>
+        </div>
+        <div className="flex-1 overflow-y-auto">
+          {convs.length === 0 ? (
+            <div className="p-8 text-center text-xs uppercase tracking-widest text-gray-400">
+              <ChatCircleDots size={48} className="mx-auto mb-3 text-gray-300" weight="light" />
+              No conversations match these filters
+            </div>
+          ) : convs.map((c) => (
+            <ConvRow key={c.id} c={c} active={c.id === activeId} onClick={() => setActiveId(c.id)} execs={execs} />
+          ))}
+        </div>
+      </aside>
+
+      {/* RIGHT THREAD */}
+      <section className={`${activeId ? "flex" : "hidden md:flex"} flex-1 min-w-0 flex-col`}>
+        {activeConv ? (
+          <ChatThread
+            conv={activeConv}
+            user={user}
+            execs={execs}
+            onClose={() => setActiveId(null)}
+            onChanged={fetchConvs}
+          />
+        ) : (
+          <EmptyState />
+        )}
+      </section>
+
+      {showNewChat && (
+        <NewChatModal
+          execs={execs}
+          isAdmin={isAdmin}
+          onClose={() => setShowNewChat(false)}
+          onCreated={(lead) => { setShowNewChat(false); fetchConvs(); setActiveId(lead.id); }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------- Sidebar row ----------------
+function ConvRow({ c, active, onClick, execs }) {
+  const last = c.last_message || {};
+  const exec = execs.find(e => e.id === c.assigned_to);
+  return (
+    <button onClick={onClick} data-testid={`conv-row-${c.id}`}
+      className={`w-full text-left px-3 py-3 flex gap-3 border-b border-gray-100 hover:bg-gray-50 ${active ? "bg-[#F0F2F5]" : ""}`}>
+      <div className="w-10 h-10 rounded-full bg-[#25D366] flex items-center justify-center text-white font-bold text-sm shrink-0">
+        {(c.customer_name || "?").slice(0, 1).toUpperCase()}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center justify-between">
+          <div className="font-semibold text-sm truncate">{c.customer_name || c.phone}</div>
+          <div className="text-[10px] text-gray-500 font-mono shrink-0 ml-2">
+            {last.at ? fmtISTTime(last.at) : ""}
+          </div>
+        </div>
+        <div className="flex items-center justify-between mt-0.5">
+          <div className="text-xs text-gray-500 truncate flex-1">
+            {last.direction === "out" && (
+              <span className={`mr-1 ${tickColor(last.status)}`}>{tickFor(last.status)}</span>
+            )}
+            {previewText(last)}
+          </div>
+          <div className="flex items-center gap-1 shrink-0 ml-2">
+            {c.unread > 0 && (
+              <span className="bg-[#25D366] text-white text-[10px] font-bold rounded-full px-1.5 py-0.5 min-w-[18px] text-center" data-testid="unread-badge">
+                {c.unread}
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-2 mt-1">
+          <SourceBadge source={c.source} />
+          <span className="text-[10px] uppercase tracking-widest text-gray-400 font-bold truncate">
+            {exec ? exec.name : c.assigned_to ? "—" : "Unassigned"}
+          </span>
+          {c.unreplied && (
+            <span className="text-[9px] uppercase tracking-widest text-[#E60000] font-bold">Reply pending</span>
+          )}
+        </div>
+      </div>
+    </button>
+  );
+}
+
+function FilterChip({ active, onClick, children, testId }) {
+  return (
+    <button onClick={onClick} data-testid={testId}
+      className={`text-[10px] uppercase tracking-widest font-bold px-2 py-1 border ${active ? "bg-gray-900 text-white border-gray-900" : "border-gray-300 text-gray-700 hover:bg-gray-100"}`}>
+      {children}
+    </button>
+  );
+}
+
+function EmptyState() {
+  return (
+    <div className="flex-1 flex flex-col items-center justify-center text-center p-8 bg-[#EFEAE2]" data-testid="chat-empty-state">
+      <ChatCircleDots size={64} weight="light" className="text-gray-400" />
+      <h3 className="font-chivo font-bold text-xl mt-4">Pick a conversation</h3>
+      <p className="text-sm text-gray-500 mt-2 max-w-sm">
+        Select a chat on the left to view the conversation, send messages, or use a quick reply.
+        New inbound WhatsApp messages appear here automatically.
+      </p>
+    </div>
+  );
+}
+
+// ---------------- Chat thread ----------------
+function ChatThread({ conv, user, execs, onClose, onChanged }) {
+  const isAdmin = user.role === "admin";
+  const canMessage = isAdmin || conv.assigned_to === user.id;
+  const [messages, setMessages] = useState([]);
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const [showQR, setShowQR] = useState(false);
+  const [showTpl, setShowTpl] = useState(false);
+  const [quickReplies, setQuickReplies] = useState([]);
+  const [templates, setTemplates] = useState([]);
+  const scrollRef = useRef(null);
+
+  const exec = execs.find(e => e.id === conv.assigned_to);
+  const within24h = !!conv.within_24h;
+
+  const loadMessages = useCallback(async () => {
+    try {
+      const { data } = await api.get(`/leads/${conv.id}/messages`);
+      setMessages(data);
+    } catch (e) {
+      const msg = errMsg(e, "");
+      if (msg && !msg.toLowerCase().includes("network")) toast.error(msg);
+    }
+  }, [conv.id]);
+
+  useEffect(() => { loadMessages(); }, [loadMessages]);
+  useEffect(() => {
+    const id = setInterval(loadMessages, POLL_MS);
+    return () => clearInterval(id);
+  }, [loadMessages]);
+
+  // Auto-mark-read when opening + after new inbound
+  useEffect(() => {
+    if (conv.unread > 0 && canMessage) {
+      api.post(`/inbox/leads/${conv.id}/mark-read`).then(() => onChanged?.()).catch(() => {});
+    }
+    // eslint-disable-next-line
+  }, [conv.id]);
+
+  // Load quick replies + templates
+  useEffect(() => {
+    api.get("/quick-replies").then(({ data }) => setQuickReplies(data)).catch(() => {});
+    api.get("/whatsapp/templates").then(({ data }) => setTemplates(data.filter(t => !t.status || t.status === "APPROVED" || !t.synced_from_meta))).catch(() => {});
+  }, []);
+
+  // Scroll to bottom on new messages
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages.length]);
+
+  const send = async () => {
+    if (!draft.trim() || !canMessage) return;
+    if (!within24h) {
+      toast.error("Outside 24-hour window — please use a template");
+      return;
+    }
+    setSending(true);
+    try {
+      await api.post("/whatsapp/send", { lead_id: conv.id, body: draft });
+      setDraft("");
+      loadMessages();
+      onChanged?.();
+    } catch (e) {
+      toast.error(errMsg(e, "Failed to send"));
+    } finally { setSending(false); }
+  };
+
+  const sendTemplate = async (tplName) => {
+    setSending(true);
+    try {
+      await api.post("/whatsapp/send", { lead_id: conv.id, body: `[Template: ${tplName}]`, template_name: tplName });
+      toast.success(`Template "${tplName}" sent`);
+      setShowTpl(false);
+      loadMessages();
+      onChanged?.();
+    } catch (e) {
+      toast.error(errMsg(e, "Template send failed"));
+    } finally { setSending(false); }
+  };
+
+  const applyQR = (qr) => {
+    const text = (qr.text || "").replace("{{name}}", conv.customer_name || "");
+    setDraft((d) => (d ? d + " " : "") + text);
+    setShowQR(false);
+  };
+
+  const requestTransfer = async () => {
+    const reason = window.prompt("Why do you need this lead transferred to you?", "Customer is on my pipeline.");
+    if (reason === null) return;
+    try {
+      await api.post("/inbox/transfer-request", { lead_id: conv.id, reason });
+      toast.success("Transfer request sent to admin");
+    } catch (e) { toast.error(errMsg(e)); }
+  };
+
+  return (
+    <>
+      {/* Top bar */}
+      <div className="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-3" data-testid="chat-topbar">
+        <button onClick={onClose} className="md:hidden p-1 -ml-1" data-testid="back-btn"><ArrowLeft size={18} /></button>
+        <div className="w-9 h-9 rounded-full bg-[#25D366] flex items-center justify-center text-white font-bold text-sm">
+          {(conv.customer_name || "?").slice(0,1).toUpperCase()}
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <div className="font-semibold truncate">{conv.customer_name}</div>
+            <StatusBadge status={conv.status} />
+          </div>
+          <div className="text-xs text-gray-500 flex items-center gap-3">
+            {conv.phone && <span className="font-mono flex items-center gap-1"><Phone size={11} /> {conv.phone}</span>}
+            <span className="flex items-center gap-1">
+              <Tag size={11} /> {exec ? exec.name : "Unassigned"}
+            </span>
+            {within24h ? (
+              <span className="text-[#25D366] font-bold uppercase tracking-widest text-[9px]">24h window OPEN</span>
+            ) : (
+              <span className="text-[#E60000] font-bold uppercase tracking-widest text-[9px]">24h window CLOSED — template only</span>
+            )}
+          </div>
+        </div>
+        {!canMessage && (
+          <button onClick={requestTransfer} className="border border-[#002FA7] text-[#002FA7] px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold hover:bg-[#002FA7] hover:text-white flex items-center gap-1" data-testid="request-transfer-btn">
+            <ArrowsLeftRight size={12} /> Request transfer
+          </button>
+        )}
+      </div>
+
+      {/* Messages */}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-1.5" style={{ background: "#EFEAE2" }} data-testid="messages-area">
+        {messages.length === 0 && (
+          <div className="text-center text-xs uppercase tracking-widest text-gray-500 py-12">No messages yet</div>
+        )}
+        {messages.map((m) => <Bubble key={m.id} m={m} />)}
+      </div>
+
+      {/* Quick reply dropdown */}
+      {showQR && quickReplies.length > 0 && (
+        <div className="bg-white border-t border-gray-200 max-h-48 overflow-y-auto">
+          {quickReplies.map(qr => (
+            <button key={qr.id} onClick={() => applyQR(qr)} className="w-full text-left px-4 py-2 hover:bg-gray-50 border-b border-gray-100" data-testid={`qr-${qr.id}`}>
+              <div className="text-xs font-bold uppercase tracking-widest text-gray-500">{qr.title}</div>
+              <div className="text-sm text-gray-800">{qr.text}</div>
+            </button>
+          ))}
+        </div>
+      )}
+      {showTpl && (
+        <div className="bg-white border-t border-gray-200 max-h-56 overflow-y-auto">
+          {templates.length === 0 ? (
+            <div className="px-4 py-6 text-xs uppercase tracking-widest text-gray-400 text-center">
+              No approved templates — sync them from Meta in /templates
+            </div>
+          ) : templates.map(t => (
+            <button key={t.id} onClick={() => sendTemplate(t.name)} className="w-full text-left px-4 py-3 hover:bg-gray-50 border-b border-gray-100" data-testid={`tpl-${t.name}`}>
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-bold">{t.name}</div>
+                <span className="kbd">{t.language || t.category}</span>
+              </div>
+              {t.body && <div className="text-xs text-gray-600 mt-1 whitespace-pre-wrap">{t.body}</div>}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Input */}
+      {canMessage ? (
+        <div className="bg-[#F0F2F5] border-t border-gray-200 p-3 flex items-end gap-2" data-testid="chat-composer">
+          <button onClick={() => { setShowQR(v => !v); setShowTpl(false); }} title="Quick replies"
+            className={`p-2 ${showQR ? "bg-gray-900 text-white" : "hover:bg-gray-200 text-gray-700"}`} data-testid="qr-toggle">
+            <Lightning size={18} weight="bold" />
+          </button>
+          <button onClick={() => { setShowTpl(v => !v); setShowQR(false); }} title="Templates"
+            className={`px-3 py-2 text-[10px] uppercase tracking-widest font-bold ${showTpl ? "bg-gray-900 text-white" : "border border-gray-300 hover:bg-gray-200"}`} data-testid="tpl-toggle">
+            Tpl
+          </button>
+          <textarea value={draft} onChange={(e) => setDraft(e.target.value)}
+            disabled={!within24h}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+            placeholder={within24h ? "Type a message…" : "Outside 24-hour window — use a template (Tpl ↑)"}
+            rows={1}
+            className="flex-1 resize-none border border-gray-300 px-3 py-2 text-sm outline-none focus:border-[#25D366] disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
+            data-testid="chat-input" />
+          <button onClick={send} disabled={!draft.trim() || sending || !within24h}
+            className="bg-[#25D366] hover:bg-[#1da851] text-white p-2 disabled:opacity-50 disabled:cursor-not-allowed" data-testid="chat-send-btn">
+            <PaperPlaneRight size={18} weight="fill" />
+          </button>
+        </div>
+      ) : (
+        <div className="bg-[#FFE9E9] border-t border-[#E60000] p-3 text-center text-sm text-[#E60000]">
+          You can't message this lead — assigned to <b>{exec?.name || "another agent"}</b>.
+          <button onClick={requestTransfer} className="ml-2 underline font-bold" data-testid="composer-request-transfer">Request transfer</button>
+        </div>
+      )}
+    </>
+  );
+}
+
+function Bubble({ m }) {
+  const isOut = m.direction === "out";
+  const isSystem = m.direction === "system";
+  if (isSystem) {
+    return (
+      <div className="flex justify-center my-2">
+        <div className="bg-white text-gray-600 text-xs px-3 py-1 shadow-sm">{m.body}</div>
+      </div>
+    );
+  }
+  return (
+    <div className={`flex ${isOut ? "justify-end" : "justify-start"}`} data-testid={`msg-${m.id}`}>
+      <div className={`max-w-[75%] px-3 py-2 ${isOut ? "bg-[#D9FDD3]" : "bg-white"} text-sm shadow-sm`}>
+        {m.template_name && (
+          <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold mb-1">Template · {m.template_name}</div>
+        )}
+        <div className="whitespace-pre-wrap break-words">{m.body}</div>
+        <div className="flex items-center justify-end gap-1 mt-1">
+          <span className="text-[10px] text-gray-500 font-mono">{fmtISTTime(m.at)}</span>
+          {isOut && <span className={`text-[10px] ${tickColor(m.status)}`}>{tickFor(m.status)}</span>}
+          {isOut && m.error && <span className="text-[9px] text-[#E60000] uppercase tracking-widest font-bold">{String(m.error).slice(0, 24)}</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- New chat modal ----------------
+function NewChatModal({ onClose, onCreated, execs, isAdmin }) {
+  const [phone, setPhone] = useState("");
+  const [name, setName] = useState("");
+  const [requirement, setRequirement] = useState("");
+  const [assignedTo, setAssignedTo] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      const payload = { phone, customer_name: name, requirement };
+      if (isAdmin && assignedTo) payload.assigned_to = assignedTo;
+      const { data } = await api.post("/inbox/start-chat", payload);
+      toast.success("Chat ready");
+      onCreated(data);
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" onClick={onClose} data-testid="new-chat-modal">
+      <form onClick={(e) => e.stopPropagation()} onSubmit={submit} className="w-full max-w-md bg-white border border-gray-900 p-6">
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">New Chat</div>
+            <h2 className="font-chivo font-black text-2xl mt-1">Start by phone</h2>
+          </div>
+          <button type="button" onClick={onClose} className="text-gray-400"><X size={18} /></button>
+        </div>
+        <div className="space-y-3">
+          <Field label="Phone *">
+            <input required autoFocus value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+91 98765 43210"
+              className="w-full border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="new-chat-phone" />
+          </Field>
+          <Field label="Customer name">
+            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Optional"
+              className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-chat-name" />
+          </Field>
+          <Field label="Requirement / context">
+            <input value={requirement} onChange={(e) => setRequirement(e.target.value)} placeholder="What are they enquiring about?"
+              className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-chat-requirement" />
+          </Field>
+          {isAdmin && (
+            <Field label="Assign to">
+              <select value={assignedTo} onChange={(e) => setAssignedTo(e.target.value)}
+                className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="new-chat-assign">
+                <option value="">Auto (round-robin)</option>
+                {execs.map(x => <option key={x.id} value={x.id}>{x.name}</option>)}
+              </select>
+            </Field>
+          )}
+          <div className="text-xs text-gray-500 leading-relaxed border border-gray-200 bg-gray-50 p-3">
+            If a lead with this phone already exists, it'll be opened instead. WhatsApp Cloud API requires a
+            template message for first-touch outside the 24-hour window.
+          </div>
+        </div>
+        <div className="flex justify-end gap-2 mt-5">
+          <button type="button" onClick={onClose} className="border border-gray-300 px-4 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-100">Cancel</button>
+          <button disabled={busy} className="bg-[#25D366] hover:bg-[#1da851] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50" data-testid="new-chat-submit">
+            {busy ? "Starting…" : "Start Chat"}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <label className="block">
+      <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">{label}</div>
+      {children}
+    </label>
+  );
+}

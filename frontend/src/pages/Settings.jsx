@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
-import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck } from "@phosphor-icons/react";
+import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck, Copy, Link as LinkIcon } from "@phosphor-icons/react";
 
 const FIELDS = [
   { k: "access_token",          label: "Access Token",              secret: true,  hint: "Permanent System User token with whatsapp_business_messaging + whatsapp_business_management scopes." },
@@ -16,13 +16,20 @@ const FIELDS = [
 
 export default function Settings() {
   const [cfg, setCfg] = useState(null);
+  const [hooks, setHooks] = useState(null);
   const [form, setForm] = useState({});
   const [reveal, setReveal] = useState({});
   const [saving, setSaving] = useState(false);
 
   const load = async () => {
-    try { const { data } = await api.get("/settings/whatsapp"); setCfg(data); resetForm(data); }
-    catch (e) { toast.error(errMsg(e)); }
+    try {
+      const [{ data: cfgD }, { data: hooksD }] = await Promise.all([
+        api.get("/settings/whatsapp"),
+        api.get("/settings/webhooks-info"),
+      ]);
+      setCfg(cfgD); resetForm(cfgD);
+      setHooks(hooksD);
+    } catch (e) { toast.error(errMsg(e)); }
   };
   useEffect(() => { load(); }, []);
 
@@ -88,6 +95,8 @@ export default function Settings() {
         <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Admin</div>
         <h1 className="font-chivo font-black text-3xl md:text-4xl">Settings</h1>
       </div>
+
+      {hooks && <WebhooksPanel hooks={hooks} />}
 
       <form onSubmit={submit} className="border border-gray-200 bg-white" data-testid="whatsapp-settings-form">
         <div className="px-5 py-4 border-b border-gray-200 flex items-center justify-between">
@@ -169,3 +178,65 @@ export default function Settings() {
     </div>
   );
 }
+
+function WebhooksPanel({ hooks }) {
+  const items = [
+    { ...hooks.whatsapp,             key: "whatsapp" },
+    { ...hooks.indiamart,            key: "indiamart" },
+    { ...hooks.gmail,                key: "gmail" },
+    { ...hooks.justdial_manual_ingest, key: "justdial" },
+  ].filter(Boolean);
+  const copy = async (text, label) => {
+    try { await navigator.clipboard.writeText(text); toast.success(`${label} copied`); }
+    catch { toast.error("Copy failed — please copy manually"); }
+  };
+  return (
+    <div className="border border-gray-200 bg-white" data-testid="webhooks-panel">
+      <div className="px-5 py-4 border-b border-gray-200 flex items-center justify-between">
+        <div>
+          <h2 className="font-chivo font-bold text-lg flex items-center gap-2"><LinkIcon size={18} weight="bold" /> Webhook URLs</h2>
+          <p className="text-xs text-gray-500 mt-1">Paste these into the respective platform dashboards.</p>
+        </div>
+      </div>
+      <div className="divide-y divide-gray-200">
+        {items.map(it => (
+          <div key={it.key} className="px-5 py-4" data-testid={`hook-${it.key}`}>
+            <div className="flex items-start justify-between gap-4">
+              <div className="min-w-0">
+                <div className="font-chivo font-bold">{it.label}</div>
+                <div className="text-xs text-gray-500 mt-1">{it.where_to_paste}</div>
+                <div className="mt-2 flex items-center gap-2">
+                  <span className="kbd">{it.method}</span>
+                  {it.subscribe_fields && it.subscribe_fields.length > 0 && (
+                    <span className="text-[10px] uppercase tracking-widest text-gray-400 font-bold">Subscribe: {it.subscribe_fields.join(", ")}</span>
+                  )}
+                  {it.auth && <span className="text-[10px] uppercase tracking-widest text-gray-400 font-bold">Auth: {it.auth}</span>}
+                </div>
+              </div>
+            </div>
+            <div className="mt-3 flex gap-2 items-stretch">
+              <code className="flex-1 font-mono text-xs bg-gray-50 border border-gray-200 px-3 py-2 break-all" data-testid={`hook-url-${it.key}`}>
+                {it.url}
+              </code>
+              <button onClick={() => copy(it.url, "URL")} className="border border-gray-900 px-3 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-900 hover:text-white flex items-center gap-1" data-testid={`copy-url-${it.key}`}>
+                <Copy size={12} /> Copy
+              </button>
+            </div>
+            {it.verify_token && (
+              <div className="mt-2 flex gap-2 items-stretch">
+                <div className="flex-1 flex">
+                  <span className="bg-gray-100 border border-gray-200 border-r-0 px-2 py-2 text-[10px] uppercase tracking-widest text-gray-500 font-bold">Verify token</span>
+                  <code className="flex-1 font-mono text-xs bg-gray-50 border border-gray-200 px-3 py-2 break-all" data-testid={`hook-verify-${it.key}`}>{it.verify_token}</code>
+                </div>
+                <button onClick={() => copy(it.verify_token, "Verify token")} className="border border-gray-900 px-3 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-900 hover:text-white flex items-center gap-1">
+                  <Copy size={12} /> Copy
+                </button>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
