@@ -1,0 +1,41 @@
+{
+  "summary": "Iteration-2 LeadOrbit CRM upgrades verified end-to-end. Added /app/backend/tests/test_new_features.py with 14 pytest cases covering: WhatsApp inbound simulator + has_whatsapp flip, status-update webhook, /api/inbox/conversations WA-active filter + new fields, /api/whatsapp/send has_whatsapp flip, receiver-numbers CRUD with 409 conflict, /api/settings/receiver-routing admin-guard, IndiaMART RECEIVER_MOBILE auto-routing (suffix-match across +91/91/0), admin excluded from auto round-robin, admin manually assignable. ALL 14 NEW TESTS PASS. Frontend Playwright verified: admin /chat list shows phone under customer name, thread header has chat-status-select + chat-reassign-select (admin-only) + chat-phone-display + chat-info-toggle, lead-info-panel opens with add-note-input/add-note-btn (note 'TEST_note_212879' persisted within 5s poll), Settings → call-routing-panel shows routing-row-{username} for Priya/Ravi/Admin with Add control. Executive (ravi) /chat correctly hides reassign select, shows fewer convs (74 vs admin 144), status select still visible.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/whatsapp/send", "issue": "Iteration-1 backend_test.py::TestWhatsApp::test_whatsapp_send_stores_message and test_welcome_auto_message_on_create now fail because (a) iteration-2 added strict 24-hour customer-care window enforcement on free-text sends (correct WhatsApp policy) and (b) WHATSAPP_ACCESS_TOKEN + PHONE_NUMBER_ID env are now configured in this preview, so wa_send_template/text hits the real Meta Graph and returns 400 instead of mock 'sent_mock'. Old tests (test_welcome_auto_message_on_create asserts status='sent_mock', test_incoming_message uses non-Meta payload shape, test_whatsapp_send_stores_message sends free-text without inbound first) need to be updated for new behavior. Not iteration-2 bugs."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_new_features.py",
+    "/app/test_reports/pytest/iter2_results.xml"
+  ],
+  "action_items": [
+    "(Optional) Update /app/backend/tests/backend_test.py::TestWhatsApp tests to (a) simulate inbound first to open the 24h window before /whatsapp/send, (b) drop the 'sent_mock' assertion since real Meta creds are now configured in preview, and (c) replace the custom inbound webhook payload in test_incoming_message with a Meta-shaped payload (or use the new /api/webhooks/whatsapp/_debug/simulate endpoint).",
+    "(Already noted in iter1) server.py is now 2498 lines — strongly recommend splitting (auth, leads, webhooks_whatsapp, webhooks_indiamart, receiver_routing, reports). Adds maintenance + test isolation."
+  ],
+  "critical_code_review_comments": [
+    "_find_user_for_receiver iterates all active users in Python instead of using a Mongo query — fine for small teams, but for >1k users add an index on receiver_numbers and query suffix directly.",
+    "auto_send_whatsapp_on_create still calls Meta even when no template approval — failing welcome messages still get persisted with status='failed', cluttering the thread. Consider only persisting on success or surfacing a system-warning row.",
+    "/api/webhooks/whatsapp/_debug/simulate uses a synthetic Request object via __get__; fragile if FastAPI ever inspects more attributes. Safer to refactor the inbound handler core into a helper called by both real and simulated flows.",
+    "_normalize_receiver_list de-dupes by last 10 digits but stores the original full normalized number — if user adds '+919999911111' then '09999911111', the second is silently dropped. UX-wise a 4xx/notice would be clearer than silent drop."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_new_features.py"
+  ],
+  "success_rate": {
+    "backend": "100% on iteration-2 features (14/14 new tests pass)",
+    "frontend": "100% on iteration-2 features (chat list phone + thread header selects + info panel + add note + call-routing panel + role-gated reassign all verified)"
+  },
+  "test_credentials": "admin/Admin@123 (admin), ravi/Exec@123 and priya/Exec@123 (execs). NOTE: Ravi's password had been changed by an earlier test run; new test fixture auto-resets it via PATCH /api/users/{id} so admin password reset still works.",
+  "seed_data_creation": "Created TEST_RR_*, TEST_Existing, TEST_Flip, TEST_WASim, TEST_RouteByReceiver, TEST_StatusSender leads via IndiaMART webhook + WA simulator. One TEST_note_<ts> was added on a chat thread.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Use /app/backend/tests/test_new_features.py as the iteration-2 regression suite (14 tests, 100% pass). It already auto-recovers Ravi's password if changed. The original /app/backend/tests/backend_test.py has 3 stale TestWhatsApp tests that fail in this preview because (a) WhatsApp creds are now real, not mock and (b) free-text sends now require an open 24h window. Those failures are NOT iteration-2 bugs. Frontend selectors confirmed: data-testid='conv-row-*', 'chat-status-select', 'chat-reassign-select' (admin-only), 'chat-phone-display', 'chat-info-toggle', 'lead-info-panel', 'add-note-input', 'add-note-btn', 'call-routing-panel', 'routing-row-{username}'. Polling is 4s — wait 5s after writes.",
+  "rca_of_the_issue": "N/A — all iteration-2 features (incoming WA flip + simulator + status webhook, WA-active filter + new conversation row fields, /whatsapp/send has_whatsapp flip, receiver-numbers CRUD + 409 conflict, /settings/receiver-routing, IM RECEIVER_MOBILE routing with suffix-match, RR excludes admin, admin manual-assign) are implemented and verified working."
+}

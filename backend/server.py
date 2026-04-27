@@ -211,6 +211,7 @@ class UserCreate(BaseModel):
     role: Literal["admin", "executive"] = "executive"
     active: bool = True
     working_hours: List[Dict[str, Any]] = []
+    receiver_numbers: List[str] = []
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
@@ -218,6 +219,10 @@ class UserUpdate(BaseModel):
     role: Optional[Literal["admin", "executive"]] = None
     active: Optional[bool] = None
     working_hours: Optional[List[Dict[str, Any]]] = None
+    receiver_numbers: Optional[List[str]] = None
+
+class ReceiverNumbersInput(BaseModel):
+    receiver_numbers: List[str]
 
 class LeadCreate(BaseModel):
     customer_name: str
@@ -352,6 +357,8 @@ async def create_user(body: UserCreate, admin: dict = Depends(require_admin)):
     uname = body.username.strip().lower()
     if await db.users.find_one({"username": uname}):
         raise HTTPException(status_code=409, detail="Username already exists")
+    rx = _normalize_receiver_list(body.receiver_numbers or [])
+    await _ensure_receiver_unique(rx, exclude_user_id=None)
     doc = {
         "id": str(uuid.uuid4()),
         "username": uname,
@@ -360,6 +367,7 @@ async def create_user(body: UserCreate, admin: dict = Depends(require_admin)):
         "role": body.role,
         "active": body.active,
         "working_hours": body.working_hours,
+        "receiver_numbers": rx,
         "created_at": iso(now_utc()),
     }
     await db.users.insert_one(doc.copy())
@@ -375,6 +383,10 @@ async def update_user(user_id: str, body: UserUpdate, admin: dict = Depends(requ
         v = getattr(body, f)
         if v is not None:
             updates[f] = v
+    if body.receiver_numbers is not None:
+        rx = _normalize_receiver_list(body.receiver_numbers)
+        await _ensure_receiver_unique(rx, exclude_user_id=user_id)
+        updates["receiver_numbers"] = rx
     if body.password:
         updates["password_hash"] = hash_password(body.password)
     if updates:
@@ -388,6 +400,85 @@ async def delete_user(user_id: str, admin: dict = Depends(require_admin)):
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
     await db.users.delete_one({"id": user_id})
     return {"ok": True}
+
+# ------------- Receiver numbers (PNS / call routing) -------------
+def _normalize_receiver_list(items: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: set = set()
+    for raw in items or []:
+        n = _normalize_phone(raw)
+        if not n:
+            continue
+        # Compare on last 10 digits to avoid +91 / 0 prefixes mismatching
+        key = n[-10:] if len(n) >= 10 else n
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(n)
+    return out
+
+
+async def _ensure_receiver_unique(numbers: List[str], exclude_user_id: Optional[str]):
+    if not numbers:
+        return
+    suffixes = [n[-10:] if len(n) >= 10 else n for n in numbers]
+    cursor = db.users.find({"receiver_numbers": {"$exists": True, "$ne": []}}, {"_id": 0, "id": 1, "name": 1, "receiver_numbers": 1})
+    async for u in cursor:
+        if exclude_user_id and u.get("id") == exclude_user_id:
+            continue
+        for ex in (u.get("receiver_numbers") or []):
+            ex_suffix = _normalize_phone(ex)[-10:]
+            if ex_suffix and ex_suffix in suffixes:
+                raise HTTPException(status_code=409, detail=f"Number {ex} is already mapped to {u.get('name')}")
+
+
+async def _find_user_for_receiver(receiver_phone: str) -> Optional[dict]:
+    """Find the user (admin or executive) whose receiver_numbers contain this phone (suffix-match)."""
+    if not receiver_phone:
+        return None
+    suffix = _normalize_phone(receiver_phone)[-10:]
+    if not suffix:
+        return None
+    cursor = db.users.find({"active": True}, {"_id": 0, "password_hash": 0})
+    async for u in cursor:
+        # 1. New: receiver_numbers array
+        for r in (u.get("receiver_numbers") or []):
+            if _normalize_phone(r)[-10:] == suffix:
+                return u
+        # 2. Legacy: phone field on the user record
+        if _normalize_phone(u.get("phone") or "")[-10:] == suffix:
+            return u
+    return None
+
+
+@api.put("/users/{user_id}/receiver-numbers")
+async def set_user_receiver_numbers(user_id: str, body: ReceiverNumbersInput, admin: dict = Depends(require_admin)):
+    u = await db.users.find_one({"id": user_id})
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    rx = _normalize_receiver_list(body.receiver_numbers)
+    await _ensure_receiver_unique(rx, exclude_user_id=user_id)
+    await db.users.update_one({"id": user_id}, {"$set": {"receiver_numbers": rx}})
+    await log_activity(admin["id"], "receiver_numbers_updated", None, {"user_id": user_id, "count": len(rx)})
+    doc = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+    return doc
+
+
+@api.get("/settings/receiver-routing")
+async def get_receiver_routing(admin: dict = Depends(require_admin)):
+    """Return the receiver-number → user mapping for the admin Call Routing UI."""
+    users = await db.users.find({"active": True}, {"_id": 0, "password_hash": 0}).sort("name", 1).to_list(500)
+    rows = []
+    for u in users:
+        rows.append({
+            "id": u["id"],
+            "name": u["name"],
+            "username": u["username"],
+            "role": u["role"],
+            "receiver_numbers": u.get("receiver_numbers") or [],
+        })
+    return {"users": rows}
+
 
 # ------------- Assignment Engine -------------
 async def get_routing_rules() -> dict:
@@ -508,6 +599,8 @@ async def auto_send_whatsapp_on_create(lead: dict):
         "by_user_id": None,
     }
     await db.messages.insert_one(msg.copy())
+    if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
+        await db.leads.update_one({"id": lead["id"]}, {"$set": {"has_whatsapp": True}})
 
 # ------------- Leads -------------
 def _lead_dedup_hash(name: str, ts: Optional[str], extra: str = "") -> str:
@@ -542,6 +635,7 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         "assignment_history": [],
         "notes": [],
         "opened_at": None,
+        "has_whatsapp": bool(data.get("has_whatsapp")),
         "last_action_at": iso(now_utc()),
         "created_at": data.get("_created_at_override") or iso(now_utc()),
     }
@@ -797,7 +891,10 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
         "by_user_id": user["id"],
     }
     await db.messages.insert_one(msg.copy())
-    await db.leads.update_one({"id": body.lead_id}, {"$set": {"last_action_at": iso(now_utc())}})
+    update_lead = {"last_action_at": iso(now_utc())}
+    if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
+        update_lead["has_whatsapp"] = True
+    await db.leads.update_one({"id": body.lead_id}, {"$set": update_lead})
     await log_activity(user["id"], "whatsapp_sent", body.lead_id, {"status": msg["status"], "wamid": msg["wamid"], "error": msg["error"]})
     if msg["status"] == "failed":
         # Surface the Meta error so the executive sees what to fix
@@ -1078,9 +1175,12 @@ async def list_conversations(
     only_unreplied: bool = False,
     status: Optional[str] = None,
     assigned_to: Optional[str] = None,
+    include_all: bool = False,
 ):
     """Returns a list of leads optimized for the chat inbox: each row carries last_msg preview,
-    unread count, last_user_message_at and within_24h flag."""
+    unread count, last_user_message_at and within_24h flag.
+    Default filters to WhatsApp-active leads (`has_whatsapp=true` OR has at least one message).
+    Pass `include_all=true` to bypass the WA filter (admin debugging)."""
     query: Dict[str, Any] = {}
     if user["role"] == "executive":
         query["assigned_to"] = user["id"]
@@ -1142,11 +1242,16 @@ async def list_conversations(
             continue
         if only_unreplied and not unreplied:
             continue
+        # Only show WhatsApp-active leads (has_whatsapp=true OR at least one message exchanged)
+        is_wa_active = bool(ld.get("has_whatsapp")) or bool(last)
+        if not include_all and not is_wa_active:
+            continue
         out.append({
             **{k: ld.get(k) for k in [
                 "id", "customer_name", "phone", "phones", "email", "requirement",
                 "area", "city", "state", "source", "source_data", "status",
                 "assigned_to", "contact_link", "created_at", "opened_at", "last_action_at",
+                "has_whatsapp", "notes",
             ]},
             "last_message": {
                 "body": last.get("body"),
@@ -1206,6 +1311,7 @@ async def start_chat(body: StartChatInput, user: dict = Depends(get_current_user
         "source": "Manual",
         "dedup_hash": _lead_dedup_hash(body.customer_name or "manual", iso(now_utc()), suffix),
         "assigned_to": target_assignee,
+        "has_whatsapp": True,
     }
     lead = await _create_lead_internal(data, by_user_id=user["id"])
     return lead
@@ -1569,9 +1675,10 @@ async def _handle_indiamart_payload(payload: Any, identifier: Optional[str] = No
             or e.get("receiver_mobile") or e.get("call_receiver_number")
         )
         if receiver:
-            exec_match = await db.users.find_one({"role": "executive", "active": True, "phone": receiver}, {"_id": 0})
-            if exec_match:
-                data["assigned_to"] = exec_match["id"]
+            user_match = await _find_user_for_receiver(receiver)
+            if user_match:
+                data["assigned_to"] = user_match["id"]
+                data["source_data"] = {**(data.get("source_data") or {}), "matched_receiver": receiver}
         lead = await _create_lead_internal(data, by_user_id=None)
         created_ids.append(lead["id"])
     await db.webhook_payloads.update_one(
@@ -1605,6 +1712,63 @@ async def webhook_indiamart_recent(admin: dict = Depends(require_admin), limit: 
         {"source": "IndiaMART"}, {"_id": 0}
     ).sort("received_at", -1).to_list(limit)
     return docs
+
+
+@api.get("/webhooks/whatsapp/_debug/recent")
+async def webhook_whatsapp_recent(admin: dict = Depends(require_admin), limit: int = 20):
+    """Admin-only: inspect last N raw WhatsApp webhook payloads (useful for debugging Meta callbacks)."""
+    docs = await db.webhook_payloads.find(
+        {"source": "WhatsApp"}, {"_id": 0}
+    ).sort("received_at", -1).to_list(limit)
+    return docs
+
+
+class WhatsAppSimulateInput(BaseModel):
+    from_phone: str
+    body: str = "Hello — testing inbound webhook"
+    name: Optional[str] = None
+
+
+@api.post("/webhooks/whatsapp/_debug/simulate")
+async def webhook_whatsapp_simulate(body: WhatsAppSimulateInput, admin: dict = Depends(require_admin)):
+    """Admin-only: simulate a Meta inbound text-message payload so we can verify the full
+    pipeline (lead lookup/auto-create, message persistence, has_whatsapp flag, /chat sync)
+    without needing Meta to actually deliver a message."""
+    cfg = await get_wa_config()
+    fake_payload = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": cfg.get("waba_id") or "0",
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": cfg.get("phone_number_id") or "",
+                        "phone_number_id": cfg.get("phone_number_id") or "",
+                    },
+                    "contacts": ([{
+                        "profile": {"name": body.name},
+                        "wa_id": _normalize_phone(body.from_phone),
+                    }] if body.name else []),
+                    "messages": [{
+                        "from": _normalize_phone(body.from_phone),
+                        "id": f"wamid.SIM.{uuid.uuid4().hex[:16]}",
+                        "timestamp": str(int(now_utc().timestamp())),
+                        "type": "text",
+                        "text": {"body": body.body},
+                    }],
+                },
+                "field": "messages",
+            }],
+        }],
+    }
+    # Re-route through the real handler so the simulation is identical to a Meta delivery
+    fake_request = type("FakeReq", (), {"json": lambda self: fake_payload})()
+    async def _aj(self):
+        return fake_payload
+    fake_request.json = _aj.__get__(fake_request)
+    res = await webhook_whatsapp(fake_request)
+    return {"ok": True, "result": res, "simulated_from": _normalize_phone(body.from_phone)}
 
 # ------------- WhatsApp webhook (Meta Cloud API) -------------
 @api.get("/webhooks/whatsapp")
@@ -1701,6 +1865,7 @@ async def webhook_whatsapp(request: Request):
                             "source": "WhatsApp",
                             "source_data": {"channel": "whatsapp_inbound", "wamid": wamid},
                             "dedup_hash": _lead_dedup_hash(sender_name or "wa", from_phone or "", wamid or ""),
+                            "has_whatsapp": True,
                         }
                         lead = await _create_lead_internal(data, by_user_id=None)
                     msg_doc = {
@@ -1720,6 +1885,7 @@ async def webhook_whatsapp(request: Request):
                         {"$set": {
                             "last_action_at": iso(now_utc()),
                             "last_user_message_at": iso(now_utc()),
+                            "has_whatsapp": True,
                         }},
                     )
                     created_msgs += 1

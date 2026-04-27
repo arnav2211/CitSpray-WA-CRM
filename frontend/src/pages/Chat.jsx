@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import { useSearchParams } from "react-router-dom";
 import {
   MagnifyingGlass, PaperPlaneRight, ChatCircleDots, Phone, ArrowsClockwise, Plus, ArrowLeft,
-  CheckCircle, Funnel, Lightning, ArrowsLeftRight, X, Tag,
+  Funnel, Lightning, ArrowsLeftRight, X, Tag, NotePencil, Info,
 } from "@phosphor-icons/react";
 import { fmtIST, fmtISTTime } from "@/lib/format";
 import { StatusBadge, SourceBadge } from "@/components/Badges";
@@ -195,6 +195,11 @@ function ConvRow({ c, active, onClick, execs }) {
             {last.at ? fmtISTTime(last.at) : ""}
           </div>
         </div>
+        {c.phone && (
+          <div className="text-[11px] text-gray-500 font-mono flex items-center gap-1 mt-0.5">
+            <Phone size={10} weight="bold" /> {c.phone}
+          </div>
+        )}
         <div className="flex items-center justify-between mt-0.5">
           <div className="text-xs text-gray-500 truncate flex-1">
             {last.direction === "out" && (
@@ -255,8 +260,11 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
   const [sending, setSending] = useState(false);
   const [showQR, setShowQR] = useState(false);
   const [showTpl, setShowTpl] = useState(false);
+  const [showInfo, setShowInfo] = useState(false);
   const [quickReplies, setQuickReplies] = useState([]);
   const [templates, setTemplates] = useState([]);
+  const [savingMeta, setSavingMeta] = useState(false);
+  const [newNote, setNewNote] = useState("");
   const scrollRef = useRef(null);
 
   const exec = execs.find(e => e.id === conv.assigned_to);
@@ -344,6 +352,40 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
     } catch (e) { toast.error(errMsg(e)); }
   };
 
+  const reassign = async (newAssigneeId) => {
+    if (!isAdmin || !newAssigneeId || newAssigneeId === conv.assigned_to) return;
+    setSavingMeta(true);
+    try {
+      await api.post(`/leads/${conv.id}/reassign`, { assigned_to: newAssigneeId });
+      toast.success("Lead reassigned");
+      onChanged?.();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setSavingMeta(false); }
+  };
+
+  const setStatus = async (newStatus) => {
+    if (!canMessage || newStatus === conv.status) return;
+    setSavingMeta(true);
+    try {
+      await api.patch(`/leads/${conv.id}`, { status: newStatus });
+      toast.success(`Status → ${newStatus}`);
+      onChanged?.();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setSavingMeta(false); }
+  };
+
+  const addNote = async () => {
+    if (!newNote.trim() || !canMessage) return;
+    setSavingMeta(true);
+    try {
+      await api.post(`/leads/${conv.id}/notes`, { body: newNote.trim() });
+      setNewNote("");
+      toast.success("Note added");
+      onChanged?.();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setSavingMeta(false); }
+  };
+
   return (
     <>
       {/* Top bar */}
@@ -353,15 +395,41 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
           {(conv.customer_name || "?").slice(0,1).toUpperCase()}
         </div>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <div className="font-semibold truncate">{conv.customer_name}</div>
-            <StatusBadge status={conv.status} />
+            {/* Inline status dropdown — disabled for non-owners */}
+            <select
+              value={conv.status || "new"}
+              onChange={(e) => setStatus(e.target.value)}
+              disabled={!canMessage || savingMeta}
+              data-testid="chat-status-select"
+              className="border border-gray-300 px-1.5 py-0.5 text-[10px] uppercase tracking-widest font-bold disabled:bg-gray-100 disabled:cursor-not-allowed"
+            >
+              {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
           </div>
-          <div className="text-xs text-gray-500 flex items-center gap-3">
-            {conv.phone && <span className="font-mono flex items-center gap-1"><Phone size={11} /> {conv.phone}</span>}
-            <span className="flex items-center gap-1">
-              <Tag size={11} /> {exec ? exec.name : "Unassigned"}
-            </span>
+          <div className="text-xs text-gray-500 flex items-center gap-3 flex-wrap">
+            {conv.phone && <span className="font-mono flex items-center gap-1" data-testid="chat-phone-display"><Phone size={11} /> {conv.phone}</span>}
+            {/* Admin: reassign dropdown ; executive: read-only assignee */}
+            {isAdmin ? (
+              <span className="flex items-center gap-1">
+                <Tag size={11} />
+                <select
+                  value={conv.assigned_to || ""}
+                  onChange={(e) => reassign(e.target.value)}
+                  disabled={savingMeta}
+                  data-testid="chat-reassign-select"
+                  className="border border-gray-300 px-1.5 py-0.5 text-[11px] disabled:bg-gray-100"
+                >
+                  <option value="">— Unassigned —</option>
+                  {execs.map(x => <option key={x.id} value={x.id}>{x.name}</option>)}
+                </select>
+              </span>
+            ) : (
+              <span className="flex items-center gap-1">
+                <Tag size={11} /> {exec ? exec.name : "Unassigned"}
+              </span>
+            )}
             {within24h ? (
               <span className="text-[#25D366] font-bold uppercase tracking-widest text-[9px]">24h window OPEN</span>
             ) : (
@@ -369,6 +437,9 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
             )}
           </div>
         </div>
+        <button onClick={() => setShowInfo(v => !v)} className={`p-2 ${showInfo ? "bg-gray-900 text-white" : "hover:bg-gray-100"}`} title="Lead info" data-testid="chat-info-toggle">
+          <Info size={16} weight={showInfo ? "fill" : "regular"} />
+        </button>
         {!canMessage && (
           <button onClick={requestTransfer} className="border border-[#002FA7] text-[#002FA7] px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold hover:bg-[#002FA7] hover:text-white flex items-center gap-1" data-testid="request-transfer-btn">
             <ArrowsLeftRight size={12} /> Request transfer
@@ -376,73 +447,152 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
         )}
       </div>
 
-      {/* Messages */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-1.5" style={{ background: "#EFEAE2" }} data-testid="messages-area">
-        {messages.length === 0 && (
-          <div className="text-center text-xs uppercase tracking-widest text-gray-500 py-12">No messages yet</div>
-        )}
-        {messages.map((m) => <Bubble key={m.id} m={m} />)}
-      </div>
+      <div className="flex-1 flex min-h-0">
+        {/* Messages column */}
+        <div className="flex-1 min-w-0 flex flex-col">
+          <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-1.5" style={{ background: "#EFEAE2" }} data-testid="messages-area">
+            {messages.length === 0 && (
+              <div className="text-center text-xs uppercase tracking-widest text-gray-500 py-12">No messages yet</div>
+            )}
+            {messages.map((m) => <Bubble key={m.id} m={m} />)}
+          </div>
 
-      {/* Quick reply dropdown */}
-      {showQR && quickReplies.length > 0 && (
-        <div className="bg-white border-t border-gray-200 max-h-48 overflow-y-auto">
-          {quickReplies.map(qr => (
-            <button key={qr.id} onClick={() => applyQR(qr)} className="w-full text-left px-4 py-2 hover:bg-gray-50 border-b border-gray-100" data-testid={`qr-${qr.id}`}>
-              <div className="text-xs font-bold uppercase tracking-widest text-gray-500">{qr.title}</div>
-              <div className="text-sm text-gray-800">{qr.text}</div>
-            </button>
-          ))}
-        </div>
-      )}
-      {showTpl && (
-        <div className="bg-white border-t border-gray-200 max-h-56 overflow-y-auto">
-          {templates.length === 0 ? (
-            <div className="px-4 py-6 text-xs uppercase tracking-widest text-gray-400 text-center">
-              No approved templates — sync them from Meta in /templates
+          {/* Quick reply dropdown */}
+          {showQR && quickReplies.length > 0 && (
+            <div className="bg-white border-t border-gray-200 max-h-48 overflow-y-auto">
+              {quickReplies.map(qr => (
+                <button key={qr.id} onClick={() => applyQR(qr)} className="w-full text-left px-4 py-2 hover:bg-gray-50 border-b border-gray-100" data-testid={`qr-${qr.id}`}>
+                  <div className="text-xs font-bold uppercase tracking-widest text-gray-500">{qr.title}</div>
+                  <div className="text-sm text-gray-800">{qr.text}</div>
+                </button>
+              ))}
             </div>
-          ) : templates.map(t => (
-            <button key={t.id} onClick={() => sendTemplate(t.name)} className="w-full text-left px-4 py-3 hover:bg-gray-50 border-b border-gray-100" data-testid={`tpl-${t.name}`}>
-              <div className="flex items-center justify-between">
-                <div className="text-sm font-bold">{t.name}</div>
-                <span className="kbd">{t.language || t.category}</span>
-              </div>
-              {t.body && <div className="text-xs text-gray-600 mt-1 whitespace-pre-wrap">{t.body}</div>}
-            </button>
-          ))}
-        </div>
-      )}
+          )}
+          {showTpl && (
+            <div className="bg-white border-t border-gray-200 max-h-56 overflow-y-auto">
+              {templates.length === 0 ? (
+                <div className="px-4 py-6 text-xs uppercase tracking-widest text-gray-400 text-center">
+                  No approved templates — sync them from Meta in /templates
+                </div>
+              ) : templates.map(t => (
+                <button key={t.id} onClick={() => sendTemplate(t.name)} className="w-full text-left px-4 py-3 hover:bg-gray-50 border-b border-gray-100" data-testid={`tpl-${t.name}`}>
+                  <div className="flex items-center justify-between">
+                    <div className="text-sm font-bold">{t.name}</div>
+                    <span className="kbd">{t.language || t.category}</span>
+                  </div>
+                  {t.body && <div className="text-xs text-gray-600 mt-1 whitespace-pre-wrap">{t.body}</div>}
+                </button>
+              ))}
+            </div>
+          )}
 
-      {/* Input */}
-      {canMessage ? (
-        <div className="bg-[#F0F2F5] border-t border-gray-200 p-3 flex items-end gap-2" data-testid="chat-composer">
-          <button onClick={() => { setShowQR(v => !v); setShowTpl(false); }} title="Quick replies"
-            className={`p-2 ${showQR ? "bg-gray-900 text-white" : "hover:bg-gray-200 text-gray-700"}`} data-testid="qr-toggle">
-            <Lightning size={18} weight="bold" />
-          </button>
-          <button onClick={() => { setShowTpl(v => !v); setShowQR(false); }} title="Templates"
-            className={`px-3 py-2 text-[10px] uppercase tracking-widest font-bold ${showTpl ? "bg-gray-900 text-white" : "border border-gray-300 hover:bg-gray-200"}`} data-testid="tpl-toggle">
-            Tpl
-          </button>
-          <textarea value={draft} onChange={(e) => setDraft(e.target.value)}
-            disabled={!within24h}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
-            placeholder={within24h ? "Type a message…" : "Outside 24-hour window — use a template (Tpl ↑)"}
-            rows={1}
-            className="flex-1 resize-none border border-gray-300 px-3 py-2 text-sm outline-none focus:border-[#25D366] disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
-            data-testid="chat-input" />
-          <button onClick={send} disabled={!draft.trim() || sending || !within24h}
-            className="bg-[#25D366] hover:bg-[#1da851] text-white p-2 disabled:opacity-50 disabled:cursor-not-allowed" data-testid="chat-send-btn">
-            <PaperPlaneRight size={18} weight="fill" />
-          </button>
+          {/* Input */}
+          {canMessage ? (
+            <div className="bg-[#F0F2F5] border-t border-gray-200 p-3 flex items-end gap-2" data-testid="chat-composer">
+              <button onClick={() => { setShowQR(v => !v); setShowTpl(false); }} title="Quick replies"
+                className={`p-2 ${showQR ? "bg-gray-900 text-white" : "hover:bg-gray-200 text-gray-700"}`} data-testid="qr-toggle">
+                <Lightning size={18} weight="bold" />
+              </button>
+              <button onClick={() => { setShowTpl(v => !v); setShowQR(false); }} title="Templates"
+                className={`px-3 py-2 text-[10px] uppercase tracking-widest font-bold ${showTpl ? "bg-gray-900 text-white" : "border border-gray-300 hover:bg-gray-200"}`} data-testid="tpl-toggle">
+                Tpl
+              </button>
+              <textarea value={draft} onChange={(e) => setDraft(e.target.value)}
+                disabled={!within24h}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+                placeholder={within24h ? "Type a message…" : "Outside 24-hour window — use a template (Tpl ↑)"}
+                rows={1}
+                className="flex-1 resize-none border border-gray-300 px-3 py-2 text-sm outline-none focus:border-[#25D366] disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
+                data-testid="chat-input" />
+              <button onClick={send} disabled={!draft.trim() || sending || !within24h}
+                className="bg-[#25D366] hover:bg-[#1da851] text-white p-2 disabled:opacity-50 disabled:cursor-not-allowed" data-testid="chat-send-btn">
+                <PaperPlaneRight size={18} weight="fill" />
+              </button>
+            </div>
+          ) : (
+            <div className="bg-[#FFE9E9] border-t border-[#E60000] p-3 text-center text-sm text-[#E60000]">
+              You can't message this lead — assigned to <b>{exec?.name || "another agent"}</b>.
+              <button onClick={requestTransfer} className="ml-2 underline font-bold" data-testid="composer-request-transfer">Request transfer</button>
+            </div>
+          )}
         </div>
-      ) : (
-        <div className="bg-[#FFE9E9] border-t border-[#E60000] p-3 text-center text-sm text-[#E60000]">
-          You can't message this lead — assigned to <b>{exec?.name || "another agent"}</b>.
-          <button onClick={requestTransfer} className="ml-2 underline font-bold" data-testid="composer-request-transfer">Request transfer</button>
-        </div>
-      )}
+
+        {/* Right info panel — toggles in/out */}
+        {showInfo && (
+          <aside className="w-[300px] shrink-0 bg-white border-l border-gray-200 overflow-y-auto" data-testid="lead-info-panel">
+            <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
+              <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Lead Details</div>
+              <button onClick={() => setShowInfo(false)} className="text-gray-400 hover:text-gray-900"><X size={14} /></button>
+            </div>
+            <div className="p-4 space-y-4 text-sm">
+              <InfoRow label="Customer">{conv.customer_name || "—"}</InfoRow>
+              <InfoRow label="Phone"><span className="font-mono">{conv.phone || "—"}</span></InfoRow>
+              {conv.email && <InfoRow label="Email"><span className="font-mono text-xs break-all">{conv.email}</span></InfoRow>}
+              <InfoRow label="Source"><SourceBadge source={conv.source} /></InfoRow>
+              <InfoRow label="Status"><StatusBadge status={conv.status} /></InfoRow>
+              <InfoRow label="Requirement">
+                <div className="text-xs text-gray-700 whitespace-pre-wrap">{conv.requirement || "—"}</div>
+              </InfoRow>
+              {(conv.city || conv.area || conv.state) && (
+                <InfoRow label="Location">
+                  <div className="text-xs text-gray-700">{[conv.area, conv.city, conv.state].filter(Boolean).join(", ")}</div>
+                </InfoRow>
+              )}
+              {conv.created_at && <InfoRow label="Created"><span className="text-xs text-gray-700">{fmtIST(conv.created_at)}</span></InfoRow>}
+
+              {/* Notes section */}
+              <div className="pt-3 border-t border-gray-200">
+                <div className="flex items-center gap-2 text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2">
+                  <NotePencil size={12} /> Notes ({(conv.notes || []).length})
+                </div>
+                <div className="space-y-2 max-h-48 overflow-y-auto">
+                  {(conv.notes || []).length === 0 && (
+                    <div className="text-xs text-gray-400 italic">No notes yet</div>
+                  )}
+                  {(conv.notes || []).map(n => (
+                    <div key={n.id} className="bg-gray-50 border border-gray-200 p-2 text-xs" data-testid={`note-${n.id}`}>
+                      <div className="text-gray-800 whitespace-pre-wrap">{n.body}</div>
+                      <div className="text-[10px] text-gray-500 mt-1 font-mono">
+                        {n.by_name || "—"} · {fmtIST(n.at)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                {canMessage && (
+                  <div className="mt-3">
+                    <textarea
+                      value={newNote}
+                      onChange={(e) => setNewNote(e.target.value)}
+                      placeholder="Add a note (visible to admin + assignee)…"
+                      rows={2}
+                      className="w-full border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-[#002FA7]"
+                      data-testid="add-note-input"
+                    />
+                    <button
+                      onClick={addNote}
+                      disabled={!newNote.trim() || savingMeta}
+                      className="mt-1.5 w-full bg-[#002FA7] hover:bg-[#002288] text-white px-2 py-1.5 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50"
+                      data-testid="add-note-btn"
+                    >
+                      Add Note
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          </aside>
+        )}
+      </div>
     </>
+  );
+}
+
+function InfoRow({ label, children }) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">{label}</div>
+      <div>{children}</div>
+    </div>
   );
 }
 

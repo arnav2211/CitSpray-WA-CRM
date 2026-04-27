@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
-import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck, Copy, Link as LinkIcon } from "@phosphor-icons/react";
+import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck, Copy, Link as LinkIcon, Phone, Plus, Trash } from "@phosphor-icons/react";
 
 const FIELDS = [
   { k: "access_token",          label: "Access Token",              secret: true,  hint: "Permanent System User token with whatsapp_business_messaging + whatsapp_business_management scopes." },
@@ -97,6 +97,8 @@ export default function Settings() {
       </div>
 
       {hooks && <WebhooksPanel hooks={hooks} />}
+
+      <CallRoutingPanel />
 
       <form onSubmit={submit} className="border border-gray-200 bg-white" data-testid="whatsapp-settings-form">
         <div className="px-5 py-4 border-b border-gray-200 flex items-center justify-between">
@@ -240,3 +242,100 @@ function WebhooksPanel({ hooks }) {
   );
 }
 
+
+function CallRoutingPanel() {
+  const [rows, setRows] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [drafts, setDrafts] = useState({}); // { user_id: "new number input" }
+
+  const load = async () => {
+    try {
+      const { data } = await api.get("/settings/receiver-routing");
+      setRows(data.users || []);
+    } catch (e) { toast.error(errMsg(e)); }
+  };
+  useEffect(() => { load(); }, []);
+
+  const saveNumbers = async (userId, numbers) => {
+    setBusy(true);
+    try {
+      await api.put(`/users/${userId}/receiver-numbers`, { receiver_numbers: numbers });
+      toast.success("Receiver numbers updated");
+      setDrafts((d) => ({ ...d, [userId]: "" }));
+      await load();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setBusy(false); }
+  };
+
+  const addNumber = (row) => {
+    const draft = (drafts[row.id] || "").trim();
+    if (!draft) return;
+    const next = [...(row.receiver_numbers || []), draft];
+    saveNumbers(row.id, next);
+  };
+
+  const removeNumber = (row, n) => {
+    const next = (row.receiver_numbers || []).filter(x => x !== n);
+    saveNumbers(row.id, next);
+  };
+
+  return (
+    <div className="border border-gray-200 bg-white" data-testid="call-routing-panel">
+      <div className="px-5 py-4 border-b border-gray-200">
+        <h2 className="font-chivo font-bold text-lg flex items-center gap-2"><Phone size={18} weight="bold" /> Call Routing / Receiver Numbers</h2>
+        <p className="text-xs text-gray-500 mt-1 leading-relaxed">
+          Map each user to one or more <b>IndiaMART receiver numbers</b>. When a PNS / call-tracked
+          enquiry arrives, the lead is auto-assigned to the user whose receiver number matched.
+          A number can only belong to one user.
+        </p>
+      </div>
+      <div className="divide-y divide-gray-200">
+        {rows.map(row => (
+          <div key={row.id} className="px-5 py-4" data-testid={`routing-row-${row.username}`}>
+            <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+              <div>
+                <div className="font-semibold text-sm">{row.name} <span className="text-gray-400 text-xs font-mono">@{row.username}</span></div>
+                <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">{row.role}</div>
+              </div>
+              <div className="text-[10px] uppercase tracking-widest text-gray-400 font-bold">
+                {(row.receiver_numbers || []).length} number{(row.receiver_numbers || []).length === 1 ? "" : "s"}
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2 mb-2">
+              {(row.receiver_numbers || []).length === 0 && (
+                <span className="text-xs text-gray-400 italic">No numbers mapped — calls / PNS leads on these numbers will go through round-robin instead.</span>
+              )}
+              {(row.receiver_numbers || []).map(n => (
+                <span key={n} className="inline-flex items-center gap-1 bg-gray-100 border border-gray-300 px-2 py-1 text-xs font-mono" data-testid={`receiver-${row.username}-${n}`}>
+                  {n}
+                  <button onClick={() => removeNumber(row, n)} disabled={busy} className="text-[#E60000] hover:bg-[#E60000] hover:text-white p-0.5" title="Remove">
+                    <Trash size={11} />
+                  </button>
+                </span>
+              ))}
+            </div>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={drafts[row.id] || ""}
+                onChange={(e) => setDrafts(d => ({ ...d, [row.id]: e.target.value }))}
+                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addNumber(row); } }}
+                placeholder="+91 9876543210"
+                className="flex-1 border border-gray-300 px-3 py-1.5 text-sm font-mono outline-none focus:border-[#002FA7]"
+                data-testid={`add-receiver-input-${row.username}`}
+              />
+              <button
+                onClick={() => addNumber(row)}
+                disabled={busy || !(drafts[row.id] || "").trim()}
+                className="bg-[#002FA7] hover:bg-[#002288] text-white px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 disabled:opacity-50"
+                data-testid={`add-receiver-btn-${row.username}`}
+              >
+                <Plus size={12} weight="bold" /> Add
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
