@@ -72,6 +72,60 @@ def _normalize_phone(p: Optional[str]) -> str:
     return re.sub(r"\D+", "", p)
 
 
+_TPL_PLACEHOLDER_RX = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+
+def count_template_placeholders(body_text: Optional[str]) -> int:
+    """Return the number of distinct placeholders ({{1}}, {{2}}, …, or {{name}}) in a
+    WhatsApp template body. Used to decide whether to include `components` and to
+    validate caller-supplied params against the actual template structure.
+    For positional placeholders we return the highest index; for named placeholders
+    we return the count of distinct names; mixed → max of the two."""
+    if not body_text:
+        return 0
+    found = _TPL_PLACEHOLDER_RX.findall(body_text)
+    if not found:
+        return 0
+    positional: List[int] = []
+    named: set = set()
+    for raw in found:
+        s = raw.strip()
+        if s.isdigit():
+            try:
+                positional.append(int(s))
+            except Exception:
+                pass
+        else:
+            named.add(s.lower())
+    pos_max = max(positional) if positional else 0
+    return max(pos_max, len(named))
+
+
+async def _resolve_template_meta(template_name: str, lang_code: Optional[str] = None) -> Dict[str, Any]:
+    """Look up an approved template doc by name (and optionally language) and return
+    {body, language, params_required}. Falls back to {} when not found locally — caller
+    can then send without components (Meta will reject if it actually has params)."""
+    if not template_name:
+        return {}
+    query: Dict[str, Any] = {"name": template_name}
+    doc = None
+    if lang_code:
+        doc = await db.whatsapp_templates.find_one({**query, "language": lang_code}, {"_id": 0})
+    if not doc:
+        doc = await db.whatsapp_templates.find_one(query, {"_id": 0})
+    if not doc:
+        return {}
+    body = doc.get("body") or ""
+    params_required = doc.get("params_required")
+    if params_required is None:
+        params_required = count_template_placeholders(body)
+    return {
+        "body": body,
+        "language": doc.get("language"),
+        "params_required": int(params_required),
+        "status": doc.get("status"),
+    }
+
+
 async def wa_send_text(to_phone: str, body: str) -> Dict[str, Any]:
     cfg = await get_wa_config()
     if not cfg["enabled"]:
@@ -119,10 +173,14 @@ async def wa_send_template(to_phone: str, template_name: str, lang_code: Optiona
         "name": template_name,
         "language": {"code": lang_code or cfg["default_template_lang"]},
     }
-    if body_params:
+    # CRITICAL: only attach `components` when there is at least one param.
+    # Sending an empty components/parameters array, or any params for a template
+    # with zero placeholders, triggers Meta error (#132000).
+    cleaned_params = [str(p) for p in (body_params or []) if str(p) != ""]
+    if cleaned_params:
         template_block["components"] = [{
             "type": "body",
-            "parameters": [{"type": "text", "text": str(p)} for p in body_params],
+            "parameters": [{"type": "text", "text": p} for p in cleaned_params],
         }]
     payload = {
         "messaging_product": "whatsapp",
@@ -273,6 +331,8 @@ class WhatsAppSendInput(BaseModel):
     lead_id: str
     body: str
     template_name: Optional[str] = None
+    template_lang: Optional[str] = None
+    template_params: Optional[List[str]] = None  # explicit body params; if omitted backend infers
 
 class TemplateCreate(BaseModel):
     name: str
@@ -578,11 +638,21 @@ async def auto_send_whatsapp_on_create(lead: dict):
         return  # cannot send without a recipient
     cfg = await get_wa_config()
     tpl_name = cfg["default_template"]
+    tpl_meta = await _resolve_template_meta(tpl_name, cfg["default_template_lang"])
+    params_required = int(tpl_meta.get("params_required") or 0)
+    # Only send body params if the template actually has placeholders.
+    body_params: Optional[List[str]] = None
+    if params_required > 0:
+        # Default substitution: {{1}} = customer name, remaining placeholders padded
+        # with the customer name as a safe filler so we never ship an under-counted
+        # parameters array (Meta error #132000).
+        first = lead.get("customer_name", "there")
+        body_params = [first] + [first] * (params_required - 1)
     api_result = await wa_send_template(
         to_phone=lead["phone"],
         template_name=tpl_name,
-        lang_code=cfg["default_template_lang"],
-        body_params=[lead.get("customer_name", "there")],
+        lang_code=tpl_meta.get("language") or cfg["default_template_lang"],
+        body_params=body_params,
     )
     body_preview = f"[Template: {tpl_name}] sent to {lead['phone']}"
     msg = {
@@ -852,11 +922,34 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
     # If a template_name is given, send as template; else send freeform text.
     if body.template_name:
         cfg = await get_wa_config()
+        tpl_meta = await _resolve_template_meta(body.template_name, body.template_lang or cfg["default_template_lang"])
+        params_required = int(tpl_meta.get("params_required") or 0)
+        # Resolve params: caller-supplied wins; else default-substitute when needed.
+        provided = list(body.template_params) if body.template_params is not None else None
+        if params_required == 0:
+            # MUST NOT include any params for zero-placeholder templates (Meta #132000)
+            params_to_send: Optional[List[str]] = None
+            if provided:
+                # Caller passed extras for a template that takes none — silently drop
+                # rather than 400, so old clients keep working.
+                logger.info(f"Dropping {len(provided)} stray params for zero-placeholder template {body.template_name}")
+        else:
+            if provided is None:
+                # Legacy fallback: default {{1}} = customer_name; pad remaining
+                first = lead.get("customer_name", "there")
+                params_to_send = [first] + [first] * (params_required - 1)
+            else:
+                if len(provided) != params_required:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Incorrect number of template parameters: template '{body.template_name}' requires {params_required}, got {len(provided)}",
+                    )
+                params_to_send = provided
         api_result = await wa_send_template(
             to_phone=lead["phone"],
             template_name=body.template_name,
-            lang_code=cfg["default_template_lang"],
-            body_params=[lead.get("customer_name", "there")],
+            lang_code=tpl_meta.get("language") or body.template_lang or cfg["default_template_lang"],
+            body_params=params_to_send,
         )
     else:
         # Free-text: enforce WhatsApp's 24-hour customer-care window
@@ -915,6 +1008,7 @@ async def create_template(body: TemplateCreate, admin: dict = Depends(require_ad
         "name": body.name,
         "category": body.category,
         "body": body.body,
+        "params_required": count_template_placeholders(body.body),
         "created_at": iso(now_utc()),
     }
     await db.whatsapp_templates.insert_one(doc.copy())
@@ -988,6 +1082,7 @@ async def sync_templates(admin: dict = Depends(require_admin)):
             "language": t.get("language"),
             "status": t.get("status"),
             "body": body,
+            "params_required": count_template_placeholders(body),
             "synced_from_meta": True,
             "synced_at": iso(now_utc()),
         }
@@ -2408,21 +2503,32 @@ async def seed_data():
             })
     # default template
     if not await db.whatsapp_templates.find_one({"name": "welcome_lead"}):
+        body_w = "Hi {{name}}, thanks for your interest. Our team will connect with you shortly. — LeadOrbit"
         await db.whatsapp_templates.insert_one({
             "id": str(uuid.uuid4()),
             "name": "welcome_lead",
             "category": "utility",
-            "body": "Hi {{name}}, thanks for your interest. Our team will connect with you shortly. — LeadOrbit",
+            "body": body_w,
+            "params_required": count_template_placeholders(body_w),
             "created_at": iso(now_utc()),
         })
     if not await db.whatsapp_templates.find_one({"name": "followup_reminder"}):
+        body_f = "Hi {{name}}, just checking in regarding your enquiry. Let us know a good time to connect."
         await db.whatsapp_templates.insert_one({
             "id": str(uuid.uuid4()),
             "name": "followup_reminder",
             "category": "utility",
-            "body": "Hi {{name}}, just checking in regarding your enquiry. Let us know a good time to connect.",
+            "body": body_f,
+            "params_required": count_template_placeholders(body_f),
             "created_at": iso(now_utc()),
         })
+    # Backfill params_required for any existing templates that don't have it (one-shot)
+    cursor = db.whatsapp_templates.find({"params_required": {"$exists": False}}, {"_id": 0, "id": 1, "body": 1})
+    async for t in cursor:
+        await db.whatsapp_templates.update_one(
+            {"id": t["id"]},
+            {"$set": {"params_required": count_template_placeholders(t.get("body") or "")}},
+        )
     # default routing rules
     await get_routing_rules()
     # default quick replies

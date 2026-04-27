@@ -324,10 +324,32 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
     } finally { setSending(false); }
   };
 
-  const sendTemplate = async (tplName) => {
+  const sendTemplate = async (tpl) => {
+    // Backwards-compat: support being called with a string name OR a full template object
+    const tplName = typeof tpl === "string" ? tpl : tpl?.name;
+    const paramsRequired = typeof tpl === "string"
+      ? (templates.find(t => t.name === tpl)?.params_required ?? 0)
+      : Number(tpl?.params_required || 0);
+    let templateParams = null;
+    if (paramsRequired > 0) {
+      // Prompt for each placeholder. {{1}} default-suggests customer name.
+      templateParams = [];
+      for (let i = 1; i <= paramsRequired; i++) {
+        const suggestion = i === 1 ? (conv.customer_name || "") : "";
+        const v = window.prompt(`Template "${tplName}" — value for {{${i}}}`, suggestion);
+        if (v === null) return; // user cancelled
+        templateParams.push(v);
+      }
+    }
     setSending(true);
     try {
-      await api.post("/whatsapp/send", { lead_id: conv.id, body: `[Template: ${tplName}]`, template_name: tplName });
+      const payload = {
+        lead_id: conv.id,
+        body: `[Template: ${tplName}]`,
+        template_name: tplName,
+      };
+      if (templateParams !== null) payload.template_params = templateParams;
+      await api.post("/whatsapp/send", payload);
       toast.success(`Template "${tplName}" sent`);
       setShowTpl(false);
       loadMessages();
@@ -475,10 +497,17 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
                   No approved templates — sync them from Meta in /templates
                 </div>
               ) : templates.map(t => (
-                <button key={t.id} onClick={() => sendTemplate(t.name)} className="w-full text-left px-4 py-3 hover:bg-gray-50 border-b border-gray-100" data-testid={`tpl-${t.name}`}>
-                  <div className="flex items-center justify-between">
+                <button key={t.id} onClick={() => sendTemplate(t)} className="w-full text-left px-4 py-3 hover:bg-gray-50 border-b border-gray-100" data-testid={`tpl-${t.name}`}>
+                  <div className="flex items-center justify-between gap-2">
                     <div className="text-sm font-bold">{t.name}</div>
-                    <span className="kbd">{t.language || t.category}</span>
+                    <div className="flex items-center gap-1">
+                      {Number(t.params_required || 0) > 0 ? (
+                        <span className="kbd bg-[#002FA7] text-white border-[#002FA7]" data-testid={`tpl-params-${t.name}`}>{t.params_required} var{t.params_required === 1 ? "" : "s"}</span>
+                      ) : (
+                        <span className="kbd" data-testid={`tpl-params-${t.name}`}>no vars</span>
+                      )}
+                      <span className="kbd">{t.language || t.category}</span>
+                    </div>
                   </div>
                   {t.body && <div className="text-xs text-gray-600 mt-1 whitespace-pre-wrap">{t.body}</div>}
                 </button>
