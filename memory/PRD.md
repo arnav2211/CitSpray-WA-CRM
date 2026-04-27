@@ -22,6 +22,14 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 2 (Feb 2026) — Strict fixes + feature upgrades
+- WhatsApp inbound webhook hardened. Added admin-only `/api/webhooks/whatsapp/_debug/simulate` that replays a real Meta-shaped payload through the actual handler so the full pipeline (lead lookup/auto-create, message persistence, status updates, has_whatsapp flip, /chat sync) is verifiable without Meta. `/api/webhooks/whatsapp/_debug/recent` lets admin inspect raw recent payloads.
+- New `has_whatsapp` boolean on every lead. Set true on (a) successful outbound send, (b) any inbound webhook message, (c) /api/inbox/start-chat creation, (d) `auto_send_whatsapp_on_create` success.
+- `/api/inbox/conversations` now FILTERS to WhatsApp-active leads only by default (has_whatsapp=true OR at least one message). Pass `include_all=true` to bypass. Each row now also carries `requirement`, `notes`, `has_whatsapp`.
+- `/chat` UI: chat list rows show phone under customer name. Chat thread header has inline status dropdown + admin-only Assigned-to dropdown + phone display + 24h-window flag. Info icon toggles a right-side `lead-info-panel` showing requirement, source, status, location, notes list, and an Add-note textarea+button.
+- Receiver-numbers feature for IndiaMART PNS / call-tracked leads. Each user (admin or executive) can have multiple `receiver_numbers`. New endpoints: `PUT /api/users/{id}/receiver-numbers`, `GET /api/settings/receiver-routing`. Same number cannot belong to multiple users (409 conflict). IndiaMART webhook now matches `RECEIVER_MOBILE` against `_find_user_for_receiver` (last-10-digit suffix match across +91/91/0). Auto-round-robin still EXCLUDES admins (`pick_next_executive` filters role=executive); admin can still be assigned manually.
+- `/settings` has a new admin section: **Call Routing / Receiver Numbers** with per-user add/remove and conflict messaging.
+
 ### Backend
 - JWT auth with username + role gate (admin / executive). bcrypt hashing.
 - Users CRUD with working_hours; admin seed + 2 test executives.
@@ -62,7 +70,6 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Mobile slide-nav refinement on `/chat` (currently stack-based; works but not fully WhatsApp-mobile feeling).
 - Drag-and-drop on Kanban board to change status.
 - IndiaMART webhook HMAC signing if Meta releases one (currently public).
-
 ## Backlog — P1
 - WebSockets replacing the 4-second poll for sub-second sync.
 - Bulk lead actions (bulk reassign, bulk status).
