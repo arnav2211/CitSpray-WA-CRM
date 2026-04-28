@@ -2486,21 +2486,7 @@ async def seed_data():
                 {"username": admin_username},
                 {"$set": {"password_hash": hash_password(admin_password), "role": "admin", "active": True}},
             )
-    # test executives
-    for uname, name in [("ravi", "Ravi Kumar"), ("priya", "Priya Sharma")]:
-        if not await db.users.find_one({"username": uname}):
-            await db.users.insert_one({
-                "id": str(uuid.uuid4()),
-                "username": uname,
-                "name": name,
-                "password_hash": hash_password("Exec@123"),
-                "role": "executive",
-                "active": True,
-                "working_hours": [
-                    {"weekday": d, "start": "09:00", "end": "19:00"} for d in range(7)
-                ],
-                "created_at": iso(now_utc()),
-            })
+
     # default template
     if not await db.whatsapp_templates.find_one({"name": "welcome_lead"}):
         body_w = "Hi {{name}}, thanks for your interest. Our team will connect with you shortly. — LeadOrbit"
