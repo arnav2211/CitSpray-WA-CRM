@@ -25,18 +25,49 @@ export default function UsersPage() {
   };
 
   return (
-    <div className="p-6 md:p-8 space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
+    <div className="p-4 md:p-8 space-y-4">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div className="min-w-0">
           <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Team</div>
-          <h1 className="font-chivo font-black text-3xl md:text-4xl">Executives</h1>
+          <h1 className="font-chivo font-black text-2xl md:text-4xl">Executives</h1>
         </div>
         <button onClick={() => setShowNew(true)} className="bg-[#002FA7] hover:bg-[#002288] text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1" data-testid="add-user-btn">
           <Plus size={12} weight="bold" /> Add User
         </button>
       </div>
 
-      <div className="border border-gray-200 bg-white overflow-x-auto">
+      {/* Mobile: card list */}
+      <div className="md:hidden space-y-2">
+        {users.map((u) => (
+          <div key={u.id} className="border border-gray-200 bg-white p-3" data-testid={`user-card-${u.username}`}>
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <div className="font-semibold truncate">{u.name}</div>
+                <div className="text-xs font-mono text-gray-500">@{u.username}</div>
+              </div>
+              <span className="kbd shrink-0">{u.role}</span>
+            </div>
+            <div className="text-xs text-gray-600 mt-2">
+              {(u.working_hours || []).length === 0 ? "Always available" :
+                u.working_hours.slice(0, 3).map((w, i) => <span key={i} className="inline-block mr-2">{WEEK[w.weekday]} {w.start}-{w.end}</span>)}
+              {(u.working_hours || []).length > 3 && <span className="text-gray-400">+{u.working_hours.length - 3}</span>}
+            </div>
+            <div className="flex items-center justify-between mt-3">
+              <button onClick={() => toggleActive(u)} className={`text-[10px] uppercase tracking-widest font-bold ${u.active ? "text-[#008A00]" : "text-[#E60000]"}`} data-testid={`toggle-active-mobile-${u.username}`}>
+                {u.active ? "Active" : "Inactive"}
+              </button>
+              <div className="flex items-center gap-3">
+                <button onClick={() => setEditing(u)} className="text-[10px] uppercase tracking-widest font-bold text-[#002FA7]" data-testid={`edit-user-mobile-${u.username}`}>Edit</button>
+                {u.role !== "admin" && <button onClick={() => del(u.id)} className="text-[#E60000]" data-testid={`delete-user-mobile-${u.username}`}><Trash size={14} /></button>}
+              </div>
+            </div>
+          </div>
+        ))}
+        {users.length === 0 && <div className="text-xs text-gray-400 text-center py-8">No users yet</div>}
+      </div>
+
+      {/* Desktop: table */}
+      <div className="hidden md:block border border-gray-200 bg-white overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="bg-gray-50 text-[10px] uppercase tracking-widest text-gray-500 font-bold">
             <tr>
@@ -118,7 +149,7 @@ function UserModal({ user, onClose, onSaved }) {
         <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">{isEdit ? "Edit" : "Create"}</div>
         <h2 className="font-chivo font-black text-2xl mt-1 mb-4">{isEdit ? "Edit User" : "New Executive"}</h2>
 
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <Field label="Username *">
             <input required disabled={isEdit} value={f.username} onChange={(e) => setF({ ...f, username: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm disabled:bg-gray-100" data-testid="user-username-input" />
           </Field>

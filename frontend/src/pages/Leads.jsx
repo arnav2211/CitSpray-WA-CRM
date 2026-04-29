@@ -64,13 +64,13 @@ export default function Leads() {
   const isAdmin = user.role === "admin";
 
   return (
-    <div className="p-6 md:p-8 space-y-4">
+    <div className="p-4 md:p-8 space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
+        <div className="min-w-0">
           <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Pipeline</div>
-          <h1 className="font-chivo font-black text-3xl md:text-4xl">All Leads <span className="text-gray-400">[{leads.length}]</span></h1>
+          <h1 className="font-chivo font-black text-2xl md:text-4xl">All Leads <span className="text-gray-400">[{leads.length}]</span></h1>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <button
             className={`border px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 ${view === "table" ? "bg-gray-900 text-white border-gray-900" : "border-gray-300 hover:bg-gray-100"}`}
             onClick={() => setView("table")} data-testid="view-table-btn"
@@ -87,7 +87,7 @@ export default function Leads() {
       </div>
 
       {/* Filters */}
-      <div className="border border-gray-200 bg-white p-4 grid grid-cols-1 md:grid-cols-5 gap-3">
+      <div className="border border-gray-200 bg-white p-3 md:p-4 grid grid-cols-1 md:grid-cols-5 gap-2 md:gap-3">
         <div className="relative md:col-span-2">
           <MagnifyingGlass className="absolute left-2 top-2.5 text-gray-400" size={14} />
           <input
@@ -114,7 +114,54 @@ export default function Leads() {
       </div>
 
       {view === "table" ? (
-        <div className="border border-gray-200 bg-white overflow-x-auto">
+        <>
+          {/* MOBILE: card list */}
+          <div className="md:hidden space-y-2" data-testid="leads-mobile-list">
+            {leads.length === 0 ? (
+              <div className="border border-gray-200 bg-white p-8 text-center">
+                <FileX size={48} weight="light" className="mx-auto text-gray-300" />
+                <div className="mt-2 text-[10px] uppercase tracking-widest text-gray-500 font-bold">No leads yet</div>
+              </div>
+            ) : leads.map((l) => {
+              const unread = !l.opened_at;
+              const ageMin = Math.floor((Date.now() - new Date(l.created_at).getTime()) / 60000);
+              const overdue = unread && ageMin > 15;
+              return (
+                <button key={l.id} onClick={() => setOpenId(l.id)}
+                  className={`w-full text-left border border-gray-200 bg-white p-3 hover:border-gray-900 transition-colors ${overdue ? "border-l-2 border-l-[#E60000]" : ""}`}
+                  data-testid={`lead-card-${l.id}`}>
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className={`truncate ${unread ? "font-bold" : "font-semibold"}`}>{l.customer_name}</div>
+                      {l.phone && (
+                        <div className="text-xs text-gray-500 font-mono mt-0.5">
+                          {l.phone}
+                          {l.phones?.length > 0 && (
+                            <span className="ml-1 text-[10px] uppercase tracking-widest text-[#002FA7] font-bold">+{l.phones.length}</span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    <StatusBadge status={l.status} />
+                  </div>
+                  {l.requirement && (
+                    <div className="text-xs text-gray-700 mt-2 line-clamp-2">{l.requirement}</div>
+                  )}
+                  <div className="mt-2 flex items-center gap-2 flex-wrap">
+                    <SourceBadge source={l.source} />
+                    <QueryTypeBadge code={l.source_data?.QUERY_TYPE} compact />
+                    <span className="text-[10px] uppercase tracking-widest text-gray-400 font-bold ml-auto">
+                      {execMap[l.assigned_to]?.name || "Unassigned"}
+                    </span>
+                  </div>
+                  <div className="text-[10px] text-gray-400 font-mono mt-1">{fmtIST(l.created_at)}</div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* DESKTOP: table */}
+          <div className="hidden md:block border border-gray-200 bg-white overflow-x-auto">
           <table className="w-full text-sm">
             <thead className="bg-gray-50 text-[10px] uppercase tracking-widest text-gray-500 font-bold">
               <tr>
@@ -184,6 +231,7 @@ export default function Leads() {
             </tbody>
           </table>
         </div>
+        </>
       ) : (
         <Kanban_ leads={leads} onOpen={setOpenId} execMap={execMap} />
       )}
@@ -256,7 +304,7 @@ function NewLeadModal({ onClose, onCreated, execs, isAdmin }) {
       >
         <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Create</div>
         <h2 className="font-chivo font-black text-2xl mt-1 mb-4">New Lead</h2>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <Field label="Customer name *"><input required value={f.customer_name} onChange={(e) => setF({ ...f, customer_name: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-name" /></Field>
           <Field label="Phone"><input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-phone" /></Field>
           <Field label="Requirement" full><input value={f.requirement} onChange={(e) => setF({ ...f, requirement: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-requirement" /></Field>
@@ -290,7 +338,7 @@ function NewLeadModal({ onClose, onCreated, execs, isAdmin }) {
 
 function Field({ label, children, full }) {
   return (
-    <label className={`${full ? "col-span-2" : ""} block`}>
+    <label className={`${full ? "md:col-span-2" : ""} block`}>
       <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">{label}</div>
       {children}
     </label>

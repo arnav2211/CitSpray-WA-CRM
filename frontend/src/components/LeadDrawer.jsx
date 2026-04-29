@@ -115,7 +115,7 @@ export default function LeadDrawer({ leadId, onClose }) {
     <div className="fixed inset-0 bg-black/40 z-40 flex justify-end" onClick={onClose} data-testid="lead-drawer">
       <div className="w-full max-w-5xl bg-white border-l border-gray-200 overflow-y-auto" onClick={(e) => e.stopPropagation()}>
         {/* Header */}
-        <div className="sticky top-0 bg-white border-b border-gray-200 p-5 flex items-start justify-between z-10">
+        <div className="sticky top-0 bg-white border-b border-gray-200 p-4 md:p-5 flex items-start justify-between z-10">
           <div className="min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
               <SourceBadge source={lead.source} />
@@ -123,7 +123,7 @@ export default function LeadDrawer({ leadId, onClose }) {
               <StatusBadge status={lead.status} />
               {!lead.opened_at && <span className="text-[10px] uppercase tracking-widest font-bold text-[#E60000]">Unopened</span>}
             </div>
-            <h2 className="font-chivo font-black text-3xl mt-2 leading-tight">{lead.customer_name}</h2>
+            <h2 className="font-chivo font-black text-2xl md:text-3xl mt-2 leading-tight break-words">{lead.customer_name}</h2>
             <div className="text-xs text-gray-500 mt-1 flex flex-wrap gap-x-4 gap-y-1">
               {lead.email && <span className="flex items-center gap-1"><EnvelopeSimple size={12} /> {lead.email}</span>}
               {(lead.area || lead.city || lead.state) && (

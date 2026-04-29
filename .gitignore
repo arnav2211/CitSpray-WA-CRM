@@ -119,3 +119,4 @@ credentials.json
 *.pem
 *.key
 .credentials
+crm.zip

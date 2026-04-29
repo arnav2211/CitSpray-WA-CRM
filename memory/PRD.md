@@ -22,6 +22,16 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 3 (Apr 2026) — Mobile-first responsiveness
+- **Sidebar drawer** — desktop persistent (`md+`), mobile hidden by default; hamburger button in header opens sidebar as fixed overlay with backdrop, X close button, auto-close on route change, body-scroll lock while open.
+- **Header** — compact on mobile (`p-4`) with hamburger, larger on desktop (`p-8`).
+- **Pages** — all admin pages dropped to `p-4 md:p-8`, H1 down-scaled to `text-2xl md:text-4xl`, modal grids stack 1-col on mobile.
+- **Tables → cards on mobile**: `/leads` and `/users` render proper card lists below `md`, full table at `md+`. No horizontal scroll on mobile.
+- **Dashboard** — Per-Executive table hides Avg-Response and Status columns on mobile (key metrics only).
+- **Lead drawer** — H2 down-scaled, header padding reduced; existing `grid-cols-1 lg:grid-cols-5` already stacks correctly on mobile.
+- **Chat info-panel** — slides over the thread on mobile (`fixed inset-y-0 right-0 w-full sm:w-[360px]`), side-by-side at `lg+` (`w-[300px]`).
+- **Chat container** — switched from `h-[calc(100vh-57px)]` to `h-full` so the parent flex container handles height, eliminating overflow when header height changes.
+
 ### Iteration 2 (Feb 2026) — Strict fixes + feature upgrades
 - WhatsApp inbound webhook hardened. Added admin-only `/api/webhooks/whatsapp/_debug/simulate` that replays a real Meta-shaped payload through the actual handler so the full pipeline (lead lookup/auto-create, message persistence, status updates, has_whatsapp flip, /chat sync) is verifiable without Meta. `/api/webhooks/whatsapp/_debug/recent` lets admin inspect raw recent payloads.
 - New `has_whatsapp` boolean on every lead. Set true on (a) successful outbound send, (b) any inbound webhook message, (c) /api/inbox/start-chat creation, (d) `auto_send_whatsapp_on_create` success.

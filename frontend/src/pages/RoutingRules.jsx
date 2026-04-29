@@ -25,10 +25,10 @@ export default function RoutingRules() {
   if (!rules) return <div className="p-8 text-xs uppercase tracking-widest text-gray-500">Loading…</div>;
 
   return (
-    <div className="p-6 md:p-8 max-w-3xl space-y-5">
+    <div className="p-4 md:p-8 max-w-3xl space-y-5">
       <div>
         <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">System</div>
-        <h1 className="font-chivo font-black text-3xl md:text-4xl">Routing Rules</h1>
+        <h1 className="font-chivo font-black text-2xl md:text-4xl">Routing Rules</h1>
       </div>
 
       <div className="border border-gray-200 bg-white p-6 space-y-6" data-testid="routing-form">
