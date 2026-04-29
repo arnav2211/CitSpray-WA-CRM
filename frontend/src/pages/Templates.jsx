@@ -33,11 +33,11 @@ export default function Templates() {
   };
 
   return (
-    <div className="p-6 md:p-8 space-y-4">
+    <div className="p-4 md:p-8 space-y-4">
       <div className="flex items-center justify-between">
         <div>
           <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Messaging</div>
-          <h1 className="font-chivo font-black text-3xl md:text-4xl">WhatsApp Templates</h1>
+          <h1 className="font-chivo font-black text-2xl md:text-4xl">WhatsApp Templates</h1>
         </div>
         <div className="flex items-center gap-2">
           <button onClick={sync} disabled={syncing}

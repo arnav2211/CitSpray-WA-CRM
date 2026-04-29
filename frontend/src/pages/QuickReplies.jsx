@@ -20,11 +20,11 @@ export default function QuickReplies() {
   };
 
   return (
-    <div className="p-6 md:p-8 space-y-4 max-w-4xl">
+    <div className="p-4 md:p-8 space-y-4 max-w-4xl">
       <div className="flex items-center justify-between">
         <div>
           <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Messaging</div>
-          <h1 className="font-chivo font-black text-3xl md:text-4xl">Quick Replies</h1>
+          <h1 className="font-chivo font-black text-2xl md:text-4xl">Quick Replies</h1>
           <p className="text-sm text-gray-600 mt-1 max-w-2xl">
             Internal canned messages executives can insert into the chat composer. These are NOT WhatsApp templates —
             they only work inside the 24-hour customer-care window. Use <span className="kbd">{"{{name}}"}</span> to inject the customer name.

@@ -90,10 +90,10 @@ export default function Settings() {
     || Object.prototype.hasOwnProperty.call(cfg.overrides || {}, `${k}_masked`);
 
   return (
-    <div className="p-6 md:p-8 space-y-6 max-w-4xl">
+    <div className="p-4 md:p-8 space-y-6 max-w-4xl">
       <div>
         <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Admin</div>
-        <h1 className="font-chivo font-black text-3xl md:text-4xl">Settings</h1>
+        <h1 className="font-chivo font-black text-2xl md:text-4xl">Settings</h1>
       </div>
 
       {hooks && <WebhooksPanel hooks={hooks} />}

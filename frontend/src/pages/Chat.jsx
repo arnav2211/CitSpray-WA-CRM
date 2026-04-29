@@ -94,7 +94,7 @@ export default function Chat() {
   const totalUnread = convs.reduce((s, c) => s + (c.unread || 0), 0);
 
   return (
-    <div className="h-[calc(100vh-57px)] flex bg-[#EFEAE2]" data-testid="chat-page">
+    <div className="h-full flex bg-[#EFEAE2]" data-testid="chat-page">
       {/* LEFT SIDEBAR */}
       <aside
         className={`${activeId ? "hidden md:flex" : "flex"} w-full md:w-[380px] shrink-0 flex-col bg-white border-r border-gray-200`}
@@ -546,9 +546,12 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
           )}
         </div>
 
-        {/* Right info panel — toggles in/out */}
+        {/* Right info panel — slides over on mobile, side-by-side on lg+ */}
         {showInfo && (
-          <aside className="w-[300px] shrink-0 bg-white border-l border-gray-200 overflow-y-auto" data-testid="lead-info-panel">
+          <aside
+            className="fixed inset-y-0 right-0 z-30 w-full sm:w-[360px] lg:relative lg:inset-auto lg:w-[300px] lg:z-auto shrink-0 bg-white border-l border-gray-200 overflow-y-auto"
+            data-testid="lead-info-panel"
+          >
             <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
               <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Lead Details</div>
               <button onClick={() => setShowInfo(false)} className="text-gray-400 hover:text-gray-900"><X size={14} /></button>

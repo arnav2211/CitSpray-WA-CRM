@@ -23,10 +23,10 @@ export default function Followups() {
   };
 
   return (
-    <div className="p-6 md:p-8 space-y-6">
+    <div className="p-4 md:p-8 space-y-6">
       <div>
         <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Schedule</div>
-        <h1 className="font-chivo font-black text-3xl md:text-4xl">Follow-ups</h1>
+        <h1 className="font-chivo font-black text-2xl md:text-4xl">Follow-ups</h1>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

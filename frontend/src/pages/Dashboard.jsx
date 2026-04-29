@@ -45,7 +45,7 @@ export default function Dashboard() {
   const bySourceData = data ? Object.entries(data.by_source || {}).map(([k, v]) => ({ name: k, value: v })) : [];
 
   return (
-    <div className="p-6 md:p-8 space-y-6">
+    <div className="p-4 md:p-8 space-y-4 md:space-y-6">
       <div className="flex items-baseline justify-between">
         <div>
           <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">
@@ -108,8 +108,8 @@ export default function Dashboard() {
                     <th className="text-left px-5 py-2">Name</th>
                     <th className="text-right px-5 py-2">Leads</th>
                     <th className="text-right px-5 py-2">Converted</th>
-                    <th className="text-right px-5 py-2">Avg Resp (s)</th>
-                    <th className="text-left px-5 py-2">Status</th>
+                    <th className="text-right px-5 py-2 hidden md:table-cell">Avg Resp (s)</th>
+                    <th className="text-left px-5 py-2 hidden md:table-cell">Status</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -121,8 +121,8 @@ export default function Dashboard() {
                       </td>
                       <td className="px-5 py-3 text-right font-mono">{e.leads}</td>
                       <td className="px-5 py-3 text-right font-mono text-[#008A00]">{e.converted}</td>
-                      <td className="px-5 py-3 text-right font-mono">{e.avg_response_seconds || "—"}</td>
-                      <td className="px-5 py-3">
+                      <td className="px-5 py-3 text-right font-mono hidden md:table-cell">{e.avg_response_seconds || "—"}</td>
+                      <td className="px-5 py-3 hidden md:table-cell">
                         <span className={`text-[10px] uppercase tracking-widest font-bold ${e.active ? "text-[#008A00]" : "text-[#E60000]"}`}>
                           {e.active ? "Active" : "Inactive"}
                         </span>
