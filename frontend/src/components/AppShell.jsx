@@ -21,10 +21,10 @@ export default function AppShell() {
   }, [sidebarOpen]);
 
   return (
-    <div className="min-h-screen flex bg-white" data-testid="app-shell">
+    <div className="h-screen flex bg-white overflow-hidden" data-testid="app-shell">
       <Sidebar mobileOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} />
-      <main className="flex-1 min-w-0 flex flex-col">
-        <header className="sticky top-0 z-20 bg-white/90 backdrop-blur-xl border-b border-gray-200 px-4 md:px-8 py-3 flex items-center justify-between gap-3">
+      <main className="flex-1 min-w-0 flex flex-col h-full overflow-hidden">
+        <header className="shrink-0 z-20 bg-white/90 backdrop-blur-xl border-b border-gray-200 px-4 md:px-8 py-3 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0">
             <button
               onClick={() => setSidebarOpen(true)}
@@ -43,7 +43,7 @@ export default function AppShell() {
             <span className="kbd">v1.0</span> · Command Console
           </div>
         </header>
-        <div className={`flex-1 ${onChat ? "overflow-hidden" : "overflow-auto"}`}>
+        <div className={`flex-1 min-h-0 ${onChat ? "overflow-hidden" : "overflow-auto"}`}>
           <Outlet />
         </div>
       </main>
