@@ -409,9 +409,9 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
   };
 
   return (
-    <>
+    <div className="flex flex-col h-full overflow-hidden">
       {/* Top bar */}
-      <div className="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-3" data-testid="chat-topbar">
+      <div className="shrink-0 bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-3" data-testid="chat-topbar">
         <button onClick={onClose} className="md:hidden p-1 -ml-1" data-testid="back-btn"><ArrowLeft size={18} /></button>
         <div className="w-9 h-9 rounded-full bg-[#25D366] flex items-center justify-center text-white font-bold text-sm">
           {(conv.customer_name || "?").slice(0,1).toUpperCase()}
@@ -469,7 +469,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
         )}
       </div>
 
-      <div className="flex-1 flex min-h-0">
+      <div className="flex-1 flex min-h-0 overflow-hidden">
         {/* Messages column */}
         <div className="flex-1 min-w-0 flex flex-col">
           <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-1.5" style={{ background: "#EFEAE2" }} data-testid="messages-area">
@@ -615,7 +615,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
           </aside>
         )}
       </div>
-    </>
+    </div>
   );
 }
 
