@@ -70,7 +70,7 @@ export default function LeadDrawer({ leadId, onClose }) {
           api.get("/users"),
           api.get("/whatsapp/templates"),
         ]);
-        setExecs(U.filter((u) => u.role === "executive"));
+        setExecs(U.filter((u) => u.role === "executive" || u.role === "admin"));
         setTpl(T);
       } catch { /* empty */ }
     })();
@@ -278,7 +278,7 @@ export default function LeadDrawer({ leadId, onClose }) {
           {isAdmin && (
             <select value={lead.assigned_to || ""} onChange={(e) => e.target.value && reassign(e.target.value)} className="border border-gray-300 px-2 py-2 text-sm" data-testid="lead-reassign-select">
               <option value="">— Reassign —</option>
-              {execs.map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+              {execs.map((x) => <option key={x.id} value={x.id}>{x.role === "admin" ? `${x.name} (admin)` : x.name}</option>)}
             </select>
           )}
           <div className="text-xs text-gray-500 ml-auto flex items-center gap-1">

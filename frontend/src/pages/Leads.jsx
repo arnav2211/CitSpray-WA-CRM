@@ -44,7 +44,9 @@ export default function Leads() {
     (async () => {
       try {
         const { data } = await api.get("/users");
-        setExecs(data.filter((u) => u.role === "executive"));
+        // Include both admins and executives so admin can self-assign or reassign-to-self.
+        // Round-robin (auto-assign) backend-side still excludes admins.
+        setExecs(data.filter((u) => u.role === "executive" || u.role === "admin"));
       } catch { /* empty */ }
     })();
   }, []);
@@ -254,7 +256,7 @@ export default function Leads() {
       )}
 
       {openId && <LeadDrawer leadId={openId} onClose={() => { setOpenId(null); load(); }} />}
-      {creating && <NewLeadModal execs={execs} onClose={() => setCreating(false)} onCreated={() => { setCreating(false); load(); }} isAdmin={isAdmin} />}
+      {creating && <NewLeadModal execs={execs} onClose={() => setCreating(false)} onCreated={(id) => { setCreating(false); load(); if (id) setOpenId(id); }} isAdmin={isAdmin} />}
     </div>
   );
 }
@@ -300,18 +302,47 @@ function Kanban_({ leads, onOpen, execMap }) {
 function NewLeadModal({ onClose, onCreated, execs, isAdmin }) {
   const [f, setF] = useState({ customer_name: "", phone: "", requirement: "", city: "", state: "", area: "", source: "Manual", assigned_to: "" });
   const [loading, setLoading] = useState(false);
+  const [conflict, setConflict] = useState(null); // { existing_lead_id, owned_by_name, message }
+  const [requesting, setRequesting] = useState(false);
 
   const submit = async (e) => {
     e.preventDefault();
     setLoading(true);
+    setConflict(null);
     try {
       const payload = { ...f };
       if (!payload.assigned_to) delete payload.assigned_to;
-      await api.post("/leads", payload);
+      const { data } = await api.post("/leads", payload);
+      if (data?.duplicate || data?.existed) {
+        toast.success(`Existing lead opened: ${data.customer_name}`);
+        onCreated(data.id);  // signal which lead to open
+        return;
+      }
       toast.success("Lead created");
-      onCreated();
-    } catch (err) { toast.error(errMsg(err)); }
-    finally { setLoading(false); }
+      onCreated(data?.id);
+    } catch (err) {
+      // Structured 409 from backend → show inline reassignment CTA instead of red toast
+      const detail = err?.response?.data?.detail;
+      if (err?.response?.status === 409 && detail && typeof detail === "object" && detail.code === "duplicate_phone") {
+        setConflict(detail);
+      } else {
+        toast.error(errMsg(err));
+      }
+    } finally { setLoading(false); }
+  };
+
+  const requestReassignment = async () => {
+    if (!conflict?.existing_lead_id) return;
+    setRequesting(true);
+    try {
+      await api.post("/inbox/transfer-request", {
+        lead_id: conflict.existing_lead_id,
+        reason: `Duplicate add attempt for phone ${f.phone || ""}. Customer name: ${f.customer_name || ""}.`,
+      });
+      toast.success("Reassignment request sent to admin");
+      onClose();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setRequesting(false); }
   };
 
   return (
@@ -321,9 +352,36 @@ function NewLeadModal({ onClose, onCreated, execs, isAdmin }) {
       >
         <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Create</div>
         <h2 className="font-chivo font-black text-2xl mt-1 mb-4">New Lead</h2>
+        {conflict && (
+          <div className="border-l-4 border-[#E60000] bg-[#FFE9E9] px-4 py-3 mb-4" data-testid="duplicate-conflict-panel">
+            <div className="text-[10px] uppercase tracking-widest font-bold text-[#E60000]">Duplicate phone</div>
+            <div className="text-sm mt-1">{conflict.message}</div>
+            <div className="text-xs text-gray-700 mt-1">
+              Currently with: <b>{conflict.owned_by_name || "another executive"}</b>
+            </div>
+            <div className="flex gap-2 mt-3">
+              <button
+                type="button"
+                onClick={requestReassignment}
+                disabled={requesting}
+                className="bg-[#E60000] hover:bg-[#cc0000] text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50"
+                data-testid="request-reassignment-btn"
+              >
+                {requesting ? "Sending…" : "Request Reassignment"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setConflict(null)}
+                className="border border-gray-300 px-3 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-100"
+              >
+                Edit phone
+              </button>
+            </div>
+          </div>
+        )}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <Field label="Customer name *"><input required value={f.customer_name} onChange={(e) => setF({ ...f, customer_name: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-name" /></Field>
-          <Field label="Phone"><input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-phone" /></Field>
+          <Field label="Phone"><input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm font-mono" placeholder="8790934618 or +255123456789" data-testid="new-lead-phone" /></Field>
           <Field label="Requirement" full><input value={f.requirement} onChange={(e) => setF({ ...f, requirement: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-requirement" /></Field>
           <Field label="Area"><input value={f.area} onChange={(e) => setF({ ...f, area: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" /></Field>
           <Field label="City"><input value={f.city} onChange={(e) => setF({ ...f, city: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" /></Field>
@@ -337,7 +395,7 @@ function NewLeadModal({ onClose, onCreated, execs, isAdmin }) {
             <Field label="Assign to" full>
               <select value={f.assigned_to} onChange={(e) => setF({ ...f, assigned_to: e.target.value })} className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="new-lead-assign-select">
                 <option value="">Auto (round-robin)</option>
-                {execs.map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+                {execs.map((x) => <option key={x.id} value={x.id}>{x.role === "admin" ? `${x.name} (admin)` : x.name}</option>)}
               </select>
             </Field>
           )}

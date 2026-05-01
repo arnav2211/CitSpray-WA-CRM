@@ -80,7 +80,7 @@ export default function Chat() {
   // Load execs for admin filter
   useEffect(() => {
     if (!isAdmin) return;
-    api.get("/users").then(({ data }) => setExecs(data.filter(u => u.role === "executive"))).catch(() => {});
+    api.get("/users").then(({ data }) => setExecs(data.filter(u => u.role === "executive" || u.role === "admin"))).catch(() => {});
   }, [isAdmin]);
 
   // Sync active lead id to URL
@@ -444,7 +444,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
                   className="border border-gray-300 px-1.5 py-0.5 text-[11px] disabled:bg-gray-100"
                 >
                   <option value="">— Unassigned —</option>
-                  {execs.map(x => <option key={x.id} value={x.id}>{x.name}</option>)}
+                  {execs.map(x => <option key={x.id} value={x.id}>{x.role === "admin" ? `${x.name} (admin)` : x.name}</option>)}
                 </select>
               </span>
             ) : (
@@ -662,18 +662,42 @@ function NewChatModal({ onClose, onCreated, execs, isAdmin }) {
   const [requirement, setRequirement] = useState("");
   const [assignedTo, setAssignedTo] = useState("");
   const [busy, setBusy] = useState(false);
+  const [conflict, setConflict] = useState(null);
+  const [requesting, setRequesting] = useState(false);
 
   const submit = async (e) => {
     e.preventDefault();
     setBusy(true);
+    setConflict(null);
     try {
       const payload = { phone, customer_name: name, requirement };
       if (isAdmin && assignedTo) payload.assigned_to = assignedTo;
       const { data } = await api.post("/inbox/start-chat", payload);
       toast.success("Chat ready");
       onCreated(data);
-    } catch (e) { toast.error(errMsg(e)); }
+    } catch (e) {
+      const detail = e?.response?.data?.detail;
+      if (e?.response?.status === 409 && detail && typeof detail === "object" && detail.code === "duplicate_phone") {
+        setConflict(detail);
+      } else {
+        toast.error(errMsg(e));
+      }
+    }
     finally { setBusy(false); }
+  };
+
+  const requestReassignment = async () => {
+    if (!conflict?.existing_lead_id) return;
+    setRequesting(true);
+    try {
+      await api.post("/inbox/transfer-request", {
+        lead_id: conflict.existing_lead_id,
+        reason: `Tried to start chat with ${phone}. Please reassign to me.`,
+      });
+      toast.success("Reassignment request sent to admin");
+      onClose();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setRequesting(false); }
   };
 
   return (
@@ -686,9 +710,22 @@ function NewChatModal({ onClose, onCreated, execs, isAdmin }) {
           </div>
           <button type="button" onClick={onClose} className="text-gray-400"><X size={18} /></button>
         </div>
+        {conflict && (
+          <div className="border-l-4 border-[#E60000] bg-[#FFE9E9] px-3 py-2 mb-3" data-testid="chat-duplicate-conflict-panel">
+            <div className="text-[10px] uppercase tracking-widest font-bold text-[#E60000]">Duplicate phone</div>
+            <div className="text-sm mt-1">{conflict.message}</div>
+            <div className="text-xs text-gray-700 mt-1">Currently with: <b>{conflict.owned_by_name || "another executive"}</b></div>
+            <div className="flex gap-2 mt-2">
+              <button type="button" onClick={requestReassignment} disabled={requesting} className="bg-[#E60000] hover:bg-[#cc0000] text-white px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50" data-testid="chat-request-reassignment-btn">
+                {requesting ? "Sending…" : "Request Reassignment"}
+              </button>
+              <button type="button" onClick={() => setConflict(null)} className="border border-gray-300 px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-100">Edit phone</button>
+            </div>
+          </div>
+        )}
         <div className="space-y-3">
           <Field label="Phone *">
-            <input required autoFocus value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+91 98765 43210"
+            <input required autoFocus value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="8790934618 or +255123456789"
               className="w-full border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="new-chat-phone" />
           </Field>
           <Field label="Customer name">
@@ -704,13 +741,14 @@ function NewChatModal({ onClose, onCreated, execs, isAdmin }) {
               <select value={assignedTo} onChange={(e) => setAssignedTo(e.target.value)}
                 className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="new-chat-assign">
                 <option value="">Auto (round-robin)</option>
-                {execs.map(x => <option key={x.id} value={x.id}>{x.name}</option>)}
+                {execs.map(x => <option key={x.id} value={x.id}>{x.role === "admin" ? `${x.name} (admin)` : x.name}</option>)}
               </select>
             </Field>
           )}
           <div className="text-xs text-gray-500 leading-relaxed border border-gray-200 bg-gray-50 p-3">
-            If a lead with this phone already exists, it'll be opened instead. WhatsApp Cloud API requires a
-            template message for first-touch outside the 24-hour window.
+            If a lead with this phone already exists and is yours, it'll open. If it's another executive's lead,
+            you can send a reassignment request to admin. WhatsApp Cloud API requires a template message for
+            first-touch outside the 24-hour window.
           </div>
         </div>
         <div className="flex justify-end gap-2 mt-5">
