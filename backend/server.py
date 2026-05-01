@@ -834,7 +834,13 @@ async def list_leads(
     last_call_outcome: Optional[str] = None,
     q: Optional[str] = None,
     limit: int = 500,
+    offset: int = 0,
+    paginate: bool = False,
 ):
+    """List leads with optional filters. Backwards-compatible:
+    - Default returns a bare array (existing callers unchanged).
+    - Pass `paginate=true&limit=25&offset=0` to receive `{items, total, limit, offset}`
+      so the UI can render page controls."""
     query: Dict[str, Any] = {}
     if user["role"] == "executive":
         query["assigned_to"] = user["id"]
@@ -869,9 +875,15 @@ async def list_leads(
             ors.append({"phone": {"$regex": q_safe, "$options": "i"}})
             ors.append({"phones": {"$regex": q_safe, "$options": "i"}})
         query["$or"] = ors
-    leads = await db.leads.find(query, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})\
-        .sort("created_at", -1).to_list(limit)
-    return leads
+    safe_limit = max(1, min(int(limit), 500))
+    safe_offset = max(0, int(offset))
+    cursor = db.leads.find(query, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})\
+        .sort("created_at", -1).skip(safe_offset).limit(safe_limit)
+    items = await cursor.to_list(safe_limit)
+    if paginate:
+        total = await db.leads.count_documents(query)
+        return {"items": items, "total": total, "limit": safe_limit, "offset": safe_offset}
+    return items
 
 @api.post("/leads")
 async def create_lead(body: LeadCreate, user: dict = Depends(get_current_user)):

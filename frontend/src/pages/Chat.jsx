@@ -726,20 +726,20 @@ function NewChatModal({ onClose, onCreated, execs, isAdmin }) {
         <div className="space-y-3">
           <Field label="Phone *">
             <input required autoFocus value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="8790934618 or +255123456789"
-              className="w-full border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="new-chat-phone" />
+              className="w-full border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="new-chat-phone-input" />
           </Field>
           <Field label="Customer name">
             <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Optional"
-              className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-chat-name" />
+              className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-chat-name-input" />
           </Field>
           <Field label="Requirement / context">
             <input value={requirement} onChange={(e) => setRequirement(e.target.value)} placeholder="What are they enquiring about?"
-              className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-chat-requirement" />
+              className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-chat-requirement-input" />
           </Field>
           {isAdmin && (
             <Field label="Assign to">
               <select value={assignedTo} onChange={(e) => setAssignedTo(e.target.value)}
-                className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="new-chat-assign">
+                className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="new-chat-assign-select">
                 <option value="">Auto (round-robin)</option>
                 {execs.map(x => <option key={x.id} value={x.id}>{x.role === "admin" ? `${x.name} (admin)` : x.name}</option>)}
               </select>
@@ -752,8 +752,8 @@ function NewChatModal({ onClose, onCreated, execs, isAdmin }) {
           </div>
         </div>
         <div className="flex justify-end gap-2 mt-5">
-          <button type="button" onClick={onClose} className="border border-gray-300 px-4 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-100">Cancel</button>
-          <button disabled={busy} className="bg-[#25D366] hover:bg-[#1da851] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50" data-testid="new-chat-submit">
+          <button type="button" onClick={onClose} className="border border-gray-300 px-4 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-100" data-testid="new-chat-cancel-btn">Cancel</button>
+          <button disabled={busy} className="bg-[#25D366] hover:bg-[#1da851] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50" data-testid="new-chat-submit-btn">
             {busy ? "Starting…" : "Start Chat"}
           </button>
         </div>
