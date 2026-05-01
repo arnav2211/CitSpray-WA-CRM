@@ -21,15 +21,30 @@ export default function Leads() {
   const [statusFilter, setStatusFilter] = useState(params.get("status") || "");
   const [sourceFilter, setSourceFilter] = useState(params.get("source") || "");
   const [assignedFilter, setAssignedFilter] = useState(params.get("assigned") || "");
+  const [outcomeFilter, setOutcomeFilter] = useState(params.get("outcome") || "");
   const [openId, setOpenId] = useState(params.get("lead") || null);
   const [creating, setCreating] = useState(false);
+  const [page, setPage] = useState(parseInt(params.get("page") || "1", 10) || 1);
+  const [pageSize, setPageSize] = useState(parseInt(params.get("size") || "25", 10) || 25);
+  const [total, setTotal] = useState(0);
 
   const load = async () => {
     try {
       const { data } = await api.get("/leads", {
-        params: { q: q || undefined, status: statusFilter || undefined, source: sourceFilter || undefined, assigned_to: assignedFilter || undefined },
+        params: {
+          q: q || undefined,
+          status: statusFilter || undefined,
+          source: sourceFilter || undefined,
+          assigned_to: assignedFilter || undefined,
+          last_call_outcome: outcomeFilter || undefined,
+          paginate: true,
+          limit: pageSize,
+          offset: (page - 1) * pageSize,
+        },
       });
-      setLeads(data);
+      // /api/leads returns {items,total,...} when paginate=true is sent.
+      setLeads(data?.items || []);
+      setTotal(typeof data?.total === "number" ? data.total : (data?.items || []).length);
     } catch (e) { toast.error(errMsg(e)); }
   };
 
@@ -37,12 +52,18 @@ export default function Leads() {
     (async () => {
       try {
         const { data } = await api.get("/users");
-        setExecs(data.filter((u) => u.role === "executive"));
+        // Include both admins and executives so admin can self-assign or reassign-to-self.
+        // Round-robin (auto-assign) backend-side still excludes admins.
+        setExecs(data.filter((u) => u.role === "executive" || u.role === "admin"));
       } catch { /* empty */ }
     })();
   }, []);
 
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter]);
+  // Reset to first page whenever a filter changes (so we never end up on an
+  // empty page after narrowing the result set).
+  useEffect(() => { setPage(1); }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, q, pageSize]);
+
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, page, pageSize]);
   useEffect(() => {
     const t = setTimeout(() => load(), 300);
     return () => clearTimeout(t);
@@ -56,19 +77,23 @@ export default function Leads() {
     if (statusFilter) p.status = statusFilter;
     if (sourceFilter) p.source = sourceFilter;
     if (assignedFilter) p.assigned = assignedFilter;
+    if (outcomeFilter) p.outcome = outcomeFilter;
     if (openId) p.lead = openId;
+    if (page > 1) p.page = String(page);
+    if (pageSize !== 25) p.size = String(pageSize);
     setParams(p, { replace: true });
-  }, [view, q, statusFilter, sourceFilter, assignedFilter, openId, setParams]);
+  }, [view, q, statusFilter, sourceFilter, assignedFilter, outcomeFilter, openId, page, pageSize, setParams]);
 
   const execMap = useMemo(() => Object.fromEntries(execs.map((e) => [e.id, e])), [execs]);
   const isAdmin = user.role === "admin";
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   return (
     <div className="p-4 md:p-8 space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0">
           <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Pipeline</div>
-          <h1 className="font-chivo font-black text-2xl md:text-4xl">All Leads <span className="text-gray-400">[{leads.length}]</span></h1>
+          <h1 className="font-chivo font-black text-2xl md:text-4xl">All Leads <span className="text-gray-400">[{total}]</span></h1>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           <button
@@ -111,6 +136,15 @@ export default function Leads() {
             {execs.map((e) => <option key={e.id} value={e.id}>{e.name}</option>)}
           </select>
         )}
+        <select value={outcomeFilter} onChange={(e) => setOutcomeFilter(e.target.value)} className="border border-gray-300 px-2 py-2 text-sm md:col-span-1 col-span-1" data-testid="leads-outcome-filter">
+          <option value="">All call outcomes</option>
+          <option value="connected">Connected</option>
+          <option value="no_response">No Response (PNR)</option>
+          <option value="not_reachable">Not Reachable</option>
+          <option value="rejected">Rejected</option>
+          <option value="busy">Busy / Engaged</option>
+          <option value="invalid">Invalid</option>
+        </select>
       </div>
 
       {view === "table" ? (
@@ -231,13 +265,21 @@ export default function Leads() {
             </tbody>
           </table>
         </div>
+        <PaginationBar
+          page={page}
+          pageSize={pageSize}
+          total={total}
+          totalPages={totalPages}
+          onPage={setPage}
+          onPageSize={setPageSize}
+        />
         </>
       ) : (
         <Kanban_ leads={leads} onOpen={setOpenId} execMap={execMap} />
       )}
 
       {openId && <LeadDrawer leadId={openId} onClose={() => { setOpenId(null); load(); }} />}
-      {creating && <NewLeadModal execs={execs} onClose={() => setCreating(false)} onCreated={() => { setCreating(false); load(); }} isAdmin={isAdmin} />}
+      {creating && <NewLeadModal execs={execs} onClose={() => setCreating(false)} onCreated={(id) => { setCreating(false); load(); if (id) setOpenId(id); }} isAdmin={isAdmin} />}
     </div>
   );
 }
@@ -283,18 +325,47 @@ function Kanban_({ leads, onOpen, execMap }) {
 function NewLeadModal({ onClose, onCreated, execs, isAdmin }) {
   const [f, setF] = useState({ customer_name: "", phone: "", requirement: "", city: "", state: "", area: "", source: "Manual", assigned_to: "" });
   const [loading, setLoading] = useState(false);
+  const [conflict, setConflict] = useState(null); // { existing_lead_id, owned_by_name, message }
+  const [requesting, setRequesting] = useState(false);
 
   const submit = async (e) => {
     e.preventDefault();
     setLoading(true);
+    setConflict(null);
     try {
       const payload = { ...f };
       if (!payload.assigned_to) delete payload.assigned_to;
-      await api.post("/leads", payload);
+      const { data } = await api.post("/leads", payload);
+      if (data?.duplicate || data?.existed) {
+        toast.success(`Existing lead opened: ${data.customer_name}`);
+        onCreated(data.id);  // signal which lead to open
+        return;
+      }
       toast.success("Lead created");
-      onCreated();
-    } catch (err) { toast.error(errMsg(err)); }
-    finally { setLoading(false); }
+      onCreated(data?.id);
+    } catch (err) {
+      // Structured 409 from backend → show inline reassignment CTA instead of red toast
+      const detail = err?.response?.data?.detail;
+      if (err?.response?.status === 409 && detail && typeof detail === "object" && detail.code === "duplicate_phone") {
+        setConflict(detail);
+      } else {
+        toast.error(errMsg(err));
+      }
+    } finally { setLoading(false); }
+  };
+
+  const requestReassignment = async () => {
+    if (!conflict?.existing_lead_id) return;
+    setRequesting(true);
+    try {
+      await api.post("/inbox/transfer-request", {
+        lead_id: conflict.existing_lead_id,
+        reason: `Duplicate add attempt for phone ${f.phone || ""}. Customer name: ${f.customer_name || ""}.`,
+      });
+      toast.success("Reassignment request sent to admin");
+      onClose();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setRequesting(false); }
   };
 
   return (
@@ -304,15 +375,42 @@ function NewLeadModal({ onClose, onCreated, execs, isAdmin }) {
       >
         <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Create</div>
         <h2 className="font-chivo font-black text-2xl mt-1 mb-4">New Lead</h2>
+        {conflict && (
+          <div className="border-l-4 border-[#E60000] bg-[#FFE9E9] px-4 py-3 mb-4" data-testid="duplicate-conflict-panel">
+            <div className="text-[10px] uppercase tracking-widest font-bold text-[#E60000]">Duplicate phone</div>
+            <div className="text-sm mt-1">{conflict.message}</div>
+            <div className="text-xs text-gray-700 mt-1">
+              Currently with: <b>{conflict.owned_by_name || "another executive"}</b>
+            </div>
+            <div className="flex gap-2 mt-3">
+              <button
+                type="button"
+                onClick={requestReassignment}
+                disabled={requesting}
+                className="bg-[#E60000] hover:bg-[#cc0000] text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50"
+                data-testid="request-reassignment-btn"
+              >
+                {requesting ? "Sending…" : "Request Reassignment"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setConflict(null)}
+                className="border border-gray-300 px-3 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-100"
+              >
+                Edit phone
+              </button>
+            </div>
+          </div>
+        )}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <Field label="Customer name *"><input required value={f.customer_name} onChange={(e) => setF({ ...f, customer_name: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-name" /></Field>
-          <Field label="Phone"><input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-phone" /></Field>
-          <Field label="Requirement" full><input value={f.requirement} onChange={(e) => setF({ ...f, requirement: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-requirement" /></Field>
-          <Field label="Area"><input value={f.area} onChange={(e) => setF({ ...f, area: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" /></Field>
-          <Field label="City"><input value={f.city} onChange={(e) => setF({ ...f, city: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" /></Field>
-          <Field label="State"><input value={f.state} onChange={(e) => setF({ ...f, state: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" /></Field>
+          <Field label="Customer name *"><input required value={f.customer_name} onChange={(e) => setF({ ...f, customer_name: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-name-input" /></Field>
+          <Field label="Phone"><input value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm font-mono" placeholder="8790934618 or +255123456789" data-testid="new-lead-phone-input" /></Field>
+          <Field label="Requirement" full><input value={f.requirement} onChange={(e) => setF({ ...f, requirement: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-requirement-input" /></Field>
+          <Field label="Area"><input value={f.area} onChange={(e) => setF({ ...f, area: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-area-input" /></Field>
+          <Field label="City"><input value={f.city} onChange={(e) => setF({ ...f, city: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-city-input" /></Field>
+          <Field label="State"><input value={f.state} onChange={(e) => setF({ ...f, state: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-state-input" /></Field>
           <Field label="Source">
-            <select value={f.source} onChange={(e) => setF({ ...f, source: e.target.value })} className="w-full border border-gray-300 px-2 py-2 text-sm">
+            <select value={f.source} onChange={(e) => setF({ ...f, source: e.target.value })} className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="new-lead-source-select">
               {SOURCES.map((s) => <option key={s} value={s}>{s}</option>)}
             </select>
           </Field>
@@ -320,14 +418,14 @@ function NewLeadModal({ onClose, onCreated, execs, isAdmin }) {
             <Field label="Assign to" full>
               <select value={f.assigned_to} onChange={(e) => setF({ ...f, assigned_to: e.target.value })} className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="new-lead-assign-select">
                 <option value="">Auto (round-robin)</option>
-                {execs.map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+                {execs.map((x) => <option key={x.id} value={x.id}>{x.role === "admin" ? `${x.name} (admin)` : x.name}</option>)}
               </select>
             </Field>
           )}
         </div>
         <div className="flex justify-end gap-2 mt-5">
-          <button type="button" onClick={onClose} className="border border-gray-300 px-4 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-100">Cancel</button>
-          <button disabled={loading} className="bg-[#002FA7] hover:bg-[#002288] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50" data-testid="new-lead-submit">
+          <button type="button" onClick={onClose} className="border border-gray-300 px-4 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-100" data-testid="new-lead-cancel-btn">Cancel</button>
+          <button disabled={loading} className="bg-[#002FA7] hover:bg-[#002288] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50" data-testid="new-lead-submit-btn">
             {loading ? "Creating…" : "Create Lead"}
           </button>
         </div>
@@ -344,3 +442,54 @@ function Field({ label, children, full }) {
     </label>
   );
 }
+
+function PaginationBar({ page, pageSize, total, totalPages, onPage, onPageSize }) {
+  if (total === 0) return null;
+  const start = (page - 1) * pageSize + 1;
+  const end = Math.min(page * pageSize, total);
+  const goPrev = () => onPage(Math.max(1, page - 1));
+  const goNext = () => onPage(Math.min(totalPages, page + 1));
+  return (
+    <div
+      className="flex flex-wrap items-center justify-between gap-2 border border-gray-200 bg-white px-3 py-2"
+      data-testid="leads-pagination-bar"
+    >
+      <div className="text-xs text-gray-500" data-testid="leads-pagination-summary">
+        Showing <span className="font-mono font-bold text-gray-900">{start}–{end}</span> of <span className="font-mono font-bold text-gray-900">{total}</span>
+      </div>
+      <div className="flex items-center gap-2">
+        <label className="flex items-center gap-1 text-[10px] uppercase tracking-widest text-gray-500 font-bold">
+          Per page
+          <select
+            value={pageSize}
+            onChange={(e) => onPageSize(parseInt(e.target.value, 10))}
+            className="border border-gray-300 px-1.5 py-1 text-xs"
+            data-testid="leads-pagination-size"
+          >
+            {[10, 25, 50, 100].map((n) => <option key={n} value={n}>{n}</option>)}
+          </select>
+        </label>
+        <button
+          onClick={goPrev}
+          disabled={page <= 1}
+          className="border border-gray-300 px-3 py-1 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed"
+          data-testid="leads-pagination-prev"
+        >
+          Prev
+        </button>
+        <span className="text-[10px] uppercase tracking-widest text-gray-500 font-mono" data-testid="leads-pagination-page">
+          {page} / {totalPages}
+        </span>
+        <button
+          onClick={goNext}
+          disabled={page >= totalPages}
+          className="border border-gray-300 px-3 py-1 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed"
+          data-testid="leads-pagination-next"
+        >
+          Next
+        </button>
+      </div>
+    </div>
+  );
+}
+

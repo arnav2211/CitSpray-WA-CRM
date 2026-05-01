@@ -1,0 +1,45 @@
+{
+  "summary": "Iteration-5 phone dedup + admin self-assign verified. 14/14 iter5 pytest cases PASS (and 23/23 iter4 regression still PASS). Discovered and fixed a CRITICAL bug: a duplicate `async def _find_lead_by_phone` at line 2247 of server.py (legacy WhatsApp helper) was shadowing the iter-5 primary helper at line 731, causing POST /api/leads/{id}/phones to 500 with `TypeError: _find_lead_by_phone() got an unexpected keyword argument 'exclude_id'`. Renamed the legacy helper to `_find_lead_by_phone_legacy` (the WhatsApp webhook still works via the primary helper whose single-arg signature is compatible). Rerun verifies all cross-lead phone-dedup, structured 409s, admin-bypass, start-chat, search-variation, admin self-reassign, round-robin-excludes-admin, and migration checks now pass.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/leads/{id}/phones (same-lead duplicate)", "issue": "Returns 409 with detail as a plain string ('Phone already on this lead') whereas cross-lead case returns structured {code, message, ...}. Consider unifying the shape so the frontend can always read `err.response.data.detail.code`."},
+      {"endpoint": "POST /api/leads/{id}/phones (cross-lead)", "issue": "Structured detail lacks `owned_by_username` (only owned_by_name/id). POST /api/leads's 409 does include username — inconsistent schema across endpoints."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "NewLeadModal (/leads) form inputs", "issue": "Review request asked NewLeadModal inputs/submit to expose data-testids (new-lead-name-input, new-lead-phone-input, new-lead-submit-btn). They are MISSING. Panel testids (duplicate-conflict-panel, request-reassignment-btn) and new-lead-assign-select ARE present, so the 409 UX is wired; only automated driving of the form fields is blocked.", "selector": "[data-testid='new-lead-name-input' | 'new-lead-phone-input' | 'new-lead-submit-btn']", "priority": "MEDIUM"},
+      {"component": "NewChatModal (/chat) form inputs", "issue": "Same gap — chat-duplicate-conflict-panel and chat-request-reassignment-btn are present, but new-chat-name-input / new-chat-phone-input / new-chat-submit-btn are missing.", "selector": "[data-testid='new-chat-phone-input' | 'new-chat-name-input' | 'new-chat-submit-btn']", "priority": "MEDIUM"}
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration5.py",
+    "/app/test_reports/pytest/iter5_results.xml"
+  ],
+  "action_items": [
+    "Add data-testid to NewLeadModal inputs & submit in Leads.jsx (name, phone, requirement, submit) — currently only the assign select + conflict panel have testids.",
+    "Add data-testid to NewChatModal inputs & submit in Chat.jsx so the duplicate-chat flow can be exercised by automation.",
+    "Unify POST /api/leads/{id}/phones 409 payloads — the same-lead case returns `detail: string` while cross-lead returns `detail: {code, message, existing_lead_id, owned_by_id, owned_by_name}`. Also add `owned_by_username` to the cross-lead detail for parity with POST /api/leads."
+  ],
+  "critical_code_review_comments": [
+    "FIXED: server.py had TWO `async def _find_lead_by_phone` definitions (lines 731 and 2247). Python used the legacy one, silently breaking cross-lead phone dedup on POST /api/leads/{id}/phones with a 500. I renamed the legacy helper to `_find_lead_by_phone_legacy`. Add a lint / static-check to catch duplicate top-level async def names in this module.",
+    "server.py is now 2993 lines — still urgently needs to be split into auth / leads / calls / webhooks_* / reports / followups modules. The duplicate-function bug above was a direct consequence of this monolith.",
+    "Phone normalization: `normalize_phone_display` treats any >=11-digit input whose last 10 digits equal itself as Indian. Edge case: a 13-digit number like '0091XXXXXXXXXX' is handled, but genuinely international numbers with 10 trailing digits (e.g. +1 555-XXX-YYYY) that happen to match 'prefix in (0, 91, 091, 0091)' are safe — though worth adding a unit test for US +1 numbers to confirm they are stored as `+1XXXXXXXXXX` and not truncated.",
+    "In `_create_lead_internal`, if `existing_by_phone` is found we early-return the *existing* lead without any audit trail — consider `log_activity(by_user_id, 'lead_dedup_hit', existing.id)` so admins can see dedup events in the activity feed.",
+    "POST /api/inbox/start-chat re-uses `_find_lead_by_phone` for dedup but does NOT flag `duplicate: true` on the returned lead (unlike POST /api/leads). UI can't tell whether it opened an existing thread or created one from the response alone."
+  ],
+  "updated_files": [
+    "/app/backend/server.py (renamed legacy _find_lead_by_phone → _find_lead_by_phone_legacy to stop it overriding the iter-5 primary helper)",
+    "/app/backend/tests/test_iteration5.py (new: 14 tests covering all iter-5 scenarios)"
+  ],
+  "success_rate": {"backend": "100% (14/14 iter5 + 23/23 iter4 regression)", "frontend": "Not fully exercised via Playwright due to missing modal-input data-testids; conflict-panel / reassign-select testids verified present in source. Admin '(admin)' suffix verified in 4 dropdowns (LeadDrawer, Leads NewLead, Chat header, Chat NewChat)."},
+  "test_credentials": "admin/Admin@123, ravi/Exec@123, priya/Exec@123 (fixture auto-resets executive password via admin if login 401s).",
+  "seed_data_creation": "Created ~15 TEST_IT5_* leads (phone-dedup seeds + cross-source + add-phone + start-chat + search + self-assign + round-robin).",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Run: `REACT_APP_BACKEND_URL=<frontend .env value> pytest /app/backend/tests/test_iteration5.py /app/backend/tests/test_iteration4.py -v`. Important: the POST /api/leads/{id}/phones endpoint returns 500 if the server ever re-introduces a second `_find_lead_by_phone` definition — my fix only renamed the legacy one; if server.py is refactored, ensure the primary helper at the top of the leads section (with `exclude_id` kwarg) is the one that survives. Frontend flows tested at API level; to exercise modal submissions, main agent must add data-testid to NewLeadModal / NewChatModal inputs (see action_items). Admin id: 1e848a05-ee63-4b06-a031-69a18cbe6304. Sample dedup lead id still works (6b359448-0f1a-42bf-8758-3ac46caf28ba, phone 8790934618).",
+  "rca_of_the_issue": "Bug: POST /api/leads/{id}/phones with a phone already on another lead returned 500 instead of the documented 409 structured payload. Root cause: server.py defines `_find_lead_by_phone` twice — the second definition at line 2247 (intended as a small WhatsApp-webhook helper with signature `(phone_digits)`) overrode the iter-5 primary helper at line 731 (signature `(phone, exclude_id=None)`). When /leads/{id}/phones called `_find_lead_by_phone(new_phone, exclude_id=lead_id)` Python raised `TypeError: _find_lead_by_phone() got an unexpected keyword argument 'exclude_id'` which FastAPI surfaced as 500. Reproduction: POST two leads with different phones, POST /api/leads/<B>/phones with phone of A → 500 (confirmed in /var/log/supervisor/backend.*.log). Mitigation applied: renamed line-2247 helper to `_find_lead_by_phone_legacy`; the WhatsApp webhook caller at line 2312 still uses the (now-unshadowed) primary helper, which accepts a single phone string and behaves equivalently for that call site. After the fix, the failing pytest case and all 14 iter-5 + 23 iter-4 regression tests PASS. Prevention: add a pre-commit check (e.g. ruff E/F rule or custom grep) that forbids duplicate `async def <name>(` at module top level in server.py, and ideally split this 2993-line module before the next iteration."
+}

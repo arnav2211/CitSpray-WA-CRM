@@ -22,6 +22,26 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 5 (May 2026) — Duplicate-lead prevention + phone standardization
+- **Phone canonicalization** — new helpers `normalize_phone_display` (Indian → bare 10-digit, e.g. `8790934618`; international → `+<digits>`) and `phone_match_pattern` (last-10-digit suffix regex). One-shot startup migration tags each lead with `_phones_canonicalized=true` after rewriting `phone`/`phones`.
+- **Cross-source dedup by phone** — `_find_lead_by_phone(phone, exclude_id?)` matches stored canonical phone OR phones[] suffix-aware. Used by `_create_lead_internal` (returns existing instead of creating), `POST /api/leads/{id}/phones` (rejects cross-lead duplicates with structured 409), and `POST /api/inbox/start-chat`.
+- **POST /api/leads dedup policy** — admin or same-owner exec receives the existing lead with `duplicate: true, existed: true`. Different-exec ownership returns 409 with `{code: 'duplicate_phone', message, existing_lead_id, owned_by_id, owned_by_name, owned_by_username}`.
+- **POST /api/leads/{id}/phones** — same-lead duplicate now returns structured 409 (`code: 'duplicate_phone_same_lead'`); cross-lead duplicate returns the same shape as POST /api/leads with `owned_by_username`.
+- **Search robustness** — user `q` is `re.escape`d before injection into Mongo regex (no more 51091 errors when user types `+91`). Phone-aware: 7+ digit queries fall through `phone_match_pattern` so `+918790934618`, `08790934618`, `8790934618` all return the same hits.
+- **Critical fix** (caught by testing agent) — duplicate `_find_lead_by_phone` definition lower in the file was shadowing the iter-5 helper. Renamed to `_find_lead_by_phone_legacy`.
+- **Admin self-assign** — `/api/users` consumers (NewLeadModal, LeadDrawer reassign, Chat header, Chat NewChatModal) now include admins with an `(admin)` suffix. Round-robin auto-assign STILL excludes admins (`pick_next_executive` filters role=executive).
+- **Frontend reassignment CTA** — both NewLeadModal (`/leads`) and NewChatModal (`/chat`) catch the structured 409 and render an inline conflict panel (`duplicate-conflict-panel` / `chat-duplicate-conflict-panel`) with a 'Request Reassignment' button that POSTs to `/api/inbox/transfer-request` (already wired to admin's transfer-requests queue).
+
+### Iteration 4 (May 2026) — Sales operating system upgrades
+- **Call activity logging** — new `call_logs` collection with structured outcomes (connected, no_response, rejected, not_reachable, busy, invalid). Endpoints: `POST/GET /api/leads/{id}/calls`, `GET /api/calls` (admin sees all, executive sees own). Connected calls require a conversation summary (400 otherwise). Lead doc carries `last_call_outcome` + `last_call_at` + `/api/leads?last_call_outcome=` filter.
+- **Reports** — `/api/reports/overview.per_executive` now exposes 19 metrics per executive: leads, new_leads, contacted, qualified, converted, lost, conversion_rate, avg_response_seconds, calls_total, calls_connected, calls_no_response, calls_not_reachable, calls_rejected, calls_busy, calls_invalid, wa_threads, wa_messages_sent, followup_total, followup_done, followup_pending, followup_completion_pct. Reports UI redesigned with full breakdown table on desktop + card grid on mobile.
+- **Lead activity log moved behind an Info button** in the LeadDrawer. New `ActivityPanel` slide-over: admin sees full reassignment trail with from→to enrichment + actor names; executives have system/reassignment events filtered out server-side.
+- **Editable customer name + aliases** — `aliases: List[str]` field on lead doc; included in regex search across `/api/leads` and `/api/inbox/conversations`. Pencil-edit UI updates everywhere via single source of truth.
+- **Editable requirement** — Edit button + textarea; `requirement_updated_at` timestamp set on save.
+- **Per-phone WhatsApp detection** — `wa_status_map` keyed by last-10 digits of each phone, set on every outbound (true on success, false on Meta error 131026/470/100), and on every inbound. UI shows green WA / grey NO-WA / `?` per phone.
+- **Active-WA-phone selector** — `PUT /api/leads/{id}/active-wa-phone` validates the phone is on the lead (suffix match), persists `active_wa_phone`. WA send routes to `active_wa_phone || phone`. UI: 'Use for WA' button next to each non-active phone.
+- **Follow-up alarm** — global `FollowupAlerts` mounted in AppShell. Polls `/api/followups?status=pending` every 30s; when a follow-up is due within ±90s and not snoozed, plays a 6-second WebAudio two-tone alarm and shows a Mark-Done / Snooze-30-min modal. `/api/followups` enriched with `lead_customer_name` + `lead_phone` so the modal needs zero extra calls.
+
 ### Iteration 3 (Apr 2026) — Mobile-first responsiveness
 - **Sidebar drawer** — desktop persistent (`md+`), mobile hidden by default; hamburger button in header opens sidebar as fixed overlay with backdrop, X close button, auto-close on route change, body-scroll lock while open.
 - **Header** — compact on mobile (`p-4`) with hamburger, larger on desktop (`p-8`).

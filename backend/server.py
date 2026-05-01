@@ -72,6 +72,42 @@ def _normalize_phone(p: Optional[str]) -> str:
     return re.sub(r"\D+", "", p)
 
 
+def normalize_phone_display(p: Optional[str]) -> str:
+    """Canonical storage / display format for phone numbers.
+    Indian numbers (+91XXXXXXXXXX, 91XXXXXXXXXX, 091XXXXXXXXXX, 0XXXXXXXXXX, XXXXXXXXXX)
+    are normalized to the bare 10-digit national form (e.g. '8790934618').
+    All other numbers are returned as `+<digits>` (E.164-ish) so they stay searchable
+    across +/space/dash variations.
+    Empty / unparseable input returns ''."""
+    if not p:
+        return ""
+    digits = re.sub(r"\D+", "", p)
+    if not digits:
+        return ""
+    # Indian: 10-digit mobile, possibly prefixed with 91 / 091 / 0
+    if len(digits) == 10:
+        return digits
+    if len(digits) in (11, 12, 13) and digits.endswith(digits[-10:]):
+        prefix = digits[:-10]
+        if prefix in ("0", "91", "091", "0091"):
+            return digits[-10:]
+    # International — keep full digits with leading +
+    return "+" + digits
+
+
+def phone_match_pattern(query: str) -> Optional[str]:
+    """Return a regex pattern that matches stored phone fields against any of the
+    common variations (with/without +, +91, 0, spaces, dashes). Indian 10-digit
+    inputs are matched against the stored canonical 10-digit form. Anything else
+    is matched on a digits-only suffix of length >= 7."""
+    digits = re.sub(r"\D+", "", query or "")
+    if not digits:
+        return None
+    if len(digits) >= 10:
+        digits = digits[-10:]
+    return re.escape(digits) + "$"
+
+
 _TPL_PLACEHOLDER_RX = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 
 def count_template_placeholders(body_text: Optional[str]) -> int:
@@ -300,6 +336,7 @@ class LeadUpdate(BaseModel):
     customer_name: Optional[str] = None
     phone: Optional[str] = None
     phones: Optional[List[str]] = None
+    aliases: Optional[List[str]] = None
     email: Optional[str] = None
     requirement: Optional[str] = None
     area: Optional[str] = None
@@ -307,6 +344,20 @@ class LeadUpdate(BaseModel):
     state: Optional[str] = None
     status: Optional[Literal["new", "contacted", "qualified", "converted", "lost"]] = None
     assigned_to: Optional[str] = None
+    active_wa_phone: Optional[str] = None
+
+
+CALL_OUTCOMES = ("connected", "no_response", "rejected", "not_reachable", "busy", "invalid")
+
+
+class CallLogInput(BaseModel):
+    phone: str
+    outcome: Literal["connected", "no_response", "rejected", "not_reachable", "busy", "invalid"]
+    summary: Optional[str] = None  # required only for outcome=connected
+
+
+class ActiveWaPhoneInput(BaseModel):
+    phone: str
 
 class PhoneInput(BaseModel):
     phone: str
@@ -677,8 +728,51 @@ def _lead_dedup_hash(name: str, ts: Optional[str], extra: str = "") -> str:
     raw = f"{(name or '').strip().lower()}|{ts or ''}|{extra}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+async def _find_lead_by_phone(phone: str, exclude_id: Optional[str] = None) -> Optional[dict]:
+    """Find an existing lead whose primary phone OR any extra phones suffix-match the
+    given input. Indian numbers match on the last-10-digit national form; international
+    numbers match on full digit string."""
+    if not phone:
+        return None
+    pattern = phone_match_pattern(phone)
+    if not pattern:
+        return None
+    query: Dict[str, Any] = {"$or": [
+        {"phone": {"$regex": pattern}},
+        {"phones": {"$regex": pattern}},
+    ]}
+    if exclude_id:
+        query["id"] = {"$ne": exclude_id}
+    return await db.leads.find_one(query, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})
+
+
 async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) -> dict:
-    # dedup
+    # Normalize phones to canonical storage format BEFORE dedup so all downstream
+    # comparisons are consistent.
+    if data.get("phone"):
+        data["phone"] = normalize_phone_display(data["phone"])
+    if data.get("phones"):
+        data["phones"] = [normalize_phone_display(p) for p in data["phones"] if p]
+        # remove duplicates and the primary phone if it slipped in
+        seen = set()
+        unique: List[str] = []
+        for p in data["phones"]:
+            if not p or p == data.get("phone"):
+                continue
+            if p in seen:
+                continue
+            seen.add(p)
+            unique.append(p)
+        data["phones"] = unique
+
+    # Phone-based dedup (cross-source). If a lead with this number already exists,
+    # we return it so callers can decide whether to surface or 409.
+    if data.get("phone"):
+        existing_by_phone = await _find_lead_by_phone(data["phone"])
+        if existing_by_phone:
+            return existing_by_phone
+
+    # Legacy hash dedup (kept for IndiaMART unique-id style payloads)
     dhash = data.get("dedup_hash")
     if dhash:
         existing = await db.leads.find_one({"dedup_hash": dhash}, {"_id": 0})
@@ -737,9 +831,16 @@ async def list_leads(
     status: Optional[str] = None,
     source: Optional[str] = None,
     assigned_to: Optional[str] = None,
+    last_call_outcome: Optional[str] = None,
     q: Optional[str] = None,
     limit: int = 500,
+    offset: int = 0,
+    paginate: bool = False,
 ):
+    """List leads with optional filters. Backwards-compatible:
+    - Default returns a bare array (existing callers unchanged).
+    - Pass `paginate=true&limit=25&offset=0` to receive `{items, total, limit, offset}`
+      so the UI can render page controls."""
     query: Dict[str, Any] = {}
     if user["role"] == "executive":
         query["assigned_to"] = user["id"]
@@ -750,20 +851,70 @@ async def list_leads(
         query["status"] = status
     if source:
         query["source"] = source
+    if last_call_outcome:
+        if last_call_outcome not in CALL_OUTCOMES:
+            raise HTTPException(status_code=400, detail=f"Invalid outcome. Must be one of {CALL_OUTCOMES}")
+        query["last_call_outcome"] = last_call_outcome
     if q:
-        query["$or"] = [
-            {"customer_name": {"$regex": q, "$options": "i"}},
-            {"phone": {"$regex": q, "$options": "i"}},
-            {"requirement": {"$regex": q, "$options": "i"}},
-            {"city": {"$regex": q, "$options": "i"}},
+        import re as _re
+        q_safe = _re.escape(q)
+        ors: List[Dict[str, Any]] = [
+            {"customer_name": {"$regex": q_safe, "$options": "i"}},
+            {"aliases": {"$regex": q_safe, "$options": "i"}},
+            {"requirement": {"$regex": q_safe, "$options": "i"}},
+            {"city": {"$regex": q_safe, "$options": "i"}},
         ]
-    leads = await db.leads.find(query, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})\
-        .sort("created_at", -1).to_list(limit)
-    return leads
+        # Phone-aware match: if the search query contains 7+ digits, treat it as a phone
+        # search and look it up by canonical-suffix regex (so '+918790934618',
+        # '08790934618' and '8790934618' all resolve to the same lead).
+        phone_pat = phone_match_pattern(q)
+        if phone_pat:
+            ors.append({"phone": {"$regex": phone_pat}})
+            ors.append({"phones": {"$regex": phone_pat}})
+        else:
+            ors.append({"phone": {"$regex": q_safe, "$options": "i"}})
+            ors.append({"phones": {"$regex": q_safe, "$options": "i"}})
+        query["$or"] = ors
+    safe_limit = max(1, min(int(limit), 500))
+    safe_offset = max(0, int(offset))
+    cursor = db.leads.find(query, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})\
+        .sort("created_at", -1).skip(safe_offset).limit(safe_limit)
+    items = await cursor.to_list(safe_limit)
+    if paginate:
+        total = await db.leads.count_documents(query)
+        return {"items": items, "total": total, "limit": safe_limit, "offset": safe_offset}
+    return items
 
 @api.post("/leads")
 async def create_lead(body: LeadCreate, user: dict = Depends(get_current_user)):
+    """Create a new lead — but enforce per-phone duplicate prevention.
+    - If the phone already belongs to a lead owned by the same user (or no one), return it.
+    - Admin: always returns the existing lead so they can open it.
+    - Executive whose phone matches a lead owned by ANOTHER executive: 409 with structured
+      payload so the UI can offer a 'Request reassignment' flow."""
     data = body.model_dump()
+    if data.get("phone"):
+        canonical = normalize_phone_display(data["phone"])
+        if canonical:
+            existing = await _find_lead_by_phone(canonical)
+            if existing:
+                owner_id = existing.get("assigned_to")
+                if user["role"] == "admin" or not owner_id or owner_id == user["id"]:
+                    # Surface the existing lead — caller will open it
+                    return {**existing, "duplicate": True, "existed": True}
+                # Different executive owns the lead → block create
+                owner = await db.users.find_one({"id": owner_id}, {"_id": 0, "id": 1, "name": 1, "username": 1}) or {}
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "duplicate_phone",
+                        "message": "This lead is already assigned to another executive.",
+                        "existing_lead_id": existing["id"],
+                        "owned_by_id": owner_id,
+                        "owned_by_name": owner.get("name"),
+                        "owned_by_username": owner.get("username"),
+                    },
+                )
     data["dedup_hash"] = _lead_dedup_hash(data["customer_name"], iso(now_utc()), data.get("phone", "") or "")
     lead = await _create_lead_internal(data, by_user_id=user["id"])
     return lead
@@ -792,10 +943,12 @@ async def update_lead(lead_id: str, body: LeadUpdate, user: dict = Depends(get_c
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     updates: Dict[str, Any] = {}
-    for f in ["customer_name", "phone", "phones", "email", "requirement", "area", "city", "state", "status"]:
+    for f in ["customer_name", "phone", "phones", "aliases", "email", "requirement", "area", "city", "state", "status", "active_wa_phone"]:
         v = getattr(body, f)
         if v is not None:
             updates[f] = v
+    if body.requirement is not None:
+        updates["requirement_updated_at"] = iso(now_utc())
     if body.assigned_to is not None and user["role"] == "admin":
         updates["assigned_to"] = body.assigned_to
     updates["last_action_at"] = iso(now_utc())
@@ -833,14 +986,34 @@ async def add_phone(lead_id: str, body: PhoneInput, user: dict = Depends(get_cur
         raise HTTPException(status_code=404, detail="Lead not found")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
-    new_phone = (body.phone or "").strip()
+    new_phone = normalize_phone_display((body.phone or "").strip())
     if not new_phone:
         raise HTTPException(status_code=400, detail="Phone required")
     existing_phones = list(lead.get("phones") or [])
-    if lead.get("phone") and lead["phone"] not in existing_phones:
-        pass  # primary kept separately
     if new_phone == lead.get("phone") or new_phone in existing_phones:
-        raise HTTPException(status_code=409, detail="Phone already on this lead")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "duplicate_phone_same_lead",
+                "message": "Phone already on this lead",
+                "existing_lead_id": lead_id,
+            },
+        )
+    # Cross-lead dedup: stop the user from adding a phone that already lives on another lead
+    other = await _find_lead_by_phone(new_phone, exclude_id=lead_id)
+    if other:
+        owner = await db.users.find_one({"id": other.get("assigned_to")}, {"_id": 0, "name": 1, "username": 1}) or {}
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "duplicate_phone",
+                "message": f"Phone {new_phone} is already on another lead ({other.get('customer_name')}).",
+                "existing_lead_id": other["id"],
+                "owned_by_id": other.get("assigned_to"),
+                "owned_by_name": owner.get("name"),
+                "owned_by_username": owner.get("username"),
+            },
+        )
     update: Dict[str, Any] = {"last_action_at": iso(now_utc())}
     if not lead.get("phone"):
         update["phone"] = new_phone  # first-ever phone → becomes primary
@@ -859,9 +1032,10 @@ async def remove_phone(lead_id: str, phone: str = Query(...), user: dict = Depen
         raise HTTPException(status_code=404, detail="Lead not found")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
+    target = normalize_phone_display(phone)
     updates: Dict[str, Any] = {"last_action_at": iso(now_utc())}
-    existing_phones = [p for p in (lead.get("phones") or []) if p != phone]
-    if phone == lead.get("phone"):
+    existing_phones = [p for p in (lead.get("phones") or []) if p != target]
+    if target == lead.get("phone"):
         # Removing the primary — promote next alt if available
         if existing_phones:
             updates["phone"] = existing_phones[0]
@@ -896,6 +1070,18 @@ async def lead_activity(lead_id: str, user: dict = Depends(get_current_user)):
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     logs = await db.activity_logs.find({"lead_id": lead_id}, {"_id": 0}).sort("at", -1).to_list(200)
+    if user["role"] != "admin":
+        # Hide system/reassignment/admin-level actions from executives
+        hidden = {"lead_assigned", "auto_reassigned_unopened", "auto_reassigned_noaction", "transfer_requested"}
+        logs = [item for item in logs if item.get("action") not in hidden]
+    # Enrich with actor name for the UI
+    actor_ids = list({item.get("actor_id") for item in logs if item.get("actor_id")})
+    name_map: Dict[str, str] = {}
+    if actor_ids:
+        async for u in db.users.find({"id": {"$in": actor_ids}}, {"_id": 0, "id": 1, "name": 1}):
+            name_map[u["id"]] = u.get("name") or ""
+    for item in logs:
+        item["actor_name"] = name_map.get(item.get("actor_id") or "", "" if item.get("actor_id") else "System")
     return logs
 
 # ------------- Messages (WhatsApp mock) -------------
@@ -909,6 +1095,111 @@ async def list_messages(lead_id: str, user: dict = Depends(get_current_user)):
     msgs = await db.messages.find({"lead_id": lead_id}, {"_id": 0}).sort("at", 1).to_list(500)
     return msgs
 
+
+# ------------- Call logs -------------
+async def _set_wa_status(lead_id: str, phone: Optional[str], has_wa: bool):
+    """Track per-phone WhatsApp availability on a lead. Updates `wa_status_map` (suffix-key
+    → bool) plus the overall `has_whatsapp` rollup (true if any phone is WA-active)."""
+    if not phone:
+        return
+    key = _normalize_phone(phone)[-10:] if phone else ""
+    if not key:
+        return
+    field = f"wa_status_map.{key}"
+    update_ops: Dict[str, Any] = {"$set": {field: has_wa}}
+    if has_wa:
+        update_ops["$set"]["has_whatsapp"] = True
+    await db.leads.update_one({"id": lead_id}, update_ops)
+
+
+@api.post("/leads/{lead_id}/calls")
+async def log_call(lead_id: str, body: CallLogInput, user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    if body.outcome == "connected" and not (body.summary or "").strip():
+        raise HTTPException(status_code=400, detail="Conversation summary is required for a connected call")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "lead_id": lead_id,
+        "phone": body.phone,
+        "outcome": body.outcome,
+        "summary": (body.summary or "").strip() if body.outcome == "connected" else None,
+        "by_user_id": user["id"],
+        "by_user_name": user["name"],
+        "at": iso(now_utc()),
+    }
+    await db.call_logs.insert_one(doc.copy())
+    await db.leads.update_one(
+        {"id": lead_id},
+        {"$set": {
+            "last_call_outcome": body.outcome,
+            "last_call_at": doc["at"],
+            "last_action_at": doc["at"],
+        }},
+    )
+    await log_activity(user["id"], "call_logged", lead_id, {"outcome": body.outcome, "phone": body.phone})
+    return strip_mongo(doc)
+
+
+@api.get("/leads/{lead_id}/calls")
+async def list_lead_calls(lead_id: str, user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    return await db.call_logs.find({"lead_id": lead_id}, {"_id": 0}).sort("at", -1).to_list(500)
+
+
+@api.get("/calls")
+async def list_all_calls(
+    user: dict = Depends(get_current_user),
+    outcome: Optional[str] = None,
+    by_user_id: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    limit: int = 500,
+):
+    """Cross-lead call log feed. Executives only see their own calls."""
+    query: Dict[str, Any] = {}
+    if user["role"] == "executive":
+        query["by_user_id"] = user["id"]
+    elif by_user_id:
+        query["by_user_id"] = by_user_id
+    if outcome:
+        if outcome not in CALL_OUTCOMES:
+            raise HTTPException(status_code=400, detail=f"Invalid outcome. Must be one of {CALL_OUTCOMES}")
+        query["outcome"] = outcome
+    if start or end:
+        rng: Dict[str, Any] = {}
+        if start:
+            rng["$gte"] = start
+        if end:
+            rng["$lte"] = end
+        query["at"] = rng
+    return await db.call_logs.find(query, {"_id": 0}).sort("at", -1).to_list(limit)
+
+
+@api.put("/leads/{lead_id}/active-wa-phone")
+async def set_active_wa_phone(lead_id: str, body: ActiveWaPhoneInput, user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    target = (body.phone or "").strip()
+    all_phones = [lead.get("phone")] + (lead.get("phones") or [])
+    target_key = _normalize_phone(target)[-10:]
+    matched = next((p for p in all_phones if p and _normalize_phone(p)[-10:] == target_key), None)
+    if not matched:
+        raise HTTPException(status_code=400, detail="Phone is not on this lead")
+    await db.leads.update_one({"id": lead_id}, {"$set": {"active_wa_phone": matched, "last_action_at": iso(now_utc())}})
+    await log_activity(user["id"], "active_wa_phone_set", lead_id, {"phone": matched})
+    return await db.leads.find_one({"id": lead_id}, {"_id": 0})
+
 @api.post("/whatsapp/send")
 async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_current_user)):
     lead = await db.leads.find_one({"id": body.lead_id}, {"_id": 0})
@@ -916,7 +1207,9 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
         raise HTTPException(status_code=404, detail="Lead not found")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
-    if not lead.get("phone"):
+    # Pick the recipient: explicit active_wa_phone wins, else primary
+    target_phone = lead.get("active_wa_phone") or lead.get("phone")
+    if not target_phone:
         raise HTTPException(status_code=400, detail="Lead has no phone number")
 
     # If a template_name is given, send as template; else send freeform text.
@@ -946,7 +1239,7 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
                     )
                 params_to_send = provided
         api_result = await wa_send_template(
-            to_phone=lead["phone"],
+            to_phone=target_phone,
             template_name=body.template_name,
             lang_code=tpl_meta.get("language") or body.template_lang or cfg["default_template_lang"],
             body_params=params_to_send,
@@ -968,13 +1261,14 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
                 status_code=400,
                 detail="Outside the 24-hour customer service window — please use a template message",
             )
-        api_result = await wa_send_text(to_phone=lead["phone"], body=body.body)
+        api_result = await wa_send_text(to_phone=target_phone, body=body.body)
 
     msg = {
         "id": str(uuid.uuid4()),
         "lead_id": body.lead_id,
         "direction": "out",
         "body": body.body,
+        "to_phone": target_phone,
         "template_name": body.template_name,
         "status": api_result.get("status", "failed"),
         "wamid": api_result.get("wamid"),
@@ -988,6 +1282,12 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
     if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
         update_lead["has_whatsapp"] = True
     await db.leads.update_one({"id": body.lead_id}, {"$set": update_lead})
+    # Per-phone WA status
+    if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
+        await _set_wa_status(body.lead_id, target_phone, True)
+    elif msg["status"] == "failed" and (msg.get("error_code") in (131026, 131047, 470, 100) or "not on whatsapp" in (msg.get("error") or "").lower()):
+        # Meta returns 131026 / "not in WhatsApp" type errors when the number isn't on WA
+        await _set_wa_status(body.lead_id, target_phone, False)
     await log_activity(user["id"], "whatsapp_sent", body.lead_id, {"status": msg["status"], "wamid": msg["wamid"], "error": msg["error"]})
     if msg["status"] == "failed":
         # Surface the Meta error so the executive sees what to fix
@@ -1100,11 +1400,28 @@ async def sync_templates(admin: dict = Depends(require_admin)):
 
 # ------------- Followups -------------
 @api.get("/followups")
-async def list_followups(user: dict = Depends(get_current_user), scope: str = "mine"):
+async def list_followups(
+    user: dict = Depends(get_current_user),
+    scope: str = "mine",
+    status: Optional[str] = None,
+):
     query: Dict[str, Any] = {}
     if user["role"] == "executive" or scope == "mine":
         query["executive_id"] = user["id"]
+    if status:
+        query["status"] = status
     fu = await db.followups.find(query, {"_id": 0}).sort("due_at", 1).to_list(500)
+    # Enrich each follow-up with the parent lead's customer_name + phone (so the
+    # alarm UI doesn't need a second roundtrip).
+    lead_ids = list({f.get("lead_id") for f in fu if f.get("lead_id")})
+    name_map: Dict[str, Dict[str, Any]] = {}
+    if lead_ids:
+        async for ld in db.leads.find({"id": {"$in": lead_ids}}, {"_id": 0, "id": 1, "customer_name": 1, "phone": 1, "active_wa_phone": 1}):
+            name_map[ld["id"]] = ld
+    for f in fu:
+        ld = name_map.get(f.get("lead_id") or "") or {}
+        f["lead_customer_name"] = ld.get("customer_name")
+        f["lead_phone"] = ld.get("active_wa_phone") or ld.get("phone")
     return fu
 
 @api.post("/followups")
@@ -1182,9 +1499,38 @@ async def reports_overview(admin: dict = Depends(require_admin)):
     # per executive
     execs = await db.users.find({"role": "executive"}, {"_id": 0, "password_hash": 0}).to_list(500)
     per_exec = []
+    # Pre-aggregate calls by user × outcome
+    call_pipeline = [
+        {"$group": {"_id": {"user": "$by_user_id", "outcome": "$outcome"}, "c": {"$sum": 1}}},
+    ]
+    call_buckets: Dict[str, Dict[str, int]] = {}
+    async for d in db.call_logs.aggregate(call_pipeline):
+        u = (d.get("_id") or {}).get("user")
+        oc = (d.get("_id") or {}).get("outcome")
+        if not u:
+            continue
+        call_buckets.setdefault(u, {})[oc] = d["c"]
+    # Pre-aggregate messages by user (sent count)
+    msg_pipeline = [
+        {"$match": {"direction": "out", "by_user_id": {"$ne": None}}},
+        {"$group": {"_id": "$by_user_id", "c": {"$sum": 1}}},
+    ]
+    msgs_sent: Dict[str, int] = {}
+    async for d in db.messages.aggregate(msg_pipeline):
+        msgs_sent[d["_id"]] = d["c"]
     for e in execs:
         count = await db.leads.count_documents({"assigned_to": e["id"]})
         conv = await db.leads.count_documents({"assigned_to": e["id"], "status": "converted"})
+        qualified = await db.leads.count_documents({"assigned_to": e["id"], "status": "qualified"})
+        lost = await db.leads.count_documents({"assigned_to": e["id"], "status": "lost"})
+        contacted = await db.leads.count_documents({"assigned_to": e["id"], "status": "contacted"})
+        new_leads = await db.leads.count_documents({"assigned_to": e["id"], "status": "new"})
+        wa_threads = await db.leads.count_documents({"assigned_to": e["id"], "has_whatsapp": True})
+        # Followup completion rate
+        fu_total = await db.followups.count_documents({"executive_id": e["id"]})
+        fu_done = await db.followups.count_documents({"executive_id": e["id"], "status": "done"})
+        fu_pending = await db.followups.count_documents({"executive_id": e["id"], "status": "pending"})
+        fu_completion = round((fu_done / fu_total) * 100, 1) if fu_total else 0
         # avg response = avg(opened_at - created_at) where both present
         pipeline = [
             {"$match": {"assigned_to": e["id"], "opened_at": {"$ne": None}}},
@@ -1196,14 +1542,34 @@ async def reports_overview(admin: dict = Depends(require_admin)):
         avg_ms = 0
         async for doc in db.leads.aggregate(pipeline):
             avg_ms = int(doc.get("avg") or 0)
+        calls = call_buckets.get(e["id"], {})
+        total_calls = sum(calls.values())
         per_exec.append({
             "id": e["id"],
             "username": e["username"],
             "name": e["name"],
             "active": e.get("active", True),
             "leads": count,
+            "new_leads": new_leads,
+            "contacted": contacted,
+            "qualified": qualified,
             "converted": conv,
+            "lost": lost,
+            "conversion_rate": round((conv / count) * 100, 1) if count else 0,
             "avg_response_seconds": int(avg_ms / 1000) if avg_ms else 0,
+            "calls_total": total_calls,
+            "calls_connected": calls.get("connected", 0),
+            "calls_no_response": calls.get("no_response", 0),
+            "calls_not_reachable": calls.get("not_reachable", 0),
+            "calls_rejected": calls.get("rejected", 0),
+            "calls_busy": calls.get("busy", 0),
+            "calls_invalid": calls.get("invalid", 0),
+            "wa_threads": wa_threads,
+            "wa_messages_sent": msgs_sent.get(e["id"], 0),
+            "followup_total": fu_total,
+            "followup_done": fu_done,
+            "followup_pending": fu_pending,
+            "followup_completion_pct": fu_completion,
         })
     # last 14 days chart
     from collections import Counter
@@ -1284,11 +1650,21 @@ async def list_conversations(
     if status:
         query["status"] = status
     if q:
-        query["$or"] = [
-            {"customer_name": {"$regex": q, "$options": "i"}},
-            {"phone": {"$regex": q, "$options": "i"}},
-            {"requirement": {"$regex": q, "$options": "i"}},
+        import re as _re
+        q_safe = _re.escape(q)
+        ors: List[Dict[str, Any]] = [
+            {"customer_name": {"$regex": q_safe, "$options": "i"}},
+            {"aliases": {"$regex": q_safe, "$options": "i"}},
+            {"requirement": {"$regex": q_safe, "$options": "i"}},
         ]
+        phone_pat = phone_match_pattern(q)
+        if phone_pat:
+            ors.append({"phone": {"$regex": phone_pat}})
+            ors.append({"phones": {"$regex": phone_pat}})
+        else:
+            ors.append({"phone": {"$regex": q_safe, "$options": "i"}})
+            ors.append({"phones": {"$regex": q_safe, "$options": "i"}})
+        query["$or"] = ors
     leads = await db.leads.find(query, {
         "_id": 0, "raw_email_html": 0, "raw_email_text": 0,
     }).sort("last_action_at", -1).to_list(500)
@@ -1381,26 +1757,35 @@ async def mark_thread_read(lead_id: str, user: dict = Depends(get_current_user))
 
 @api.post("/inbox/start-chat")
 async def start_chat(body: StartChatInput, user: dict = Depends(get_current_user)):
-    phone = (body.phone or "").strip()
+    phone = normalize_phone_display((body.phone or "").strip())
     if not phone:
         raise HTTPException(status_code=400, detail="Phone is required")
     digits = _normalize_phone(phone)
     if len(digits) < 10:
         raise HTTPException(status_code=400, detail="Phone must contain at least 10 digits")
-    # Try to find an existing lead by phone-suffix match (last 10 digits)
     suffix = digits[-10:]
-    existing = await _find_lead_by_phone(digits)
+    existing = await _find_lead_by_phone(phone)
     if existing:
-        # If executive, must be assigned to them
-        if user["role"] == "executive" and existing.get("assigned_to") != user["id"]:
-            raise HTTPException(status_code=409, detail="Lead already exists and is assigned to another executive — request transfer from admin")
-        return existing
-    # Decide who this lead goes to
+        # Same exec or admin → return so caller can open it
+        if user["role"] == "admin" or existing.get("assigned_to") == user["id"] or not existing.get("assigned_to"):
+            return existing
+        owner = await db.users.find_one({"id": existing.get("assigned_to")}, {"_id": 0, "name": 1, "username": 1}) or {}
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "duplicate_phone",
+                "message": "This lead is already assigned to another executive.",
+                "existing_lead_id": existing["id"],
+                "owned_by_id": existing.get("assigned_to"),
+                "owned_by_name": owner.get("name"),
+                "owned_by_username": owner.get("username"),
+            },
+        )
     target_assignee = body.assigned_to if (user["role"] == "admin" and body.assigned_to) else (
         body.assigned_to if user["role"] == "admin" else user["id"]
     )
     data = {
-        "customer_name": (body.customer_name or "").strip() or f"+{suffix}",
+        "customer_name": (body.customer_name or "").strip() or phone,
         "phone": phone,
         "requirement": body.requirement or "",
         "source": "Manual",
@@ -1880,13 +2265,13 @@ async def whatsapp_verify(request: Request):
     raise HTTPException(status_code=403, detail="Verify token mismatch")
 
 
-async def _find_lead_by_phone(phone_digits: str) -> Optional[dict]:
-    """Best-effort lookup: leads store phone in original format; normalize for compare.
-    Tries exact suffix match (last 10 digits) for Indian numbers."""
+async def _find_lead_by_phone_legacy(phone_digits: str) -> Optional[dict]:
+    """[LEGACY — WhatsApp webhook fallback only] Best-effort lookup by digits suffix.
+    The primary/structured _find_lead_by_phone is defined earlier in this module.
+    Kept distinct to avoid name collision that previously overrode the main helper."""
     if not phone_digits:
         return None
     suffix = phone_digits[-10:] if len(phone_digits) >= 10 else phone_digits
-    # Use regex to match any stored phone whose digits-only suffix equals our suffix
     cursor = db.leads.find({"phone": {"$regex": suffix}}, {"_id": 0})
     async for lead in cursor:
         if _normalize_phone(lead.get("phone"))[-10:] == suffix:
@@ -1981,6 +2366,7 @@ async def webhook_whatsapp(request: Request):
                             "last_action_at": iso(now_utc()),
                             "last_user_message_at": iso(now_utc()),
                             "has_whatsapp": True,
+                            f"wa_status_map.{(_normalize_phone(from_phone or '')[-10:] or 'unk')}": True,
                         }},
                     )
                     created_msgs += 1
@@ -2549,6 +2935,30 @@ async def seed_data():
     await db.activity_logs.create_index("lead_id")
     await db.transfer_requests.create_index([("status", 1), ("created_at", -1)])
     await db.quick_replies.create_index("title")
+    await db.call_logs.create_index([("lead_id", 1), ("at", -1)])
+    await db.call_logs.create_index([("by_user_id", 1), ("at", -1)])
+    await db.call_logs.create_index("outcome")
+    # Phone canonicalization migration (one-shot per cold-start). Iterates through any
+    # lead whose phone/phones haven't been flagged migrated yet and rewrites them in
+    # canonical form (Indian → 10-digit national, others → +<digits>). Idempotent.
+    n_migrated = 0
+    async for ld in db.leads.find({"_phones_canonicalized": {"$ne": True}}, {"_id": 0, "id": 1, "phone": 1, "phones": 1}):
+        new_primary = normalize_phone_display(ld.get("phone")) if ld.get("phone") else ld.get("phone")
+        new_phones: List[str] = []
+        seen: set = set()
+        for raw in (ld.get("phones") or []):
+            cn = normalize_phone_display(raw) if raw else None
+            if not cn or cn == new_primary or cn in seen:
+                continue
+            seen.add(cn)
+            new_phones.append(cn)
+        await db.leads.update_one(
+            {"id": ld["id"]},
+            {"$set": {"phone": new_primary, "phones": new_phones, "_phones_canonicalized": True}},
+        )
+        n_migrated += 1
+    if n_migrated:
+        logger.info(f"Canonicalized phone format on {n_migrated} leads")
 
 scheduler: Optional[AsyncIOScheduler] = None
 
