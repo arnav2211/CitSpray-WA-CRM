@@ -22,6 +22,16 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 4 (May 2026) — Sales operating system upgrades
+- **Call activity logging** — new `call_logs` collection with structured outcomes (connected, no_response, rejected, not_reachable, busy, invalid). Endpoints: `POST/GET /api/leads/{id}/calls`, `GET /api/calls` (admin sees all, executive sees own). Connected calls require a conversation summary (400 otherwise). Lead doc carries `last_call_outcome` + `last_call_at` + `/api/leads?last_call_outcome=` filter.
+- **Reports** — `/api/reports/overview.per_executive` now exposes 19 metrics per executive: leads, new_leads, contacted, qualified, converted, lost, conversion_rate, avg_response_seconds, calls_total, calls_connected, calls_no_response, calls_not_reachable, calls_rejected, calls_busy, calls_invalid, wa_threads, wa_messages_sent, followup_total, followup_done, followup_pending, followup_completion_pct. Reports UI redesigned with full breakdown table on desktop + card grid on mobile.
+- **Lead activity log moved behind an Info button** in the LeadDrawer. New `ActivityPanel` slide-over: admin sees full reassignment trail with from→to enrichment + actor names; executives have system/reassignment events filtered out server-side.
+- **Editable customer name + aliases** — `aliases: List[str]` field on lead doc; included in regex search across `/api/leads` and `/api/inbox/conversations`. Pencil-edit UI updates everywhere via single source of truth.
+- **Editable requirement** — Edit button + textarea; `requirement_updated_at` timestamp set on save.
+- **Per-phone WhatsApp detection** — `wa_status_map` keyed by last-10 digits of each phone, set on every outbound (true on success, false on Meta error 131026/470/100), and on every inbound. UI shows green WA / grey NO-WA / `?` per phone.
+- **Active-WA-phone selector** — `PUT /api/leads/{id}/active-wa-phone` validates the phone is on the lead (suffix match), persists `active_wa_phone`. WA send routes to `active_wa_phone || phone`. UI: 'Use for WA' button next to each non-active phone.
+- **Follow-up alarm** — global `FollowupAlerts` mounted in AppShell. Polls `/api/followups?status=pending` every 30s; when a follow-up is due within ±90s and not snoozed, plays a 6-second WebAudio two-tone alarm and shows a Mark-Done / Snooze-30-min modal. `/api/followups` enriched with `lead_customer_name` + `lead_phone` so the modal needs zero extra calls.
+
 ### Iteration 3 (Apr 2026) — Mobile-first responsiveness
 - **Sidebar drawer** — desktop persistent (`md+`), mobile hidden by default; hamburger button in header opens sidebar as fixed overlay with backdrop, X close button, auto-close on route change, body-scroll lock while open.
 - **Header** — compact on mobile (`p-4`) with hamburger, larger on desktop (`p-8`).
