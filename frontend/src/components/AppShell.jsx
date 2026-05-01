@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import Sidebar from "@/components/Sidebar";
+import FollowupAlerts from "@/components/FollowupAlerts";
 import { Outlet, useLocation } from "react-router-dom";
 import { List } from "@phosphor-icons/react";
 
@@ -47,6 +48,7 @@ export default function AppShell() {
           <Outlet />
         </div>
       </main>
+      <FollowupAlerts />
     </div>
   );
 }

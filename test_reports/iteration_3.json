@@ -1,0 +1,36 @@
+{
+  "summary": "Iteration-4 LeadOrbit CRM verified end-to-end. Added /app/backend/tests/test_iteration4.py with 23 pytest cases (23/23 PASS) covering call logs (happy path + 400-on-missing-summary + sort-desc + exec RBAC), GET /api/calls (admin/exec filtering + invalid-outcome 400), /api/leads?last_call_outcome filter, PATCH aliases + requirement_updated_at + active_wa_phone, PUT /active-wa-phone (valid, suffix-match, 400 invalid), alias substring search, /leads/{id}/activity RBAC (exec hides reassignments + actor_name enrichment), /reports/overview per_executive enriched with all 19 required fields, /followups enrichment with lead_customer_name + lead_phone + PATCH done, round-robin still excludes admin. Frontend Playwright: admin login, leads-outcome-filter select works, open-activity-btn → activity-panel with activity-admin-flag + 87 rows, edit-name-btn → aliases persist (aliases-display shows 'aka UIalias1 · UIalias2'), edit-requirement-btn → save persists, call-log-section: outcome=connected shows call-summary-input, logging no_response increments call-rows (2→3), Reports shows Conv%, Calls, Conn, PNR, N/R, Rej, Busy, WA, Msgs, F/U%, Resp s columns with 2 exec-cards rendered.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration4.py",
+    "/app/test_reports/pytest/iter4_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is now 2826 lines — still strongly recommend splitting into modules (auth, leads, calls, webhooks_*, reports, followups). Test isolation + review time will benefit.",
+    "In /api/followups the default scope='mine' is applied even for admin, which silently filters out lead followups the admin didn't personally create. If this is intentional, UI must always pass scope=all for admins; if not, default should be 'all' for admin role. (Test had to pass scope=all to find the just-created followup.)",
+    "log_call sets last_action_at on the lead (good), but the lead's response-time SLA aggregation (avg_response_seconds in reports) currently only considers first contact — confirm call events feed into SLA if that is desired.",
+    "_set_wa_status only flips has_whatsapp → true when any phone is WA-active; it never sets has_whatsapp=false even if all mapped phones are marked WA=false. Minor, but could cause stale UI badges after a WhatsApp 131047/470 failure."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration4.py"
+  ],
+  "success_rate": {
+    "backend": "100% (23/23 iteration-4 tests pass)",
+    "frontend": "100% on tested iteration-4 surfaces (outcome filter, activity panel, name/alias edit, requirement edit, call log section, phones row, reports breakdown)"
+  },
+  "test_credentials": "admin/Admin@123 (admin), ravi/Exec@123, priya/Exec@123. Exec password is auto-reset by the fixture if changed.",
+  "seed_data_creation": "Created TEST_IT4_* lead (iteration-4 fixture lead) + TEST_IT4_RR_* leads (3) via IndiaMART webhook. Call logs + aliases + requirement edits attached to the existing 'Routing Test' lead (56495865-6699-42c5-87dd-aeb00409dde2).",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Use /app/backend/tests/test_iteration4.py as the iteration-4 regression suite (23 tests). BASE_URL must be passed via env: REACT_APP_BACKEND_URL=<frontend .env value> pytest ... Frontend data-testids verified: leads-outcome-filter, open-activity-btn, activity-panel, activity-admin-flag, activity-row-*, edit-name-btn, edit-name-input, edit-aliases-input, save-name-btn, aliases-display, edit-requirement-btn, edit-requirement-input, save-requirement-btn, requirement-display, call-log-section, call-phone-select, call-outcome-select, call-summary-input, log-call-btn, call-row-*, lead-phones-row, wa-yes-*, wa-no-*, wa-active-*, set-wa-active-*, exec-card-*, followup-alert, followup-done-btn, followup-snooze-btn. Note: /api/followups defaults scope=mine for admin — tests must pass scope=all when asserting admin can see another user's followups. Login redirects to /dashboard (not /leads).",
+  "rca_of_the_issue": "N/A — all iteration-4 features implemented and verified working."
+}

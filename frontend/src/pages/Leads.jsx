@@ -21,13 +21,20 @@ export default function Leads() {
   const [statusFilter, setStatusFilter] = useState(params.get("status") || "");
   const [sourceFilter, setSourceFilter] = useState(params.get("source") || "");
   const [assignedFilter, setAssignedFilter] = useState(params.get("assigned") || "");
+  const [outcomeFilter, setOutcomeFilter] = useState(params.get("outcome") || "");
   const [openId, setOpenId] = useState(params.get("lead") || null);
   const [creating, setCreating] = useState(false);
 
   const load = async () => {
     try {
       const { data } = await api.get("/leads", {
-        params: { q: q || undefined, status: statusFilter || undefined, source: sourceFilter || undefined, assigned_to: assignedFilter || undefined },
+        params: {
+          q: q || undefined,
+          status: statusFilter || undefined,
+          source: sourceFilter || undefined,
+          assigned_to: assignedFilter || undefined,
+          last_call_outcome: outcomeFilter || undefined,
+        },
       });
       setLeads(data);
     } catch (e) { toast.error(errMsg(e)); }
@@ -42,7 +49,7 @@ export default function Leads() {
     })();
   }, []);
 
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter]);
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter]);
   useEffect(() => {
     const t = setTimeout(() => load(), 300);
     return () => clearTimeout(t);
@@ -56,9 +63,10 @@ export default function Leads() {
     if (statusFilter) p.status = statusFilter;
     if (sourceFilter) p.source = sourceFilter;
     if (assignedFilter) p.assigned = assignedFilter;
+    if (outcomeFilter) p.outcome = outcomeFilter;
     if (openId) p.lead = openId;
     setParams(p, { replace: true });
-  }, [view, q, statusFilter, sourceFilter, assignedFilter, openId, setParams]);
+  }, [view, q, statusFilter, sourceFilter, assignedFilter, outcomeFilter, openId, setParams]);
 
   const execMap = useMemo(() => Object.fromEntries(execs.map((e) => [e.id, e])), [execs]);
   const isAdmin = user.role === "admin";
@@ -111,6 +119,15 @@ export default function Leads() {
             {execs.map((e) => <option key={e.id} value={e.id}>{e.name}</option>)}
           </select>
         )}
+        <select value={outcomeFilter} onChange={(e) => setOutcomeFilter(e.target.value)} className="border border-gray-300 px-2 py-2 text-sm md:col-span-1 col-span-1" data-testid="leads-outcome-filter">
+          <option value="">All call outcomes</option>
+          <option value="connected">Connected</option>
+          <option value="no_response">No Response (PNR)</option>
+          <option value="not_reachable">Not Reachable</option>
+          <option value="rejected">Rejected</option>
+          <option value="busy">Busy / Engaged</option>
+          <option value="invalid">Invalid</option>
+        </select>
       </div>
 
       {view === "table" ? (
