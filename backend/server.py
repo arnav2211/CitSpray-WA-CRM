@@ -979,11 +979,18 @@ async def add_phone(lead_id: str, body: PhoneInput, user: dict = Depends(get_cur
         raise HTTPException(status_code=400, detail="Phone required")
     existing_phones = list(lead.get("phones") or [])
     if new_phone == lead.get("phone") or new_phone in existing_phones:
-        raise HTTPException(status_code=409, detail="Phone already on this lead")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "duplicate_phone_same_lead",
+                "message": "Phone already on this lead",
+                "existing_lead_id": lead_id,
+            },
+        )
     # Cross-lead dedup: stop the user from adding a phone that already lives on another lead
     other = await _find_lead_by_phone(new_phone, exclude_id=lead_id)
     if other:
-        owner = await db.users.find_one({"id": other.get("assigned_to")}, {"_id": 0, "name": 1}) or {}
+        owner = await db.users.find_one({"id": other.get("assigned_to")}, {"_id": 0, "name": 1, "username": 1}) or {}
         raise HTTPException(
             status_code=409,
             detail={
@@ -992,6 +999,7 @@ async def add_phone(lead_id: str, body: PhoneInput, user: dict = Depends(get_cur
                 "existing_lead_id": other["id"],
                 "owned_by_id": other.get("assigned_to"),
                 "owned_by_name": owner.get("name"),
+                "owned_by_username": owner.get("username"),
             },
         )
     update: Dict[str, Any] = {"last_action_at": iso(now_utc())}
@@ -1758,6 +1766,7 @@ async def start_chat(body: StartChatInput, user: dict = Depends(get_current_user
                 "existing_lead_id": existing["id"],
                 "owned_by_id": existing.get("assigned_to"),
                 "owned_by_name": owner.get("name"),
+                "owned_by_username": owner.get("username"),
             },
         )
     target_assignee = body.assigned_to if (user["role"] == "admin" and body.assigned_to) else (
