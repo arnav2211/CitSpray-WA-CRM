@@ -1533,6 +1533,42 @@ class ResendInput(BaseModel):
     message_id: str
 
 
+class ReactInput(BaseModel):
+    message_id: str  # local UUID of the target message
+    emoji: str = ""  # "" clears the reaction
+
+
+@api.post("/whatsapp/react")
+async def whatsapp_react(body: ReactInput, user: dict = Depends(get_current_user)):
+    """Send or remove a reaction on a message. Emits one `reaction` message to Meta
+    and upserts the reaction on the target message doc. Only one reaction per user per
+    message (per WA semantics). Empty emoji removes the reaction."""
+    target = await db.messages.find_one({"id": body.message_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Message not found")
+    target_wamid = target.get("wamid")
+    if not target_wamid:
+        raise HTTPException(status_code=400, detail="Target message has no WhatsApp id (mock?) — cannot react")
+    ctx = await _assert_chat_permitted(user, target["lead_id"])
+    to_phone = ctx["target_phone"]
+    api_result = await wa_send_reaction(to_phone=to_phone, message_wamid=target_wamid, emoji=body.emoji or "")
+    if api_result.get("status") == "failed":
+        raise HTTPException(status_code=400, detail=api_result.get("error") or "Reaction send failed")
+    # Upsert reaction on the target message: one per (direction=out, user_id)
+    reactions = [r for r in (target.get("reactions") or []) if not (r.get("direction") == "out" and r.get("user_id") == user["id"])]
+    if body.emoji:
+        reactions.append({
+            "emoji": body.emoji,
+            "direction": "out",
+            "user_id": user["id"],
+            "user_name": user.get("name") or user.get("username"),
+            "wamid": api_result.get("wamid"),
+            "at": iso(now_utc()),
+        })
+    await db.messages.update_one({"id": body.message_id}, {"$set": {"reactions": reactions}})
+    return {"ok": True, "emoji": body.emoji or None, "reactions": reactions}
+
+
 @api.post("/whatsapp/resend")
 async def whatsapp_resend(body: ResendInput, user: dict = Depends(get_current_user)):
     """Retry sending a previously-failed outbound message. Picks up every field from the
@@ -2651,6 +2687,15 @@ async def wa_send_contacts(to_phone: str, contacts: List[Dict[str, Any]], reply_
     return await _wa_send_typed(to_phone, {"type": "contacts", "contacts": contacts}, reply_to_wamid=reply_to_wamid)
 
 
+async def wa_send_reaction(to_phone: str, message_wamid: str, emoji: str) -> Dict[str, Any]:
+    """Send or remove a WhatsApp reaction. Passing emoji='' (empty string) removes the reaction.
+    Per WA Cloud API, reactions don't support context / quoted replies — it's its own message type."""
+    return await _wa_send_typed(to_phone, {
+        "type": "reaction",
+        "reaction": {"message_id": message_wamid, "emoji": emoji or ""},
+    })
+
+
 async def _wa_send_typed(to_phone: str, payload_extra: Dict[str, Any], reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
     """Shared transport for non-text WhatsApp messages. Keeps version, auth, error shape
     identical to the other wa_send_* helpers."""
@@ -3433,7 +3478,8 @@ def _prepare_video_for_whatsapp(raw: bytes, suffix: str, mime: str) -> tuple:
     mime_l = (mime or "").split(";", 1)[0].lower().strip()
     if mime_l in _WA_VIDEO_OK_MIMES or suffix in _WA_VIDEO_OK_EXTS:
         return raw, suffix or ".mp4", mime_l or "video/mp4"
-    import tempfile, subprocess
+    import tempfile
+    import subprocess
     with tempfile.NamedTemporaryFile(suffix=suffix or ".bin", delete=False) as tf_in:
         tf_in.write(raw)
         in_path = tf_in.name
@@ -3647,6 +3693,36 @@ async def webhook_whatsapp(request: Request):
                             body_text = f"[list] {(ia.get('list_reply') or {}).get('title','')}".strip()
                         else:
                             body_text = f"[interactive] {json.dumps(ia)[:200]}"
+                    elif msg_type == "reaction":
+                        # Customer reacted to one of our messages (or another of theirs).
+                        # Do NOT create a regular message bubble — upsert the reaction onto the target.
+                        rx = m.get("reaction") or {}
+                        target_wamid = rx.get("message_id")
+                        emoji = (rx.get("emoji") or "").strip()
+                        target_lead = await _find_lead_by_phone(from_phone or "")
+                        if target_wamid and target_lead:
+                            target_msg = await db.messages.find_one(
+                                {"wamid": target_wamid, "lead_id": target_lead["id"]},
+                                {"_id": 0},
+                            )
+                            if target_msg:
+                                reactions = [r for r in (target_msg.get("reactions") or [])
+                                             if not (r.get("direction") == "in" and (r.get("from_phone") == from_phone))]
+                                if emoji:
+                                    reactions.append({
+                                        "emoji": emoji,
+                                        "direction": "in",
+                                        "from_phone": from_phone,
+                                        "wamid": wamid,
+                                        "at": iso(now_utc()),
+                                    })
+                                await db.messages.update_one(
+                                    {"id": target_msg["id"]},
+                                    {"$set": {"reactions": reactions}},
+                                )
+                            else:
+                                logger.info(f"Inbound reaction for unknown wamid={target_wamid} (lead={target_lead['id'][:8]})")
+                        continue  # do not fall through to create a normal msg_doc
                     else:
                         body_text = f"[{msg_type}]"
 

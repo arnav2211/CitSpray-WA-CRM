@@ -539,6 +539,13 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
     } catch (e) { toast.error(errMsg(e, "Resend failed")); }
   };
 
+  const reactToMessage = async (m, emoji) => {
+    try {
+      await api.post("/whatsapp/react", { message_id: m.id, emoji });
+      loadMessages();
+    } catch (e) { toast.error(errMsg(e, "Reaction failed")); }
+  };
+
   return (
     <>
     <div className="flex flex-col h-full overflow-hidden">
@@ -614,12 +621,14 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
                 m={m}
                 allMessages={messages}
                 canMessage={canMessage && within24h}
+                currentUserId={user?.id}
                 onReply={(target) => setReplyTo({
                   id: target.id,
                   preview: (target.caption || target.body || "").slice(0, 120),
                   direction: target.direction,
                 })}
                 onResend={canMessage ? resendMessage : null}
+                onReact={canMessage ? reactToMessage : null}
               />
             ))}
           </div>
@@ -891,9 +900,10 @@ function InfoRow({ label, children }) {
   );
 }
 
-function Bubble({ m, allMessages = [], onReply, onResend, canMessage = true }) {
+function Bubble({ m, allMessages = [], onReply, onResend, onReact, canMessage = true, currentUserId = null }) {
   const isOut = m.direction === "out";
   const isSystem = m.direction === "system";
+  const [pickerOpen, setPickerOpen] = useState(false);
   if (isSystem) {
     return (
       <div className="flex justify-center my-2">
@@ -902,7 +912,6 @@ function Bubble({ m, allMessages = [], onReply, onResend, canMessage = true }) {
     );
   }
   const media = renderMedia(m);
-  // When rendering structured non-media payloads, hide the textual placeholder
   const hasStructured = media || m.msg_type === "location" || m.msg_type === "contacts";
   const captionText = m.caption || (hasStructured ? "" : m.body);
   const quoted = m.reply_to_message_id
@@ -912,16 +921,34 @@ function Bubble({ m, allMessages = [], onReply, onResend, canMessage = true }) {
     ? ((quoted.caption || quoted.body || "").slice(0, 120))
     : (m.reply_to_preview ? m.reply_to_preview.slice(0, 120) : null);
   const quotedDirection = quoted?.direction || (m.reply_to_wamid && isOut ? "in" : "out");
+  // Aggregate reactions for display: {emoji: {count, mine}}
+  const reactionAgg = {};
+  (m.reactions || []).forEach((r) => {
+    const k = r.emoji || "?";
+    if (!reactionAgg[k]) reactionAgg[k] = { count: 0, mine: false, directions: new Set() };
+    reactionAgg[k].count += 1;
+    if (r.direction === "out" && currentUserId && r.user_id === currentUserId) reactionAgg[k].mine = true;
+    reactionAgg[k].directions.add(r.direction);
+  });
+  const handleReact = (emoji) => {
+    setPickerOpen(false);
+    onReact?.(m, emoji);
+  };
   return (
-    <div className={`group flex ${isOut ? "justify-end" : "justify-start"}`} data-testid={`msg-${m.id}`}>
+    <div className={`group flex ${isOut ? "justify-end" : "justify-start"} relative`} data-testid={`msg-${m.id}`}>
       {!isOut && canMessage && onReply && (
-        <button onClick={() => onReply(m)}
-          className="opacity-0 group-hover:opacity-100 transition-opacity text-gray-500 hover:text-[#25D366] text-[10px] uppercase tracking-widest font-bold self-center mr-1 px-1"
-          title="Reply" data-testid={`reply-btn-${m.id}`}>
-          ↩ Reply
-        </button>
+        <div className="opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center gap-0.5 self-center mr-1">
+          {onReact && (
+            <button onClick={() => setPickerOpen(v => !v)} className="text-gray-500 hover:text-[#FF8800] text-sm" title="React" data-testid={`react-btn-${m.id}`}>
+              😊
+            </button>
+          )}
+          <button onClick={() => onReply(m)} className="text-gray-500 hover:text-[#25D366] text-[10px] uppercase tracking-widest font-bold px-1" title="Reply" data-testid={`reply-btn-${m.id}`}>
+            ↩
+          </button>
+        </div>
       )}
-      <div className={`max-w-[75%] ${media ? "p-1.5" : "px-3 py-2"} ${isOut ? "bg-[#D9FDD3]" : "bg-white"} text-sm shadow-sm`}>
+      <div className={`max-w-[75%] ${media ? "p-1.5" : "px-3 py-2"} ${isOut ? "bg-[#D9FDD3]" : "bg-white"} text-sm shadow-sm relative`}>
         {m.template_name && (
           <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold mb-1 px-2 pt-1">Template · {m.template_name}</div>
         )}
@@ -953,13 +980,48 @@ function Bubble({ m, allMessages = [], onReply, onResend, canMessage = true }) {
           {isOut && <span className={`text-[10px] ${tickColor(m.status)}`}>{tickFor(m.status)}</span>}
           {isOut && m.error && <span className="text-[9px] text-[#E60000] uppercase tracking-widest font-bold">{String(m.error).slice(0, 24)}</span>}
         </div>
+        {/* Reaction badges anchored to bottom-start of the bubble */}
+        {Object.keys(reactionAgg).length > 0 && (
+          <div className={`absolute -bottom-3 ${isOut ? "left-2" : "right-2"} flex items-center gap-1`} data-testid={`reactions-${m.id}`}>
+            {Object.entries(reactionAgg).map(([emoji, info]) => (
+              <button
+                key={emoji}
+                onClick={() => onReact && info.mine ? onReact(m, "") : onReact && onReact(m, emoji)}
+                className={`bg-white border ${info.mine ? "border-[#25D366]" : "border-gray-200"} rounded-full px-1.5 py-0.5 text-[11px] flex items-center gap-0.5 shadow-sm hover:scale-110 transition-transform`}
+                title={info.mine ? "Click to remove" : `React ${emoji}`}
+                data-testid={`reaction-badge-${emoji}-${m.id}`}
+              >
+                <span>{emoji}</span>
+                {info.count > 1 && <span className="text-[10px] text-gray-600 font-bold">{info.count}</span>}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
-      {isOut && canMessage && onReply && (
-        <button onClick={() => onReply(m)}
-          className="opacity-0 group-hover:opacity-100 transition-opacity text-gray-500 hover:text-[#25D366] text-[10px] uppercase tracking-widest font-bold self-center ml-1 px-1"
-          title="Reply" data-testid={`reply-btn-${m.id}`}>
-          ↩ Reply
-        </button>
+      {isOut && canMessage && (onReply || onReact) && (
+        <div className="opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center gap-0.5 self-center ml-1">
+          {onReact && (
+            <button onClick={() => setPickerOpen(v => !v)} className="text-gray-500 hover:text-[#FF8800] text-sm" title="React" data-testid={`react-btn-${m.id}`}>
+              😊
+            </button>
+          )}
+          {onReply && (
+            <button onClick={() => onReply(m)} className="text-gray-500 hover:text-[#25D366] text-[10px] uppercase tracking-widest font-bold px-1" title="Reply" data-testid={`reply-btn-${m.id}`}>
+              ↩
+            </button>
+          )}
+        </div>
+      )}
+      {pickerOpen && (
+        <div className={`absolute z-20 ${isOut ? "right-12" : "left-12"} -top-2 bg-white border border-gray-200 shadow-lg px-1.5 py-1.5 flex items-center gap-1`} data-testid={`emoji-picker-${m.id}`}
+          onClick={(e) => e.stopPropagation()}>
+          {["👍", "❤️", "😂", "😮", "😢", "🙏"].map((e) => (
+            <button key={e} onClick={() => handleReact(e)} className="hover:bg-gray-100 w-7 h-7 flex items-center justify-center text-base" data-testid={`emoji-${e}-${m.id}`}>
+              {e}
+            </button>
+          ))}
+          <button onClick={() => setPickerOpen(false)} className="ml-1 text-gray-400 hover:text-gray-900 p-1"><X size={12} /></button>
+        </div>
       )}
     </div>
   );
