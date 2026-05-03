@@ -22,6 +22,15 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 11 (Feb 2026) — WhatsApp Reactions (send + receive)
+- **`wa_send_reaction(to, message_wamid, emoji)`** — thin helper via `_wa_send_typed`. Empty emoji (`""`) clears the reaction per WA spec.
+- **`POST /api/whatsapp/react {message_id, emoji}`** — admin/exec endpoint. Resolves local UUID → target's Meta wamid, calls Meta, and upserts one reaction entry per `(direction="out", user_id)` on the target message's `reactions` array. Enforces RBAC (same lead-ownership rules), 24h window, and 404 for invalid target.
+- **Inbound webhook — `type: reaction`** — parser now handles reaction messages: does NOT create a bubble, instead finds the target message by `wamid + lead_id` and upserts one entry per `(direction="in", from_phone)`. Empty emoji removes the customer's reaction. Unknown target wamid is logged & skipped (never crashes the webhook).
+- **Chat UI (`Chat.jsx`)** — `Bubble` now aggregates `m.reactions[]` into `{emoji: {count, mine}}` and renders tiny white pills (WhatsApp-style) anchored to the bubble's bottom. On hover, a small 😊 button next to the reply arrow opens a 6-emoji quick picker (👍 ❤️ 😂 😮 😢 🙏) with an X to close. Clicking your own reaction pill clears it. Pill has green border if it's yours, grey otherwise; count shown only when ≥2 reactions on the same emoji.
+- **Currently-user awareness** — `currentUserId` flows from parent to highlight "mine" reactions correctly.
+- **Verified live against +917447717744** — 8/8 scenarios: react 👍, change to ❤️, verify single entry (not dupe), remove (empty string), inbound reaction 🔥 stored, inbound change to 👏 overwrites, inbound empty clears, 404 for invalid target. All sends returned real Meta wamids.
+- **Tested**: 39/39 iter7+iter8 regression green + 8/8 reaction scenarios.
+
 ### Iteration 10 (Feb 2026) — Media transcoding + preview/download (prod-ready media pipeline)
 - **Root cause fix for "audio/video not playable"** — Browser `MediaRecorder` outputs `audio/webm;codecs=opus` which WhatsApp does NOT accept (spec allows: audio/ogg-opus, audio/aac, audio/mp4 m4a, audio/mpeg mp3, audio/amr). Similarly quicktime (.mov) video isn't in WA's whitelist (only mp4 / 3gp). Meta was happily accepting our sends (returning wamids) but the recipient's device could not decode → appeared as "not sent".
 - **Backend transcoder (ffmpeg)** — `POST /api/chatflows/upload-media` now invokes ffmpeg when needed: `_prepare_audio_for_whatsapp` remuxes opus-in-webm to opus-in-ogg (preferred, no quality loss) with a libmp3lame fallback; `_prepare_video_for_whatsapp` transcodes any non-mp4/3gp to H.264/AAC mp4 with `+faststart` (uses temp input+output files because MP4 mux needs seekable output); `_prepare_image_for_whatsapp` converts webp/heic/gif to jpeg. Response now includes `mime_type` and `transcoded: bool`.
