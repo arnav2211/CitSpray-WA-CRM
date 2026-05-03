@@ -1,0 +1,41 @@
+{
+  "summary": "Iteration 8 (Internal Q&A tracking): 13/13 backend pytest cases passing; full UI flow on /qa and Chat deep-link verified for both admin and executive. Centralized /qa page renders correctly with filters/search/rows/chips, executive sees only own threads (9 rows ravi-only), admin sees all (11 rows mixed ravi+priya). Open-chat deep-link navigates to /chat, auto-opens right-side panel with Internal Q&A tab active (blue), and for admin pre-selects the specific agent's thread (priya's 'priya isolate q' message visible). Inbox conv list shows orange 'QUESTION ASKED' (qa-tag-pending) and green 'ANSWERED' (qa-tag-answered) badges driven by internal_qa_status. nav-qa sidebar entry visible to BOTH admin and executive.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {
+        "flow": "Deep-link from /qa → /chat",
+        "issue": "After deep-link consumes tab=internal & agent= via initialDeeplink useMemo, the URL is normalized to /chat?lead=<id> only (tab and agent params stripped). Functionally OK (panel opens, Internal Q&A tab active, correct agent thread shown), and the spec explicitly says params are consumed ONCE on mount. Just noting that browser-history-based 'copy link' will lose tab/agent state — re-opening the link cold will only restore lead, not the specific agent thread or panel-open state. Consider preserving tab=internal in the URL (replaceState) for shareable deep-links.",
+        "affected_selectors": ["[data-testid='qa-open-chat-{lead_id}']"]
+      }
+    ],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration8_qa_tracking.py",
+    "/app/test_reports/pytest/iter8_qa_results.xml"
+  ],
+  "action_items": [
+    "(Optional, not blocking) After consuming initialDeeplink in Chat.jsx, retain tab=internal (and agent= for admin) in the URL via window.history.replaceState so users can copy/share the link and land back on the same panel state."
+  ],
+  "critical_code_review_comments": [
+    "server.py reached 5487 lines — both the /api/internal-qa/threads aggregation block (≈110 lines incl. enrichment) and the inbox iqa_pipeline (≈70 lines) belong in a dedicated internal_qa router/service module. Splitting will make the file maintainable and easier to test in isolation.",
+    "internal_qa_threads currently issues an extra db.users.find_one for the replier inside the per-row loop (line ~1037). For threads with many distinct repliers this is N round-trips. Pre-load all from_user_ids of admin messages into a single $in lookup like the existing users_map.",
+    "The triple .sort() at the end of internal_qa_threads (lines 1074-1076) is sorted three times for the same final ordering — only the last call (status pending-first) survives. Drop the first two sorts or merge into a single key tuple to avoid confusion.",
+    "iqa_map roll-up in /api/inbox/conversations (lines 2587-2595) silently uses 'last_at' but never reads it; the variable can be removed or the rollup re-keyed by lead_id with last_at to break ties between two agent threads on the same lead consistently. Currently first-encountered wins."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration8_qa_tracking.py"
+  ],
+  "success_rate": {"backend": "100% (13/13)", "frontend": "100% (all critical UI testids and flows verified)"},
+  "test_credentials": "admin / Admin@123, ravi / Exec@123, priya / Exec@123 (from /app/memory/test_credentials.md)",
+  "seed_data_creation": "Created ~7 TEST_iter8_* leads assigned to ravi/priya during testing. Each carries 1-2 internal messages. These do NOT collide with iteration 7's seeded data; previous threads still visible to admin in /qa.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend regression for iter8 lives at /app/backend/tests/test_iteration8_qa_tracking.py (13 cases). Iter7 suite still at test_iteration7_routing_leaves_internal.py (22 cases). Total backend regression ~35 cases. Both run under 30s. The deep-link URL stripping (tab=internal/agent= dropped after mount) is BY DESIGN per spec — don't flag as a bug, but it does mean shareable deep-links lose context (logged as minor integration note above). Sidebar nav-qa testid is present and visible to both admin and executive roles.",
+  "rca_of_the_issue": "N/A — no failing flows."
+}

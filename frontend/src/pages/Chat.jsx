@@ -94,6 +94,12 @@ export default function Chat() {
 
   const activeConv = useMemo(() => convs.find(c => c.id === activeId), [convs, activeId]);
   const totalUnread = convs.reduce((s, c) => s + (c.unread || 0), 0);
+  // Capture the initial deep-link params ONCE so the URL-sync effect below doesn't
+  // strip them before ChatThread mounts (convs are loaded async).
+  const initialDeeplink = useMemo(() => ({
+    tab: params.get("tab"),
+    agent: params.get("agent"),
+  }), []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="h-full flex bg-[#EFEAE2]" data-testid="chat-page">
@@ -163,6 +169,8 @@ export default function Chat() {
             execs={execs}
             onClose={() => setActiveId(null)}
             onChanged={fetchConvs}
+            initialTab={initialDeeplink.tab}
+            initialAgentId={initialDeeplink.agent}
           />
         ) : (
           <EmptyState />
@@ -226,6 +234,16 @@ function ConvRow({ c, active, onClick, execs }) {
           {c.unreplied && (
             <span className="text-[9px] uppercase tracking-widest text-[#E60000] font-bold">Reply pending</span>
           )}
+          {c.internal_qa_status === "pending" && (
+            <span className="inline-flex items-center gap-1 bg-[#FFF4E5] border border-[#E67E00] text-[#B85F00] text-[9px] uppercase tracking-widest font-bold px-1.5 py-0.5" data-testid={`qa-tag-pending-${c.id}`}>
+              Question Asked
+            </span>
+          )}
+          {c.internal_qa_status === "answered" && (
+            <span className="inline-flex items-center gap-1 bg-[#E7F7E6] border border-[#008A00] text-[#005F00] text-[9px] uppercase tracking-widest font-bold px-1.5 py-0.5" data-testid={`qa-tag-answered-${c.id}`}>
+              Answered
+            </span>
+          )}
         </div>
       </div>
     </button>
@@ -255,7 +273,7 @@ function EmptyState() {
 }
 
 // ---------------- Chat thread ----------------
-function ChatThread({ conv, user, execs, onClose, onChanged }) {
+function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initialAgentId }) {
   const isAdmin = user.role === "admin";
   const canMessage = isAdmin || conv.assigned_to === user.id;
   const [messages, setMessages] = useState([]);
@@ -263,9 +281,10 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
   const [sending, setSending] = useState(false);
   const [showQR, setShowQR] = useState(false);
   const [showTpl, setShowTpl] = useState(false);
-  const [showInfo, setShowInfo] = useState(false);
-  const [panelTab, setPanelTab] = useState("details"); // 'details' | 'internal'
+  const [showInfo, setShowInfo] = useState(initialTab === "internal");
+  const [panelTab, setPanelTab] = useState(initialTab === "internal" ? "internal" : "details"); // 'details' | 'internal'
   const [internalQuote, setInternalQuote] = useState(null); // WA message selected to ask admin about
+  const [internalPreselectAgent, setInternalPreselectAgent] = useState(initialAgentId || null);
   const [quickReplies, setQuickReplies] = useState([]);
   const [templates, setTemplates] = useState([]);
   const [savingMeta, setSavingMeta] = useState(false);
@@ -847,6 +866,8 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
               execs={execs}
               quote={internalQuote}
               clearQuote={() => setInternalQuote(null)}
+              preselectAgentId={internalPreselectAgent}
+              onPreselectConsumed={() => setInternalPreselectAgent(null)}
             />
             )}
           </aside>
@@ -1350,14 +1371,23 @@ function Field({ label, children }) {
 
 
 // ---------------- Internal Admin ↔ Agent Q&A ----------------
-function InternalChat({ leadId, currentUser, assignedTo, execs, quote, clearQuote }) {
+function InternalChat({ leadId, currentUser, assignedTo, execs, quote, clearQuote, preselectAgentId, onPreselectConsumed }) {
   const isAdmin = currentUser?.role === "admin";
   const [threads, setThreads] = useState([]); // admin view
-  const [activeAgentId, setActiveAgentId] = useState(null); // admin: selected thread
+  const [activeAgentId, setActiveAgentId] = useState(preselectAgentId || null); // admin: selected thread
   const [msgs, setMsgs] = useState([]);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const scrollRef = useRef(null);
+
+  // Consume the preselect on mount (admin deep-link from /qa)
+  useEffect(() => {
+    if (preselectAgentId && !activeAgentId) {
+      setActiveAgentId(preselectAgentId);
+    }
+    if (preselectAgentId) onPreselectConsumed?.();
+    // eslint-disable-next-line
+  }, [preselectAgentId]);
 
   const canPost = isAdmin ? !!activeAgentId : (assignedTo === currentUser?.id);
 

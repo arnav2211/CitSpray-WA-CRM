@@ -957,6 +957,126 @@ async def internal_chat_unread(user: dict = Depends(get_current_user)):
     return {"unread": total}
 
 
+@api.get("/internal-qa/threads")
+async def internal_qa_threads(
+    user: dict = Depends(get_current_user),
+    status: Optional[str] = None,     # 'pending' | 'answered' | None
+    agent_id: Optional[str] = None,   # admin-only filter
+    q: Optional[str] = None,          # free-text search on customer name / lead requirement
+):
+    """List all internal Q&A threads visible to the caller, one row per (lead_id, agent_id).
+    Each row reports: asked_by, replied_by, first/last question timestamps, last admin reply
+    timestamp, overall status (pending/answered/new), unread count, and lead preview info."""
+    match: Dict[str, Any] = {}
+    if user["role"] == "executive":
+        match["agent_id"] = user["id"]
+    elif agent_id:
+        match["agent_id"] = agent_id
+
+    pipeline = [
+        {"$match": match} if match else {"$match": {}},
+        {"$sort": {"at": 1}},
+        {"$group": {
+            "_id": {"lead_id": "$lead_id", "agent_id": "$agent_id"},
+            "messages": {"$push": "$$ROOT"},
+            "count": {"$sum": 1},
+            "unread_for_me": {"$sum": {"$cond": [
+                {"$not": {"$in": [user["id"], {"$ifNull": ["$read_by", []]}]}},
+                1, 0,
+            ]}},
+            "first_at": {"$min": "$at"},
+            "last_at": {"$max": "$at"},
+        }},
+    ]
+    cursor = db.internal_messages.aggregate(pipeline)
+    raw_threads = []
+    async for doc in cursor:
+        raw_threads.append(doc)
+
+    # Enrich with lead + user info
+    lead_ids = list({t["_id"]["lead_id"] for t in raw_threads})
+    agent_ids = list({t["_id"]["agent_id"] for t in raw_threads})
+
+    leads = {}
+    if lead_ids:
+        async for ld in db.leads.find({"id": {"$in": lead_ids}}, {
+            "_id": 0, "id": 1, "customer_name": 1, "phone": 1, "status": 1,
+            "source": 1, "assigned_to": 1,
+        }):
+            leads[ld["id"]] = ld
+
+    users_map: Dict[str, dict] = {}
+    if agent_ids:
+        async for u in db.users.find({"id": {"$in": agent_ids}}, {
+            "_id": 0, "id": 1, "name": 1, "username": 1,
+        }):
+            users_map[u["id"]] = u
+
+    rows: List[dict] = []
+    for t in raw_threads:
+        msgs = t["messages"]
+        exec_msgs = [m for m in msgs if m.get("from_role") == "executive"]
+        admin_msgs = [m for m in msgs if m.get("from_role") == "admin"]
+        last_msg = msgs[-1] if msgs else None
+        first_question = exec_msgs[0] if exec_msgs else None
+        last_question = exec_msgs[-1] if exec_msgs else None
+        last_reply = admin_msgs[-1] if admin_msgs else None
+        # Status: if last overall message is from agent → pending. If from admin → answered.
+        # If only admin has messaged (admin initiated, no agent yet) → "answered" semantics don't fit
+        # so we label it "answered" (nothing awaits admin). Frontend chip handles both.
+        if last_msg is None:
+            st = "new"
+        elif last_msg.get("from_role") == "executive":
+            st = "pending"
+        else:
+            st = "answered"
+        # Resolve replier name (name of the admin who sent last_reply)
+        replied_by_id = last_reply.get("from_user_id") if last_reply else None
+        replied_by = None
+        if replied_by_id:
+            ru = await db.users.find_one({"id": replied_by_id}, {"_id": 0, "id": 1, "name": 1, "username": 1})
+            replied_by = {"id": replied_by_id, "name": (ru or {}).get("name"), "username": (ru or {}).get("username")} if ru else None
+        lead = leads.get(t["_id"]["lead_id"]) or {}
+        agent = users_map.get(t["_id"]["agent_id"]) or {}
+        row = {
+            "lead_id": t["_id"]["lead_id"],
+            "agent_id": t["_id"]["agent_id"],
+            "agent_name": agent.get("name"),
+            "agent_username": agent.get("username"),
+            "replied_by": replied_by,
+            "lead_customer_name": lead.get("customer_name"),
+            "lead_phone": lead.get("phone"),
+            "lead_status": lead.get("status"),
+            "lead_source": lead.get("source"),
+            "count": t["count"],
+            "unread_for_me": t["unread_for_me"],
+            "first_asked_at": first_question.get("at") if first_question else t.get("first_at"),
+            "last_asked_at": last_question.get("at") if last_question else None,
+            "last_replied_at": last_reply.get("at") if last_reply else None,
+            "last_body": (last_msg.get("body") if last_msg else "")[:160],
+            "last_from_role": last_msg.get("from_role") if last_msg else None,
+            "status": st,
+        }
+        rows.append(row)
+
+    # Post-filters (status, q)
+    if status in ("pending", "answered", "new"):
+        rows = [r for r in rows if r["status"] == status]
+    if q:
+        ql = q.lower()
+        rows = [r for r in rows if
+                (r.get("lead_customer_name") or "").lower().find(ql) >= 0
+                or (r.get("lead_phone") or "").lower().find(ql) >= 0
+                or (r.get("agent_name") or "").lower().find(ql) >= 0
+                or (r.get("last_body") or "").lower().find(ql) >= 0]
+
+    # Sort: pending first, then by most-recent activity
+    rows.sort(key=lambda r: (0 if r["status"] == "pending" else 1, r.get("last_asked_at") or r.get("last_replied_at") or ""), reverse=False)
+    rows.sort(key=lambda r: (r.get("last_asked_at") or r.get("last_replied_at") or ""), reverse=True)
+    rows.sort(key=lambda r: 0 if r["status"] == "pending" else 1)
+    return rows
+
+
 # ------------- Assignment Engine -------------
 async def get_routing_rules() -> dict:
     r = await db.routing_rules.find_one({"key": "default"}, {"_id": 0})
@@ -2449,6 +2569,30 @@ async def list_conversations(
     msg_map: Dict[str, dict] = {}
     async for doc in db.messages.aggregate(pipeline):
         msg_map[doc["_id"]] = doc
+    # Aggregate internal Q&A status per lead for the current user.
+    # Executives only see their own threads. Admins see all threads.
+    iqa_match: Dict[str, Any] = {"lead_id": {"$in": lead_ids}}
+    if user["role"] == "executive":
+        iqa_match["agent_id"] = user["id"]
+    iqa_pipeline = [
+        {"$match": iqa_match},
+        {"$sort": {"at": 1}},
+        {"$group": {
+            "_id": {"lead_id": "$lead_id", "agent_id": "$agent_id"},
+            "last_role": {"$last": "$from_role"},
+            "last_at": {"$max": "$at"},
+        }},
+    ]
+    # Roll up per lead: pending wins over answered (one question outstanding → show pending)
+    iqa_map: Dict[str, str] = {}
+    async for doc in db.internal_messages.aggregate(iqa_pipeline):
+        lid = doc["_id"]["lead_id"]
+        this_status = "pending" if doc.get("last_role") == "executive" else "answered"
+        cur = iqa_map.get(lid)
+        if cur == "pending":
+            continue
+        if this_status == "pending" or not cur:
+            iqa_map[lid] = this_status
     now = now_utc()
     out: List[dict] = []
     for ld in leads:
@@ -2496,6 +2640,7 @@ async def list_conversations(
             "last_out_at": last_out_at,
             "within_24h": within_24h,
             "unreplied": unreplied,
+            "internal_qa_status": iqa_map.get(ld["id"], "none"),
         })
     return out
 

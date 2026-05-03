@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText,
 } from "@phosphor-icons/react";
 
 const navBase = "flex items-center gap-3 px-4 py-3 md:py-2.5 text-sm border-l-2 border-transparent hover:bg-gray-100 transition-colors";
@@ -72,6 +72,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
           <Item to="/chat" icon={ChatTeardropDots} testId="nav-chat" onNavigate={handleNavigate}>WhatsApp</Item>
           <Item to="/leads" icon={Kanban} testId="nav-leads" onNavigate={handleNavigate}>Leads</Item>
           <Item to="/followups" icon={Bell} testId="nav-followups" onNavigate={handleNavigate}>Follow-ups</Item>
+          <Item to="/qa" icon={ChatTeardropText} testId="nav-qa" onNavigate={handleNavigate}>Internal Q&amp;A</Item>
           {isAdmin && (
             <>
               <div className="px-5 pt-4 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Admin</div>
