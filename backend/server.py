@@ -2279,6 +2279,379 @@ async def _find_lead_by_phone_legacy(phone_digits: str) -> Optional[dict]:
     return None
 
 
+# ------------- Chatbot flow engine -------------
+class ChatFlowInput(BaseModel):
+    name: str
+    is_active: bool = False
+    description: Optional[str] = None
+
+
+class ChatFlowUpdate(BaseModel):
+    name: Optional[str] = None
+    is_active: Optional[bool] = None
+    description: Optional[str] = None
+
+
+class ChatNodeInput(BaseModel):
+    name: str
+    message_type: Literal["text", "button", "list"]
+    message_content: Dict[str, Any] = {}
+    is_start_node: bool = False
+
+
+class ChatNodeUpdate(BaseModel):
+    name: Optional[str] = None
+    message_type: Optional[Literal["text", "button", "list"]] = None
+    message_content: Optional[Dict[str, Any]] = None
+    is_start_node: Optional[bool] = None
+
+
+class ChatOptionInput(BaseModel):
+    option_id: str
+    label: str
+    next_node_id: Optional[str] = None
+    position: int = 0
+    section_title: Optional[str] = None
+    description: Optional[str] = None
+
+
+async def _is_within_24h_window(lead: dict) -> bool:
+    last_in = lead.get("last_user_message_at")
+    if not last_in:
+        return False
+    try:
+        d = datetime.fromisoformat(last_in.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return (now_utc() - d) < timedelta(hours=24)
+    except Exception:
+        return False
+
+
+async def wa_send_interactive(to_phone: str, interactive_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Send a WA interactive message (button / list) using the existing WA abstraction.
+    cfg['api_version'] is read dynamically — never hardcoded."""
+    cfg = await get_wa_config()
+    if not cfg["enabled"]:
+        return {"mock": True, "status": "sent_mock", "wamid": None}
+    to = _normalize_phone(to_phone)
+    if not to:
+        return {"error": "no_phone", "status": "failed"}
+    url = f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['phone_number_id']}/messages"
+    body_payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "interactive",
+        "interactive": interactive_payload,
+    }
+    headers = {"Authorization": f"Bearer {cfg['access_token']}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(url, json=body_payload, headers=headers)
+        data = r.json() if r.content else {}
+        if r.status_code >= 400:
+            err = (data.get("error") or {})
+            return {"error": err.get("message") or r.text, "code": err.get("code"), "status": "failed"}
+        wamid = None
+        try:
+            wamid = data["messages"][0]["id"]
+        except Exception:
+            pass
+        return {"status": "sent", "wamid": wamid, "raw": data}
+    except Exception as e:
+        logger.exception(f"WA interactive send failed: {e}")
+        return {"error": str(e), "status": "failed"}
+
+
+def _build_interactive_payload(node: dict, options: List[dict]) -> Dict[str, Any]:
+    content = node.get("message_content") or {}
+    body_text = (content.get("body") or "").strip()
+    if not body_text:
+        raise ValueError("Node body is required")
+    block: Dict[str, Any] = {"body": {"text": body_text}}
+    if content.get("header"):
+        block["header"] = {"type": "text", "text": content["header"]}
+    if content.get("footer"):
+        block["footer"] = {"text": content["footer"]}
+    if node["message_type"] == "button":
+        if not options:
+            raise ValueError("Button nodes require at least one option")
+        if len(options) > 3:
+            raise ValueError("WhatsApp allows a maximum of 3 buttons")
+        block["type"] = "button"
+        block["action"] = {"buttons": [
+            {"type": "reply", "reply": {"id": o["option_id"], "title": o["label"][:20]}}
+            for o in options
+        ]}
+    elif node["message_type"] == "list":
+        if not options:
+            raise ValueError("List nodes require at least one option")
+        button_text = (content.get("button_text") or "Choose").strip()[:20]
+        sections_map: Dict[str, List[Dict[str, Any]]] = {}
+        sections_order: List[str] = []
+        for o in options:
+            title = (o.get("section_title") or "Options").strip()
+            if title not in sections_map:
+                sections_map[title] = []
+                sections_order.append(title)
+            row = {"id": o["option_id"], "title": o["label"][:24]}
+            if o.get("description"):
+                row["description"] = o["description"][:72]
+            sections_map[title].append(row)
+        sections = [{"title": t[:24], "rows": sections_map[t]} for t in sections_order]
+        block["type"] = "list"
+        block["action"] = {"button": button_text, "sections": sections}
+    else:
+        raise ValueError(f"Unsupported interactive type {node['message_type']}")
+    return block
+
+
+async def send_flow_message(to_phone: str, node_id: str, lead: Optional[dict] = None) -> Dict[str, Any]:
+    node = await db.chat_nodes.find_one({"id": node_id}, {"_id": 0})
+    if not node:
+        return {"error": "node_not_found"}
+    if not lead:
+        lead = await _find_lead_by_phone(to_phone)
+    options: List[Dict[str, Any]] = []
+    if node["message_type"] in ("button", "list"):
+        options = await db.chat_options.find({"node_id": node_id}, {"_id": 0}).sort("position", 1).to_list(50)
+        if lead and not await _is_within_24h_window(lead):
+            return {"status": "skipped_outside_24h"}
+    msg_body_preview = (node.get("message_content") or {}).get("body") or f"[flow:{node['message_type']}]"
+    if node["message_type"] == "text":
+        api_result = await wa_send_text(to_phone=to_phone, body=msg_body_preview)
+    else:
+        try:
+            interactive = _build_interactive_payload(node, options)
+        except ValueError as e:
+            return {"error": str(e)}
+        api_result = await wa_send_interactive(to_phone=to_phone, interactive_payload=interactive)
+    if lead:
+        await db.messages.insert_one({
+            "id": str(uuid.uuid4()),
+            "lead_id": lead["id"],
+            "direction": "out",
+            "body": msg_body_preview,
+            "to_phone": to_phone,
+            "flow_id": node.get("flow_id"),
+            "flow_node_id": node_id,
+            "status": api_result.get("status", "failed"),
+            "wamid": api_result.get("wamid"),
+            "error": api_result.get("error"),
+            "at": iso(now_utc()),
+            "by_user_id": None,
+        })
+        if api_result.get("status") in ("sent", "sent_mock"):
+            await db.leads.update_one({"id": lead["id"]}, {"$set": {"has_whatsapp": True, "last_action_at": iso(now_utc())}})
+    target_phone = _normalize_phone(to_phone)[-10:]
+    if target_phone and api_result.get("status") in ("sent", "sent_mock"):
+        await db.chat_sessions.update_one(
+            {"phone_key": target_phone},
+            {"$set": {
+                "phone_key": target_phone,
+                "phone": to_phone,
+                "current_flow_id": node.get("flow_id"),
+                "current_node_id": node_id,
+                "last_interaction_at": iso(now_utc()),
+                "lead_id": (lead or {}).get("id"),
+            }},
+            upsert=True,
+        )
+    return {"status": api_result.get("status"), "wamid": api_result.get("wamid"), "node_id": node_id}
+
+
+async def handle_flow_inbound(from_phone: str, interactive: Dict[str, Any], lead: Optional[dict]) -> Optional[Dict[str, Any]]:
+    selected_id: Optional[str] = None
+    kind = interactive.get("type")
+    if kind == "button_reply":
+        selected_id = (interactive.get("button_reply") or {}).get("id")
+    elif kind == "list_reply":
+        selected_id = (interactive.get("list_reply") or {}).get("id")
+    if not selected_id:
+        return None
+    phone_key = _normalize_phone(from_phone or "")[-10:]
+    session = await db.chat_sessions.find_one({"phone_key": phone_key}, {"_id": 0}) if phone_key else None
+    if not session or not session.get("current_node_id"):
+        flow = await db.chat_flows.find_one({"is_active": True}, {"_id": 0})
+        if not flow:
+            return {"status": "no_active_flow"}
+        start_node = await db.chat_nodes.find_one({"flow_id": flow["id"], "is_start_node": True}, {"_id": 0})
+        if not start_node:
+            return {"status": "no_start_node"}
+        option = await db.chat_options.find_one({"node_id": start_node["id"], "option_id": selected_id}, {"_id": 0})
+        if not option:
+            return {"status": "unknown_option_on_start"}
+        if option.get("next_node_id"):
+            return await send_flow_message(from_phone, option["next_node_id"], lead=lead)
+        return {"status": "flow_ended"}
+    option = await db.chat_options.find_one({"node_id": session["current_node_id"], "option_id": selected_id}, {"_id": 0})
+    if not option:
+        return {"status": "no_match"}
+    if option.get("next_node_id"):
+        return await send_flow_message(from_phone, option["next_node_id"], lead=lead)
+    await db.chat_sessions.delete_one({"phone_key": phone_key})
+    return {"status": "flow_ended"}
+
+
+@api.get("/chatflows")
+async def list_chatflows(admin: dict = Depends(require_admin)):
+    return await db.chat_flows.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+
+@api.post("/chatflows")
+async def create_chatflow(body: ChatFlowInput, admin: dict = Depends(require_admin)):
+    if body.is_active:
+        await db.chat_flows.update_many({"is_active": True}, {"$set": {"is_active": False}})
+    doc = {
+        "id": str(uuid.uuid4()),
+        "name": body.name,
+        "description": body.description,
+        "is_active": body.is_active,
+        "created_at": iso(now_utc()),
+        "updated_at": iso(now_utc()),
+    }
+    await db.chat_flows.insert_one(doc.copy())
+    return strip_mongo(doc)
+
+
+@api.get("/chatflows/{flow_id}")
+async def get_chatflow(flow_id: str, admin: dict = Depends(require_admin)):
+    flow = await db.chat_flows.find_one({"id": flow_id}, {"_id": 0})
+    if not flow:
+        raise HTTPException(status_code=404, detail="Flow not found")
+    nodes = await db.chat_nodes.find({"flow_id": flow_id}, {"_id": 0}).sort("is_start_node", -1).to_list(500)
+    options = await db.chat_options.find({"node_id": {"$in": [n["id"] for n in nodes]}}, {"_id": 0}).sort("position", 1).to_list(2000)
+    opts_by_node: Dict[str, List[Dict[str, Any]]] = {}
+    for o in options:
+        opts_by_node.setdefault(o["node_id"], []).append(o)
+    for n in nodes:
+        n["options"] = opts_by_node.get(n["id"], [])
+    return {**flow, "nodes": nodes}
+
+
+@api.patch("/chatflows/{flow_id}")
+async def update_chatflow(flow_id: str, body: ChatFlowUpdate, admin: dict = Depends(require_admin)):
+    flow = await db.chat_flows.find_one({"id": flow_id}, {"_id": 0})
+    if not flow:
+        raise HTTPException(status_code=404, detail="Flow not found")
+    upd: Dict[str, Any] = {"updated_at": iso(now_utc())}
+    if body.name is not None:
+        upd["name"] = body.name
+    if body.description is not None:
+        upd["description"] = body.description
+    if body.is_active is not None:
+        if body.is_active:
+            await db.chat_flows.update_many({"id": {"$ne": flow_id}, "is_active": True}, {"$set": {"is_active": False}})
+        upd["is_active"] = body.is_active
+    await db.chat_flows.update_one({"id": flow_id}, {"$set": upd})
+    return await db.chat_flows.find_one({"id": flow_id}, {"_id": 0})
+
+
+@api.delete("/chatflows/{flow_id}")
+async def delete_chatflow(flow_id: str, admin: dict = Depends(require_admin)):
+    node_ids: List[str] = []
+    async for n in db.chat_nodes.find({"flow_id": flow_id}, {"_id": 0, "id": 1}):
+        node_ids.append(n["id"])
+    if node_ids:
+        await db.chat_options.delete_many({"node_id": {"$in": node_ids}})
+    await db.chat_nodes.delete_many({"flow_id": flow_id})
+    await db.chat_flows.delete_one({"id": flow_id})
+    return {"ok": True}
+
+
+@api.post("/chatflows/{flow_id}/nodes")
+async def create_chat_node(flow_id: str, body: ChatNodeInput, admin: dict = Depends(require_admin)):
+    if not await db.chat_flows.find_one({"id": flow_id}):
+        raise HTTPException(status_code=404, detail="Flow not found")
+    if body.is_start_node:
+        await db.chat_nodes.update_many({"flow_id": flow_id, "is_start_node": True}, {"$set": {"is_start_node": False}})
+    doc = {
+        "id": str(uuid.uuid4()),
+        "flow_id": flow_id,
+        "name": body.name,
+        "message_type": body.message_type,
+        "message_content": body.message_content,
+        "is_start_node": body.is_start_node,
+        "created_at": iso(now_utc()),
+    }
+    await db.chat_nodes.insert_one(doc.copy())
+    return strip_mongo(doc)
+
+
+@api.patch("/chatflows/{flow_id}/nodes/{node_id}")
+async def update_chat_node(flow_id: str, node_id: str, body: ChatNodeUpdate, admin: dict = Depends(require_admin)):
+    node = await db.chat_nodes.find_one({"id": node_id, "flow_id": flow_id}, {"_id": 0})
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    upd: Dict[str, Any] = {}
+    for f in ["name", "message_type", "message_content"]:
+        v = getattr(body, f)
+        if v is not None:
+            upd[f] = v
+    if body.is_start_node is not None:
+        if body.is_start_node:
+            await db.chat_nodes.update_many({"flow_id": flow_id, "is_start_node": True, "id": {"$ne": node_id}}, {"$set": {"is_start_node": False}})
+        upd["is_start_node"] = body.is_start_node
+    if upd:
+        await db.chat_nodes.update_one({"id": node_id}, {"$set": upd})
+    return await db.chat_nodes.find_one({"id": node_id}, {"_id": 0})
+
+
+@api.delete("/chatflows/{flow_id}/nodes/{node_id}")
+async def delete_chat_node(flow_id: str, node_id: str, admin: dict = Depends(require_admin)):
+    await db.chat_options.delete_many({"node_id": node_id})
+    await db.chat_options.update_many({"next_node_id": node_id}, {"$set": {"next_node_id": None}})
+    await db.chat_nodes.delete_one({"id": node_id, "flow_id": flow_id})
+    return {"ok": True}
+
+
+@api.put("/chatflows/{flow_id}/nodes/{node_id}/options")
+async def replace_node_options(flow_id: str, node_id: str, options: List[ChatOptionInput], admin: dict = Depends(require_admin)):
+    if not await db.chat_nodes.find_one({"id": node_id, "flow_id": flow_id}):
+        raise HTTPException(status_code=404, detail="Node not found")
+    await db.chat_options.delete_many({"node_id": node_id})
+    docs = [{
+        "id": str(uuid.uuid4()),
+        "node_id": node_id,
+        "option_id": o.option_id.strip(),
+        "label": o.label.strip(),
+        "next_node_id": o.next_node_id,
+        "position": o.position,
+        "section_title": o.section_title,
+        "description": o.description,
+    } for o in options]
+    if docs:
+        await db.chat_options.insert_many([d.copy() for d in docs])
+    return [strip_mongo(d) for d in docs]
+
+
+class FlowStartInput(BaseModel):
+    phone: str
+    node_id: Optional[str] = None
+
+
+@api.post("/chatflows/{flow_id}/start")
+async def start_flow(flow_id: str, body: FlowStartInput, admin: dict = Depends(require_admin)):
+    flow = await db.chat_flows.find_one({"id": flow_id}, {"_id": 0})
+    if not flow:
+        raise HTTPException(status_code=404, detail="Flow not found")
+    node_id = body.node_id
+    if not node_id:
+        start = await db.chat_nodes.find_one({"flow_id": flow_id, "is_start_node": True}, {"_id": 0})
+        if not start:
+            raise HTTPException(status_code=400, detail="Flow has no start node — mark one first.")
+        node_id = start["id"]
+    return await send_flow_message(body.phone, node_id)
+
+
+@api.get("/chat-sessions")
+async def list_chat_sessions(admin: dict = Depends(require_admin), limit: int = 200):
+    return await db.chat_sessions.find({}, {"_id": 0}).sort("last_interaction_at", -1).to_list(limit)
+
+
+
+
 @api.post("/webhooks/whatsapp")
 async def webhook_whatsapp(request: Request):
     """Receive incoming WhatsApp messages and delivery status updates from Meta."""
@@ -2326,7 +2699,13 @@ async def webhook_whatsapp(request: Request):
                         body_text = f"[button reply] {(m.get('button') or {}).get('text','')}"
                     elif msg_type == "interactive":
                         ia = m.get("interactive") or {}
-                        body_text = f"[interactive] {json.dumps(ia)[:200]}"
+                        ia_type = ia.get("type")
+                        if ia_type == "button_reply":
+                            body_text = f"[button] {(ia.get('button_reply') or {}).get('title','')}".strip()
+                        elif ia_type == "list_reply":
+                            body_text = f"[list] {(ia.get('list_reply') or {}).get('title','')}".strip()
+                        else:
+                            body_text = f"[interactive] {json.dumps(ia)[:200]}"
                     else:
                         body_text = f"[{msg_type}]"
 
@@ -2370,6 +2749,14 @@ async def webhook_whatsapp(request: Request):
                         }},
                     )
                     created_msgs += 1
+                    # ---- Flow engine dispatch (interactive replies) ----
+                    if msg_type == "interactive":
+                        try:
+                            flow_res = await handle_flow_inbound(from_phone or "", m.get("interactive") or {}, lead)
+                            if flow_res:
+                                logger.info(f"Flow dispatch for {from_phone}: {flow_res}")
+                        except Exception as e:
+                            logger.exception(f"Flow dispatch failed: {e}")
 
                 # ---- Delivery status updates ----
                 for s in (value.get("statuses") or []):
@@ -2952,6 +3339,11 @@ async def seed_data():
     await db.call_logs.create_index([("lead_id", 1), ("at", -1)])
     await db.call_logs.create_index([("by_user_id", 1), ("at", -1)])
     await db.call_logs.create_index("outcome")
+    await db.chat_flows.create_index("is_active")
+    await db.chat_nodes.create_index([("flow_id", 1), ("is_start_node", -1)])
+    await db.chat_options.create_index([("node_id", 1), ("position", 1)])
+    await db.chat_options.create_index([("node_id", 1), ("option_id", 1)])
+    await db.chat_sessions.create_index("phone_key", unique=True)
     # Phone canonicalization migration (one-shot per cold-start). Iterates through any
     # lead whose phone/phones haven't been flagged migrated yet and rewrites them in
     # canonical form (Indian → 10-digit national, others → +<digits>). Idempotent.
