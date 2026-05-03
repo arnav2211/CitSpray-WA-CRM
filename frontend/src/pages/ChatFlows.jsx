@@ -657,8 +657,25 @@ function NodeInspector({ flow, node, onChanged, onDelete, onClose }) {
             </FieldBlock>
           )}
           {content.media_url && (
-            <div className="border border-gray-200 p-2 text-[11px] text-gray-500 break-all">
-              Preview: <a href={mediaHref(content.media_url)} target="_blank" rel="noreferrer" className="text-[#002FA7] underline">{content.media_url}</a>
+            <div className="border border-gray-200 p-2 space-y-2">
+              <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Preview</div>
+              {type === "image" && (
+                <img src={mediaHref(content.media_url)} alt="" className="max-h-48 w-auto border border-gray-100" data-testid="node-media-preview-image" />
+              )}
+              {type === "video" && (
+                <video src={mediaHref(content.media_url)} controls preload="metadata" className="max-h-48 w-full bg-black" data-testid="node-media-preview-video" />
+              )}
+              {type === "document" && (
+                <a href={mediaHref(content.media_url)} target="_blank" rel="noreferrer"
+                  className="flex items-center gap-2 bg-gray-50 px-3 py-2 border border-gray-100 hover:bg-gray-100" data-testid="node-media-preview-document">
+                  <span className="text-xl">📄</span>
+                  <div className="min-w-0 text-xs">
+                    <div className="font-semibold truncate">{content.filename || content.media_url.split("/").pop()}</div>
+                    <div className="text-[10px] text-gray-500 uppercase tracking-widest">Open document</div>
+                  </div>
+                </a>
+              )}
+              <div className="text-[10px] text-gray-400 break-all">{content.media_url}</div>
             </div>
           )}
         </>
@@ -691,6 +708,9 @@ function NodeInspector({ flow, node, onChanged, onDelete, onClose }) {
                 <input placeholder="Image URL" value={c.image_url || ""} onChange={(e) => updateCard(i, { image_url: e.target.value })}
                   className="w-full border border-gray-300 px-2 py-1.5 text-xs font-mono" data-testid={`card-image-url-${i}`} />
                 <MediaUploader kind="image" onUploaded={(res) => updateCard(i, { image_url: res.url })} />
+                {c.image_url && (
+                  <img src={mediaHref(c.image_url)} alt="" className="max-h-32 w-auto border border-gray-100" data-testid={`card-image-preview-${i}`} />
+                )}
                 <input placeholder="Title" value={c.title || ""} onChange={(e) => updateCard(i, { title: e.target.value })}
                   className="w-full border border-gray-300 px-2 py-1.5 text-xs" data-testid={`card-title-${i}`} />
                 <textarea placeholder="Subtitle — supports line breaks & *bold*" rows={3} value={c.subtitle || ""} onChange={(e) => updateCard(i, { subtitle: e.target.value })}

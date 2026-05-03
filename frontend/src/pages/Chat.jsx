@@ -638,14 +638,19 @@ function Bubble({ m }) {
       </div>
     );
   }
+  const media = renderMedia(m);
+  const captionText = m.caption || (media ? "" : m.body);
   return (
     <div className={`flex ${isOut ? "justify-end" : "justify-start"}`} data-testid={`msg-${m.id}`}>
-      <div className={`max-w-[75%] px-3 py-2 ${isOut ? "bg-[#D9FDD3]" : "bg-white"} text-sm shadow-sm`}>
+      <div className={`max-w-[75%] ${media ? "p-1.5" : "px-3 py-2"} ${isOut ? "bg-[#D9FDD3]" : "bg-white"} text-sm shadow-sm`}>
         {m.template_name && (
-          <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold mb-1">Template · {m.template_name}</div>
+          <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold mb-1 px-2 pt-1">Template · {m.template_name}</div>
         )}
-        <div className="whitespace-pre-wrap break-words">{m.body}</div>
-        <div className="flex items-center justify-end gap-1 mt-1">
+        {media}
+        {captionText && (
+          <div className={`whitespace-pre-wrap break-words ${media ? "px-2 pt-1.5" : ""}`}>{captionText}</div>
+        )}
+        <div className={`flex items-center justify-end gap-1 mt-1 ${media ? "px-2 pb-1" : ""}`}>
           <span className="text-[10px] text-gray-500 font-mono">{fmtISTTime(m.at)}</span>
           {isOut && <span className={`text-[10px] ${tickColor(m.status)}`}>{tickFor(m.status)}</span>}
           {isOut && m.error && <span className="text-[9px] text-[#E60000] uppercase tracking-widest font-bold">{String(m.error).slice(0, 24)}</span>}
@@ -653,6 +658,51 @@ function Bubble({ m }) {
       </div>
     </div>
   );
+}
+
+function renderMedia(m) {
+  const type = m.media_type;
+  if (!type) return null;
+  const url = m.media_url;  // outbound (admin-provided/uploaded public URL)
+  if (type === "image" && url) {
+    return (
+      <a href={url} target="_blank" rel="noreferrer" data-testid={`msg-media-image-${m.id}`}>
+        <img src={url} alt="" className="block w-full max-h-[320px] object-cover bg-gray-100" loading="lazy" />
+      </a>
+    );
+  }
+  if (type === "video" && url) {
+    return (
+      <video controls preload="metadata" className="block w-full max-h-[320px] bg-black" data-testid={`msg-media-video-${m.id}`}>
+        <source src={url} />
+      </video>
+    );
+  }
+  if (type === "document" && url) {
+    const name = m.filename || url.split("/").pop();
+    return (
+      <a href={url} target="_blank" rel="noreferrer"
+        className="flex items-center gap-2 bg-white/60 px-3 py-2 border border-gray-200 text-gray-800 hover:bg-white"
+        data-testid={`msg-media-document-${m.id}`}>
+        <span className="text-lg">📄</span>
+        <div className="min-w-0">
+          <div className="text-xs font-semibold truncate">{name}</div>
+          <div className="text-[10px] text-gray-500 uppercase tracking-widest">Document</div>
+        </div>
+      </a>
+    );
+  }
+  // Inbound without a downloaded URL — show a lightweight placeholder using media_id
+  if (m.media_id) {
+    const icon = type === "image" ? "🖼️" : type === "video" ? "🎬" : "📄";
+    return (
+      <div className="flex items-center gap-2 bg-gray-100 px-3 py-2 text-gray-700" data-testid={`msg-media-placeholder-${m.id}`}>
+        <span className="text-lg">{icon}</span>
+        <div className="text-[11px] uppercase tracking-widest font-bold">Incoming {type}</div>
+      </div>
+    );
+  }
+  return null;
 }
 
 // ---------------- New chat modal ----------------

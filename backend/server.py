@@ -2496,7 +2496,7 @@ async def send_flow_message(to_phone: str, node_id: str, lead: Optional[dict] = 
             return {"error": str(e)}
         api_result = await wa_send_interactive(to_phone=to_phone, interactive_payload=interactive)
     if lead:
-        await db.messages.insert_one({
+        msg_doc = {
             "id": str(uuid.uuid4()),
             "lead_id": lead["id"],
             "direction": "out",
@@ -2509,7 +2509,19 @@ async def send_flow_message(to_phone: str, node_id: str, lead: Optional[dict] = 
             "error": api_result.get("error"),
             "at": iso(now_utc()),
             "by_user_id": None,
-        })
+        }
+        # Attach media metadata so the chat thread can render an inline preview.
+        if mtype in ("image", "video", "document"):
+            msg_doc["media_type"] = mtype
+            msg_doc["media_url"] = content.get("media_url") or ""
+            if content.get("caption"):
+                msg_doc["caption"] = content.get("caption")
+            if mtype == "document" and content.get("filename"):
+                msg_doc["filename"] = content.get("filename")
+        elif mtype == "carousel":
+            msg_doc["media_type"] = "carousel"
+            msg_doc["cards"] = content.get("cards") or []
+        await db.messages.insert_one(msg_doc)
         if api_result.get("status") in ("sent", "sent_mock"):
             await db.leads.update_one({"id": lead["id"]}, {"$set": {"has_whatsapp": True, "last_action_at": iso(now_utc())}})
     target_phone = _normalize_phone(to_phone)[-10:]
@@ -2702,13 +2714,14 @@ ALLOWED_MEDIA_KINDS = {"image", "video", "document"}
 
 @api.post("/chatflows/upload-media")
 async def upload_flow_media(
+    request: Request,
     file: UploadFile = File(...),
     kind: str = Form("document"),
     admin: dict = Depends(require_admin),
 ):
-    """Accept a local file upload and return a publicly accessible URL. Admins paste this
-    URL (or the returned filename) into a flow node's `media_url`. Files are served from
-    /api/media/<filename> so they travel through the same ingress as the rest of the API."""
+    """Accept a local file upload and return an ABSOLUTE publicly accessible URL.
+    Meta (WhatsApp) requires a fully-qualified HTTPS URL to fetch the media from,
+    so we return e.g. `https://<host>/api/media/<uuid>.jpg`, not a relative path."""
     if kind not in ALLOWED_MEDIA_KINDS:
         raise HTTPException(status_code=400, detail=f"kind must be one of {sorted(ALLOWED_MEDIA_KINDS)}")
     original = (file.filename or "upload.bin").strip().replace("/", "_").replace("\\", "_")
@@ -2725,7 +2738,17 @@ async def upload_flow_media(
     except Exception as e:
         logger.exception(f"upload failed: {e}")
         raise HTTPException(status_code=500, detail="Upload failed")
-    public_url = f"/api/media/{stored_name}"
+    # Build absolute URL. Prefer PUBLIC_BASE_URL env (e.g. https://crm.example.com)
+    # so it works behind proxies that strip X-Forwarded-Host. Fallback to request.base_url.
+    base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+    if not base:
+        fwd_proto = request.headers.get("x-forwarded-proto")
+        fwd_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        if fwd_host:
+            base = f"{fwd_proto or request.url.scheme}://{fwd_host}"
+        else:
+            base = str(request.base_url).rstrip("/")
+    public_url = f"{base}/api/media/{stored_name}"
     return {
         "url": public_url,
         "filename": original,
@@ -2832,18 +2855,33 @@ async def webhook_whatsapp(request: Request):
                     msg_type = m.get("type")
                     wamid = m.get("id")
                     body_text = ""
+                    inbound_media_type = None
+                    inbound_media_id = None
+                    inbound_caption = None
+                    inbound_filename = None
                     if msg_type == "text":
                         body_text = ((m.get("text") or {}).get("body")) or ""
                     elif msg_type == "image":
                         img = m.get("image") or {}
                         body_text = f"[image] {img.get('caption','')}".strip()
+                        inbound_media_type = "image"
+                        inbound_media_id = img.get("id")
+                        inbound_caption = img.get("caption")
                     elif msg_type == "document":
                         doc = m.get("document") or {}
                         body_text = f"[document: {doc.get('filename','file')}] {doc.get('caption','')}".strip()
+                        inbound_media_type = "document"
+                        inbound_media_id = doc.get("id")
+                        inbound_caption = doc.get("caption")
+                        inbound_filename = doc.get("filename")
                     elif msg_type == "audio":
                         body_text = "[audio message]"
                     elif msg_type == "video":
-                        body_text = f"[video] {(m.get('video') or {}).get('caption','')}".strip()
+                        vid = m.get("video") or {}
+                        body_text = f"[video] {vid.get('caption','')}".strip()
+                        inbound_media_type = "video"
+                        inbound_media_id = vid.get("id")
+                        inbound_caption = vid.get("caption")
                     elif msg_type == "location":
                         loc = m.get("location") or {}
                         body_text = f"[location: {loc.get('latitude')},{loc.get('longitude')}]"
@@ -2890,6 +2928,14 @@ async def webhook_whatsapp(request: Request):
                         "at": iso(now_utc()),
                         "by_user_id": None,
                     }
+                    if inbound_media_type:
+                        msg_doc["media_type"] = inbound_media_type
+                        if inbound_media_id:
+                            msg_doc["media_id"] = inbound_media_id
+                        if inbound_caption:
+                            msg_doc["caption"] = inbound_caption
+                        if inbound_filename:
+                            msg_doc["filename"] = inbound_filename
                     await db.messages.insert_one(msg_doc.copy())
                     await db.leads.update_one(
                         {"id": lead["id"]},
