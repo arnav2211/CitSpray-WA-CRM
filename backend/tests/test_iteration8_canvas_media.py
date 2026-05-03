@@ -137,10 +137,11 @@ class TestUploadAndServeMedia:
         assert r2.content[:8] == png_bytes[:8]
 
     def test_upload_invalid_kind_rejected(self, admin_token):
+        # `sticker` is not in ALLOWED_MEDIA_KINDS (image/video/document/audio)
         files = {"file": ("x.bin", io.BytesIO(b"abc"), "application/octet-stream")}
         r = requests.post(f"{API}/chatflows/upload-media",
                           headers=_h(admin_token),
-                          files=files, data={"kind": "audio"}, timeout=30)
+                          files=files, data={"kind": "sticker"}, timeout=30)
         assert r.status_code == 400
 
     def test_upload_admin_only(self):

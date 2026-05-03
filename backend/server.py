@@ -1336,6 +1336,246 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
         raise HTTPException(status_code=400, detail=msg["error"] or "WhatsApp send failed")
     return strip_mongo(msg)
 
+
+# ------------- Rich-media composer endpoints (image / video / document / audio / location / contact / resend) -------------
+
+class WAComposerBase(BaseModel):
+    lead_id: str
+    reply_to_message_id: Optional[str] = None
+
+
+class WASendMedia(WAComposerBase):
+    media_type: Literal["image", "video", "document", "audio"]
+    media_url: str
+    caption: Optional[str] = None
+    filename: Optional[str] = None  # document only
+
+
+class WASendLocation(WAComposerBase):
+    latitude: float
+    longitude: float
+    name: Optional[str] = None
+    address: Optional[str] = None
+
+
+class WAContactPhone(BaseModel):
+    phone: str
+    type: Optional[str] = "CELL"
+
+
+class WAContactEmail(BaseModel):
+    email: str
+    type: Optional[str] = "WORK"
+
+
+class WASendContact(WAComposerBase):
+    name: str  # formatted display name
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phones: List[WAContactPhone]
+    emails: Optional[List[WAContactEmail]] = None
+    organization: Optional[str] = None
+
+
+async def _assert_chat_permitted(user: dict, lead_id: str) -> dict:
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    target_phone = lead.get("active_wa_phone") or lead.get("phone")
+    if not target_phone:
+        raise HTTPException(status_code=400, detail="Lead has no phone number")
+    last_in = lead.get("last_user_message_at")
+    within = False
+    if last_in:
+        try:
+            d = datetime.fromisoformat(last_in.replace("Z", "+00:00"))
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            within = (now_utc() - d) < timedelta(hours=24)
+        except Exception:
+            within = False
+    if not within:
+        raise HTTPException(status_code=400, detail="Outside the 24-hour customer service window — please use a template message")
+    return {"lead": lead, "target_phone": target_phone}
+
+
+async def _resolve_reply_context(lead_id: str, reply_to_message_id: Optional[str]) -> Dict[str, Optional[str]]:
+    if not reply_to_message_id:
+        return {"wamid": None, "local_id": None, "preview": None}
+    src = await db.messages.find_one({"id": reply_to_message_id, "lead_id": lead_id},
+                                      {"_id": 0, "id": 1, "wamid": 1, "body": 1, "caption": 1})
+    if not src or not src.get("wamid"):
+        return {"wamid": None, "local_id": None, "preview": None}
+    return {
+        "wamid": src["wamid"],
+        "local_id": src["id"],
+        "preview": (src.get("caption") or src.get("body") or "")[:120],
+    }
+
+
+async def _record_sent_message(lead_id: str, user_id: str, target_phone: str, body_preview: str,
+                                api_result: Dict[str, Any], extra: Dict[str, Any],
+                                reply_ctx: Dict[str, Optional[str]]) -> Dict[str, Any]:
+    msg = {
+        "id": str(uuid.uuid4()),
+        "lead_id": lead_id,
+        "direction": "out",
+        "body": body_preview,
+        "to_phone": target_phone,
+        "status": api_result.get("status", "failed"),
+        "wamid": api_result.get("wamid"),
+        "error": api_result.get("error"),
+        "error_code": api_result.get("code"),
+        "at": iso(now_utc()),
+        "by_user_id": user_id,
+        **extra,
+    }
+    if reply_ctx.get("local_id"):
+        msg["reply_to_message_id"] = reply_ctx["local_id"]
+    if reply_ctx.get("wamid"):
+        msg["reply_to_wamid"] = reply_ctx["wamid"]
+    if reply_ctx.get("preview"):
+        msg["reply_to_preview"] = reply_ctx["preview"]
+    await db.messages.insert_one(msg.copy())
+    update_lead = {"last_action_at": iso(now_utc())}
+    if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
+        update_lead["has_whatsapp"] = True
+    await db.leads.update_one({"id": lead_id}, {"$set": update_lead})
+    if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
+        await _set_wa_status(lead_id, target_phone, True)
+    return msg
+
+
+@api.post("/whatsapp/send-media")
+async def whatsapp_send_media(body: WASendMedia, user: dict = Depends(get_current_user)):
+    """Send an image/video/document/audio message to the lead. Media must be a public HTTPS URL
+    (use POST /chatflows/upload-media first if uploading a local file)."""
+    ctx = await _assert_chat_permitted(user, body.lead_id)
+    target_phone = ctx["target_phone"]
+    reply_ctx = await _resolve_reply_context(body.lead_id, body.reply_to_message_id)
+    if body.media_type == "audio":
+        api_result = await wa_send_audio(to_phone=target_phone, url=body.media_url, reply_to_wamid=reply_ctx["wamid"])
+        preview = "[voice note]"
+    else:
+        api_result = await wa_send_media(
+            to_phone=target_phone, media_type=body.media_type, url=body.media_url,
+            caption=body.caption, filename=body.filename, reply_to_wamid=reply_ctx["wamid"],
+        )
+        if body.media_type == "image":
+            preview = f"[image] {body.caption or ''}".rstrip()
+        elif body.media_type == "video":
+            preview = f"[video] {body.caption or ''}".rstrip()
+        else:
+            preview = f"[document: {body.filename or 'file'}] {body.caption or ''}".rstrip()
+    extra = {"media_type": body.media_type, "media_url": body.media_url}
+    if body.caption:
+        extra["caption"] = body.caption
+    if body.filename:
+        extra["filename"] = body.filename
+    msg = await _record_sent_message(body.lead_id, user["id"], target_phone, preview, api_result, extra, reply_ctx)
+    await log_activity(user["id"], "whatsapp_sent", body.lead_id,
+                       {"status": msg["status"], "wamid": msg["wamid"], "media_type": body.media_type})
+    if msg["status"] == "failed":
+        raise HTTPException(status_code=400, detail=msg.get("error") or "WhatsApp media send failed")
+    return strip_mongo(msg)
+
+
+@api.post("/whatsapp/send-location")
+async def whatsapp_send_location(body: WASendLocation, user: dict = Depends(get_current_user)):
+    ctx = await _assert_chat_permitted(user, body.lead_id)
+    target_phone = ctx["target_phone"]
+    reply_ctx = await _resolve_reply_context(body.lead_id, body.reply_to_message_id)
+    api_result = await wa_send_location(
+        to_phone=target_phone, latitude=body.latitude, longitude=body.longitude,
+        name=body.name, address=body.address, reply_to_wamid=reply_ctx["wamid"],
+    )
+    preview = f"[location] {body.name or ''} ({body.latitude:.4f}, {body.longitude:.4f})".strip()
+    extra = {"msg_type": "location", "location": {
+        "latitude": body.latitude, "longitude": body.longitude,
+        "name": body.name, "address": body.address,
+    }}
+    msg = await _record_sent_message(body.lead_id, user["id"], target_phone, preview, api_result, extra, reply_ctx)
+    if msg["status"] == "failed":
+        raise HTTPException(status_code=400, detail=msg.get("error") or "WhatsApp location send failed")
+    return strip_mongo(msg)
+
+
+@api.post("/whatsapp/send-contact")
+async def whatsapp_send_contact(body: WASendContact, user: dict = Depends(get_current_user)):
+    ctx = await _assert_chat_permitted(user, body.lead_id)
+    target_phone = ctx["target_phone"]
+    reply_ctx = await _resolve_reply_context(body.lead_id, body.reply_to_message_id)
+    contact_payload: Dict[str, Any] = {
+        "name": {
+            "formatted_name": body.name,
+            "first_name": body.first_name or body.name.split(" ")[0],
+            **({"last_name": body.last_name} if body.last_name else {}),
+        },
+        "phones": [{"phone": p.phone, "type": (p.type or "CELL").upper()} for p in body.phones],
+    }
+    if body.emails:
+        contact_payload["emails"] = [{"email": e.email, "type": (e.type or "WORK").upper()} for e in body.emails]
+    if body.organization:
+        contact_payload["org"] = {"company": body.organization}
+    api_result = await wa_send_contacts(to_phone=target_phone, contacts=[contact_payload], reply_to_wamid=reply_ctx["wamid"])
+    phones_str = ", ".join(p.phone for p in body.phones)
+    preview = f"[contact] {body.name} · {phones_str}"
+    extra = {"msg_type": "contacts", "contacts": [contact_payload]}
+    msg = await _record_sent_message(body.lead_id, user["id"], target_phone, preview, api_result, extra, reply_ctx)
+    if msg["status"] == "failed":
+        raise HTTPException(status_code=400, detail=msg.get("error") or "WhatsApp contact send failed")
+    return strip_mongo(msg)
+
+
+class ResendInput(BaseModel):
+    message_id: str
+
+
+@api.post("/whatsapp/resend")
+async def whatsapp_resend(body: ResendInput, user: dict = Depends(get_current_user)):
+    """Retry sending a previously-failed outbound message. Picks up every field from the
+    original message doc (text / media / location / contacts / reply context) and re-sends."""
+    src = await db.messages.find_one({"id": body.message_id}, {"_id": 0})
+    if not src:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if src.get("direction") != "out":
+        raise HTTPException(status_code=400, detail="Only outbound messages can be resent")
+    if src.get("status") not in ("failed",):
+        raise HTTPException(status_code=400, detail=f"Only failed messages can be resent (current status: {src.get('status')})")
+    ctx = await _assert_chat_permitted(user, src["lead_id"])
+    target_phone = ctx["target_phone"]
+    reply_to_wamid = src.get("reply_to_wamid")
+    if src.get("media_type") in ("image", "video", "document"):
+        api_result = await wa_send_media(target_phone, src["media_type"], src.get("media_url"),
+                                         caption=src.get("caption"), filename=src.get("filename"),
+                                         reply_to_wamid=reply_to_wamid)
+    elif src.get("media_type") == "audio":
+        api_result = await wa_send_audio(target_phone, src.get("media_url"), reply_to_wamid=reply_to_wamid)
+    elif src.get("msg_type") == "location":
+        loc = src.get("location") or {}
+        api_result = await wa_send_location(target_phone, loc.get("latitude"), loc.get("longitude"),
+                                             loc.get("name"), loc.get("address"), reply_to_wamid=reply_to_wamid)
+    elif src.get("msg_type") == "contacts":
+        api_result = await wa_send_contacts(target_phone, src.get("contacts") or [], reply_to_wamid=reply_to_wamid)
+    else:
+        api_result = await wa_send_text(target_phone, src.get("body") or "", reply_to_wamid=reply_to_wamid)
+    await db.messages.update_one({"id": src["id"]}, {"$set": {
+        "status": api_result.get("status", "failed"),
+        "wamid": api_result.get("wamid"),
+        "error": api_result.get("error"),
+        "error_code": api_result.get("code"),
+        "resent_at": iso(now_utc()),
+    }})
+    updated = await db.messages.find_one({"id": src["id"]}, {"_id": 0})
+    if updated.get("status") == "failed":
+        raise HTTPException(status_code=400, detail=updated.get("error") or "Resend failed")
+    return strip_mongo(updated)
+
+
+
+
 @api.get("/whatsapp/templates")
 async def list_templates(user: dict = Depends(get_current_user)):
     return await db.whatsapp_templates.find({}, {"_id": 0}).sort("name", 1).to_list(200)
@@ -2392,6 +2632,25 @@ async def wa_send_media(to_phone: str, media_type: str, url: str, caption: Optio
     return await _wa_send_typed(to_phone, {"type": media_type, media_type: media_block}, reply_to_wamid=reply_to_wamid)
 
 
+async def wa_send_audio(to_phone: str, url: str, reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
+    """Send an audio/voice note. WA Cloud API does not accept caption/filename for audio."""
+    return await _wa_send_typed(to_phone, {"type": "audio", "audio": {"link": url}}, reply_to_wamid=reply_to_wamid)
+
+
+async def wa_send_location(to_phone: str, latitude: float, longitude: float, name: Optional[str] = None, address: Optional[str] = None, reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
+    loc: Dict[str, Any] = {"latitude": float(latitude), "longitude": float(longitude)}
+    if name:
+        loc["name"] = name
+    if address:
+        loc["address"] = address
+    return await _wa_send_typed(to_phone, {"type": "location", "location": loc}, reply_to_wamid=reply_to_wamid)
+
+
+async def wa_send_contacts(to_phone: str, contacts: List[Dict[str, Any]], reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
+    """Send one or more contact cards. Each contact must include a `name.formatted_name` and at least one phone."""
+    return await _wa_send_typed(to_phone, {"type": "contacts", "contacts": contacts}, reply_to_wamid=reply_to_wamid)
+
+
 async def _wa_send_typed(to_phone: str, payload_extra: Dict[str, Any], reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
     """Shared transport for non-text WhatsApp messages. Keeps version, auth, error shape
     identical to the other wa_send_* helpers."""
@@ -2438,7 +2697,9 @@ async def _wa_send_typed(to_phone: str, payload_extra: Dict[str, Any], reply_to_
 _WA_MIME_EXT = {
     "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png", "image/webp": ".webp",
     "image/gif": ".gif", "video/mp4": ".mp4", "video/3gpp": ".3gp", "video/quicktime": ".mov",
-    "application/pdf": ".pdf", "audio/ogg": ".ogg", "audio/mpeg": ".mp3",
+    "application/pdf": ".pdf",
+    "audio/ogg": ".ogg", "audio/opus": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
+    "audio/amr": ".amr", "audio/aac": ".aac", "audio/webm": ".webm",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
     "application/msword": ".doc", "text/plain": ".txt",
@@ -3026,7 +3287,7 @@ async def save_node_positions(flow_id: str, body: BulkNodePositions, admin: dict
 UPLOAD_ROOT = Path("/app/backend/uploads")
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
-ALLOWED_MEDIA_KINDS = {"image", "video", "document"}
+ALLOWED_MEDIA_KINDS = {"image", "video", "document", "audio"}
 
 
 @api.post("/chatflows/upload-media")
@@ -3201,7 +3462,11 @@ async def webhook_whatsapp(request: Request):
                         inbound_filename = doc.get("filename")
                         inbound_mime = doc.get("mime_type")
                     elif msg_type == "audio":
-                        body_text = "[audio message]"
+                        aud = m.get("audio") or {}
+                        body_text = "[voice note]" if aud.get("voice") else "[audio message]"
+                        inbound_media_type = "audio"
+                        inbound_media_id = aud.get("id")
+                        inbound_mime = aud.get("mime_type")
                     elif msg_type == "video":
                         vid = m.get("video") or {}
                         body_text = f"[video] {vid.get('caption','')}".strip()
@@ -3212,6 +3477,12 @@ async def webhook_whatsapp(request: Request):
                     elif msg_type == "location":
                         loc = m.get("location") or {}
                         body_text = f"[location: {loc.get('latitude')},{loc.get('longitude')}]"
+                    elif msg_type == "contacts":
+                        cc = m.get("contacts") or []
+                        first_name = ""
+                        if cc:
+                            first_name = (cc[0].get("name") or {}).get("formatted_name") or ""
+                        body_text = f"[contact] {first_name}".strip() or "[contact]"
                     elif msg_type == "button":
                         body_text = f"[button reply] {(m.get('button') or {}).get('text','')}"
                     elif msg_type == "interactive":
@@ -3276,7 +3547,7 @@ async def webhook_whatsapp(request: Request):
                         if inbound_mime:
                             msg_doc["mime_type"] = inbound_mime
                         # Download the blob from Meta and re-serve it from /api/media
-                        # so the chat UI can render the actual image/video/document.
+                        # so the chat UI can render the actual image/video/document/audio.
                         if inbound_media_id:
                             try:
                                 dl = await _download_wa_media(inbound_media_id, mime_hint=inbound_mime, request=request)
@@ -3285,6 +3556,19 @@ async def webhook_whatsapp(request: Request):
                                     msg_doc["media_stored_name"] = dl.get("stored_name")
                             except Exception as _e:
                                 logger.warning(f"Inbound media cache failed: {_e}")
+                    # Structured location / contacts payload
+                    if msg_type == "location":
+                        loc = m.get("location") or {}
+                        msg_doc["msg_type"] = "location"
+                        msg_doc["location"] = {
+                            "latitude": loc.get("latitude"),
+                            "longitude": loc.get("longitude"),
+                            "name": loc.get("name"),
+                            "address": loc.get("address"),
+                        }
+                    elif msg_type == "contacts":
+                        msg_doc["msg_type"] = "contacts"
+                        msg_doc["contacts"] = m.get("contacts") or []
                     await db.messages.insert_one(msg_doc.copy())
                     await db.leads.update_one(
                         {"id": lead["id"]},

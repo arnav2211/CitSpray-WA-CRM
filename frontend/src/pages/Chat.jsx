@@ -6,6 +6,7 @@ import { useSearchParams } from "react-router-dom";
 import {
   MagnifyingGlass, PaperPlaneRight, ChatCircleDots, Phone, ArrowsClockwise, Plus, ArrowLeft,
   Funnel, Lightning, ArrowsLeftRight, X, Tag, NotePencil, Info,
+  Paperclip, Image as ImageIcon, VideoCamera, FileText, Microphone, MapPin, IdentificationCard, Stop,
 } from "@phosphor-icons/react";
 import { fmtIST, fmtISTTime } from "@/lib/format";
 import { StatusBadge, SourceBadge } from "@/components/Badges";
@@ -266,7 +267,12 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
   const [savingMeta, setSavingMeta] = useState(false);
   const [newNote, setNewNote] = useState("");
   const [replyTo, setReplyTo] = useState(null);  // {id, preview, direction}
+  const [showAttach, setShowAttach] = useState(false);
+  const [attachMode, setAttachMode] = useState(null);  // 'location' | 'contact' | null
+  const [recording, setRecording] = useState(null);  // {recorder, chunks, startedAt} or null
   const scrollRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const fileKindRef = useRef("image");
 
   const exec = execs.find(e => e.id === conv.assigned_to);
   const within24h = !!conv.within_24h;
@@ -412,6 +418,125 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
     finally { setSavingMeta(false); }
   };
 
+  // ────────── Rich media send helpers ──────────
+  const uploadAndSend = async (file, kind) => {
+    if (!file) return;
+    if (file.size > 50 * 1024 * 1024) {
+      toast.error("File too large (max 50 MB)");
+      return;
+    }
+    setSending(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("kind", kind);
+      const { data: up } = await api.post("/chatflows/upload-media", fd, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      const payload = {
+        lead_id: conv.id,
+        media_type: kind,
+        media_url: up.url,
+      };
+      if (kind === "document" && up.filename) payload.filename = up.filename;
+      if (replyTo?.id) payload.reply_to_message_id = replyTo.id;
+      await api.post("/whatsapp/send-media", payload);
+      setReplyTo(null);
+      loadMessages();
+      onChanged?.();
+      toast.success(`Sent ${kind}`);
+    } catch (e) {
+      toast.error(errMsg(e, `Failed to send ${kind}`));
+    } finally {
+      setSending(false);
+      setShowAttach(false);
+    }
+  };
+
+  const pickFile = (kind) => {
+    fileKindRef.current = kind;
+    if (fileInputRef.current) {
+      fileInputRef.current.accept = kind === "image" ? "image/*" : kind === "video" ? "video/*" : kind === "audio" ? "audio/*" : "";
+      fileInputRef.current.value = "";
+      fileInputRef.current.click();
+    }
+  };
+
+  const onFilePicked = (e) => {
+    const f = e.target.files?.[0];
+    if (f) uploadAndSend(f, fileKindRef.current);
+  };
+
+  const startRecording = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      toast.error("Audio recording not supported in this browser");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus"
+        : MediaRecorder.isTypeSupported("audio/ogg;codecs=opus") ? "audio/ogg;codecs=opus" : "";
+      const rec = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      const chunks = [];
+      rec.ondataavailable = (ev) => { if (ev.data && ev.data.size > 0) chunks.push(ev.data); };
+      rec.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop());
+        const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
+        const ext = (blob.type.includes("ogg") ? "ogg" : "webm");
+        const file = new File([blob], `voice_${Date.now()}.${ext}`, { type: blob.type });
+        await uploadAndSend(file, "audio");
+      };
+      rec.start();
+      setRecording({ rec, startedAt: Date.now() });
+      setShowAttach(false);
+    } catch (e) {
+      toast.error("Microphone permission denied");
+    }
+  };
+
+  const stopRecording = () => {
+    if (recording?.rec) {
+      try { recording.rec.stop(); } catch (e) {}
+    }
+    setRecording(null);
+  };
+
+  const sendLocation = async ({ latitude, longitude, name, address }) => {
+    setSending(true);
+    try {
+      const payload = { lead_id: conv.id, latitude: Number(latitude), longitude: Number(longitude) };
+      if (name) payload.name = name;
+      if (address) payload.address = address;
+      if (replyTo?.id) payload.reply_to_message_id = replyTo.id;
+      await api.post("/whatsapp/send-location", payload);
+      setReplyTo(null); setAttachMode(null); setShowAttach(false);
+      loadMessages(); onChanged?.();
+      toast.success("Location sent");
+    } catch (e) { toast.error(errMsg(e, "Failed to send location")); }
+    finally { setSending(false); }
+  };
+
+  const sendContact = async (contact) => {
+    setSending(true);
+    try {
+      const payload = { lead_id: conv.id, ...contact };
+      if (replyTo?.id) payload.reply_to_message_id = replyTo.id;
+      await api.post("/whatsapp/send-contact", payload);
+      setReplyTo(null); setAttachMode(null); setShowAttach(false);
+      loadMessages(); onChanged?.();
+      toast.success("Contact card sent");
+    } catch (e) { toast.error(errMsg(e, "Failed to send contact")); }
+    finally { setSending(false); }
+  };
+
+  const resendMessage = async (m) => {
+    try {
+      await api.post("/whatsapp/resend", { message_id: m.id });
+      loadMessages();
+      toast.success("Message resent");
+    } catch (e) { toast.error(errMsg(e, "Resend failed")); }
+  };
+
   return (
     <>
       {/* Top bar */}
@@ -491,6 +616,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
                   preview: (target.caption || target.body || "").slice(0, 120),
                   direction: target.direction,
                 })}
+                onResend={canMessage ? resendMessage : null}
               />
             ))}
           </div>
@@ -548,26 +674,54 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
 
           {/* Input */}
           {canMessage ? (
-            <div className="bg-[#F0F2F5] border-t border-gray-200 p-3 flex items-end gap-2" data-testid="chat-composer">
-              <button onClick={() => { setShowQR(v => !v); setShowTpl(false); }} title="Quick replies"
+            <div className="bg-[#F0F2F5] border-t border-gray-200 p-3 flex items-end gap-2 relative" data-testid="chat-composer">
+              <input ref={fileInputRef} type="file" onChange={onFilePicked} className="hidden" data-testid="hidden-file-input" />
+              <button onClick={() => { setShowAttach(v => !v); setShowQR(false); setShowTpl(false); }} title="Attach"
+                className={`p-2 ${showAttach ? "bg-gray-900 text-white" : "hover:bg-gray-200 text-gray-700"}`} disabled={!within24h} data-testid="attach-toggle">
+                <Paperclip size={18} weight="bold" />
+              </button>
+              {showAttach && (
+                <div className="absolute bottom-16 left-3 bg-white border border-gray-200 shadow-md z-10 w-52" data-testid="attach-menu">
+                  <button onClick={() => pickFile("image")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-image"><ImageIcon size={16} className="text-[#C2410C]" /> Photo</button>
+                  <button onClick={() => pickFile("video")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-video"><VideoCamera size={16} className="text-[#BE185D]" /> Video</button>
+                  <button onClick={() => pickFile("document")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-document"><FileText size={16} className="text-[#475569]" /> Document</button>
+                  <button onClick={() => pickFile("audio")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-audio-file"><Microphone size={16} className="text-[#7C3AED]" /> Audio file</button>
+                  <button onClick={startRecording} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-record"><Microphone size={16} weight="fill" className="text-[#E60000]" /> Record voice note</button>
+                  <button onClick={() => { setAttachMode("location"); setShowAttach(false); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-location"><MapPin size={16} className="text-[#0891B2]" /> Location</button>
+                  <button onClick={() => { setAttachMode("contact"); setShowAttach(false); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-contact"><IdentificationCard size={16} className="text-[#15803D]" /> Contact</button>
+                </div>
+              )}
+              <button onClick={() => { setShowQR(v => !v); setShowTpl(false); setShowAttach(false); }} title="Quick replies"
                 className={`p-2 ${showQR ? "bg-gray-900 text-white" : "hover:bg-gray-200 text-gray-700"}`} data-testid="qr-toggle">
                 <Lightning size={18} weight="bold" />
               </button>
-              <button onClick={() => { setShowTpl(v => !v); setShowQR(false); }} title="Templates"
+              <button onClick={() => { setShowTpl(v => !v); setShowQR(false); setShowAttach(false); }} title="Templates"
                 className={`px-3 py-2 text-[10px] uppercase tracking-widest font-bold ${showTpl ? "bg-gray-900 text-white" : "border border-gray-300 hover:bg-gray-200"}`} data-testid="tpl-toggle">
                 Tpl
               </button>
-              <textarea value={draft} onChange={(e) => setDraft(e.target.value)}
-                disabled={!within24h}
-                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
-                placeholder={within24h ? "Type a message…" : "Outside 24-hour window — use a template (Tpl ↑)"}
-                rows={1}
-                className="flex-1 resize-none border border-gray-300 px-3 py-2 text-sm outline-none focus:border-[#25D366] disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
-                data-testid="chat-input" />
-              <button onClick={send} disabled={!draft.trim() || sending || !within24h}
-                className="bg-[#25D366] hover:bg-[#1da851] text-white p-2 disabled:opacity-50 disabled:cursor-not-allowed" data-testid="chat-send-btn">
-                <PaperPlaneRight size={18} weight="fill" />
-              </button>
+              {recording ? (
+                <div className="flex-1 flex items-center gap-2 bg-[#FFE9E9] border border-[#E60000] px-3 py-2 text-sm" data-testid="recording-bar">
+                  <span className="w-2 h-2 rounded-full bg-[#E60000] animate-pulse" />
+                  <span className="text-[#E60000] font-bold">Recording…</span>
+                  <button onClick={stopRecording} className="ml-auto bg-[#E60000] text-white px-3 py-1 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1" data-testid="recording-stop">
+                    <Stop size={12} weight="fill" /> Stop &amp; send
+                  </button>
+                </div>
+              ) : (
+                <textarea value={draft} onChange={(e) => setDraft(e.target.value)}
+                  disabled={!within24h}
+                  onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+                  placeholder={within24h ? "Type a message…" : "Outside 24-hour window — use a template (Tpl ↑)"}
+                  rows={1}
+                  className="flex-1 resize-none border border-gray-300 px-3 py-2 text-sm outline-none focus:border-[#25D366] disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
+                  data-testid="chat-input" />
+              )}
+              {!recording && (
+                <button onClick={send} disabled={!draft.trim() || sending || !within24h}
+                  className="bg-[#25D366] hover:bg-[#1da851] text-white p-2 disabled:opacity-50 disabled:cursor-not-allowed" data-testid="chat-send-btn">
+                  <PaperPlaneRight size={18} weight="fill" />
+                </button>
+              )}
             </div>
           ) : (
             <div className="bg-[#FFE9E9] border-t border-[#E60000] p-3 text-center text-sm text-[#E60000]">
@@ -646,7 +800,81 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
           </aside>
         )}
       </div>
+      {attachMode === "location" && (
+        <LocationSendModal onClose={() => setAttachMode(null)} onSend={sendLocation} sending={sending} />
+      )}
+      {attachMode === "contact" && (
+        <ContactSendModal onClose={() => setAttachMode(null)} onSend={sendContact} sending={sending} lead={conv} />
+      )}
     </>
+  );
+}
+
+function LocationSendModal({ onClose, onSend, sending }) {
+  const [lat, setLat] = useState("");
+  const [lng, setLng] = useState("");
+  const [name, setName] = useState("");
+  const [address, setAddress] = useState("");
+  const useMyLocation = () => {
+    if (!navigator.geolocation) { toast.error("Geolocation unavailable"); return; }
+    navigator.geolocation.getCurrentPosition(
+      (p) => { setLat(p.coords.latitude.toFixed(6)); setLng(p.coords.longitude.toFixed(6)); },
+      () => toast.error("Could not read your location"),
+      { enableHighAccuracy: true, timeout: 10000 },
+    );
+  };
+  const submit = (e) => {
+    e.preventDefault();
+    if (!lat || !lng) { toast.error("Latitude and longitude are required"); return; }
+    onSend({ latitude: lat, longitude: lng, name, address });
+  };
+  return (
+    <div className="fixed inset-0 z-40 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <form onClick={(e) => e.stopPropagation()} onSubmit={submit} className="w-full max-w-md bg-white border border-gray-900 p-6 space-y-3" data-testid="send-location-modal">
+        <h3 className="font-chivo font-black text-xl">Send Location</h3>
+        <div className="grid grid-cols-2 gap-2">
+          <input required placeholder="Latitude" value={lat} onChange={(e) => setLat(e.target.value)} className="border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="loc-lat" />
+          <input required placeholder="Longitude" value={lng} onChange={(e) => setLng(e.target.value)} className="border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="loc-lng" />
+        </div>
+        <input placeholder="Name (optional) — e.g. 'Office'" value={name} onChange={(e) => setName(e.target.value)} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="loc-name" />
+        <input placeholder="Address (optional)" value={address} onChange={(e) => setAddress(e.target.value)} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="loc-address" />
+        <button type="button" onClick={useMyLocation} className="text-[10px] uppercase tracking-widest font-bold text-[#002FA7] hover:underline" data-testid="loc-use-mine">Use my current location</button>
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={onClose} className="border border-gray-300 px-3 py-2 text-[10px] uppercase tracking-widest font-bold">Cancel</button>
+          <button disabled={sending} className="bg-[#25D366] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50" data-testid="loc-send-btn">{sending ? "Sending…" : "Send"}</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function ContactSendModal({ onClose, onSend, sending, lead }) {
+  const [name, setName] = useState(lead?.customer_name || "");
+  const [phone, setPhone] = useState("");
+  const [organization, setOrganization] = useState("");
+  const [email, setEmail] = useState("");
+  const submit = (e) => {
+    e.preventDefault();
+    if (!name.trim() || !phone.trim()) { toast.error("Name and at least one phone required"); return; }
+    const payload = { name: name.trim(), phones: [{ phone: phone.trim(), type: "CELL" }] };
+    if (email.trim()) payload.emails = [{ email: email.trim(), type: "WORK" }];
+    if (organization.trim()) payload.organization = organization.trim();
+    onSend(payload);
+  };
+  return (
+    <div className="fixed inset-0 z-40 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <form onClick={(e) => e.stopPropagation()} onSubmit={submit} className="w-full max-w-md bg-white border border-gray-900 p-6 space-y-3" data-testid="send-contact-modal">
+        <h3 className="font-chivo font-black text-xl">Send Contact Card</h3>
+        <input required placeholder="Name" value={name} onChange={(e) => setName(e.target.value)} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="contact-name" />
+        <input required placeholder="Phone (+91…)" value={phone} onChange={(e) => setPhone(e.target.value)} className="w-full border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="contact-phone" />
+        <input placeholder="Email (optional)" type="email" value={email} onChange={(e) => setEmail(e.target.value)} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="contact-email" />
+        <input placeholder="Organization (optional)" value={organization} onChange={(e) => setOrganization(e.target.value)} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="contact-org" />
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={onClose} className="border border-gray-300 px-3 py-2 text-[10px] uppercase tracking-widest font-bold">Cancel</button>
+          <button disabled={sending} className="bg-[#25D366] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50" data-testid="contact-send-btn">{sending ? "Sending…" : "Send"}</button>
+        </div>
+      </form>
+    </div>
   );
 }
 
@@ -659,7 +887,7 @@ function InfoRow({ label, children }) {
   );
 }
 
-function Bubble({ m, allMessages = [], onReply, canMessage = true }) {
+function Bubble({ m, allMessages = [], onReply, onResend, canMessage = true }) {
   const isOut = m.direction === "out";
   const isSystem = m.direction === "system";
   if (isSystem) {
@@ -670,8 +898,9 @@ function Bubble({ m, allMessages = [], onReply, canMessage = true }) {
     );
   }
   const media = renderMedia(m);
-  const captionText = m.caption || (media ? "" : m.body);
-  // Resolve quoted/reply-to preview if this message is itself a reply
+  // When rendering structured non-media payloads, hide the textual placeholder
+  const hasStructured = media || m.msg_type === "location" || m.msg_type === "contacts";
+  const captionText = m.caption || (hasStructured ? "" : m.body);
   const quoted = m.reply_to_message_id
     ? allMessages.find((x) => x.id === m.reply_to_message_id)
     : null;
@@ -681,7 +910,6 @@ function Bubble({ m, allMessages = [], onReply, canMessage = true }) {
   const quotedDirection = quoted?.direction || (m.reply_to_wamid && isOut ? "in" : "out");
   return (
     <div className={`group flex ${isOut ? "justify-end" : "justify-start"}`} data-testid={`msg-${m.id}`}>
-      {/* Reply affordance on the left side for incoming, right for outgoing */}
       {!isOut && canMessage && onReply && (
         <button onClick={() => onReply(m)}
           className="opacity-0 group-hover:opacity-100 transition-opacity text-gray-500 hover:text-[#25D366] text-[10px] uppercase tracking-widest font-bold self-center mr-1 px-1"
@@ -706,10 +934,17 @@ function Bubble({ m, allMessages = [], onReply, canMessage = true }) {
           </div>
         )}
         {media}
+        {m.msg_type === "location" && renderLocation(m)}
+        {m.msg_type === "contacts" && renderContacts(m)}
         {captionText && (
           <div className={`whitespace-pre-wrap break-words ${media ? "px-2 pt-1.5" : ""}`}>{captionText}</div>
         )}
         <div className={`flex items-center justify-end gap-1 mt-1 ${media ? "px-2 pb-1" : ""}`}>
+          {isOut && m.status === "failed" && onResend && (
+            <button onClick={() => onResend(m)} className="text-[9px] text-[#E60000] uppercase tracking-widest font-bold hover:underline mr-2" data-testid={`resend-btn-${m.id}`}>
+              ↻ Resend
+            </button>
+          )}
           <span className="text-[10px] text-gray-500 font-mono">{fmtISTTime(m.at)}</span>
           {isOut && <span className={`text-[10px] ${tickColor(m.status)}`}>{tickFor(m.status)}</span>}
           {isOut && m.error && <span className="text-[9px] text-[#E60000] uppercase tracking-widest font-bold">{String(m.error).slice(0, 24)}</span>}
@@ -758,9 +993,16 @@ function renderMedia(m) {
       </a>
     );
   }
+  if (type === "audio" && url) {
+    return (
+      <audio controls preload="metadata" className="block w-full min-w-[220px]" data-testid={`msg-media-audio-${m.id}`}>
+        <source src={url} />
+      </audio>
+    );
+  }
   // Inbound without a downloaded URL — show a lightweight placeholder using media_id
   if (m.media_id) {
-    const icon = type === "image" ? "🖼️" : type === "video" ? "🎬" : "📄";
+    const icon = type === "image" ? "🖼️" : type === "video" ? "🎬" : type === "audio" ? "🎧" : "📄";
     return (
       <div className="flex items-center gap-2 bg-gray-100 px-3 py-2 text-gray-700" data-testid={`msg-media-placeholder-${m.id}`}>
         <span className="text-lg">{icon}</span>
@@ -769,6 +1011,60 @@ function renderMedia(m) {
     );
   }
   return null;
+}
+
+function renderLocation(m) {
+  const loc = m.location || {};
+  const lat = loc.latitude, lng = loc.longitude;
+  if (typeof lat !== "number" || typeof lng !== "number") return null;
+  const mapSrc = `https://maps.google.com/maps?q=${lat},${lng}&z=15&output=embed`;
+  const openHref = `https://maps.google.com/maps?q=${lat},${lng}`;
+  return (
+    <div className="-mx-1.5 -my-1.5 mb-0.5 overflow-hidden" data-testid={`msg-location-${m.id}`}>
+      <iframe title={`map-${m.id}`} src={mapSrc} width="100%" height="160" loading="lazy" className="block border-0" />
+      <a href={openHref} target="_blank" rel="noreferrer" className="block px-3 py-2 bg-white text-xs border-t border-gray-200 hover:bg-gray-50">
+        <div className="flex items-center gap-1.5">
+          <span className="text-[#0891B2]">📍</span>
+          <div className="min-w-0 flex-1">
+            {loc.name && <div className="font-semibold truncate">{loc.name}</div>}
+            {loc.address && <div className="text-gray-500 truncate">{loc.address}</div>}
+            {!loc.name && !loc.address && <div className="font-mono text-[10px] text-gray-500">{lat.toFixed(4)}, {lng.toFixed(4)}</div>}
+          </div>
+          <span className="text-[10px] uppercase tracking-widest text-[#002FA7] font-bold">Open →</span>
+        </div>
+      </a>
+    </div>
+  );
+}
+
+function renderContacts(m) {
+  const contacts = m.contacts || [];
+  if (!contacts.length) return null;
+  return (
+    <div className="space-y-1.5" data-testid={`msg-contacts-${m.id}`}>
+      {contacts.map((c, i) => {
+        const name = (c.name || {}).formatted_name || (c.name || {}).first_name || "Contact";
+        const firstPhone = (c.phones || [])[0]?.phone;
+        const firstEmail = (c.emails || [])[0]?.email;
+        const org = (c.org || {}).company;
+        return (
+          <div key={i} className="bg-white/70 border border-gray-200 px-3 py-2 text-xs">
+            <div className="flex items-center gap-2">
+              <div className="w-9 h-9 rounded-full bg-[#25D366] flex items-center justify-center text-white font-bold">
+                {(name || "?").slice(0, 1).toUpperCase()}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="font-semibold truncate">{name}</div>
+                {org && <div className="text-[10px] text-gray-500 truncate">{org}</div>}
+                {firstPhone && <a href={`tel:${firstPhone}`} className="text-[11px] text-[#002FA7] hover:underline block truncate">{firstPhone}</a>}
+                {firstEmail && <a href={`mailto:${firstEmail}`} className="text-[11px] text-[#002FA7] hover:underline block truncate">{firstEmail}</a>}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 // ---------------- New chat modal ----------------

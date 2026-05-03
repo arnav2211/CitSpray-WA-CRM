@@ -22,6 +22,19 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 9 (Feb 2026) — Full rich-message support (audio, location, contact, resend)
+- **Backend helpers** — new `wa_send_audio`, `wa_send_location`, `wa_send_contacts` (all routed through `_wa_send_typed` so they automatically get `context.message_id` reply support, 24h-window gating, mock-mode fallback, status tracking).
+- **New composer endpoints** (all admin+exec with lead-assignment RBAC, 24h window enforcement, reply_to_message_id support, status+error persisted):
+  - `POST /api/whatsapp/send-media` — image/video/document/audio. Pair with `POST /api/chatflows/upload-media` for file uploads (now accepts `kind=audio`); the returned absolute URL is fed back in.
+  - `POST /api/whatsapp/send-location` — latitude/longitude with optional name & address.
+  - `POST /api/whatsapp/send-contact` — formatted_name, phones[], emails[], organization → Meta's `contacts[]` payload.
+  - `POST /api/whatsapp/resend` — re-send a previously `failed` outbound message; preserves media_type/caption/filename/location/contacts and reply context.
+- **Inbound webhook** — now parses `audio` (distinguishes voice notes), `location` (stored as `location: {latitude, longitude, name, address}`), `contacts` (full Meta contacts array), and downloads audio media via the existing `_download_wa_media` helper (mime map extended to cover opus/mp3/m4a/amr/aac/webm).
+- **Chat UI** — Paperclip attach button opens a menu: Photo / Video / Document / Audio file / Record voice note / Location / Contact. Voice recording uses browser `MediaRecorder` (opus/webm → server as file upload → send-media). Bubbles render `<audio controls>` for audio, an embedded Google Maps iframe + "Open →" for locations, and WhatsApp-style contact cards with clickable phone/email. `↻ Resend` button appears on any failed outbound bubble.
+- **File size validation** — client-side 50 MB cap + backend 50 MB cap on upload. Quoted preview UI unchanged (still green for "You", blue for "Customer").
+- **Not in scope** (WA Cloud API doesn't expose these for business accounts): typing indicators, user presence, last-seen.
+- **Tested**: 39/39 iter7+iter8 regression green; `/tmp/test_rich.py` covers image / audio upload+send / location / contact / reply-with-media / resend / inbound audio+location+contacts parsing.
+
 ### Iteration 8 (Feb 2026) — Visual Canvas + Media Nodes + Inbound download + Templates + Quoted Replies
 - **Visual Flow Designer** — `/app/frontend/src/pages/ChatFlows.jsx` fully rewritten on `@xyflow/react`. Custom `<FlowNodeCard />` with colour-banded left border per type, icon, body preview, option list, Start flag, source/target handles (one per option for button/list/carousel so edges render per-option).
 - **Inbound media download-and-serve** — `_download_wa_media(media_id, mime_hint, request)` does Meta's 2-step flow (GET `/{api_version}/{media_id}` → `{url}` → download blob with Bearer). Saves to `/app/backend/uploads/<uuid><ext>` (mime → ext map covers jpg/png/webp/mp4/pdf/…), returns absolute public URL. Webhook now attaches `media_url`, `media_stored_name`, `mime_type` to inbound image/video/document messages. Fails silently in mock mode or on 4xx.
