@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
-import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck, Copy, Link as LinkIcon, Phone, Plus, Trash } from "@phosphor-icons/react";
+import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck, Copy, Link as LinkIcon, Phone, Plus, Trash, Lightning } from "@phosphor-icons/react";
+import { fmtIST } from "@/lib/format";
 
 const FIELDS = [
   { k: "access_token",          label: "Access Token",              secret: true,  hint: "Permanent System User token with whatsapp_business_messaging + whatsapp_business_management scopes." },
@@ -98,6 +99,8 @@ export default function Settings() {
 
       {hooks && <WebhooksPanel hooks={hooks} />}
 
+      <ExportersIndiaPanel onChanged={load} />
+
       <CallRoutingPanel />
 
       <form onSubmit={submit} className="border border-gray-200 bg-white" data-testid="whatsapp-settings-form">
@@ -185,9 +188,10 @@ function WebhooksPanel({ hooks }) {
   const items = [
     { ...hooks.whatsapp,             key: "whatsapp" },
     { ...hooks.indiamart,            key: "indiamart" },
+    { ...hooks.exportersindia,       key: "exportersindia" },
     { ...hooks.gmail,                key: "gmail" },
     { ...hooks.justdial_manual_ingest, key: "justdial" },
-  ].filter(Boolean);
+  ].filter((x) => x && (x.url || x.label));
   const copy = async (text, label) => {
     try { await navigator.clipboard.writeText(text); toast.success(`${label} copied`); }
     catch { toast.error("Copy failed — please copy manually"); }
@@ -339,3 +343,172 @@ function CallRoutingPanel() {
     </div>
   );
 }
+
+function ExportersIndiaPanel({ onChanged }) {
+  const [cfg, setCfg] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [apiKey, setApiKey] = useState("");
+  const [email, setEmail] = useState("");
+  const [mins, setMins] = useState(1);
+  const [secs, setSecs] = useState(0);
+  const [reveal, setReveal] = useState(false);
+
+  const load = async () => {
+    try {
+      const { data } = await api.get("/settings/exportersindia-pull");
+      setCfg(data);
+      setEmail(data.email || "");
+      setMins(data.interval_minutes ?? 1);
+      setSecs(data.interval_seconds ?? 0);
+      setApiKey("");
+    } catch (e) { toast.error(errMsg(e)); }
+  };
+  useEffect(() => { load(); }, []);
+
+  const save = async (patch) => {
+    setSaving(true);
+    try {
+      await api.put("/settings/exportersindia-pull", patch);
+      toast.success("Saved");
+      await load();
+      onChanged?.();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setSaving(false); }
+  };
+
+  const runNow = async () => {
+    setRunning(true);
+    try {
+      const { data } = await api.post("/settings/exportersindia-pull/run-now");
+      const n = (data.created || []).length;
+      toast.success(n ? `Pulled ${n} new lead(s)` : `Pull OK — ${data.skipped_empty ? "no new enquiries" : "nothing to do"}`);
+      await load();
+      onChanged?.();
+    } catch (e) { toast.error(errMsg(e, "Pull failed")); }
+    finally { setRunning(false); }
+  };
+
+  const toggleEnabled = async () => {
+    const next = !cfg.enabled;
+    if (next && (!apiKey.trim() && !cfg.has_key)) { toast.error("Set an API key first"); return; }
+    if (next && !email.trim()) { toast.error("Set an email first"); return; }
+    await save({ enabled: next });
+  };
+
+  if (!cfg) return null;
+  const lastSuccess = cfg.last_success_at ? fmtIST(cfg.last_success_at) : "Never";
+  return (
+    <div className="border border-gray-200 bg-white" data-testid="exportersindia-panel">
+      <div className="px-5 py-4 border-b border-gray-200 flex items-start justify-between gap-3">
+        <div>
+          <h2 className="font-chivo font-bold text-lg flex items-center gap-2"><ShieldCheck size={18} weight="bold" /> ExportersIndia Pull API</h2>
+          <p className="text-xs text-gray-500 mt-1 max-w-2xl">
+            LeadOrbit polls ExportersIndia on an interval you choose and imports new enquiries
+            automatically — no webhook needed on their side. You can rotate the API key any time.
+          </p>
+        </div>
+        <label className="inline-flex items-center gap-2 cursor-pointer" data-testid="ei-pull-enable-toggle">
+          <input type="checkbox" checked={cfg.enabled} onChange={toggleEnabled} className="w-4 h-4 accent-[#25D366]" />
+          <span className="text-[10px] uppercase tracking-widest font-bold">{cfg.enabled ? "Enabled" : "Disabled"}</span>
+        </label>
+      </div>
+
+      <div className="p-5 space-y-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Current key</div>
+            <div className="font-mono text-sm bg-gray-50 border border-gray-200 p-2">
+              {cfg.has_key ? cfg.api_key_masked : <span className="text-gray-400">Not set</span>}
+            </div>
+          </div>
+          <div className="space-y-2">
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Last successful pull</div>
+            <div className="text-sm bg-gray-50 border border-gray-200 p-2">
+              {lastSuccess}
+              {cfg.last_date_from && <span className="text-[10px] text-gray-500 ml-2">(date_from: {cfg.last_date_from})</span>}
+              {typeof cfg.last_created_count === "number" && (
+                <span className="ml-2 text-[10px] uppercase tracking-widest text-[#008A00] font-bold">+{cfg.last_created_count} new</span>
+              )}
+            </div>
+            {cfg.last_error && <div className="text-[11px] text-[#E60000] font-mono bg-[#FFE9E9] p-2 border border-[#E60000]">⚠ {cfg.last_error}</div>}
+          </div>
+        </div>
+
+        <label className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">API key (rotate anytime)</div>
+          <div className="flex items-stretch gap-2">
+            <input
+              type={reveal ? "text" : "password"}
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder={cfg.has_key ? "Paste new key to replace, or leave blank" : "Paste ExportersIndia API key (e.g. RFVOVXlpV2NlQVMvVzl4Wk92VkcwUT09)"}
+              className="flex-1 border border-gray-300 px-3 py-2 text-sm font-mono"
+              data-testid="ei-pull-apikey-input"
+            />
+            <button type="button" onClick={() => setReveal(v => !v)} className="border border-gray-300 px-3 py-2 text-gray-700 hover:bg-gray-50" title={reveal ? "Hide" : "Reveal"}>
+              {reveal ? <EyeSlash size={16} weight="bold" /> : <Eye size={16} weight="bold" />}
+            </button>
+            <button type="button" onClick={() => save({ api_key: apiKey })} disabled={!apiKey.trim() || saving}
+              className="bg-[#002FA7] hover:bg-[#002288] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 disabled:opacity-50"
+              data-testid="ei-pull-save-key-btn">
+              <FloppyDisk size={14} weight="bold" /> {saving ? "Saving…" : "Save key"}
+            </button>
+          </div>
+        </label>
+
+        <label className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Account email</div>
+          <div className="flex items-stretch gap-2">
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="e.g. citspray@gmail.com"
+              className="flex-1 border border-gray-300 px-3 py-2 text-sm"
+              data-testid="ei-pull-email-input"
+            />
+            <button type="button" onClick={() => save({ email })} disabled={saving}
+              className="border border-gray-900 hover:bg-gray-900 hover:text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold" data-testid="ei-pull-save-email-btn">
+              Save email
+            </button>
+          </div>
+        </label>
+
+        <div className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Pull interval</div>
+          <div className="flex items-stretch gap-2 flex-wrap">
+            <div className="flex items-center gap-1">
+              <input type="number" min="0" max="60" value={mins} onChange={(e) => setMins(Number(e.target.value))}
+                className="w-20 border border-gray-300 px-2 py-2 text-sm" data-testid="ei-pull-mins-input" />
+              <span className="text-xs text-gray-500">min</span>
+            </div>
+            <div className="flex items-center gap-1">
+              <input type="number" min="0" max="59" value={secs} onChange={(e) => setSecs(Number(e.target.value))}
+                className="w-20 border border-gray-300 px-2 py-2 text-sm" data-testid="ei-pull-secs-input" />
+              <span className="text-xs text-gray-500">sec</span>
+            </div>
+            <button type="button" onClick={() => save({ interval_minutes: mins, interval_seconds: secs })} disabled={saving}
+              className="bg-[#002FA7] hover:bg-[#002288] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold" data-testid="ei-pull-save-interval-btn">
+              Save interval
+            </button>
+            <span className="text-[10px] text-gray-500 self-center">Minimum 10s. Current: every {cfg.interval_minutes}m {cfg.interval_seconds}s.</span>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-between border-t border-gray-200 pt-4">
+          <div className="text-[11px] text-gray-500 font-mono break-all">
+            GET {cfg.pull_url}?k=…&amp;email={email || "…"}&amp;date_from=YYYY-MM-DD
+          </div>
+          <button type="button" onClick={runNow} disabled={running || !cfg.has_key || !email}
+            className="bg-[#25D366] hover:bg-[#1da851] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 disabled:opacity-50"
+            data-testid="ei-pull-run-now-btn">
+            <Lightning size={14} weight="bold" /> {running ? "Pulling…" : "Run pull now"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+

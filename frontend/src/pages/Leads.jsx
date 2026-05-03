@@ -2,14 +2,14 @@ import React, { useEffect, useMemo, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { Link, useSearchParams } from "react-router-dom";
-import { StatusBadge, SourceBadge, QueryTypeBadge } from "@/components/Badges";
+import { StatusBadge, SourceBadge, EnquiryTypeBadge } from "@/components/Badges";
 import { toast } from "sonner";
 import { Kanban, Table, Plus, MagnifyingGlass, FileX } from "@phosphor-icons/react";
 import LeadDrawer from "@/components/LeadDrawer";
 import { fmtIST } from "@/lib/format";
 
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
-const SOURCES = ["IndiaMART", "Justdial", "Manual", "WhatsApp"];
+const SOURCES = ["IndiaMART", "ExportersIndia", "Justdial", "Manual", "WhatsApp"];
 
 export default function Leads() {
   const { user } = useAuth();
@@ -183,7 +183,7 @@ export default function Leads() {
                   )}
                   <div className="mt-2 flex items-center gap-2 flex-wrap">
                     <SourceBadge source={l.source} />
-                    <QueryTypeBadge code={l.source_data?.QUERY_TYPE} compact />
+                    <EnquiryTypeBadge lead={l} />
                     <span className="text-[10px] uppercase tracking-widest text-gray-400 font-bold ml-auto">
                       {execMap[l.assigned_to]?.name || "Unassigned"}
                     </span>
@@ -234,10 +234,10 @@ export default function Leads() {
                       )}
                     </td>
                     <td className="px-4 py-3 max-w-[260px] truncate">{l.requirement || "—"}</td>
-                    <td className="px-4 py-3 text-xs text-gray-600">{[l.area, l.city, l.state].filter(Boolean).join(", ") || "—"}</td>
+                    <td className="px-4 py-3 text-xs text-gray-600">{[l.area, l.city, l.state, l.country].filter(Boolean).join(", ") || "—"}</td>
                     <td className="px-4 py-3"><SourceBadge source={l.source} /></td>
                     <td className="px-4 py-3">
-                      <QueryTypeBadge code={l.source_data?.QUERY_TYPE} compact />
+                      <EnquiryTypeBadge lead={l} />
                       {l.source_data?.QUERY_TYPE === "P" && l.source_data?.RECEIVER_MOBILE && (
                         <div className="text-[10px] font-mono text-gray-500 mt-1" title="PNS Receiver Number">
                           Rcv: {l.source_data.RECEIVER_MOBILE}
@@ -307,7 +307,7 @@ function Kanban_({ leads, onOpen, execMap }) {
                   </div>
                   <div className="text-xs text-gray-500 mt-1 truncate">{l.requirement || "—"}</div>
                   <div className="mt-2 flex items-center gap-2">
-                    <QueryTypeBadge code={l.source_data?.QUERY_TYPE} compact />
+                    <EnquiryTypeBadge lead={l} />
                     <div className="text-[10px] uppercase tracking-widest text-gray-400 font-bold">
                       {execMap[l.assigned_to]?.name || "Unassigned"}
                     </div>
