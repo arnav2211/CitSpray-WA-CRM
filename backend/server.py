@@ -2212,11 +2212,219 @@ async def delete_quick_reply(qr_id: str, admin: dict = Depends(require_admin)):
 
 # Webhook URLs panel (admin)
 async def _get_exportersindia_api_key() -> Optional[str]:
-    """Return the configured ExportersIndia API key (or None if unset).
-    DB override in `system_settings` key='exportersindia' field 'api_key' wins over env."""
+    """Return the configured ExportersIndia API key (or None if unset)."""
     doc = await db.system_settings.find_one({"key": "exportersindia"}, {"_id": 0}) or {}
     val = (doc.get("api_key") or os.environ.get("EXPORTERSINDIA_API_KEY") or "").strip()
     return val or None
+
+
+DEFAULT_EI_PULL_URL = "https://members.exportersindia.com/api-inquiry-detail.php"
+DEFAULT_EI_INTERVAL = 60  # seconds
+
+
+async def _get_exportersindia_pull_cfg() -> Dict[str, Any]:
+    """Current pull-API config: api_key, email, interval_seconds, enabled, pull_url,
+    last_pulled_at (last attempt), last_success_at (last successful run)."""
+    doc = await db.system_settings.find_one({"key": "exportersindia_pull"}, {"_id": 0}) or {}
+    return {
+        "api_key": (doc.get("api_key") or "").strip(),
+        "email": (doc.get("email") or "").strip(),
+        "pull_url": (doc.get("pull_url") or DEFAULT_EI_PULL_URL).strip(),
+        "interval_seconds": int(doc.get("interval_seconds") or DEFAULT_EI_INTERVAL),
+        "enabled": bool(doc.get("enabled", False)),
+        "last_pulled_at": doc.get("last_pulled_at"),
+        "last_success_at": doc.get("last_success_at"),
+        "last_error": doc.get("last_error"),
+        "last_created_count": doc.get("last_created_count"),
+        "last_date_from": doc.get("last_date_from"),
+    }
+
+
+async def _pull_exportersindia_once(force_date_from: Optional[str] = None) -> Dict[str, Any]:
+    """Run a single pull of ExportersIndia enquiries. Uses `last_success_at` (or today)
+    as `date_from` so we don't re-download old leads each tick. Dedup by inq_id / phone
+    is already handled downstream by `_handle_exportersindia_payload`."""
+    cfg = await _get_exportersindia_pull_cfg()
+    api_key = cfg["api_key"]
+    email = cfg["email"]
+    pull_url = cfg["pull_url"]
+    if not api_key or not email:
+        return {"skipped": True, "reason": "api_key or email not configured"}
+    # Choose date_from — prefer explicit override, else last successful pull date,
+    # else today (UTC, YYYY-MM-DD).
+    if force_date_from:
+        date_from = force_date_from
+    elif cfg.get("last_success_at"):
+        try:
+            dt = datetime.fromisoformat(cfg["last_success_at"].replace("Z", "+00:00"))
+            # Step back 1 day to catch late-arriving enquiries; dedup will drop repeats.
+            date_from = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
+        except Exception:
+            date_from = now_utc().strftime("%Y-%m-%d")
+    else:
+        date_from = now_utc().strftime("%Y-%m-%d")
+
+    params = {"k": api_key, "email": email, "date_from": date_from}
+    started_at = iso(now_utc())
+    try:
+        async with httpx.AsyncClient(timeout=30) as client_http:
+            r = await client_http.get(pull_url, params=params)
+        if r.status_code >= 400:
+            err = f"HTTP {r.status_code}: {r.text[:300]}"
+            await db.system_settings.update_one(
+                {"key": "exportersindia_pull"},
+                {"$set": {"last_pulled_at": started_at, "last_error": err, "last_date_from": date_from, "key": "exportersindia_pull"}},
+                upsert=True,
+            )
+            return {"ok": False, "error": err, "date_from": date_from}
+        try:
+            payload = r.json()
+        except Exception:
+            payload = {"raw": r.text}
+    except Exception as e:
+        err = str(e)
+        await db.system_settings.update_one(
+            {"key": "exportersindia_pull"},
+            {"$set": {"last_pulled_at": started_at, "last_error": err, "last_date_from": date_from, "key": "exportersindia_pull"}},
+            upsert=True,
+        )
+        return {"ok": False, "error": err, "date_from": date_from}
+
+    # Ingest via the same parser as the push path
+    result = await _handle_exportersindia_payload(payload, identifier="pull")
+    finished_at = iso(now_utc())
+    await db.system_settings.update_one(
+        {"key": "exportersindia_pull"},
+        {"$set": {
+            "key": "exportersindia_pull",
+            "last_pulled_at": started_at,
+            "last_success_at": finished_at,
+            "last_error": None,
+            "last_created_count": len(result.get("created") or []),
+            "last_date_from": date_from,
+        }},
+        upsert=True,
+    )
+    return {"ok": True, "date_from": date_from, **result}
+
+
+async def exportersindia_pull_task():
+    """APScheduler tick. Reads current config (so admins can enable/change interval at
+    runtime without restart); reschedules itself when interval changes."""
+    try:
+        cfg = await _get_exportersindia_pull_cfg()
+        if not cfg["enabled"]:
+            return
+        if not cfg["api_key"] or not cfg["email"]:
+            return
+        res = await _pull_exportersindia_once()
+        if not res.get("ok"):
+            logger.warning(f"EI pull failed: {res.get('error')}")
+        else:
+            logger.info(f"EI pull ok date_from={res.get('date_from')} created={len(res.get('created') or [])}")
+    except Exception as e:
+        logger.exception(f"EI pull task crashed: {e}")
+
+
+async def _reschedule_exportersindia_pull(new_interval_seconds: int):
+    """Update the scheduler job in place so interval changes are applied live."""
+    global scheduler
+    if not scheduler:
+        return
+    try:
+        scheduler.remove_job("exportersindia_pull")
+    except Exception:
+        pass
+    scheduler.add_job(
+        exportersindia_pull_task, "interval",
+        seconds=max(10, int(new_interval_seconds or DEFAULT_EI_INTERVAL)),
+        id="exportersindia_pull", max_instances=1, coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=5),
+    )
+
+
+class ExportersIndiaPullInput(BaseModel):
+    api_key: Optional[str] = None
+    email: Optional[str] = None
+    pull_url: Optional[str] = None
+    interval_minutes: Optional[int] = None  # convenience input from UI
+    interval_seconds: Optional[int] = None  # residual seconds component
+    enabled: Optional[bool] = None
+
+
+@api.get("/settings/exportersindia-pull")
+async def get_exportersindia_pull(admin: dict = Depends(require_admin)):
+    cfg = await _get_exportersindia_pull_cfg()
+    total = cfg["interval_seconds"]
+    return {
+        "api_key_masked": _mask_token(cfg["api_key"]) if cfg["api_key"] else "",
+        "has_key": bool(cfg["api_key"]),
+        "email": cfg["email"],
+        "pull_url": cfg["pull_url"],
+        "interval_seconds_total": total,
+        "interval_minutes": total // 60,
+        "interval_seconds": total % 60,
+        "enabled": cfg["enabled"],
+        "last_pulled_at": cfg["last_pulled_at"],
+        "last_success_at": cfg["last_success_at"],
+        "last_error": cfg["last_error"],
+        "last_created_count": cfg["last_created_count"],
+        "last_date_from": cfg["last_date_from"],
+        "defaults": {"pull_url": DEFAULT_EI_PULL_URL, "interval_seconds": DEFAULT_EI_INTERVAL},
+    }
+
+
+@api.put("/settings/exportersindia-pull")
+async def update_exportersindia_pull(body: ExportersIndiaPullInput, admin: dict = Depends(require_admin)):
+    updates: Dict[str, Any] = {"key": "exportersindia_pull", "updated_by": admin["id"], "updated_at": iso(now_utc())}
+    unsets: Dict[str, str] = {}
+    if body.api_key is not None:
+        if body.api_key.strip():
+            updates["api_key"] = body.api_key.strip()
+        else:
+            unsets["api_key"] = ""
+    if body.email is not None:
+        updates["email"] = body.email.strip()
+    if body.pull_url is not None:
+        updates["pull_url"] = (body.pull_url.strip() or DEFAULT_EI_PULL_URL)
+    # Interval: combine minutes + residual seconds. Minimum 10s to avoid hammering the API.
+    if body.interval_minutes is not None or body.interval_seconds is not None:
+        mins = max(0, int(body.interval_minutes or 0))
+        secs = max(0, int(body.interval_seconds or 0))
+        total = mins * 60 + secs
+        if total < 10:
+            raise HTTPException(status_code=400, detail="Minimum interval is 10 seconds")
+        updates["interval_seconds"] = total
+    if body.enabled is not None:
+        updates["enabled"] = bool(body.enabled)
+    op: Dict[str, Any] = {"$set": updates}
+    if unsets:
+        op["$unset"] = unsets
+    await db.system_settings.update_one({"key": "exportersindia_pull"}, op, upsert=True)
+    await log_activity(admin["id"], "exportersindia_pull_updated", None, {k: (v if k != "api_key" else "***") for k, v in updates.items()})
+
+    # Reschedule the job so interval/enabled changes take effect immediately
+    cfg = await _get_exportersindia_pull_cfg()
+    if cfg["enabled"]:
+        await _reschedule_exportersindia_pull(cfg["interval_seconds"])
+    else:
+        global scheduler
+        if scheduler:
+            try:
+                scheduler.remove_job("exportersindia_pull")
+            except Exception:
+                pass
+
+    return await get_exportersindia_pull(admin)
+
+
+@api.post("/settings/exportersindia-pull/run-now")
+async def run_exportersindia_pull_now(admin: dict = Depends(require_admin), date_from: Optional[str] = Query(None)):
+    """Manual trigger for an immediate pull (for admins to backfill or test)."""
+    cfg = await _get_exportersindia_pull_cfg()
+    if not cfg["api_key"] or not cfg["email"]:
+        raise HTTPException(status_code=400, detail="api_key and email must be configured before running a pull")
+    return await _pull_exportersindia_once(force_date_from=date_from)
 
 
 class ExportersIndiaSettingsInput(BaseModel):
@@ -2628,8 +2836,20 @@ async def _handle_exportersindia_payload(payload: Any, identifier: Optional[str]
         entries = payload
 
     created_ids: List[str] = []
+    skipped_empty = 0
     for e in entries:
         if not isinstance(e, dict):
+            continue
+        # Skip status/error wrapper payloads that ExportersIndia returns when there's
+        # no data — e.g. {"msg":"No record found"} or {"msg":"Your next request will..."}.
+        has_real_fields = any(
+            e.get(k) for k in (
+                "inq_id", "INQ_ID", "enquiry_id", "mobile", "MOBILE", "phone",
+                "email", "EMAIL", "name", "NAME", "detail_req", "subject", "product",
+            )
+        )
+        if not has_real_fields:
+            skipped_empty += 1
             continue
         name = e.get("name") or e.get("NAME") or "ExportersIndia Buyer"
         phone = e.get("mobile") or e.get("MOBILE") or e.get("phone") or e.get("contact_no")
@@ -2671,15 +2891,16 @@ async def _handle_exportersindia_payload(payload: Any, identifier: Optional[str]
         created_ids.append(lead["id"])
     await db.webhook_payloads.update_one(
         {"id": raw["id"]},
-        {"$set": {"processed": True, "lead_ids": created_ids, "entry_count": len(entries)}},
+        {"$set": {"processed": True, "lead_ids": created_ids, "entry_count": len(entries), "skipped_empty": skipped_empty}},
     )
-    return {"status": "SUCCESS", "ok": True, "created": created_ids, "received": len(entries)}
+    return {"status": "SUCCESS", "ok": True, "created": created_ids, "received": len(entries), "skipped_empty": skipped_empty}
 
 
 @api.post("/webhooks/exportersindia")
 async def webhook_exportersindia(request: Request, key: Optional[str] = Query(None)):
-    configured = await _get_exportersindia_api_key()
-    if configured and key != configured:
+    # Kept for backwards-compat; prefer the Pull API configured in Settings.
+    configured_push = await _get_exportersindia_api_key()
+    if configured_push and key != configured_push:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     try:
         payload = await request.json()
@@ -4643,6 +4864,18 @@ async def on_startup():
             gmail_poll_task, "interval", minutes=GMAIL_POLL_MINUTES,
             id="gmail_poll", max_instances=1, coalesce=True,
         )
+    # ExportersIndia pull — only schedule if admin has enabled it
+    try:
+        ei_cfg = await _get_exportersindia_pull_cfg()
+        if ei_cfg.get("enabled") and ei_cfg.get("api_key") and ei_cfg.get("email"):
+            scheduler.add_job(
+                exportersindia_pull_task, "interval",
+                seconds=max(10, int(ei_cfg.get("interval_seconds") or DEFAULT_EI_INTERVAL)),
+                id="exportersindia_pull", max_instances=1, coalesce=True,
+            )
+            logger.info(f"ExportersIndia pull enabled every {ei_cfg['interval_seconds']}s")
+    except Exception as e:
+        logger.warning(f"Could not schedule ExportersIndia pull: {e}")
     scheduler.start()
     logger.info(f"Startup complete; scheduler running (gmail_enabled={GMAIL_ENABLED})")
 

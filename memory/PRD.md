@@ -22,7 +22,20 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
-### Iteration 13 (Feb 2026) — ExportersIndia API-key auth
+### Iteration 14 (Feb 2026) — ExportersIndia Pull API (scheduled poll)
+- **Switched from push webhook to pull** — we now poll `https://members.exportersindia.com/api-inquiry-detail.php?k=<api_key>&email=<email>&date_from=<yyyy-mm-dd>` on a configurable interval (default 1 minute; 10-second minimum enforced). Uses `last_success_at - 1 day` as `date_from` to catch late-arriving enquiries; dedup via `inq_id` and phone handles repeats.
+- **APScheduler job `exportersindia_pull`** — scheduled at boot if the admin has enabled it; rescheduled in-place on config changes (no service restart needed). Skips ticks automatically if key/email are missing.
+- **Endpoints**:
+  - `GET /api/settings/exportersindia-pull` — masked key, email, pull_url, interval_minutes+interval_seconds, enabled, `last_pulled_at` / `last_success_at` / `last_error` / `last_created_count` / `last_date_from`.
+  - `PUT /api/settings/exportersindia-pull {api_key?, email?, pull_url?, interval_minutes?, interval_seconds?, enabled?}` — partial updates; rescheduling done automatically.
+  - `POST /api/settings/exportersindia-pull/run-now?date_from=YYYY-MM-DD` — manual trigger for admins to backfill or test.
+- **Parser hardening** — `_handle_exportersindia_payload` now skips status-wrapper responses like `{"msg":"No record found"}` (no lead created) and reports `skipped_empty` count.
+- **Push webhook** kept for backward-compat (with optional key auth via `/api/settings/exportersindia`) but marked deprecated in favour of the pull flow.
+- **UI (`Settings.jsx`)** — new "ExportersIndia Pull API" panel: enable toggle, current-key mask, last successful pull with `date_from` + `+N new` badge, new-key input with eye-toggle + "Save key", email field + "Save email", **min + sec** interval inputs + "Save interval", "Run pull now" button, and a live preview of the GET URL.
+- **Verified live** — configured `k=RFV0VXlpV2NlQVMvVzl4Wk92VkcwUT09` + `email=citspray@gmail.com`, interval=30s for testing → `last_success_at` advanced every tick. "No record found" wrapper is skipped correctly. Restored to 1m for production use.
+- **Tested**: 39/39 iter7+iter8 regression green.
+
+### Iteration 13 (Feb 2026) — ExportersIndia API-key auth (deprecated — now Pull API)
 - **`POST /api/webhooks/exportersindia?key=…`** now enforces the configured API key. If no key is configured → webhook stays public (dev-friendly). If configured → any request missing the key or with a wrong key returns HTTP 401.
 - **`GET /api/settings/exportersindia`** (admin) returns `{api_key_masked, has_key, webhook_url, full_integration_url}` — last field is ready-to-paste with `?key=…` appended.
 - **`PUT /api/settings/exportersindia {api_key}`** (admin) persists the key to `system_settings` collection (or clears it with empty string). Env-var `EXPORTERSINDIA_API_KEY` also supported as fallback.
