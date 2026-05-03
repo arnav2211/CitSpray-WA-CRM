@@ -2756,6 +2756,23 @@ async def _download_wa_media(media_id: str, mime_hint: Optional[str] = None, req
     ext = _ext_for_mime(mime_type)
     stored_name = f"{uuid.uuid4().hex}{ext}"
     (UPLOAD_ROOT / stored_name).write_bytes(content_bytes)
+    # Persist metadata so /api/media/{name}?download=1 can set a proper filename.
+    try:
+        await db.media_files.update_one(
+            {"stored_name": stored_name},
+            {"$set": {
+                "stored_name": stored_name,
+                "original_filename": f"whatsapp_{stored_name}",
+                "mime_type": mime_type,
+                "size": len(content_bytes),
+                "kind": "inbound",
+                "uploaded_at": iso(now_utc()),
+                "source": "whatsapp_webhook",
+            }},
+            upsert=True,
+        )
+    except Exception:
+        pass
     # Build absolute URL
     base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
     if not base and request is not None:
@@ -3298,53 +3315,189 @@ async def upload_flow_media(
     admin: dict = Depends(require_admin),
 ):
     """Accept a local file upload and return an ABSOLUTE publicly accessible URL.
-    Meta (WhatsApp) requires a fully-qualified HTTPS URL to fetch the media from,
-    so we return e.g. `https://<host>/api/media/<uuid>.jpg`, not a relative path."""
+    For audio/video we transcode (remux) to a WhatsApp-supported container/codec so
+    Meta's recipient side can decode it. Meta requires a fully-qualified HTTPS URL,
+    so we return e.g. `https://<host>/api/media/<uuid>.jpg`."""
     if kind not in ALLOWED_MEDIA_KINDS:
         raise HTTPException(status_code=400, detail=f"kind must be one of {sorted(ALLOWED_MEDIA_KINDS)}")
     original = (file.filename or "upload.bin").strip().replace("/", "_").replace("\\", "_")
-    suffix = Path(original).suffix.lower()
-    stored_name = f"{uuid.uuid4().hex}{suffix}"
+    original_ct = (file.content_type or "").lower()
+    content_bytes = await file.read()
+    if len(content_bytes) > 50 * 1024 * 1024:  # 50 MB cap
+        raise HTTPException(status_code=413, detail="File too large (max 50 MB)")
+
+    suffix_in = Path(original).suffix.lower()
+    # Transcode to a WhatsApp-supported format if needed (audio/video only).
+    final_bytes = content_bytes
+    final_ext = suffix_in
+    final_mime = original_ct
+    if kind == "audio":
+        final_bytes, final_ext, final_mime = _prepare_audio_for_whatsapp(content_bytes, suffix_in, original_ct)
+    elif kind == "video":
+        final_bytes, final_ext, final_mime = _prepare_video_for_whatsapp(content_bytes, suffix_in, original_ct)
+    elif kind == "image":
+        # WhatsApp supports jpeg / png only. If caller sent heic/webp/gif → convert to jpeg.
+        final_bytes, final_ext, final_mime = _prepare_image_for_whatsapp(content_bytes, suffix_in, original_ct)
+
+    stored_name = f"{uuid.uuid4().hex}{final_ext or '.bin'}"
     dest = UPLOAD_ROOT / stored_name
     try:
-        content_bytes = await file.read()
-        if len(content_bytes) > 50 * 1024 * 1024:  # 50 MB cap
-            raise HTTPException(status_code=413, detail="File too large (max 50 MB)")
-        dest.write_bytes(content_bytes)
-    except HTTPException:
-        raise
+        dest.write_bytes(final_bytes)
     except Exception as e:
         logger.exception(f"upload failed: {e}")
         raise HTTPException(status_code=500, detail="Upload failed")
-    # Build absolute URL. Prefer PUBLIC_BASE_URL env (e.g. https://crm.example.com)
-    # so it works behind proxies that strip X-Forwarded-Host. Fallback to request.base_url.
+
+    # Persist original filename mapping so downloads preserve the name.
+    await db.media_files.update_one(
+        {"stored_name": stored_name},
+        {"$set": {
+            "stored_name": stored_name,
+            "original_filename": original,
+            "mime_type": final_mime,
+            "size": len(final_bytes),
+            "kind": kind,
+            "uploaded_at": iso(now_utc()),
+            "uploaded_by": admin["id"],
+        }},
+        upsert=True,
+    )
+
     base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
     if not base:
         fwd_proto = request.headers.get("x-forwarded-proto")
         fwd_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
-        if fwd_host:
-            base = f"{fwd_proto or request.url.scheme}://{fwd_host}"
-        else:
-            base = str(request.base_url).rstrip("/")
+        base = f"{fwd_proto or request.url.scheme}://{fwd_host}" if fwd_host else str(request.base_url).rstrip("/")
     public_url = f"{base}/api/media/{stored_name}"
     return {
         "url": public_url,
         "filename": original,
         "stored_name": stored_name,
-        "size": len(content_bytes),
+        "size": len(final_bytes),
+        "original_size": len(content_bytes),
         "kind": kind,
+        "mime_type": final_mime,
+        "transcoded": len(content_bytes) != len(final_bytes) or (suffix_in != final_ext),
     }
 
 
+def _run_ffmpeg(args: List[str], input_bytes: bytes, timeout: int = 60) -> Optional[bytes]:
+    """Invoke ffmpeg with stdin input bytes, return stdout bytes or None on error."""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args],
+            input=input_bytes, capture_output=True, timeout=timeout, check=False,
+        )
+        if proc.returncode != 0:
+            logger.warning(f"ffmpeg failed (rc={proc.returncode}): {proc.stderr[:500].decode('utf-8', 'ignore')}")
+            return None
+        return proc.stdout
+    except FileNotFoundError:
+        logger.warning("ffmpeg not installed")
+        return None
+    except Exception as e:
+        logger.warning(f"ffmpeg error: {e}")
+        return None
+
+
+_WA_AUDIO_OK_MIMES = {"audio/aac", "audio/mp4", "audio/mpeg", "audio/amr", "audio/ogg"}
+_WA_AUDIO_OK_EXTS = {".aac", ".m4a", ".mp3", ".amr", ".ogg"}
+_WA_VIDEO_OK_MIMES = {"video/mp4", "video/3gpp"}
+_WA_VIDEO_OK_EXTS = {".mp4", ".3gp"}
+
+
+def _prepare_audio_for_whatsapp(raw: bytes, suffix: str, mime: str) -> tuple:
+    """Return (bytes, ext, mime) — transcoded to ogg/opus if input isn't supported.
+    Browsers' MediaRecorder default is audio/webm;codecs=opus, which WhatsApp rejects.
+    Since the opus payload is already there, we remux the container without re-encoding."""
+    mime_l = (mime or "").split(";", 1)[0].lower().strip()
+    if mime_l in _WA_AUDIO_OK_MIMES or suffix in _WA_AUDIO_OK_EXTS:
+        return raw, suffix or ".ogg", mime_l or "audio/ogg"
+    # Common input: audio/webm;codecs=opus (.webm) → remux to ogg/opus
+    # Use ffmpeg to transcode (copy opus stream into ogg, re-encode to opus if necessary)
+    out = _run_ffmpeg(["-i", "pipe:0", "-vn", "-c:a", "libopus", "-b:a", "64k", "-f", "ogg", "pipe:1"], raw)
+    if out:
+        return out, ".ogg", "audio/ogg"
+    # Fallback: encode to mp3 which WA also accepts
+    out = _run_ffmpeg(["-i", "pipe:0", "-vn", "-c:a", "libmp3lame", "-b:a", "96k", "-f", "mp3", "pipe:1"], raw)
+    if out:
+        return out, ".mp3", "audio/mpeg"
+    # Last resort: hand the file back untouched (will likely fail on Meta side)
+    logger.warning("audio transcode failed — returning original bytes")
+    return raw, suffix or ".bin", mime_l or "application/octet-stream"
+
+
+def _prepare_video_for_whatsapp(raw: bytes, suffix: str, mime: str) -> tuple:
+    """Return (bytes, ext, mime) — transcoded to H.264/AAC MP4 if input is not mp4/3gp.
+    MP4 mux needs seekable output so we transcode via temp files (input + output)."""
+    mime_l = (mime or "").split(";", 1)[0].lower().strip()
+    if mime_l in _WA_VIDEO_OK_MIMES or suffix in _WA_VIDEO_OK_EXTS:
+        return raw, suffix or ".mp4", mime_l or "video/mp4"
+    import tempfile, subprocess
+    with tempfile.NamedTemporaryFile(suffix=suffix or ".bin", delete=False) as tf_in:
+        tf_in.write(raw)
+        in_path = tf_in.name
+    out_path = in_path + ".out.mp4"
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-i", in_path,
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-c:a", "aac", "-b:a", "128k",
+             "-movflags", "+faststart",
+             out_path],
+            capture_output=True, timeout=300, check=False,
+        )
+        if proc.returncode == 0 and Path(out_path).exists():
+            data = Path(out_path).read_bytes()
+            return data, ".mp4", "video/mp4"
+        logger.warning(f"video transcode failed rc={proc.returncode}: {proc.stderr[:400].decode('utf-8','ignore')}")
+    except FileNotFoundError:
+        logger.warning("ffmpeg not installed — returning original video")
+    except Exception as e:
+        logger.warning(f"video transcode error: {e}")
+    finally:
+        for p in (in_path, out_path):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+    return raw, suffix or ".bin", mime_l or "application/octet-stream"
+
+
+def _prepare_image_for_whatsapp(raw: bytes, suffix: str, mime: str) -> tuple:
+    """WhatsApp accepts image/jpeg and image/png only. Convert others (webp/gif/heic) → jpeg."""
+    mime_l = (mime or "").split(";", 1)[0].lower().strip()
+    if mime_l in ("image/jpeg", "image/png") or suffix in (".jpg", ".jpeg", ".png"):
+        return raw, suffix or ".jpg", mime_l or "image/jpeg"
+    # Transcode to jpeg via ffmpeg
+    out = _run_ffmpeg(["-i", "pipe:0", "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "3", "pipe:1"], raw)
+    if out:
+        return out, ".jpg", "image/jpeg"
+    return raw, suffix or ".bin", mime_l or "application/octet-stream"
+
+
 @api.get("/media/{stored_name}")
-async def serve_flow_media(stored_name: str):
-    """Serve files previously uploaded by admins. Public so WhatsApp can fetch them."""
+async def serve_flow_media(stored_name: str, download: bool = False):
+    """Serve files uploaded by admins or cached from WhatsApp. Public (no auth) so Meta
+    can fetch on send and so `<img>` tags work from the chat UI. Pass `?download=1` to
+    force `Content-Disposition: attachment` with the original filename preserved."""
     safe = stored_name.replace("..", "").replace("/", "").replace("\\", "")
     path = UPLOAD_ROOT / safe
     if not path.exists():
         raise HTTPException(status_code=404, detail="Not found")
+    meta = await db.media_files.find_one({"stored_name": safe}, {"_id": 0})
     from fastapi.responses import FileResponse
-    return FileResponse(str(path))
+    filename = (meta or {}).get("original_filename") or safe
+    mime_type = (meta or {}).get("mime_type")
+    headers = {}
+    if download:
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    else:
+        # Inline preview by default
+        headers["Content-Disposition"] = f'inline; filename="{filename}"'
+    headers["Cache-Control"] = "public, max-age=86400"
+    return FileResponse(str(path), media_type=mime_type, headers=headers, filename=filename)
 
 
 @api.delete("/chatflows/{flow_id}/nodes/{node_id}")
@@ -3554,6 +3707,12 @@ async def webhook_whatsapp(request: Request):
                                 if dl and dl.get("url"):
                                     msg_doc["media_url"] = dl["url"]
                                     msg_doc["media_stored_name"] = dl.get("stored_name")
+                                    # If WhatsApp gave us a real filename for documents, overwrite the default
+                                    if inbound_filename and dl.get("stored_name"):
+                                        await db.media_files.update_one(
+                                            {"stored_name": dl["stored_name"]},
+                                            {"$set": {"original_filename": inbound_filename}},
+                                        )
                             except Exception as _e:
                                 logger.warning(f"Inbound media cache failed: {_e}")
                     # Structured location / contacts payload

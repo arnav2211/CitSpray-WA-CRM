@@ -22,6 +22,20 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 10 (Feb 2026) — Media transcoding + preview/download (prod-ready media pipeline)
+- **Root cause fix for "audio/video not playable"** — Browser `MediaRecorder` outputs `audio/webm;codecs=opus` which WhatsApp does NOT accept (spec allows: audio/ogg-opus, audio/aac, audio/mp4 m4a, audio/mpeg mp3, audio/amr). Similarly quicktime (.mov) video isn't in WA's whitelist (only mp4 / 3gp). Meta was happily accepting our sends (returning wamids) but the recipient's device could not decode → appeared as "not sent".
+- **Backend transcoder (ffmpeg)** — `POST /api/chatflows/upload-media` now invokes ffmpeg when needed: `_prepare_audio_for_whatsapp` remuxes opus-in-webm to opus-in-ogg (preferred, no quality loss) with a libmp3lame fallback; `_prepare_video_for_whatsapp` transcodes any non-mp4/3gp to H.264/AAC mp4 with `+faststart` (uses temp input+output files because MP4 mux needs seekable output); `_prepare_image_for_whatsapp` converts webp/heic/gif to jpeg. Response now includes `mime_type` and `transcoded: bool`.
+- **`media_files` collection** — every uploaded/downloaded file gets a DB row (stored_name, original_filename, mime_type, size, kind, uploaded_by, uploaded_at). Inbound webhook media also creates rows and overrides original_filename when Meta provides one for documents.
+- **`GET /api/media/{stored_name}`** — enhanced to: (a) set accurate `Content-Type` from stored mime, (b) set `Content-Disposition: inline` for previews (default), (c) `?download=1` switches to `attachment; filename="original.ext"` so browser "Save As" preserves the original filename, (d) `Cache-Control: public, max-age=86400` for CDN caching.
+- **Frontend (`Chat.jsx`)**:
+  - `<Lightbox />` component (mounted globally) — full-screen image preview triggered by clicking any image bubble, with a top-right Download button + X (or Esc) to close.
+  - Every media bubble (image/video/document/audio) now has a `DownloadSimple` icon that downloads the file with the original filename via `?download=1`.
+  - Image bubbles render with `cursor-zoom-in` and open the lightbox instead of a new tab.
+  - Video/audio still use native HTML5 `<video>`/`<audio>` controls (play/pause/seek/volume all built-in).
+- **File size validation** — client 50 MB hard-block + server 50 MB hard-block with HTTP 413.
+- **Verified against live Meta** — `+917447717744` received both transcoded mp4 video (30 KB mov → 42 KB mp4) and ogg/opus voice note (19 KB webm → 18 KB ogg) with real wamids.
+- **Tested**: 39/39 iter7+iter8 regression green.
+
 ### Iteration 9 (Feb 2026) — Full rich-message support (audio, location, contact, resend)
 - **Backend helpers** — new `wa_send_audio`, `wa_send_location`, `wa_send_contacts` (all routed through `_wa_send_typed` so they automatically get `context.message_id` reply support, 24h-window gating, mock-mode fallback, status tracking).
 - **New composer endpoints** (all admin+exec with lead-assignment RBAC, 24h window enforcement, reply_to_message_id support, status+error persisted):

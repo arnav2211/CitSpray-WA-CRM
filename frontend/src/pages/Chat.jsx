@@ -7,6 +7,7 @@ import {
   MagnifyingGlass, PaperPlaneRight, ChatCircleDots, Phone, ArrowsClockwise, Plus, ArrowLeft,
   Funnel, Lightning, ArrowsLeftRight, X, Tag, NotePencil, Info,
   Paperclip, Image as ImageIcon, VideoCamera, FileText, Microphone, MapPin, IdentificationCard, Stop,
+  DownloadSimple,
 } from "@phosphor-icons/react";
 import { fmtIST, fmtISTTime } from "@/lib/format";
 import { StatusBadge, SourceBadge } from "@/components/Badges";
@@ -96,6 +97,7 @@ export default function Chat() {
 
   return (
     <div className="h-full flex bg-[#EFEAE2]" data-testid="chat-page">
+      <Lightbox />
       {/* LEFT SIDEBAR */}
       <aside
         className={`${activeId ? "hidden md:flex" : "flex"} w-full md:w-[380px] shrink-0 flex-col bg-white border-r border-gray-200`}
@@ -965,39 +967,56 @@ function renderMedia(m) {
   const type = m.media_type;
   if (!type) return null;
   const url = m.media_url;  // outbound (admin-provided/uploaded public URL)
+  const downloadUrl = url ? `${url}${url.includes("?") ? "&" : "?"}download=1` : null;
+  const filename = m.filename || (url ? url.split("/").pop() : "media");
   if (type === "image" && url) {
     return (
-      <a href={url} target="_blank" rel="noreferrer" data-testid={`msg-media-image-${m.id}`}>
-        <img src={url} alt="" className="block w-full max-h-[320px] object-cover bg-gray-100" loading="lazy" />
-      </a>
+      <div className="relative group/media" data-testid={`msg-media-image-${m.id}`}>
+        <a href={url} target="_blank" rel="noreferrer" onClick={(e) => { e.preventDefault(); window.dispatchEvent(new CustomEvent("lightbox:open", { detail: { url, filename, downloadUrl, kind: "image" } })); }}>
+          <img src={url} alt={filename} className="block w-full max-h-[320px] object-cover bg-gray-100 cursor-zoom-in" loading="lazy" />
+        </a>
+        <a href={downloadUrl} download={filename} className="absolute top-1.5 right-1.5 bg-black/60 hover:bg-black/80 text-white p-1.5 opacity-0 group-hover/media:opacity-100 transition-opacity" title={`Download ${filename}`} data-testid={`download-${m.id}`}>
+          <DownloadSimple size={14} weight="bold" />
+        </a>
+      </div>
     );
   }
   if (type === "video" && url) {
     return (
-      <video controls preload="metadata" className="block w-full max-h-[320px] bg-black" data-testid={`msg-media-video-${m.id}`}>
-        <source src={url} />
-      </video>
+      <div className="relative group/media" data-testid={`msg-media-video-${m.id}`}>
+        <video controls preload="metadata" className="block w-full max-h-[320px] bg-black">
+          <source src={url} />
+        </video>
+        <a href={downloadUrl} download={filename} className="absolute top-1.5 right-1.5 bg-black/60 hover:bg-black/80 text-white p-1.5 opacity-0 group-hover/media:opacity-100 transition-opacity" title={`Download ${filename}`} data-testid={`download-${m.id}`}>
+          <DownloadSimple size={14} weight="bold" />
+        </a>
+      </div>
     );
   }
   if (type === "document" && url) {
-    const name = m.filename || url.split("/").pop();
     return (
-      <a href={url} target="_blank" rel="noreferrer"
-        className="flex items-center gap-2 bg-white/60 px-3 py-2 border border-gray-200 text-gray-800 hover:bg-white"
-        data-testid={`msg-media-document-${m.id}`}>
+      <div className="flex items-center gap-2 bg-white/60 px-3 py-2 border border-gray-200 text-gray-800" data-testid={`msg-media-document-${m.id}`}>
         <span className="text-lg">📄</span>
-        <div className="min-w-0">
-          <div className="text-xs font-semibold truncate">{name}</div>
-          <div className="text-[10px] text-gray-500 uppercase tracking-widest">Document</div>
-        </div>
-      </a>
+        <a href={url} target="_blank" rel="noreferrer" className="min-w-0 flex-1 hover:underline">
+          <div className="text-xs font-semibold truncate">{filename}</div>
+          <div className="text-[10px] text-gray-500 uppercase tracking-widest">Document · Click to preview</div>
+        </a>
+        <a href={downloadUrl} download={filename} className="text-gray-500 hover:text-[#25D366] p-1" title={`Download ${filename}`} data-testid={`download-${m.id}`}>
+          <DownloadSimple size={14} weight="bold" />
+        </a>
+      </div>
     );
   }
   if (type === "audio" && url) {
     return (
-      <audio controls preload="metadata" className="block w-full min-w-[220px]" data-testid={`msg-media-audio-${m.id}`}>
-        <source src={url} />
-      </audio>
+      <div className="flex items-center gap-2" data-testid={`msg-media-audio-${m.id}`}>
+        <audio controls preload="metadata" className="block flex-1 min-w-[220px]">
+          <source src={url} />
+        </audio>
+        <a href={downloadUrl} download={filename} className="text-gray-500 hover:text-[#25D366] p-1" title={`Download ${filename}`} data-testid={`download-${m.id}`}>
+          <DownloadSimple size={14} weight="bold" />
+        </a>
+      </div>
     );
   }
   // Inbound without a downloaded URL — show a lightweight placeholder using media_id
@@ -1011,6 +1030,39 @@ function renderMedia(m) {
     );
   }
   return null;
+}
+
+function Lightbox() {
+  const [state, setState] = useState(null);  // { url, filename, downloadUrl, kind }
+  useEffect(() => {
+    const onOpen = (e) => setState(e.detail);
+    const onKey = (e) => { if (e.key === "Escape") setState(null); };
+    window.addEventListener("lightbox:open", onOpen);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("lightbox:open", onOpen);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, []);
+  if (!state) return null;
+  return (
+    <div className="fixed inset-0 z-50 bg-black/95 flex items-center justify-center p-4" onClick={() => setState(null)} data-testid="lightbox">
+      <div className="absolute top-4 right-4 flex items-center gap-2 z-10">
+        <a href={state.downloadUrl} download={state.filename} onClick={(e) => e.stopPropagation()}
+          className="bg-white/10 hover:bg-white/20 text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1.5"
+          data-testid="lightbox-download">
+          <DownloadSimple size={14} weight="bold" /> Download
+        </a>
+        <button onClick={() => setState(null)} className="bg-white/10 hover:bg-white/20 text-white p-2" data-testid="lightbox-close">
+          <X size={18} weight="bold" />
+        </button>
+      </div>
+      <div className="max-w-[90vw] max-h-[90vh]" onClick={(e) => e.stopPropagation()}>
+        <img src={state.url} alt={state.filename} className="max-w-full max-h-[90vh] object-contain" />
+        <div className="text-center text-white text-xs mt-2 opacity-70">{state.filename}</div>
+      </div>
+    </div>
+  );
 }
 
 function renderLocation(m) {
