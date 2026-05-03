@@ -2381,6 +2381,82 @@ async def _wa_send_typed(to_phone: str, payload_extra: Dict[str, Any]) -> Dict[s
         return {"error": str(e), "status": "failed"}
 
 
+# ────────────── Inbound media download (Meta) ──────────────
+_WA_MIME_EXT = {
+    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+    "image/gif": ".gif", "video/mp4": ".mp4", "video/3gpp": ".3gp", "video/quicktime": ".mov",
+    "application/pdf": ".pdf", "audio/ogg": ".ogg", "audio/mpeg": ".mp3",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/msword": ".doc", "text/plain": ".txt",
+}
+
+
+def _ext_for_mime(mime: Optional[str], fallback: str = "") -> str:
+    if not mime:
+        return fallback or ".bin"
+    mime = mime.split(";", 1)[0].strip().lower()
+    if mime in _WA_MIME_EXT:
+        return _WA_MIME_EXT[mime]
+    import mimetypes
+    ext = mimetypes.guess_extension(mime)
+    return ext or (fallback or ".bin")
+
+
+async def _download_wa_media(media_id: str, mime_hint: Optional[str] = None, request: Optional[Request] = None) -> Optional[Dict[str, Any]]:
+    """Fetch an inbound WhatsApp media blob from Meta and store it locally so the
+    chat UI can render it. Returns {stored_name, url, mime} on success, None on failure.
+    Two-step flow per Meta docs: (1) GET /{media_id} → {"url": ...}, (2) GET that URL
+    with the same Bearer token → bytes."""
+    cfg = await get_wa_config()
+    if not cfg.get("enabled"):
+        return None
+    token = cfg.get("access_token")
+    api_version = cfg.get("api_version")
+    if not token or not media_id:
+        return None
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r1 = await client.get(f"{WA_BASE_URL}/{api_version}/{media_id}", headers=headers)
+            if r1.status_code >= 400:
+                logger.warning(f"WA media lookup failed {r1.status_code}: {r1.text[:200]}")
+                return None
+            meta = r1.json() or {}
+            download_url = meta.get("url")
+            mime_type = meta.get("mime_type") or mime_hint
+            if not download_url:
+                return None
+            r2 = await client.get(download_url, headers=headers)
+            if r2.status_code >= 400:
+                logger.warning(f"WA media blob fetch failed {r2.status_code}")
+                return None
+            content_bytes = r2.content
+    except Exception as e:
+        logger.warning(f"WA media download error: {e}")
+        return None
+    if len(content_bytes) > 100 * 1024 * 1024:
+        logger.warning("WA media too large — skipping local cache")
+        return None
+    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    ext = _ext_for_mime(mime_type)
+    stored_name = f"{uuid.uuid4().hex}{ext}"
+    (UPLOAD_ROOT / stored_name).write_bytes(content_bytes)
+    # Build absolute URL
+    base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+    if not base and request is not None:
+        fwd_proto = request.headers.get("x-forwarded-proto")
+        fwd_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        if fwd_host:
+            base = f"{fwd_proto or request.url.scheme}://{fwd_host}"
+        else:
+            base = str(request.base_url).rstrip("/")
+    public_url = f"{base}/api/media/{stored_name}" if base else f"/api/media/{stored_name}"
+    return {"stored_name": stored_name, "url": public_url, "mime": mime_type, "size": len(content_bytes)}
+
+
+
+
 def _build_interactive_payload(node: dict, options: List[dict]) -> Dict[str, Any]:
     content = node.get("message_content") or {}
     body_text = (content.get("body") or "").strip()
@@ -2572,6 +2648,194 @@ async def handle_flow_inbound(from_phone: str, interactive: Dict[str, Any], lead
         return await send_flow_message(from_phone, option["next_node_id"], lead=lead)
     await db.chat_sessions.delete_one({"phone_key": phone_key})
     return {"status": "flow_ended"}
+
+
+# ────────────── Flow templates ──────────────
+# Each template is a self-contained blueprint: nodes[] + per-node options[] referenced
+# by local `ref` (e.g. "greet") so we don't need to know DB uuids up front. At import
+# time we materialise real uuids and resolve every `next_ref` → `next_node_id`.
+FLOW_TEMPLATES: List[Dict[str, Any]] = [
+    {
+        "id": "lead_qualification",
+        "name": "Lead Qualification",
+        "description": "Greet new enquirers, ask if they are ready to buy or just enquiring, and route to a human handoff.",
+        "category": "Sales",
+        "nodes": [
+            {
+                "ref": "greet", "name": "Greet", "is_start_node": True,
+                "message_type": "button", "x": 80, "y": 80,
+                "message_content": {"body": "Hi 👋 Welcome! Are you looking to buy or just enquiring?"},
+                "options": [
+                    {"option_id": "buy", "label": "Ready to buy", "next_ref": "handoff"},
+                    {"option_id": "enq", "label": "Just enquiring", "next_ref": "enquiry_ack"},
+                ],
+            },
+            {
+                "ref": "handoff", "name": "Buying handoff",
+                "message_type": "text", "x": 480, "y": 20,
+                "message_content": {"body": "Great — a sales executive will call you within 15 minutes."},
+                "options": [],
+            },
+            {
+                "ref": "enquiry_ack", "name": "Enquiry acknowledged",
+                "message_type": "text", "x": 480, "y": 200,
+                "message_content": {"body": "Thanks for reaching out! Our team will share details shortly."},
+                "options": [],
+            },
+        ],
+    },
+    {
+        "id": "after_hours",
+        "name": "After-hours autoresponder",
+        "description": "A single friendly note sent automatically outside business hours.",
+        "category": "Support",
+        "nodes": [
+            {
+                "ref": "autoresp", "name": "After hours", "is_start_node": True,
+                "message_type": "text", "x": 80, "y": 80,
+                "message_content": {"body": "Thanks for your message! Our team is offline right now. We'll get back to you first thing tomorrow (9 AM IST)."},
+                "options": [],
+            },
+        ],
+    },
+    {
+        "id": "feedback_survey",
+        "name": "Feedback Survey (CSAT)",
+        "description": "Ask a 3-option CSAT after service, thank the user, and log the score.",
+        "category": "Support",
+        "nodes": [
+            {
+                "ref": "ask", "name": "Ask CSAT", "is_start_node": True,
+                "message_type": "button", "x": 80, "y": 80,
+                "message_content": {"body": "How was your experience with us today?"},
+                "options": [
+                    {"option_id": "good", "label": "Great", "next_ref": "thanks_good"},
+                    {"option_id": "ok", "label": "Okay", "next_ref": "thanks_ok"},
+                    {"option_id": "bad", "label": "Poor", "next_ref": "thanks_bad"},
+                ],
+            },
+            {"ref": "thanks_good", "name": "Thanks (Great)", "message_type": "text", "x": 480, "y": -20,
+             "message_content": {"body": "Thanks - glad you had a great experience!"}, "options": []},
+            {"ref": "thanks_ok", "name": "Thanks (Okay)", "message_type": "text", "x": 480, "y": 160,
+             "message_content": {"body": "Thanks for the feedback - we'll keep improving."}, "options": []},
+            {"ref": "thanks_bad", "name": "Thanks (Poor)", "message_type": "text", "x": 480, "y": 340,
+             "message_content": {"body": "Sorry we fell short. A team lead will reach out to make it right."}, "options": []},
+        ],
+    },
+    {
+        "id": "product_catalog",
+        "name": "Product Catalog (List)",
+        "description": "Show a list of product categories and route to each category's details.",
+        "category": "Sales",
+        "nodes": [
+            {
+                "ref": "menu", "name": "Catalog menu", "is_start_node": True,
+                "message_type": "list", "x": 80, "y": 80,
+                "message_content": {
+                    "body": "Pick a category to see our bestsellers:",
+                    "button_text": "Categories",
+                },
+                "options": [
+                    {"option_id": "oils", "label": "Essential Oils", "section_title": "Wellness", "next_ref": "oils_info"},
+                    {"option_id": "fragrance", "label": "Fragrance Oils", "section_title": "Wellness", "next_ref": "fragrance_info"},
+                    {"option_id": "talk", "label": "Talk to an expert", "section_title": "Support", "next_ref": "expert_info"},
+                ],
+            },
+            {"ref": "oils_info", "name": "Oils info", "message_type": "text", "x": 480, "y": -20,
+             "message_content": {"body": "Our essential oils - lavender, tea tree, eucalyptus - starting at Rs.249."}, "options": []},
+            {"ref": "fragrance_info", "name": "Fragrance info", "message_type": "text", "x": 480, "y": 160,
+             "message_content": {"body": "Our fragrance oils - jasmine, rose, sandalwood - starting at Rs.199."}, "options": []},
+            {"ref": "expert_info", "name": "Expert handoff", "message_type": "text", "x": 480, "y": 340,
+             "message_content": {"body": "A product expert will call you within the hour."}, "options": []},
+        ],
+    },
+]
+
+
+@api.get("/chatflows/templates")
+async def list_chatflow_templates(admin: dict = Depends(require_admin)):
+    """Return the built-in template gallery so the admin UI can render it."""
+    return [
+        {
+            "id": t["id"], "name": t["name"],
+            "description": t.get("description", ""),
+            "category": t.get("category", ""),
+            "node_count": len(t["nodes"]),
+            "types": sorted({n["message_type"] for n in t["nodes"]}),
+        }
+        for t in FLOW_TEMPLATES
+    ]
+
+
+class ImportTemplateInput(BaseModel):
+    template_id: str
+    name: Optional[str] = None
+    is_active: bool = False
+
+
+@api.post("/chatflows/import-template")
+async def import_chatflow_template(body: ImportTemplateInput, admin: dict = Depends(require_admin)):
+    """Materialise a built-in template into real DB docs (flow + nodes + options)."""
+    template = next((t for t in FLOW_TEMPLATES if t["id"] == body.template_id), None)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    if body.is_active:
+        await db.chat_flows.update_many({"is_active": True}, {"$set": {"is_active": False}})
+    flow_id = str(uuid.uuid4())
+    await db.chat_flows.insert_one({
+        "id": flow_id,
+        "name": body.name or template["name"],
+        "description": template.get("description", ""),
+        "is_active": body.is_active,
+        "source_template": template["id"],
+        "created_at": iso(now_utc()),
+        "updated_at": iso(now_utc()),
+    })
+    ref_to_id: Dict[str, str] = {}
+    for n in template["nodes"]:
+        nid = str(uuid.uuid4())
+        ref_to_id[n["ref"]] = nid
+        await db.chat_nodes.insert_one({
+            "id": nid,
+            "flow_id": flow_id,
+            "name": n["name"],
+            "message_type": n["message_type"],
+            "message_content": n.get("message_content", {}),
+            "is_start_node": bool(n.get("is_start_node")),
+            "x": float(n.get("x", 80)),
+            "y": float(n.get("y", 80)),
+            "created_at": iso(now_utc()),
+        })
+    for n in template["nodes"]:
+        node_id = ref_to_id[n["ref"]]
+        opts = n.get("options") or []
+        if not opts:
+            continue
+        docs = []
+        for i, o in enumerate(opts):
+            next_ref = o.get("next_ref")
+            docs.append({
+                "id": str(uuid.uuid4()),
+                "node_id": node_id,
+                "option_id": o["option_id"],
+                "label": o["label"],
+                "next_node_id": ref_to_id.get(next_ref) if next_ref else None,
+                "position": i,
+                "section_title": o.get("section_title"),
+                "description": o.get("description"),
+            })
+        await db.chat_options.insert_many([d.copy() for d in docs])
+    nodes = await db.chat_nodes.find({"flow_id": flow_id}, {"_id": 0}).sort("is_start_node", -1).to_list(500)
+    options = await db.chat_options.find({"node_id": {"$in": [n["id"] for n in nodes]}}, {"_id": 0}).sort("position", 1).to_list(2000)
+    opts_by_node: Dict[str, List[Dict[str, Any]]] = {}
+    for o in options:
+        opts_by_node.setdefault(o["node_id"], []).append(o)
+    for n in nodes:
+        n["options"] = opts_by_node.get(n["id"], [])
+    flow_doc = await db.chat_flows.find_one({"id": flow_id}, {"_id": 0})
+    return {**flow_doc, "nodes": nodes}
+
+
 
 
 @api.get("/chatflows")
@@ -2859,6 +3123,7 @@ async def webhook_whatsapp(request: Request):
                     inbound_media_id = None
                     inbound_caption = None
                     inbound_filename = None
+                    inbound_mime = None
                     if msg_type == "text":
                         body_text = ((m.get("text") or {}).get("body")) or ""
                     elif msg_type == "image":
@@ -2867,6 +3132,7 @@ async def webhook_whatsapp(request: Request):
                         inbound_media_type = "image"
                         inbound_media_id = img.get("id")
                         inbound_caption = img.get("caption")
+                        inbound_mime = img.get("mime_type")
                     elif msg_type == "document":
                         doc = m.get("document") or {}
                         body_text = f"[document: {doc.get('filename','file')}] {doc.get('caption','')}".strip()
@@ -2874,6 +3140,7 @@ async def webhook_whatsapp(request: Request):
                         inbound_media_id = doc.get("id")
                         inbound_caption = doc.get("caption")
                         inbound_filename = doc.get("filename")
+                        inbound_mime = doc.get("mime_type")
                     elif msg_type == "audio":
                         body_text = "[audio message]"
                     elif msg_type == "video":
@@ -2882,6 +3149,7 @@ async def webhook_whatsapp(request: Request):
                         inbound_media_type = "video"
                         inbound_media_id = vid.get("id")
                         inbound_caption = vid.get("caption")
+                        inbound_mime = vid.get("mime_type")
                     elif msg_type == "location":
                         loc = m.get("location") or {}
                         body_text = f"[location: {loc.get('latitude')},{loc.get('longitude')}]"
@@ -2936,6 +3204,18 @@ async def webhook_whatsapp(request: Request):
                             msg_doc["caption"] = inbound_caption
                         if inbound_filename:
                             msg_doc["filename"] = inbound_filename
+                        if inbound_mime:
+                            msg_doc["mime_type"] = inbound_mime
+                        # Download the blob from Meta and re-serve it from /api/media
+                        # so the chat UI can render the actual image/video/document.
+                        if inbound_media_id:
+                            try:
+                                dl = await _download_wa_media(inbound_media_id, mime_hint=inbound_mime, request=request)
+                                if dl and dl.get("url"):
+                                    msg_doc["media_url"] = dl["url"]
+                                    msg_doc["media_stored_name"] = dl.get("stored_name")
+                            except Exception as _e:
+                                logger.warning(f"Inbound media cache failed: {_e}")
                     await db.messages.insert_one(msg_doc.copy())
                     await db.leads.update_one(
                         {"id": lead["id"]},

@@ -109,6 +109,7 @@ export default function ChatFlows() {
   const [flow, setFlow] = useState(null);
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
+  const [showTemplates, setShowTemplates] = useState(false);
 
   const loadFlows = async () => {
     try {
@@ -156,9 +157,14 @@ export default function ChatFlows() {
             customer button taps.
           </p>
         </div>
-        <button onClick={() => setCreating(true)} className="bg-[#002FA7] hover:bg-[#002288] text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1" data-testid="new-flow-btn">
-          <Plus size={12} weight="bold" /> New Flow
-        </button>
+        <div className="flex gap-2">
+          <button onClick={() => setShowTemplates(true)} className="border border-gray-900 hover:bg-gray-900 hover:text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1" data-testid="browse-templates-btn">
+            <SquaresFour size={12} weight="bold" /> Templates
+          </button>
+          <button onClick={() => setCreating(true)} className="bg-[#002FA7] hover:bg-[#002288] text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1" data-testid="new-flow-btn">
+            <Plus size={12} weight="bold" /> New Flow
+          </button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-[240px_1fr] gap-4">
@@ -207,6 +213,87 @@ export default function ChatFlows() {
           </form>
         </div>
       )}
+
+      {showTemplates && (
+        <TemplatesGallery
+          onClose={() => setShowTemplates(false)}
+          onImported={async (newFlow) => {
+            setShowTemplates(false);
+            await loadFlows();
+            setSelectedFlowId(newFlow.id);
+            toast.success(`Imported "${newFlow.name}"`);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ────────────────────── Templates gallery ──────────────────────
+
+function TemplatesGallery({ onClose, onImported }) {
+  const [items, setItems] = useState(null);
+  const [importing, setImporting] = useState(null);
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data } = await api.get("/chatflows/templates");
+        setItems(data);
+      } catch (e) { toast.error(errMsg(e)); setItems([]); }
+    })();
+  }, []);
+  const doImport = async (tid) => {
+    setImporting(tid);
+    try {
+      const { data } = await api.post("/chatflows/import-template", { template_id: tid, is_active: false });
+      onImported(data);
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setImporting(null); }
+  };
+  return (
+    <div className="fixed inset-0 z-40 bg-black/40 flex items-center justify-center p-4" onClick={onClose} data-testid="templates-gallery-modal">
+      <div onClick={(e) => e.stopPropagation()} className="w-full max-w-4xl max-h-[90vh] overflow-y-auto bg-white border border-gray-900 p-6 space-y-4">
+        <div className="flex items-start justify-between">
+          <div>
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Chatbot</div>
+            <h3 className="font-chivo font-black text-2xl">Start from a template</h3>
+            <p className="text-xs text-gray-500 mt-1 max-w-xl">
+              Pick a ready-made conversation flow, clone it into your workspace, then
+              tweak the copy or connect more nodes on the canvas.
+            </p>
+          </div>
+          <button onClick={onClose} className="text-gray-500 hover:text-gray-900 p-1" data-testid="close-templates-btn"><X size={16} /></button>
+        </div>
+        {items === null && <div className="py-12 text-center text-xs uppercase tracking-widest text-gray-400">Loading…</div>}
+        {items && items.length === 0 && <div className="py-12 text-center text-xs uppercase tracking-widest text-gray-400">No templates available</div>}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {(items || []).map((t) => (
+            <div key={t.id} className="border border-gray-200 p-4 hover:border-gray-900 transition-colors" data-testid={`template-card-${t.id}`}>
+              <div className="flex items-center justify-between gap-2">
+                <div className="font-chivo font-black text-lg truncate">{t.name}</div>
+                {t.category && <span className="text-[9px] uppercase tracking-widest text-[#002FA7] font-bold bg-[#F0F4FF] px-1.5 py-0.5">{t.category}</span>}
+              </div>
+              <p className="text-xs text-gray-600 mt-1.5 leading-relaxed">{t.description}</p>
+              <div className="flex items-center gap-1.5 mt-3 flex-wrap">
+                <span className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">{t.node_count} node{t.node_count === 1 ? "" : "s"}</span>
+                {(t.types || []).map((ty) => {
+                  const meta = typeMeta(ty); const Icon = meta.icon;
+                  return (
+                    <span key={ty} className="text-[9px] uppercase tracking-widest font-bold flex items-center gap-1 border border-gray-200 px-1.5 py-0.5" style={{ color: meta.color }}>
+                      <Icon size={10} weight="bold" /> {ty}
+                    </span>
+                  );
+                })}
+              </div>
+              <button onClick={() => doImport(t.id)} disabled={importing === t.id}
+                className="mt-3 w-full bg-[#002FA7] hover:bg-[#002288] text-white py-2 text-[10px] uppercase tracking-widest font-bold flex items-center justify-center gap-1 disabled:opacity-50"
+                data-testid={`import-template-${t.id}`}>
+                {importing === t.id ? "Importing…" : (<><Plus size={11} weight="bold" /> Use this template</>)}
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

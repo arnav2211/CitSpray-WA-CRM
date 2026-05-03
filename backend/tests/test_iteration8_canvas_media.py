@@ -126,11 +126,13 @@ class TestUploadAndServeMedia:
                           files=files, data={"kind": "image"}, timeout=30)
         assert r.status_code == 200, r.text
         data = r.json()
-        assert data["url"].startswith("/api/media/")
+        # Upload must return an ABSOLUTE HTTPS URL so Meta can fetch the media.
+        assert data["url"].startswith("http"), f"expected absolute URL, got {data['url']}"
+        assert "/api/media/" in data["url"]
         assert data["filename"] == "hello.png"
         assert data["size"] == len(png_bytes)
-        # Fetch it
-        r2 = requests.get(BASE_URL + data["url"], timeout=30)
+        # Fetch it back (absolute URL works as-is)
+        r2 = requests.get(data["url"], timeout=30)
         assert r2.status_code == 200
         assert r2.content[:8] == png_bytes[:8]
 

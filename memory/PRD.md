@@ -22,8 +22,10 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
-### Iteration 8 (Feb 2026) — Visual Canvas + Media Nodes
+### Iteration 8 (Feb 2026) — Visual Canvas + Media Nodes + Inbound download + Templates
 - **Visual Flow Designer** — `/app/frontend/src/pages/ChatFlows.jsx` fully rewritten on `@xyflow/react`. Custom `<FlowNodeCard />` with colour-banded left border per type, icon, body preview, option list, Start flag, source/target handles (one per option for button/list/carousel so edges render per-option).
+- **Inbound media download-and-serve** — `_download_wa_media(media_id, mime_hint, request)` does Meta's 2-step flow (GET `/{api_version}/{media_id}` → `{url}` → download blob with Bearer). Saves to `/app/backend/uploads/<uuid><ext>` (mime → ext map covers jpg/png/webp/mp4/pdf/…), returns absolute public URL. Webhook now attaches `media_url`, `media_stored_name`, `mime_type` to inbound image/video/document messages. Fails silently in mock mode or on 4xx.
+- **Flow Templates Gallery** — 4 built-in templates (Lead Qualification, After-hours autoresponder, Feedback Survey CSAT, Product Catalog List). `GET /api/chatflows/templates` lists them (admin only), `POST /api/chatflows/import-template {template_id, name?, is_active?}` materialises the full graph with resolved `next_node_id` refs, returns the hydrated flow. Frontend shows a new "Templates" button on `/chatflows` header → modal gallery with category badges, node count, type chips, "Use this template" CTA.
 - **Drag & Drop** — nodes drag freely; positions auto-save 600 ms after drop via `PUT /api/chatflows/{flow_id}/positions`. MiniMap + Controls + `fitView`.
 - **Connect-by-drag** — drag from an option's right-edge handle to another node creates an edge, saved via `PUT /chatflows/{flow_id}/nodes/{src}/options` (writes `next_node_id` of the matching option).
 - **Node Inspector (right-side panel)** — all fields rebuild per-selected node: name, type, body/header/footer/button_text (text/button/list), media_url/caption/filename (image/video/document), cards editor (carousel), options editor (button/list), start-node checkbox. Save does a combined node PATCH + options PUT.
