@@ -2469,7 +2469,8 @@ async def send_flow_message(to_phone: str, node_id: str, lead: Optional[dict] = 
         for card in cards:
             img_url = (card.get("image_url") or "").strip()
             cap_parts = [card.get("title") or "", card.get("subtitle") or ""]
-            cap = "\n".join([p for p in cap_parts if p]).strip() or None
+            # Preserve the caption exactly — join non-empty parts with a newline, no outer strip.
+            cap = "\n".join([p for p in cap_parts if p]) or None
             if img_url:
                 last_result = await wa_send_media(to_phone=to_phone, media_type="image", url=img_url, caption=cap)
             elif cap:

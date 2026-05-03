@@ -644,9 +644,11 @@ function NodeInspector({ flow, node, onChanged, onDelete, onClose }) {
               placeholder="https://..." className="w-full border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="node-media-url-input" />
             <MediaUploader kind={type} onUploaded={(res) => patchContent({ media_url: res.url, ...(type === "document" && res.filename && !content.filename ? { filename: res.filename } : {}) })} />
           </FieldBlock>
-          <FieldBlock label={type === "document" ? "Caption (optional)" : "Caption (optional)"}>
-            <input value={content.caption || ""} onChange={(e) => patchContent({ caption: e.target.value })}
-              className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="node-caption-input" />
+          <FieldBlock label={type === "document" ? "Caption (optional — supports line breaks, *bold*)" : "Caption (optional — supports line breaks, *bold*)"}>
+            <textarea value={content.caption || ""} onChange={(e) => patchContent({ caption: e.target.value })}
+              rows={6} className="w-full border border-gray-300 px-3 py-2 text-sm whitespace-pre-wrap font-mono" data-testid="node-caption-input"
+              placeholder={"Dear Sir/Madam,\n\nGreetings from *CitSpray* 🌿\n\n*Our Bestsellers:*\n• Essential Oils\n• Fragrance Oils"} />
+            <div className="text-[10px] text-gray-400 mt-1">Line breaks and WhatsApp markdown (*bold*, _italic_, ~strike~) are preserved.</div>
           </FieldBlock>
           {type === "document" && (
             <FieldBlock label="Filename shown to recipient">
@@ -691,8 +693,8 @@ function NodeInspector({ flow, node, onChanged, onDelete, onClose }) {
                 <MediaUploader kind="image" onUploaded={(res) => updateCard(i, { image_url: res.url })} />
                 <input placeholder="Title" value={c.title || ""} onChange={(e) => updateCard(i, { title: e.target.value })}
                   className="w-full border border-gray-300 px-2 py-1.5 text-xs" data-testid={`card-title-${i}`} />
-                <input placeholder="Subtitle" value={c.subtitle || ""} onChange={(e) => updateCard(i, { subtitle: e.target.value })}
-                  className="w-full border border-gray-300 px-2 py-1.5 text-xs" data-testid={`card-subtitle-${i}`} />
+                <textarea placeholder="Subtitle — supports line breaks & *bold*" rows={3} value={c.subtitle || ""} onChange={(e) => updateCard(i, { subtitle: e.target.value })}
+                  className="w-full border border-gray-300 px-2 py-1.5 text-xs whitespace-pre-wrap font-mono" data-testid={`card-subtitle-${i}`} />
                 <input placeholder="Button label (max 20 chars)" maxLength={20} value={c.button_label || ""} onChange={(e) => updateCard(i, { button_label: e.target.value })}
                   className="w-full border border-gray-300 px-2 py-1.5 text-xs" data-testid={`card-button-label-${i}`} />
                 <select value={(options[i] && options[i].next_node_id) || ""} onChange={(e) => updateOption(i, { next_node_id: e.target.value || null })}
