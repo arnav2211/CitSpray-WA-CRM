@@ -98,6 +98,8 @@ export default function Settings() {
 
       {hooks && <WebhooksPanel hooks={hooks} />}
 
+      <ExportersIndiaPanel onChanged={load} />
+
       <CallRoutingPanel />
 
       <form onSubmit={submit} className="border border-gray-200 bg-white" data-testid="whatsapp-settings-form">
@@ -340,3 +342,95 @@ function CallRoutingPanel() {
     </div>
   );
 }
+
+function ExportersIndiaPanel({ onChanged }) {
+  const [cfg, setCfg] = useState(null);
+  const [key, setKey] = useState("");
+  const [reveal, setReveal] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const load = async () => {
+    try {
+      const { data } = await api.get("/settings/exportersindia");
+      setCfg(data);
+      setKey("");
+    } catch (e) { toast.error(errMsg(e)); }
+  };
+  useEffect(() => { load(); }, []);
+  const copy = async (text, label) => {
+    try { await navigator.clipboard.writeText(text); toast.success(`${label} copied`); }
+    catch { toast.error("Copy failed — please copy manually"); }
+  };
+  const save = async (clear = false) => {
+    setSaving(true);
+    try {
+      await api.put("/settings/exportersindia", { api_key: clear ? "" : key.trim() });
+      toast.success(clear ? "Key cleared" : "API key saved");
+      await load();
+      onChanged?.();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setSaving(false); }
+  };
+  if (!cfg) return null;
+  return (
+    <div className="border border-gray-200 bg-white" data-testid="exportersindia-panel">
+      <div className="px-5 py-4 border-b border-gray-200">
+        <h2 className="font-chivo font-bold text-lg flex items-center gap-2"><ShieldCheck size={18} weight="bold" /> ExportersIndia API key</h2>
+        <p className="text-xs text-gray-500 mt-1">
+          Paste the API key that ExportersIndia issued for your account. Once saved, the webhook
+          only accepts payloads where the URL includes <span className="kbd">?key=…</span>.
+        </p>
+      </div>
+      <div className="p-5 space-y-4">
+        <div className="bg-gray-50 border border-gray-200 p-3 space-y-2">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Current key</div>
+          <div className="font-mono text-sm">{cfg.has_key ? cfg.api_key_masked : <span className="text-gray-400">Not set — webhook currently public</span>}</div>
+        </div>
+        <label className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">New key</div>
+          <div className="flex items-stretch gap-2">
+            <input
+              type={reveal ? "text" : "password"}
+              value={key}
+              onChange={(e) => setKey(e.target.value)}
+              placeholder="Paste API key (e.g. bDE1QTVzaGUxYUU1UlRvK0JiU0REZz09)"
+              className="flex-1 border border-gray-300 px-3 py-2 text-sm font-mono"
+              data-testid="exportersindia-api-key-input"
+            />
+            <button type="button" onClick={() => setReveal(v => !v)} className="border border-gray-300 px-3 py-2 text-gray-700 hover:bg-gray-50" title={reveal ? "Hide" : "Reveal"}>
+              {reveal ? <EyeSlash size={16} weight="bold" /> : <Eye size={16} weight="bold" />}
+            </button>
+            <button type="button" onClick={() => save(false)} disabled={!key.trim() || saving}
+              className="bg-[#002FA7] hover:bg-[#002288] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 disabled:opacity-50"
+              data-testid="exportersindia-save-key-btn">
+              <FloppyDisk size={14} weight="bold" /> {saving ? "Saving…" : "Save"}
+            </button>
+            {cfg.has_key && (
+              <button type="button" onClick={() => { if (window.confirm("Clear the API key? Webhook will become public again.")) save(true); }}
+                disabled={saving} className="border border-[#E60000] text-[#E60000] hover:bg-[#E60000] hover:text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold" data-testid="exportersindia-clear-key-btn">
+                Clear
+              </button>
+            )}
+          </div>
+        </label>
+        {cfg.has_key && (
+          <div className="border border-[#008A00] bg-[#F0FDF4] p-3 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-[10px] uppercase tracking-widest text-[#008A00] font-bold">
+                Full integration URL (paste this on ExportersIndia)
+              </div>
+              <button type="button" onClick={() => copy(cfg.full_integration_url, "Integration URL")}
+                className="text-[10px] uppercase tracking-widest text-[#002FA7] hover:underline flex items-center gap-1"
+                data-testid="exportersindia-copy-url-btn">
+                <Copy size={12} weight="bold" /> Copy
+              </button>
+            </div>
+            <div className="font-mono text-xs break-all bg-white border border-gray-200 p-2">
+              {cfg.full_integration_url}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+

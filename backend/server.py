@@ -2211,10 +2211,64 @@ async def delete_quick_reply(qr_id: str, admin: dict = Depends(require_admin)):
 
 
 # Webhook URLs panel (admin)
+async def _get_exportersindia_api_key() -> Optional[str]:
+    """Return the configured ExportersIndia API key (or None if unset).
+    DB override in `system_settings` key='exportersindia' field 'api_key' wins over env."""
+    doc = await db.system_settings.find_one({"key": "exportersindia"}, {"_id": 0}) or {}
+    val = (doc.get("api_key") or os.environ.get("EXPORTERSINDIA_API_KEY") or "").strip()
+    return val or None
+
+
+class ExportersIndiaSettingsInput(BaseModel):
+    api_key: Optional[str] = None  # empty string clears
+
+
+@api.get("/settings/exportersindia")
+async def get_exportersindia_settings(request: Request, admin: dict = Depends(require_admin)):
+    """Admin-only: show the masked ExportersIndia API key and the full integration URL to paste."""
+    key = await _get_exportersindia_api_key()
+    base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+    if not base:
+        fwd_proto = request.headers.get("x-forwarded-proto")
+        fwd_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        base = f"{fwd_proto or request.url.scheme}://{fwd_host}" if fwd_host else str(request.base_url).rstrip("/")
+    webhook_url = f"{base}/api/webhooks/exportersindia"
+    full_url = f"{webhook_url}?key={key}" if key else webhook_url
+    return {
+        "api_key_masked": _mask_token(key or ""),
+        "has_key": bool(key),
+        "webhook_url": webhook_url,
+        "full_integration_url": full_url,
+    }
+
+
+@api.put("/settings/exportersindia")
+async def update_exportersindia_settings(body: ExportersIndiaSettingsInput, request: Request, admin: dict = Depends(require_admin)):
+    """Admin-only: set or clear the ExportersIndia API key (empty string clears)."""
+    val = (body.api_key or "").strip()
+    if val:
+        await db.system_settings.update_one(
+            {"key": "exportersindia"},
+            {"$set": {"key": "exportersindia", "api_key": val, "updated_by": admin["id"], "updated_at": iso(now_utc())}},
+            upsert=True,
+        )
+    else:
+        await db.system_settings.update_one(
+            {"key": "exportersindia"},
+            {"$unset": {"api_key": ""}, "$set": {"updated_by": admin["id"], "updated_at": iso(now_utc()), "key": "exportersindia"}},
+            upsert=True,
+        )
+    await log_activity(admin["id"], "exportersindia_settings_updated", None, {"cleared": not val})
+    return await get_exportersindia_settings(request, admin)
+
+
 @api.get("/settings/webhooks-info")
 async def webhooks_info(admin: dict = Depends(require_admin)):
     base = (FRONTEND_BASE_URL or os.environ.get("FRONTEND_BASE_URL") or "").rstrip("/")
     cfg = await get_wa_config()
+    ei_key = await _get_exportersindia_api_key()
+    ei_url = f"{base}/api/webhooks/exportersindia"
+    ei_full_url = f"{ei_url}?key={ei_key}" if ei_key else ei_url
     return {
         "indiamart": {
             "label": "IndiaMART Push API",
@@ -2225,10 +2279,12 @@ async def webhooks_info(admin: dict = Depends(require_admin)):
         },
         "exportersindia": {
             "label": "ExportersIndia Webhook",
-            "url": f"{base}/api/webhooks/exportersindia",
+            "url": ei_url,
+            "full_integration_url": ei_full_url,
             "method": "POST",
-            "where_to_paste": "ExportersIndia Dashboard → Integrations → Webhook URL (paste the URL above)",
-            "auth": "none (public endpoint)",
+            "where_to_paste": "ExportersIndia Dashboard → Integrations → Webhook URL (paste the full URL above, including ?key=…)",
+            "auth": "API key via `?key=…` query param (configure in Settings → Integrations → ExportersIndia)",
+            "has_key": bool(ei_key),
             "sample_payload": {
                 "inq_id": "84138043", "supplier_id": "7412131", "inq_type": "direct",
                 "product": "500ml Avc Liquid Detergent", "subject": "Daily Shine Liquid Detergent",
@@ -2621,7 +2677,10 @@ async def _handle_exportersindia_payload(payload: Any, identifier: Optional[str]
 
 
 @api.post("/webhooks/exportersindia")
-async def webhook_exportersindia(request: Request):
+async def webhook_exportersindia(request: Request, key: Optional[str] = Query(None)):
+    configured = await _get_exportersindia_api_key()
+    if configured and key != configured:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
     try:
         payload = await request.json()
     except Exception:
@@ -2630,8 +2689,11 @@ async def webhook_exportersindia(request: Request):
 
 
 @api.post("/webhooks/exportersindia/{identifier}")
-async def webhook_exportersindia_tenant(identifier: str, request: Request):
+async def webhook_exportersindia_tenant(identifier: str, request: Request, key: Optional[str] = Query(None)):
     """Per-tenant variant so different ExportersIndia accounts can be routed to different sub-orgs."""
+    configured = await _get_exportersindia_api_key()
+    if configured and key != configured:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
     try:
         payload = await request.json()
     except Exception:

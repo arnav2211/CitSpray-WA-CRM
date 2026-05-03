@@ -22,6 +22,15 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 13 (Feb 2026) — ExportersIndia API-key auth
+- **`POST /api/webhooks/exportersindia?key=…`** now enforces the configured API key. If no key is configured → webhook stays public (dev-friendly). If configured → any request missing the key or with a wrong key returns HTTP 401.
+- **`GET /api/settings/exportersindia`** (admin) returns `{api_key_masked, has_key, webhook_url, full_integration_url}` — last field is ready-to-paste with `?key=…` appended.
+- **`PUT /api/settings/exportersindia {api_key}`** (admin) persists the key to `system_settings` collection (or clears it with empty string). Env-var `EXPORTERSINDIA_API_KEY` also supported as fallback.
+- **`_get_exportersindia_api_key()`** — DB override > env. Cached per request (no extra mongo call needed as reads are cheap and infrequent).
+- **UI** — new "ExportersIndia API key" panel on `/settings`: masked display, paste field with eye toggle, Save/Clear buttons, and a green highlighted box showing the full integration URL with a Copy button once a key is set. `/settings/webhooks-info` also returns `full_integration_url` so the Webhooks panel stamps the URL with `?key=…` automatically.
+- **Verified**: wrong key → 401, no key → 401, correct key → 200; UI panel renders key as `bDE1QT…Zz09 (32 chars)` and shows the full ready-to-paste URL.
+- **Tested**: 39/39 iter7+iter8 regression green.
+
 ### Iteration 12 (Feb 2026) — ExportersIndia integration + enquiry_type badge
 - **New public webhook** `POST /api/webhooks/exportersindia` (+ per-tenant `/exportersindia/{identifier}`) — parses ExportersIndia's enquiry JSON (fields `inq_id`, `supplier_id`, `inq_type`, `product`, `subject`, `detail_req`, `mobile`, `email`, `name`, `company`, `address`, `country`, `state`, `city`, `enq_date`). Requirement defaults to `detail_req` → `subject` → `product`. Dedup via `_lead_dedup_hash(name, enq_date, inq_id)` plus phone-based cross-source merge. Debug endpoint `GET /api/webhooks/exportersindia/_debug/recent` for admins.
 - **`Lead.enquiry_type` + `Lead.country`** — added to `LeadCreate`/`LeadUpdate` Pydantic models and persisted by `_create_lead_internal`. IndiaMART parser also now captures `QUERY_TYPE`/`INQUIRY_TYPE` into the same `enquiry_type` field for uniformity.
