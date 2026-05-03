@@ -645,6 +645,74 @@ def _exec_in_working_hours(exec_user: dict, at: datetime) -> bool:
             continue
     return False
 
+async def _is_user_on_leave(user_id: str, at: Optional[datetime] = None) -> Optional[dict]:
+    """Return the active leave doc if the user is on leave at `at` (default: now).
+    A leave is "active" when start_date <= today <= end_date AND not cancelled."""
+    at = at or now_utc()
+    today = at.strftime("%Y-%m-%d")
+    leave = await db.leaves.find_one({
+        "user_id": user_id,
+        "cancelled": {"$ne": True},
+        "start_date": {"$lte": today},
+        "end_date": {"$gte": today},
+    }, {"_id": 0})
+    return leave
+
+
+async def _get_buyleads_routing(source: str) -> dict:
+    """Return the buyleads routing config for a source ('IndiaMART' / 'ExportersIndia')."""
+    doc = await db.buyleads_routing.find_one({"source": source}, {"_id": 0})
+    return {
+        "source": source,
+        "mode": (doc or {}).get("mode", "all"),  # 'all' | 'selected'
+        "agent_ids": (doc or {}).get("agent_ids", []),
+        "updated_at": (doc or {}).get("updated_at"),
+        "updated_by": (doc or {}).get("updated_by"),
+    }
+
+
+def _is_buylead(lead_data: dict) -> bool:
+    """Strict buylead detection per spec:
+    IndiaMART: source_data.QUERY_TYPE == 'B'
+    ExportersIndia: enquiry_type (case-insensitive) == 'buyleads'."""
+    src = (lead_data.get("source") or "").strip()
+    if src == "IndiaMART":
+        qt = (lead_data.get("source_data") or {}).get("QUERY_TYPE") or (lead_data.get("source_data") or {}).get("query_type")
+        return (qt or "").strip().upper() == "B"
+    if src == "ExportersIndia":
+        et = (lead_data.get("enquiry_type") or "").strip().lower()
+        return et == "buyleads"
+    return False
+
+
+async def _pick_buyleads_executive(source: str) -> Optional[dict]:
+    """Round-robin across the allow-listed agents for a given buyleads source.
+    Respects leave status and `active` flag. Falls back to `pick_next_executive` if
+    the config is mode='all' or no eligible agent remains."""
+    cfg = await _get_buyleads_routing(source)
+    if cfg["mode"] != "selected" or not cfg["agent_ids"]:
+        return None
+    # Filter by active + not-on-leave
+    eligible: List[dict] = []
+    for uid in cfg["agent_ids"]:
+        u = await db.users.find_one({"id": uid, "role": "executive", "active": True}, {"_id": 0, "password_hash": 0})
+        if not u:
+            continue
+        if await _is_user_on_leave(uid):
+            continue
+        eligible.append(u)
+    if not eligible:
+        return None
+    eligible.sort(key=lambda e: e["username"])
+    # Round-robin pointer stored per-source under buyleads_routing doc
+    ptr_doc = await db.buyleads_routing.find_one({"source": source}, {"_id": 0, "last_assigned_index": 1})
+    idx = int((ptr_doc or {}).get("last_assigned_index", -1))
+    idx = (idx + 1) % len(eligible)
+    chosen = eligible[idx]
+    await db.buyleads_routing.update_one({"source": source}, {"$set": {"last_assigned_index": idx}}, upsert=True)
+    return chosen
+
+
 async def pick_next_executive(exclude_user_id: Optional[str] = None) -> Optional[dict]:
     rules = await get_routing_rules()
     execs = await db.users.find(
@@ -660,8 +728,23 @@ async def pick_next_executive(exclude_user_id: Optional[str] = None) -> Optional
         eligible = execs
     if exclude_user_id:
         eligible = [e for e in eligible if e["id"] != exclude_user_id]
+    # Remove users on leave
+    after_leave: List[dict] = []
+    for e in eligible:
+        if not await _is_user_on_leave(e["id"]):
+            after_leave.append(e)
+    eligible = after_leave
     if not eligible:
-        eligible = [e for e in execs if e["id"] != exclude_user_id] or execs
+        # Fallback: ignore working-hours filter, still exclude leave
+        fallback = []
+        for e in execs:
+            if e["id"] == exclude_user_id:
+                continue
+            if not await _is_user_on_leave(e["id"]):
+                fallback.append(e)
+        eligible = fallback or []
+    if not eligible:
+        return None
     # sort deterministic
     eligible.sort(key=lambda e: e["username"])
     idx = int(rules.get("last_assigned_index", -1))
