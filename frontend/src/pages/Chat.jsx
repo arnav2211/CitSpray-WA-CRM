@@ -265,6 +265,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
   const [templates, setTemplates] = useState([]);
   const [savingMeta, setSavingMeta] = useState(false);
   const [newNote, setNewNote] = useState("");
+  const [replyTo, setReplyTo] = useState(null);  // {id, preview, direction}
   const scrollRef = useRef(null);
 
   const exec = execs.find(e => e.id === conv.assigned_to);
@@ -315,8 +316,11 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
     }
     setSending(true);
     try {
-      await api.post("/whatsapp/send", { lead_id: conv.id, body: draft });
+      const payload = { lead_id: conv.id, body: draft };
+      if (replyTo?.id) payload.reply_to_message_id = replyTo.id;
+      await api.post("/whatsapp/send", payload);
       setDraft("");
+      setReplyTo(null);
       loadMessages();
       onChanged?.();
     } catch (e) {
@@ -476,7 +480,19 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
             {messages.length === 0 && (
               <div className="text-center text-xs uppercase tracking-widest text-gray-500 py-12">No messages yet</div>
             )}
-            {messages.map((m) => <Bubble key={m.id} m={m} />)}
+            {messages.map((m) => (
+              <Bubble
+                key={m.id}
+                m={m}
+                allMessages={messages}
+                canMessage={canMessage && within24h}
+                onReply={(target) => setReplyTo({
+                  id: target.id,
+                  preview: (target.caption || target.body || "").slice(0, 120),
+                  direction: target.direction,
+                })}
+              />
+            ))}
           </div>
 
           {/* Quick reply dropdown */}
@@ -512,6 +528,21 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
                   {t.body && <div className="text-xs text-gray-600 mt-1 whitespace-pre-wrap">{t.body}</div>}
                 </button>
               ))}
+            </div>
+          )}
+
+          {/* Reply-to preview banner */}
+          {replyTo && canMessage && (
+            <div className="bg-white border-t border-gray-200 px-3 py-2 flex items-center gap-2" data-testid="reply-to-banner">
+              <div className="flex-1 min-w-0 border-l-[3px] border-[#25D366] pl-2">
+                <div className="text-[10px] uppercase tracking-widest text-[#25D366] font-bold">
+                  Replying to {replyTo.direction === "out" ? "your message" : "customer"}
+                </div>
+                <div className="text-xs text-gray-700 truncate">{replyTo.preview || "(no preview)"}</div>
+              </div>
+              <button onClick={() => setReplyTo(null)} className="text-gray-500 hover:text-gray-900 p-1" data-testid="reply-to-cancel">
+                <X size={14} />
+              </button>
             </div>
           )}
 
@@ -628,7 +659,7 @@ function InfoRow({ label, children }) {
   );
 }
 
-function Bubble({ m }) {
+function Bubble({ m, allMessages = [], onReply, canMessage = true }) {
   const isOut = m.direction === "out";
   const isSystem = m.direction === "system";
   if (isSystem) {
@@ -640,11 +671,39 @@ function Bubble({ m }) {
   }
   const media = renderMedia(m);
   const captionText = m.caption || (media ? "" : m.body);
+  // Resolve quoted/reply-to preview if this message is itself a reply
+  const quoted = m.reply_to_message_id
+    ? allMessages.find((x) => x.id === m.reply_to_message_id)
+    : null;
+  const quotedPreview = quoted
+    ? ((quoted.caption || quoted.body || "").slice(0, 120))
+    : (m.reply_to_preview ? m.reply_to_preview.slice(0, 120) : null);
+  const quotedDirection = quoted?.direction || (m.reply_to_wamid && isOut ? "in" : "out");
   return (
-    <div className={`flex ${isOut ? "justify-end" : "justify-start"}`} data-testid={`msg-${m.id}`}>
+    <div className={`group flex ${isOut ? "justify-end" : "justify-start"}`} data-testid={`msg-${m.id}`}>
+      {/* Reply affordance on the left side for incoming, right for outgoing */}
+      {!isOut && canMessage && onReply && (
+        <button onClick={() => onReply(m)}
+          className="opacity-0 group-hover:opacity-100 transition-opacity text-gray-500 hover:text-[#25D366] text-[10px] uppercase tracking-widest font-bold self-center mr-1 px-1"
+          title="Reply" data-testid={`reply-btn-${m.id}`}>
+          ↩ Reply
+        </button>
+      )}
       <div className={`max-w-[75%] ${media ? "p-1.5" : "px-3 py-2"} ${isOut ? "bg-[#D9FDD3]" : "bg-white"} text-sm shadow-sm`}>
         {m.template_name && (
           <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold mb-1 px-2 pt-1">Template · {m.template_name}</div>
+        )}
+        {quotedPreview && (
+          <div
+            className={`mb-1.5 border-l-[3px] pl-2 py-1 text-xs bg-black/5 ${media ? "mx-1.5 mt-1.5" : ""}`}
+            style={{ borderColor: quotedDirection === "out" ? "#25D366" : "#002FA7" }}
+            data-testid={`quoted-preview-${m.id}`}
+          >
+            <div className="text-[9px] uppercase tracking-widest font-bold" style={{ color: quotedDirection === "out" ? "#128C7E" : "#002FA7" }}>
+              {quotedDirection === "out" ? "You" : "Customer"}
+            </div>
+            <div className="text-gray-700 truncate">{quotedPreview}</div>
+          </div>
         )}
         {media}
         {captionText && (
@@ -656,6 +715,13 @@ function Bubble({ m }) {
           {isOut && m.error && <span className="text-[9px] text-[#E60000] uppercase tracking-widest font-bold">{String(m.error).slice(0, 24)}</span>}
         </div>
       </div>
+      {isOut && canMessage && onReply && (
+        <button onClick={() => onReply(m)}
+          className="opacity-0 group-hover:opacity-100 transition-opacity text-gray-500 hover:text-[#25D366] text-[10px] uppercase tracking-widest font-bold self-center ml-1 px-1"
+          title="Reply" data-testid={`reply-btn-${m.id}`}>
+          ↩ Reply
+        </button>
+      )}
     </div>
   );
 }

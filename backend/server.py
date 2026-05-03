@@ -163,7 +163,7 @@ async def _resolve_template_meta(template_name: str, lang_code: Optional[str] = 
     }
 
 
-async def wa_send_text(to_phone: str, body: str) -> Dict[str, Any]:
+async def wa_send_text(to_phone: str, body: str, reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
     cfg = await get_wa_config()
     if not cfg["enabled"]:
         return {"mock": True, "status": "sent_mock", "wamid": None}
@@ -178,11 +178,28 @@ async def wa_send_text(to_phone: str, body: str) -> Dict[str, Any]:
         "type": "text",
         "text": {"preview_url": False, "body": body},
     }
-    async with httpx.AsyncClient(timeout=20.0) as cli:
-        r = await cli.post(url, json=payload, headers={
-            "Authorization": f"Bearer {cfg['access_token']}",
-            "Content-Type": "application/json",
-        })
+    if reply_to_wamid:
+        payload["context"] = {"message_id": reply_to_wamid}
+
+    async def _post(p: Dict[str, Any]) -> Any:
+        async with httpx.AsyncClient(timeout=20.0) as cli:
+            return await cli.post(url, json=p, headers={
+                "Authorization": f"Bearer {cfg['access_token']}",
+                "Content-Type": "application/json",
+            })
+
+    r = await _post(payload)
+    # Meta returns 131009 / similar when context message_id is stale or from a different chat.
+    # Spec asks us to fall back to a plain send in that case.
+    if r.status_code >= 400 and reply_to_wamid:
+        try:
+            err = (r.json().get("error") or {})
+        except Exception:
+            err = {}
+        if err.get("code") in (131009, 100, 131026) or "context" in (err.get("message") or "").lower():
+            logger.info(f"Reply-context failed ({err.get('code')}); retrying without context")
+            payload.pop("context", None)
+            r = await _post(payload)
     try:
         data = r.json()
     except Exception:
@@ -385,6 +402,7 @@ class WhatsAppSendInput(BaseModel):
     template_name: Optional[str] = None
     template_lang: Optional[str] = None
     template_params: Optional[List[str]] = None  # explicit body params; if omitted backend infers
+    reply_to_message_id: Optional[str] = None  # local UUID of the message being replied to
 
 class TemplateCreate(BaseModel):
     name: str
@@ -1262,7 +1280,21 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
                 status_code=400,
                 detail="Outside the 24-hour customer service window — please use a template message",
             )
-        api_result = await wa_send_text(to_phone=target_phone, body=body.body)
+        # Resolve reply context: must reference a message on the SAME lead.
+        reply_ctx_wamid: Optional[str] = None
+        reply_ctx_local_id: Optional[str] = None
+        reply_ctx_preview: Optional[str] = None
+        if body.reply_to_message_id:
+            src = await db.messages.find_one(
+                {"id": body.reply_to_message_id, "lead_id": body.lead_id},
+                {"_id": 0, "id": 1, "wamid": 1, "body": 1, "caption": 1, "direction": 1},
+            )
+            if src and src.get("wamid"):
+                reply_ctx_wamid = src["wamid"]
+                reply_ctx_local_id = src["id"]
+                reply_ctx_preview = (src.get("caption") or src.get("body") or "")[:120]
+            # If src not found or has no wamid (e.g. mock), we skip the context — fallback to plain send.
+        api_result = await wa_send_text(to_phone=target_phone, body=body.body, reply_to_wamid=reply_ctx_wamid)
 
     msg = {
         "id": str(uuid.uuid4()),
@@ -1278,6 +1310,15 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
         "at": iso(now_utc()),
         "by_user_id": user["id"],
     }
+    # Attach reply-context metadata so the chat bubble can render a quoted preview
+    if not body.template_name and body.reply_to_message_id:
+        # Use the same resolved ids from the block above (still in scope)
+        if 'reply_ctx_local_id' in locals() and reply_ctx_local_id:
+            msg["reply_to_message_id"] = reply_ctx_local_id
+        if 'reply_ctx_wamid' in locals() and reply_ctx_wamid:
+            msg["reply_to_wamid"] = reply_ctx_wamid
+        if 'reply_ctx_preview' in locals() and reply_ctx_preview:
+            msg["reply_to_preview"] = reply_ctx_preview
     await db.messages.insert_one(msg.copy())
     update_lead = {"last_action_at": iso(now_utc())}
     if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
@@ -2331,13 +2372,13 @@ async def _is_within_24h_window(lead: dict) -> bool:
         return False
 
 
-async def wa_send_interactive(to_phone: str, interactive_payload: Dict[str, Any]) -> Dict[str, Any]:
+async def wa_send_interactive(to_phone: str, interactive_payload: Dict[str, Any], reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
     """Send a WA interactive message (button / list) using the existing WA abstraction.
     cfg['api_version'] is read dynamically — never hardcoded."""
-    return await _wa_send_typed(to_phone, {"type": "interactive", "interactive": interactive_payload})
+    return await _wa_send_typed(to_phone, {"type": "interactive", "interactive": interactive_payload}, reply_to_wamid=reply_to_wamid)
 
 
-async def wa_send_media(to_phone: str, media_type: str, url: str, caption: Optional[str] = None, filename: Optional[str] = None) -> Dict[str, Any]:
+async def wa_send_media(to_phone: str, media_type: str, url: str, caption: Optional[str] = None, filename: Optional[str] = None, reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
     """Send an image, video, or document message via the existing WA abstraction.
     `media_type` is one of 'image','video','document'. `url` must be public HTTPS.
     Caption supported on image/video; filename on document."""
@@ -2348,10 +2389,10 @@ async def wa_send_media(to_phone: str, media_type: str, url: str, caption: Optio
         media_block["caption"] = caption
     if filename and media_type == "document":
         media_block["filename"] = filename
-    return await _wa_send_typed(to_phone, {"type": media_type, media_type: media_block})
+    return await _wa_send_typed(to_phone, {"type": media_type, media_type: media_block}, reply_to_wamid=reply_to_wamid)
 
 
-async def _wa_send_typed(to_phone: str, payload_extra: Dict[str, Any]) -> Dict[str, Any]:
+async def _wa_send_typed(to_phone: str, payload_extra: Dict[str, Any], reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
     """Shared transport for non-text WhatsApp messages. Keeps version, auth, error shape
     identical to the other wa_send_* helpers."""
     cfg = await get_wa_config()
@@ -2361,11 +2402,23 @@ async def _wa_send_typed(to_phone: str, payload_extra: Dict[str, Any]) -> Dict[s
     if not to:
         return {"error": "no_phone", "status": "failed"}
     url = f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['phone_number_id']}/messages"
-    body_payload = {"messaging_product": "whatsapp", "recipient_type": "individual", "to": to, **payload_extra}
+    body_payload: Dict[str, Any] = {"messaging_product": "whatsapp", "recipient_type": "individual", "to": to, **payload_extra}
+    if reply_to_wamid:
+        body_payload["context"] = {"message_id": reply_to_wamid}
     headers = {"Authorization": f"Bearer {cfg['access_token']}", "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(url, json=body_payload, headers=headers)
+            # Invalid/stale context → retry once without it
+            if r.status_code >= 400 and reply_to_wamid:
+                try:
+                    err = (r.json().get("error") or {})
+                except Exception:
+                    err = {}
+                if err.get("code") in (131009, 100, 131026) or "context" in (err.get("message") or "").lower():
+                    logger.info(f"Reply-context failed ({err.get('code')}); retrying without context")
+                    body_payload.pop("context", None)
+                    r = await client.post(url, json=body_payload, headers=headers)
         data = r.json() if r.content else {}
         if r.status_code >= 400:
             err = (data.get("error") or {})
@@ -3118,6 +3171,12 @@ async def webhook_whatsapp(request: Request):
                     from_phone = m.get("from")  # digits, e.g. "919876543210"
                     msg_type = m.get("type")
                     wamid = m.get("id")
+                    inbound_context_wamid: Optional[str] = None
+                    # Meta sends `context.id` when the user taps "Reply" and quotes one of our messages.
+                    try:
+                        inbound_context_wamid = (m.get("context") or {}).get("id")
+                    except Exception:
+                        inbound_context_wamid = None
                     body_text = ""
                     inbound_media_type = None
                     inbound_media_id = None
@@ -3196,6 +3255,16 @@ async def webhook_whatsapp(request: Request):
                         "at": iso(now_utc()),
                         "by_user_id": None,
                     }
+                    # Quoted-reply context from the customer
+                    if inbound_context_wamid:
+                        quoted = await db.messages.find_one(
+                            {"wamid": inbound_context_wamid, "lead_id": lead["id"]},
+                            {"_id": 0, "id": 1, "body": 1, "caption": 1, "direction": 1},
+                        )
+                        msg_doc["reply_to_wamid"] = inbound_context_wamid
+                        if quoted:
+                            msg_doc["reply_to_message_id"] = quoted["id"]
+                            msg_doc["reply_to_preview"] = (quoted.get("caption") or quoted.get("body") or "")[:120]
                     if inbound_media_type:
                         msg_doc["media_type"] = inbound_media_type
                         if inbound_media_id:
