@@ -540,6 +540,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
   };
 
   return (
+    <>
     <div className="flex flex-col h-full overflow-hidden">
       {/* Top bar */}
       <div className="shrink-0 bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-3" data-testid="chat-topbar">
@@ -802,6 +803,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
           </aside>
         )}
       </div>
+    </div>
       {attachMode === "location" && (
         <LocationSendModal onClose={() => setAttachMode(null)} onSend={sendLocation} sending={sending} />
       )}
