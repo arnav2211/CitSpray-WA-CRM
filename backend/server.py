@@ -2294,16 +2294,18 @@ class ChatFlowUpdate(BaseModel):
 
 class ChatNodeInput(BaseModel):
     name: str
-    message_type: Literal["text", "button", "list"]
+    message_type: Literal["text", "button", "list", "image", "video", "document", "carousel"]
     message_content: Dict[str, Any] = {}
     is_start_node: bool = False
 
 
 class ChatNodeUpdate(BaseModel):
     name: Optional[str] = None
-    message_type: Optional[Literal["text", "button", "list"]] = None
+    message_type: Optional[Literal["text", "button", "list", "image", "video", "document", "carousel"]] = None
     message_content: Optional[Dict[str, Any]] = None
     is_start_node: Optional[bool] = None
+    x: Optional[float] = None  # canvas position
+    y: Optional[float] = None
 
 
 class ChatOptionInput(BaseModel):
@@ -2331,6 +2333,26 @@ async def _is_within_24h_window(lead: dict) -> bool:
 async def wa_send_interactive(to_phone: str, interactive_payload: Dict[str, Any]) -> Dict[str, Any]:
     """Send a WA interactive message (button / list) using the existing WA abstraction.
     cfg['api_version'] is read dynamically — never hardcoded."""
+    return await _wa_send_typed(to_phone, {"type": "interactive", "interactive": interactive_payload})
+
+
+async def wa_send_media(to_phone: str, media_type: str, url: str, caption: Optional[str] = None, filename: Optional[str] = None) -> Dict[str, Any]:
+    """Send an image, video, or document message via the existing WA abstraction.
+    `media_type` is one of 'image','video','document'. `url` must be public HTTPS.
+    Caption supported on image/video; filename on document."""
+    if media_type not in ("image", "video", "document"):
+        return {"error": f"invalid media_type {media_type}", "status": "failed"}
+    media_block: Dict[str, Any] = {"link": url}
+    if caption and media_type in ("image", "video", "document"):
+        media_block["caption"] = caption
+    if filename and media_type == "document":
+        media_block["filename"] = filename
+    return await _wa_send_typed(to_phone, {"type": media_type, media_type: media_block})
+
+
+async def _wa_send_typed(to_phone: str, payload_extra: Dict[str, Any]) -> Dict[str, Any]:
+    """Shared transport for non-text WhatsApp messages. Keeps version, auth, error shape
+    identical to the other wa_send_* helpers."""
     cfg = await get_wa_config()
     if not cfg["enabled"]:
         return {"mock": True, "status": "sent_mock", "wamid": None}
@@ -2338,13 +2360,7 @@ async def wa_send_interactive(to_phone: str, interactive_payload: Dict[str, Any]
     if not to:
         return {"error": "no_phone", "status": "failed"}
     url = f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['phone_number_id']}/messages"
-    body_payload = {
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": to,
-        "type": "interactive",
-        "interactive": interactive_payload,
-    }
+    body_payload = {"messaging_product": "whatsapp", "recipient_type": "individual", "to": to, **payload_extra}
     headers = {"Authorization": f"Bearer {cfg['access_token']}", "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -2360,7 +2376,7 @@ async def wa_send_interactive(to_phone: str, interactive_payload: Dict[str, Any]
             pass
         return {"status": "sent", "wamid": wamid, "raw": data}
     except Exception as e:
-        logger.exception(f"WA interactive send failed: {e}")
+        logger.exception(f"WA typed send failed: {e}")
         return {"error": str(e), "status": "failed"}
 
 
@@ -2585,7 +2601,7 @@ async def update_chat_node(flow_id: str, node_id: str, body: ChatNodeUpdate, adm
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
     upd: Dict[str, Any] = {}
-    for f in ["name", "message_type", "message_content"]:
+    for f in ["name", "message_type", "message_content", "x", "y"]:
         v = getattr(body, f)
         if v is not None:
             upd[f] = v
@@ -2596,6 +2612,27 @@ async def update_chat_node(flow_id: str, node_id: str, body: ChatNodeUpdate, adm
     if upd:
         await db.chat_nodes.update_one({"id": node_id}, {"$set": upd})
     return await db.chat_nodes.find_one({"id": node_id}, {"_id": 0})
+
+
+class BulkNodePositions(BaseModel):
+    positions: Dict[str, Dict[str, float]]  # { node_id: {x,y} }
+
+
+@api.put("/chatflows/{flow_id}/positions")
+async def save_node_positions(flow_id: str, body: BulkNodePositions, admin: dict = Depends(require_admin)):
+    """Persist canvas coordinates for many nodes at once (used by the drag-to-layout UI)."""
+    if not await db.chat_flows.find_one({"id": flow_id}):
+        raise HTTPException(status_code=404, detail="Flow not found")
+    count = 0
+    for nid, pos in body.positions.items():
+        if "x" not in pos or "y" not in pos:
+            continue
+        res = await db.chat_nodes.update_one(
+            {"id": nid, "flow_id": flow_id},
+            {"$set": {"x": float(pos["x"]), "y": float(pos["y"])}},
+        )
+        count += res.modified_count
+    return {"updated": count}
 
 
 @api.delete("/chatflows/{flow_id}/nodes/{node_id}")
