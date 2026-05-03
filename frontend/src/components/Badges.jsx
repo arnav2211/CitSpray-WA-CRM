@@ -21,6 +21,7 @@ export function StatusBadge({ status }) {
 export function SourceBadge({ source }) {
   const map = {
     IndiaMART: "border-[#002FA7] text-[#002FA7]",
+    ExportersIndia: "border-[#BE185D] text-[#BE185D]",
     Justdial: "border-[#E60000] text-[#E60000]",
     Manual: "border-gray-500 text-gray-700",
     WhatsApp: "border-[#008A00] text-[#008A00]",
@@ -44,4 +45,32 @@ export function QueryTypeBadge({ code, compact = false }) {
       {compact ? info.short : info.label}
     </span>
   );
+}
+
+// Unified enquiry-type badge that works for both IndiaMART (single-char QUERY_TYPE like W/P/B)
+// and free-text enquiry_type fields ("direct", "buyleads", etc) from ExportersIndia and others.
+const FREE_TYPE_COLORS = {
+  direct: "bg-[#F0F4FF] text-[#002FA7]",
+  buyleads: "bg-[#FEF3C7] text-[#92400E]",
+  inquiry: "bg-[#F0F9FF] text-[#0891B2]",
+  catalog: "bg-[#ECFDF5] text-[#008A00]",
+};
+
+export function EnquiryTypeBadge({ lead }) {
+  if (!lead) return null;
+  // Prefer the explicit free-text enquiry_type, then fall back to IndiaMART's QUERY_TYPE code.
+  const freeText = (lead.enquiry_type || "").trim();
+  if (freeText) {
+    const key = freeText.toLowerCase().replace(/[^a-z]/g, "");
+    const cls = FREE_TYPE_COLORS[key] || "bg-gray-100 text-gray-800";
+    return (
+      <span className={`inline-flex items-center px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest ${cls}`}
+        title={`Enquiry type: ${freeText}`}
+        data-testid={`enquiry-type-badge-${key || "generic"}`}>
+        {freeText}
+      </span>
+    );
+  }
+  const code = lead.source_data?.QUERY_TYPE;
+  return <QueryTypeBadge code={code} compact />;
 }

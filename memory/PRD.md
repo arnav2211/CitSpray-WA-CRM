@@ -22,6 +22,14 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 12 (Feb 2026) — ExportersIndia integration + enquiry_type badge
+- **New public webhook** `POST /api/webhooks/exportersindia` (+ per-tenant `/exportersindia/{identifier}`) — parses ExportersIndia's enquiry JSON (fields `inq_id`, `supplier_id`, `inq_type`, `product`, `subject`, `detail_req`, `mobile`, `email`, `name`, `company`, `address`, `country`, `state`, `city`, `enq_date`). Requirement defaults to `detail_req` → `subject` → `product`. Dedup via `_lead_dedup_hash(name, enq_date, inq_id)` plus phone-based cross-source merge. Debug endpoint `GET /api/webhooks/exportersindia/_debug/recent` for admins.
+- **`Lead.enquiry_type` + `Lead.country`** — added to `LeadCreate`/`LeadUpdate` Pydantic models and persisted by `_create_lead_internal`. IndiaMART parser also now captures `QUERY_TYPE`/`INQUIRY_TYPE` into the same `enquiry_type` field for uniformity.
+- **`EnquiryTypeBadge` component** — unified badge renderer that accepts free-text (`direct` / `buyleads` / `inquiry` / `catalog` → colour-coded) and falls back to IndiaMART's `QUERY_TYPE` single-char code via the existing `QueryTypeBadge`. Replaces all three usages in `Leads.jsx`.
+- **UI touch-ups** — `Leads.jsx` source filter now includes "ExportersIndia" (pink `#BE185D` border); location column shows `area, city, state, country`; LeadDrawer header pin also renders country. Settings → Webhooks panel lists the new ExportersIndia URL with copy-paste instructions + sample payload.
+- **Verified end-to-end** — posting the user's exact sample JSON creates a lead with `source=ExportersIndia`, `enquiry_type=direct`, `country=India`; dedup on re-post returns the same UUID; `source_data` retains the full original payload.
+- **Tested**: 39/39 iter7+iter8 regression green.
+
 ### Iteration 11 (Feb 2026) — WhatsApp Reactions (send + receive)
 - **`wa_send_reaction(to, message_wamid, emoji)`** — thin helper via `_wa_send_typed`. Empty emoji (`""`) clears the reaction per WA spec.
 - **`POST /api/whatsapp/react {message_id, emoji}`** — admin/exec endpoint. Resolves local UUID → target's Meta wamid, calls Meta, and upserts one reaction entry per `(direction="out", user_id)` on the target message's `reactions` array. Enforces RBAC (same lead-ownership rules), 24h window, and 404 for invalid target.

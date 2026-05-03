@@ -235,8 +235,8 @@ export default function LeadDrawer({ leadId, onClose }) {
             )}
             <div className="text-xs text-gray-500 mt-1 flex flex-wrap gap-x-4 gap-y-1">
               {lead.email && <span className="flex items-center gap-1"><EnvelopeSimple size={12} /> {lead.email}</span>}
-              {(lead.area || lead.city || lead.state) && (
-                <span className="flex items-center gap-1"><MapPin size={12} /> {[lead.area, lead.city, lead.state].filter(Boolean).join(", ")}</span>
+              {(lead.area || lead.city || lead.state || lead.country) && (
+                <span className="flex items-center gap-1"><MapPin size={12} /> {[lead.area, lead.city, lead.state, lead.country].filter(Boolean).join(", ")}</span>
               )}
               {lead.source_data?.QUERY_TYPE === "P" && lead.source_data?.RECEIVER_MOBILE && (
                 <span className="flex items-center gap-1 text-[#E60000] font-bold" data-testid="pns-receiver">

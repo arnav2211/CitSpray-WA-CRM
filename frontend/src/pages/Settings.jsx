@@ -185,9 +185,10 @@ function WebhooksPanel({ hooks }) {
   const items = [
     { ...hooks.whatsapp,             key: "whatsapp" },
     { ...hooks.indiamart,            key: "indiamart" },
+    { ...hooks.exportersindia,       key: "exportersindia" },
     { ...hooks.gmail,                key: "gmail" },
     { ...hooks.justdial_manual_ingest, key: "justdial" },
-  ].filter(Boolean);
+  ].filter((x) => x && (x.url || x.label));
   const copy = async (text, label) => {
     try { await navigator.clipboard.writeText(text); toast.success(`${label} copied`); }
     catch { toast.error("Copy failed — please copy manually"); }

@@ -345,7 +345,9 @@ class LeadCreate(BaseModel):
     area: Optional[str] = None
     city: Optional[str] = None
     state: Optional[str] = None
+    country: Optional[str] = None
     source: str = "Manual"
+    enquiry_type: Optional[str] = None
     contact_link: Optional[str] = None
     source_data: Dict[str, Any] = {}
     assigned_to: Optional[str] = None  # user id
@@ -360,6 +362,8 @@ class LeadUpdate(BaseModel):
     area: Optional[str] = None
     city: Optional[str] = None
     state: Optional[str] = None
+    country: Optional[str] = None
+    enquiry_type: Optional[str] = None
     status: Optional[Literal["new", "contacted", "qualified", "converted", "lost"]] = None
     assigned_to: Optional[str] = None
     active_wa_phone: Optional[str] = None
@@ -807,6 +811,8 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         "area": data.get("area"),
         "city": data.get("city"),
         "state": data.get("state"),
+        "country": data.get("country"),
+        "enquiry_type": data.get("enquiry_type"),
         "source": data.get("source", "Manual"),
         "contact_link": data.get("contact_link"),
         "source_data": data.get("source_data", {}),
@@ -2217,6 +2223,21 @@ async def webhooks_info(admin: dict = Depends(require_admin)):
             "where_to_paste": "IndiaMART Lead Manager → Push API → Webhook URL",
             "auth": "none (public endpoint)",
         },
+        "exportersindia": {
+            "label": "ExportersIndia Webhook",
+            "url": f"{base}/api/webhooks/exportersindia",
+            "method": "POST",
+            "where_to_paste": "ExportersIndia Dashboard → Integrations → Webhook URL (paste the URL above)",
+            "auth": "none (public endpoint)",
+            "sample_payload": {
+                "inq_id": "84138043", "supplier_id": "7412131", "inq_type": "direct",
+                "product": "500ml Avc Liquid Detergent", "subject": "Daily Shine Liquid Detergent",
+                "detail_req": "I am interested in buying…", "mobile": "9876543xxx",
+                "email": "buyer@example.com", "name": "Test Buyer", "company": "Weblink",
+                "address": "Kirtinagar, Delhi", "country": "India", "state": "Delhi", "city": "Delhi",
+                "enq_date": "2025-11-17 16:47:38",
+            },
+        },
         "whatsapp": {
             "label": "WhatsApp Cloud API",
             "url": f"{base}/api/webhooks/whatsapp",
@@ -2455,6 +2476,10 @@ async def _handle_indiamart_payload(payload: Any, identifier: Optional[str] = No
         )
         query_time = e.get("QUERY_TIME") or e.get("query_time") or iso(now_utc())
         unique_id = e.get("UNIQUE_QUERY_ID") or e.get("unique_query_id")
+        enquiry_type = (
+            e.get("QUERY_TYPE") or e.get("INQUIRY_TYPE") or e.get("ENQ_TYPE")
+            or e.get("query_type") or e.get("inquiry_type")
+        )
         dhash = _lead_dedup_hash(name, query_time, unique_id or (phone or ""))
         data = {
             "customer_name": name,
@@ -2468,6 +2493,8 @@ async def _handle_indiamart_payload(payload: Any, identifier: Optional[str] = No
             "source_data": {**e, **({"SENDER_COMPANY": company} if company else {})},
             "dedup_hash": dhash,
         }
+        if enquiry_type:
+            data["enquiry_type"] = str(enquiry_type).strip()
         receiver = (
             e.get("RECEIVER_MOBILE") or e.get("CALL_RECEIVER_NUMBER")
             or e.get("receiver_mobile") or e.get("call_receiver_number")
@@ -2508,6 +2535,115 @@ async def webhook_indiamart_recent(admin: dict = Depends(require_admin), limit: 
     """Admin-only: inspect last N raw IndiaMART webhook payloads (useful for debugging activations)."""
     docs = await db.webhook_payloads.find(
         {"source": "IndiaMART"}, {"_id": 0}
+    ).sort("received_at", -1).to_list(limit)
+    return docs
+
+
+# ---------------- ExportersIndia webhook ----------------
+
+async def _handle_exportersindia_payload(payload: Any, identifier: Optional[str] = None) -> dict:
+    """Parse and ingest lead enquiries pushed by ExportersIndia. Accepts either a single
+    enquiry object or a list/wrapper array. Fields mirror IndiaMART semantically — we
+    preserve `inq_type` in `enquiry_type` on the lead so the UI can show the same badge."""
+    raw = {
+        "id": str(uuid.uuid4()),
+        "source": "ExportersIndia",
+        "identifier": identifier,
+        "payload": payload,
+        "received_at": iso(now_utc()),
+        "processed": False,
+    }
+    await db.webhook_payloads.insert_one(raw.copy())
+
+    entries: List[dict] = []
+    if isinstance(payload, dict):
+        # Accept common wrapper keys first
+        for k in ("RESPONSE", "response", "enquiries", "enquiry", "data"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                entries = v
+                break
+            if isinstance(v, dict):
+                entries = [v]
+                break
+        if not entries:
+            entries = [payload]
+    elif isinstance(payload, list):
+        entries = payload
+
+    created_ids: List[str] = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        name = e.get("name") or e.get("NAME") or "ExportersIndia Buyer"
+        phone = e.get("mobile") or e.get("MOBILE") or e.get("phone") or e.get("contact_no")
+        email = e.get("email") or e.get("EMAIL")
+        company = e.get("company") or e.get("COMPANY")
+        address = e.get("address") or e.get("ADDRESS")
+        city = e.get("city") or e.get("CITY")
+        state = e.get("state") or e.get("STATE")
+        country = e.get("country") or e.get("COUNTRY")
+
+        # Requirement: prefer detail_req (full enquiry body), then subject, then product.
+        requirement = (
+            e.get("detail_req") or e.get("DETAIL_REQ") or e.get("message")
+            or e.get("subject") or e.get("SUBJECT") or e.get("product") or e.get("PRODUCT")
+        )
+        inq_type = e.get("inq_type") or e.get("INQ_TYPE") or e.get("enquiry_type")
+
+        # Dedup: ExportersIndia's inq_id is unique per enquiry.
+        inq_id = e.get("inq_id") or e.get("INQ_ID") or e.get("enquiry_id")
+        enq_date = e.get("enq_date") or e.get("ENQ_DATE") or iso(now_utc())
+        dhash = _lead_dedup_hash(name, enq_date, str(inq_id) if inq_id else (phone or ""))
+
+        data = {
+            "customer_name": name,
+            "phone": phone,
+            "email": email,
+            "requirement": requirement,
+            "area": address,
+            "city": city,
+            "state": state,
+            "country": country,
+            "source": "ExportersIndia",
+            "source_data": {**e, **({"company": company} if company else {})},
+            "dedup_hash": dhash,
+        }
+        if inq_type:
+            data["enquiry_type"] = str(inq_type).strip()
+        lead = await _create_lead_internal(data, by_user_id=None)
+        created_ids.append(lead["id"])
+    await db.webhook_payloads.update_one(
+        {"id": raw["id"]},
+        {"$set": {"processed": True, "lead_ids": created_ids, "entry_count": len(entries)}},
+    )
+    return {"status": "SUCCESS", "ok": True, "created": created_ids, "received": len(entries)}
+
+
+@api.post("/webhooks/exportersindia")
+async def webhook_exportersindia(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    return await _handle_exportersindia_payload(payload, identifier=None)
+
+
+@api.post("/webhooks/exportersindia/{identifier}")
+async def webhook_exportersindia_tenant(identifier: str, request: Request):
+    """Per-tenant variant so different ExportersIndia accounts can be routed to different sub-orgs."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    return await _handle_exportersindia_payload(payload, identifier=identifier)
+
+
+@api.get("/webhooks/exportersindia/_debug/recent")
+async def webhook_exportersindia_recent(admin: dict = Depends(require_admin), limit: int = 20):
+    """Admin-only: inspect last N raw ExportersIndia webhook payloads."""
+    docs = await db.webhook_payloads.find(
+        {"source": "ExportersIndia"}, {"_id": 0}
     ).sort("received_at", -1).to_list(limit)
     return docs
 
