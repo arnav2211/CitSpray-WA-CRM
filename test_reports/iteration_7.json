@@ -1,0 +1,42 @@
+{
+  "summary": "Iteration 7: validated buyleads routing, leave management, and internal Q&A chat. 22/22 backend pytest cases passing. Frontend Settings panels (buyleads-routing-panel, leave-panel, leave-add-btn) verified. Could not deep-test the /chat 'Internal Q&A' tab because the lead rows on the WhatsApp/chat inbox lack a stable data-testid, so the drawer could not be opened from Playwright.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/webhooks/exportersindia", "issue": "Public webhook requires API key in this env; e2e test was switched to use POST /api/leads with source=ExportersIndia + enquiry_type=buyleads which exercises the same _is_buylead + _pick_buyleads_executive routing path. Both still pass."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Chat (WhatsApp inbox lead list)", "issue": "Lead list rows do not expose a deterministic data-testid (e.g. 'lead-row-{id}' or 'chat-lead-{id}'), so opening the lead drawer programmatically is unreliable. Manual click works visually but blocks automated coverage of the Internal Q&A tab.", "selector": "lead-row in inbox list", "priority": "MEDIUM"}
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Settings → Leave Management", "issues": ["React hydration warning: <span> rendered as a child of <option> inside the user picker (Settings.jsx ~L776). Causes a console error in dev and potential SSR mismatch warnings."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration7_routing_leaves_internal.py",
+    "/app/test_reports/pytest/iter7_results.xml"
+  ],
+  "action_items": [
+    "Add data-testid like 'lead-row-{lead_id}' (or 'chat-lead-{id}') to each row inside the WhatsApp/chat inbox list in /app/frontend/src/pages/Chat.jsx so the Internal Q&A tab can be reached from automated tests.",
+    "Fix Settings.jsx LeaveManagementPanel user-select <option> rendering — do not nest a <span> inside <option>; output {u.name} as plain text to silence the hydration warning."
+  ],
+  "critical_code_review_comments": [
+    "server.py is now 5342 lines; consider splitting into routers (auth, leads, webhooks, internal_chat, leaves, buyleads_routing) for maintainability.",
+    "_pick_buyleads_executive sorts eligible by username then advances last_assigned_index — pointer survives across config updates which is the intended 'sticky RR'. Looks correct; covered by tests.",
+    "create_leave does not check overlap with existing active leaves for the same user; not in spec but could lead to confusing UI state.",
+    "internal_chat_send returns the inserted doc directly with read_by[user_id] populated — good for optimistic UI."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration7_routing_leaves_internal.py"
+  ],
+  "success_rate": {"backend": "100% (22/22)", "frontend": "60% (settings panels OK, internal chat tab not reachable due to missing testids on lead rows)"},
+  "test_credentials": "admin / Admin@123, ravi / Exec@123, priya / Exec@123",
+  "seed_data_creation": "Created and cancelled test leaves for ravi (TEST_iter7, TEST_iter7_future). Created several IndiaMART buyleads + non-buyleads via webhook and one ExportersIndia buylead via POST /api/leads. Reset buyleads-routing config to mode=all for both sources at end. No persistent test pollution beyond a few extra TEST_-prefixed leads.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend regression suite for the three iteration-7 features lives at /app/backend/tests/test_iteration7_routing_leaves_internal.py. It self-resets buyleads routing and cancels its leaves at teardown. If you need to verify the /chat Internal Q&A tab via Playwright, first add 'lead-row-{id}' testids in Chat.jsx — currently only the inbox container is selectable.",
+  "rca_of_the_issue": "N/A — no failing flows. Only minor automation-blocking gap (missing data-testid on lead rows) and a non-fatal React hydration warning on the Settings leave form."
+}

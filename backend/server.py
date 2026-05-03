@@ -426,6 +426,30 @@ class JustdialIngestInput(BaseModel):
     subject: Optional[str] = ""
     from_email: Optional[str] = "instantemail@justdial.com"
 
+# Buyleads routing (per-source selective round-robin)
+class BuyleadsRoutingInput(BaseModel):
+    mode: Optional[str] = None          # "all" | "selected"
+    agent_ids: Optional[List[str]] = None
+
+# Leave / Holiday management
+class LeaveCreate(BaseModel):
+    user_id: str
+    start_date: str                     # "YYYY-MM-DD"
+    end_date: str                       # "YYYY-MM-DD"
+    reason: Optional[str] = ""
+
+class LeaveUpdate(BaseModel):
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    reason: Optional[str] = None
+
+# Internal Admin↔Agent Q&A
+class InternalChatSend(BaseModel):
+    lead_id: str
+    body: str
+    message_id: Optional[str] = None    # optional WA message the agent is referring to
+    to_user_id: Optional[str] = None    # required when admin replies (which agent)
+
 # ------------- Auth dependencies -------------
 async def get_current_user(request: Request) -> dict:
     token = request.cookies.get("access_token")
@@ -444,6 +468,21 @@ async def get_current_user(request: Request) -> dict:
     user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0})
     if not user or not user.get("active", True):
         raise HTTPException(status_code=401, detail="User not found or inactive")
+    # Soft-logout: if this is an executive currently on leave, force-401 so the
+    # frontend's global 401 interceptor logs them out on the next poll (~4s).
+    # Admins are never blocked even if they are marked on leave (edge-case safety).
+    if user.get("role") == "executive":
+        leave = await _is_user_on_leave(user["id"])
+        if leave:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "code": "user_on_leave",
+                    "message": "You are currently on leave. Access has been disabled until your return.",
+                    "leave_start": leave.get("start_date"),
+                    "leave_end": leave.get("end_date"),
+                },
+            )
     user.pop("password_hash", None)
     return user
 
@@ -461,6 +500,19 @@ async def login(body: LoginInput, response: Response):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not user.get("active", True):
         raise HTTPException(status_code=403, detail="Account disabled")
+    # Block login during an active leave (executives only). Admins stay active.
+    if user.get("role") == "executive":
+        leave = await _is_user_on_leave(user["id"])
+        if leave:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "user_on_leave",
+                    "message": f"You are on leave until {leave.get('end_date')}. Access is disabled during this period.",
+                    "leave_start": leave.get("start_date"),
+                    "leave_end": leave.get("end_date"),
+                },
+            )
     token = create_access_token(user["id"], user["username"], user["role"])
     response.set_cookie(
         key="access_token", value=token, httponly=True, secure=False,
@@ -612,6 +664,297 @@ async def get_receiver_routing(admin: dict = Depends(require_admin)):
             "receiver_numbers": u.get("receiver_numbers") or [],
         })
     return {"users": rows}
+
+
+# ------------- Buyleads routing (admin-only) -------------
+BUYLEADS_SOURCES = ("IndiaMART", "ExportersIndia")
+
+@api.get("/settings/buyleads-routing")
+async def get_buyleads_routing(admin: dict = Depends(require_admin)):
+    """Return the per-source buyleads routing config + eligible executives for the UI."""
+    out = []
+    for src in BUYLEADS_SOURCES:
+        cfg = await _get_buyleads_routing(src)
+        out.append(cfg)
+    # Include active executives so UI can render the multi-select
+    execs = await db.users.find(
+        {"role": "executive", "active": True},
+        {"_id": 0, "password_hash": 0},
+    ).sort("name", 1).to_list(500)
+    return {"configs": out, "executives": execs}
+
+
+@api.put("/settings/buyleads-routing/{source}")
+async def update_buyleads_routing(source: str, body: BuyleadsRoutingInput, admin: dict = Depends(require_admin)):
+    if source not in BUYLEADS_SOURCES:
+        raise HTTPException(status_code=400, detail=f"source must be one of {list(BUYLEADS_SOURCES)}")
+    patch: Dict[str, Any] = {"source": source, "updated_at": iso(now_utc()), "updated_by": admin["id"]}
+    if body.mode is not None:
+        if body.mode not in ("all", "selected"):
+            raise HTTPException(status_code=400, detail="mode must be 'all' or 'selected'")
+        patch["mode"] = body.mode
+    if body.agent_ids is not None:
+        # Validate agents exist and are executives
+        valid_ids: List[str] = []
+        for uid in body.agent_ids:
+            u = await db.users.find_one({"id": uid, "role": "executive"}, {"_id": 0, "id": 1})
+            if u:
+                valid_ids.append(uid)
+        patch["agent_ids"] = valid_ids
+    await db.buyleads_routing.update_one({"source": source}, {"$set": patch}, upsert=True)
+    await log_activity(admin["id"], "buyleads_routing_updated", None, {"source": source, "mode": patch.get("mode"), "count": len(patch.get("agent_ids", []) or [])})
+    cfg = await _get_buyleads_routing(source)
+    return cfg
+
+
+# ------------- Leave / Holiday management (admin-only CRUD) -------------
+def _valid_date_str(s: str) -> bool:
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return True
+    except Exception:
+        return False
+
+
+@api.get("/leaves")
+async def list_leaves(admin: dict = Depends(require_admin), user_id: Optional[str] = None, active_only: bool = False):
+    query: Dict[str, Any] = {"cancelled": {"$ne": True}}
+    if user_id:
+        query["user_id"] = user_id
+    if active_only:
+        today = now_utc().strftime("%Y-%m-%d")
+        query["start_date"] = {"$lte": today}
+        query["end_date"] = {"$gte": today}
+    leaves = await db.leaves.find(query, {"_id": 0}).sort("start_date", -1).to_list(500)
+    # Enrich with user name for easy display
+    by_id: Dict[str, dict] = {}
+    for lv in leaves:
+        uid = lv.get("user_id")
+        if uid and uid not in by_id:
+            u = await db.users.find_one({"id": uid}, {"_id": 0, "id": 1, "name": 1, "username": 1, "role": 1})
+            if u:
+                by_id[uid] = u
+        u = by_id.get(uid) or {}
+        lv["user_name"] = u.get("name")
+        lv["user_username"] = u.get("username")
+        today = now_utc().strftime("%Y-%m-%d")
+        lv["is_active"] = (lv.get("start_date", "") <= today <= lv.get("end_date", ""))
+    return leaves
+
+
+@api.post("/leaves")
+async def create_leave(body: LeaveCreate, admin: dict = Depends(require_admin)):
+    if not _valid_date_str(body.start_date) or not _valid_date_str(body.end_date):
+        raise HTTPException(status_code=400, detail="start_date/end_date must be YYYY-MM-DD")
+    if body.start_date > body.end_date:
+        raise HTTPException(status_code=400, detail="start_date cannot be after end_date")
+    u = await db.users.find_one({"id": body.user_id}, {"_id": 0, "id": 1, "name": 1, "role": 1})
+    if not u:
+        raise HTTPException(status_code=404, detail="user not found")
+    leave = {
+        "id": str(uuid.uuid4()),
+        "user_id": body.user_id,
+        "start_date": body.start_date,
+        "end_date": body.end_date,
+        "reason": (body.reason or "").strip(),
+        "cancelled": False,
+        "created_at": iso(now_utc()),
+        "created_by": admin["id"],
+    }
+    await db.leaves.insert_one(leave.copy())
+    leave.pop("_id", None)
+    await log_activity(admin["id"], "leave_created", None, {"user_id": body.user_id, "start_date": body.start_date, "end_date": body.end_date})
+    return leave
+
+
+@api.patch("/leaves/{leave_id}")
+async def update_leave(leave_id: str, body: LeaveUpdate, admin: dict = Depends(require_admin)):
+    existing = await db.leaves.find_one({"id": leave_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="leave not found")
+    patch: Dict[str, Any] = {"updated_at": iso(now_utc()), "updated_by": admin["id"]}
+    if body.start_date is not None:
+        if not _valid_date_str(body.start_date):
+            raise HTTPException(status_code=400, detail="start_date must be YYYY-MM-DD")
+        patch["start_date"] = body.start_date
+    if body.end_date is not None:
+        if not _valid_date_str(body.end_date):
+            raise HTTPException(status_code=400, detail="end_date must be YYYY-MM-DD")
+        patch["end_date"] = body.end_date
+    if body.reason is not None:
+        patch["reason"] = body.reason.strip()
+    final_start = patch.get("start_date", existing.get("start_date"))
+    final_end = patch.get("end_date", existing.get("end_date"))
+    if final_start > final_end:
+        raise HTTPException(status_code=400, detail="start_date cannot be after end_date")
+    await db.leaves.update_one({"id": leave_id}, {"$set": patch})
+    await log_activity(admin["id"], "leave_updated", None, {"leave_id": leave_id, **{k: v for k, v in patch.items() if k != "updated_at"}})
+    updated = await db.leaves.find_one({"id": leave_id}, {"_id": 0})
+    return updated
+
+
+@api.post("/leaves/{leave_id}/cancel")
+async def cancel_leave(leave_id: str, admin: dict = Depends(require_admin)):
+    existing = await db.leaves.find_one({"id": leave_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="leave not found")
+    await db.leaves.update_one({"id": leave_id}, {"$set": {
+        "cancelled": True, "cancelled_at": iso(now_utc()), "cancelled_by": admin["id"],
+    }})
+    await log_activity(admin["id"], "leave_cancelled", None, {"leave_id": leave_id, "user_id": existing.get("user_id")})
+    return {"ok": True}
+
+
+@api.delete("/leaves/{leave_id}")
+async def delete_leave(leave_id: str, admin: dict = Depends(require_admin)):
+    # Alias for cancel — keeps the DELETE verb available for the UI.
+    return await cancel_leave(leave_id, admin=admin)
+
+
+# ------------- Internal Admin ↔ Agent Q&A chat -------------
+async def _admin_ids() -> List[str]:
+    admins = await db.users.find({"role": "admin", "active": True}, {"_id": 0, "id": 1}).to_list(50)
+    return [a["id"] for a in admins]
+
+
+@api.post("/internal-chat/send")
+async def internal_chat_send(body: InternalChatSend, user: dict = Depends(get_current_user)):
+    """Send an internal Q&A message.
+    - Agents always send TO an admin (to_user_id ignored — broadcast to all admins).
+    - Admins send TO a specific agent (to_user_id required). Admin→agent is 1:1.
+    - Agent↔Agent is strictly forbidden.
+    """
+    body_text = (body.body or "").strip()
+    if not body_text:
+        raise HTTPException(status_code=400, detail="body required")
+    lead = await db.leads.find_one({"id": body.lead_id}, {"_id": 0, "id": 1, "assigned_to": 1})
+    if not lead:
+        raise HTTPException(status_code=404, detail="lead not found")
+    role = user.get("role")
+    if role == "executive":
+        # Executive can only use internal chat for leads assigned to them
+        if lead.get("assigned_to") != user["id"]:
+            raise HTTPException(status_code=403, detail="You can only use internal chat on your own leads")
+        agent_id = user["id"]
+        sender_role = "executive"
+    elif role == "admin":
+        if not body.to_user_id:
+            raise HTTPException(status_code=400, detail="to_user_id (agent) required for admin replies")
+        target = await db.users.find_one({"id": body.to_user_id, "role": "executive"}, {"_id": 0, "id": 1})
+        if not target:
+            raise HTTPException(status_code=400, detail="Target must be an executive")
+        agent_id = body.to_user_id
+        sender_role = "admin"
+    else:
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    # Optional quote: the WA message the agent is referring to
+    quoted = None
+    if body.message_id:
+        qm = await db.messages.find_one({"id": body.message_id, "lead_id": body.lead_id}, {"_id": 0})
+        if qm:
+            quoted = {
+                "id": qm["id"],
+                "direction": qm.get("direction"),
+                "body": (qm.get("body") or qm.get("caption") or "").strip()[:200],
+                "at": qm.get("at"),
+                "msg_type": qm.get("msg_type"),
+            }
+    msg = {
+        "id": str(uuid.uuid4()),
+        "lead_id": body.lead_id,
+        "agent_id": agent_id,           # thread key (per-agent per-lead)
+        "from_user_id": user["id"],
+        "from_role": sender_role,
+        "body": body_text,
+        "quoted": quoted,
+        "read_by": [user["id"]],
+        "at": iso(now_utc()),
+    }
+    await db.internal_messages.insert_one(msg.copy())
+    msg.pop("_id", None)
+    return msg
+
+
+@api.get("/internal-chat/{lead_id}")
+async def internal_chat_get(lead_id: str, agent_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    """Fetch messages for a (lead, agent) thread.
+    - Executive: always their own thread (agent_id ignored).
+    - Admin: if agent_id omitted → return list of threads for this lead with last-message preview.
+             if agent_id provided → return the full thread.
+    """
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0, "id": 1, "assigned_to": 1})
+    if not lead:
+        raise HTTPException(status_code=404, detail="lead not found")
+    role = user.get("role")
+    if role == "executive":
+        # Strict isolation: only the lead's assignee can view the internal thread.
+        if lead.get("assigned_to") != user["id"]:
+            raise HTTPException(status_code=403, detail="You can only view internal chat on your own leads")
+        msgs = await db.internal_messages.find(
+            {"lead_id": lead_id, "agent_id": user["id"]}, {"_id": 0}
+        ).sort("at", 1).to_list(1000)
+        return {"thread": msgs}
+    if role == "admin":
+        if agent_id:
+            msgs = await db.internal_messages.find(
+                {"lead_id": lead_id, "agent_id": agent_id}, {"_id": 0}
+            ).sort("at", 1).to_list(1000)
+            return {"thread": msgs}
+        # List threads grouped by agent_id
+        cursor = db.internal_messages.find({"lead_id": lead_id}, {"_id": 0}).sort("at", 1)
+        all_msgs = await cursor.to_list(2000)
+        groups: Dict[str, List[dict]] = {}
+        for m in all_msgs:
+            groups.setdefault(m["agent_id"], []).append(m)
+        threads = []
+        for aid, lst in groups.items():
+            last = lst[-1]
+            unread_for_admin = sum(1 for x in lst if user["id"] not in (x.get("read_by") or []))
+            agent = await db.users.find_one({"id": aid}, {"_id": 0, "id": 1, "name": 1, "username": 1})
+            threads.append({
+                "agent_id": aid,
+                "agent_name": (agent or {}).get("name"),
+                "agent_username": (agent or {}).get("username"),
+                "count": len(lst),
+                "unread_for_admin": unread_for_admin,
+                "last_at": last.get("at"),
+                "last_body": last.get("body", "")[:120],
+            })
+        threads.sort(key=lambda t: t.get("last_at") or "", reverse=True)
+        return {"threads": threads}
+    raise HTTPException(status_code=403, detail="Not permitted")
+
+
+@api.post("/internal-chat/{lead_id}/mark-read")
+async def internal_chat_mark_read(lead_id: str, agent_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    role = user.get("role")
+    query: Dict[str, Any] = {"lead_id": lead_id}
+    if role == "executive":
+        query["agent_id"] = user["id"]
+    elif role == "admin":
+        if agent_id:
+            query["agent_id"] = agent_id
+    else:
+        raise HTTPException(status_code=403, detail="Not permitted")
+    await db.internal_messages.update_many(
+        {**query, "read_by": {"$ne": user["id"]}},
+        {"$push": {"read_by": user["id"]}},
+    )
+    return {"ok": True}
+
+
+@api.get("/internal-chat/inbox/unread")
+async def internal_chat_unread(user: dict = Depends(get_current_user)):
+    """Return total unread internal messages for the current user (admin or exec) —
+    used by the UI to display a badge on the lead drawer tab."""
+    query: Dict[str, Any] = {"read_by": {"$ne": user["id"]}}
+    role = user.get("role")
+    if role == "executive":
+        query["agent_id"] = user["id"]
+    # Admin: count anything addressed to any agent where admin hasn't read yet.
+    total = await db.internal_messages.count_documents(query)
+    return {"unread": total}
 
 
 # ------------- Assignment Engine -------------
@@ -915,7 +1258,16 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
     # auto-assign if no explicit assignee
     if not lead["assigned_to"]:
         try:
-            await assign_lead(lead["id"], target_user_id=None, by_user_id=by_user_id)
+            # Buyleads routing: if the lead qualifies as a "buylead" for its source
+            # and an admin has configured mode=selected with agent_ids, route it
+            # through the round-robin of that allow-list. Falls back to the normal
+            # pick_next_executive() when mode=all or no eligible selected agent.
+            target_uid: Optional[str] = None
+            if _is_buylead(data):
+                chosen_bl = await _pick_buyleads_executive(lead["source"])
+                if chosen_bl:
+                    target_uid = chosen_bl["id"]
+            await assign_lead(lead["id"], target_user_id=target_uid, by_user_id=by_user_id)
         except Exception as e:
             logger.warning(f"auto-assign failed: {e}")
     else:
@@ -2849,8 +3201,12 @@ async def _handle_indiamart_payload(payload: Any, identifier: Optional[str] = No
         if receiver:
             user_match = await _find_user_for_receiver(receiver)
             if user_match:
-                data["assigned_to"] = user_match["id"]
-                data["source_data"] = {**(data.get("source_data") or {}), "matched_receiver": receiver}
+                # Skip assignment if user is currently on leave — fall back to round-robin
+                if await _is_user_on_leave(user_match["id"]):
+                    data["source_data"] = {**(data.get("source_data") or {}), "matched_receiver": receiver, "receiver_on_leave": True}
+                else:
+                    data["assigned_to"] = user_match["id"]
+                    data["source_data"] = {**(data.get("source_data") or {}), "matched_receiver": receiver}
         lead = await _create_lead_internal(data, by_user_id=None)
         created_ids.append(lead["id"])
     await db.webhook_payloads.update_one(
