@@ -85,12 +85,17 @@ export default function Chat() {
     api.get("/users").then(({ data }) => setExecs(data.filter(u => u.role === "executive" || u.role === "admin"))).catch(() => {});
   }, [isAdmin]);
 
-  // Sync active lead id to URL
+  // Sync active lead id to URL — preserve tab/agent deep-link params if present
+  // so links from /qa remain shareable (copy-paste URL still restores the panel state).
   useEffect(() => {
     const p = {};
     if (activeId) p.lead = activeId;
+    const tab = params.get("tab");
+    const agent = params.get("agent");
+    if (tab) p.tab = tab;
+    if (agent) p.agent = agent;
     setParams(p, { replace: true });
-  }, [activeId, setParams]);
+  }, [activeId, setParams]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const activeConv = useMemo(() => convs.find(c => c.id === activeId), [convs, activeId]);
   const totalUnread = convs.reduce((s, c) => s + (c.unread || 0), 0);

@@ -22,6 +22,31 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 16 (Feb 2026) — Internal Q&A Tracker + Chat-list tags + Deep-links
+- **Centralized tracker page `/qa`** (`InternalQA.jsx`) — visible to both admin and executives via sidebar nav (`nav-qa`). Desktop table + mobile card grid.
+  - Columns: Lead/Customer · Agent · Last Question + timestamp · Last Reply + timestamp · Replied By · Status chip · "Open chat" action button.
+  - Filter chips: `All` / `Pending` / `Answered` (with counts) + free-text search box covering customer name, phone, agent name, last body.
+  - Polling: 6s. Backend filter + client-side search; pending threads always sort first.
+  - Status chip: orange `Pending` / green `Answered` / neutral `New` (admin-initiated without agent reply), with unread-for-me pill.
+
+- **Backend `GET /api/internal-qa/threads`** — aggregates `internal_messages` per `(lead_id, agent_id)`.
+  - Executive → filter to `agent_id=self` (strict isolation, reusing existing RBAC).
+  - Admin → sees all threads; optional `?agent_id=`, `?status=pending|answered`, `?q=` filters.
+  - Output per row: `lead_customer_name`, `lead_phone`, `agent_name/username`, `replied_by {id,name,username}`, `first_asked_at`, `last_asked_at`, `last_replied_at`, `last_body` (truncated 160), `last_from_role`, `count`, `unread_for_me`, `status`.
+  - Path chosen as `/internal-qa/threads` to avoid the `/internal-chat/{lead_id}` single-segment matcher; `internal-chat/*` endpoints remain unchanged.
+
+- **`GET /api/inbox/conversations` augmented** — now returns `internal_qa_status: 'none' | 'pending' | 'answered'` per conversation, derived from the latest internal message `from_role`. Executive scope filters to `agent_id=self`; admin rolls up across all threads (pending wins). Drives the chat-list tags.
+
+- **Chat inbox tags** (`ConvRow` in `Chat.jsx`) — two new per-row badges driven by `internal_qa_status`:
+  - `qa-tag-pending-{lead_id}` → orange `QUESTION ASKED` (agent question awaiting admin reply).
+  - `qa-tag-answered-{lead_id}` → green `ANSWERED` (admin has responded).
+
+- **Deep-linking from `/qa` → `/chat`** — `Open chat` button navigates to `/chat?lead={id}&tab=internal[&agent={id}]`. `Chat.jsx` captures the initial params ONCE via `useMemo` (so the URL-sync effect doesn't strip them before `ChatThread` mounts async after conv fetch). URL retains `tab`/`agent` for shareable links. `ChatThread` accepts `initialTab` + `initialAgentId`; `InternalChat` consumes `preselectAgentId` so admin deep-links land directly in the specific agent's thread (skipping the thread-list view). Executive deep-links go straight to their own thread (no agent-picker exists for them).
+
+- **Access control remains intact** — executives only see their own threads in `/qa`, in `/api/internal-qa/threads`, and inside the chat inbox `internal_qa_status`. Previous iteration's `/api/internal-chat/{lead_id}` 403 on unassigned leads still holds.
+
+- **Tested**: 13/13 new pytest backend suite green + full Playwright UI coverage for both admin and executive flows (Q&A page filters, search, tags, deep-link into specific agent's thread, executive-only row isolation).
+
 ### Iteration 15 (Feb 2026) — Buyleads Routing + Internal Q&A + Leave Management
 - **Buyleads routing (per-source allow-list round-robin)**
   - Collections: `buyleads_routing` keyed by `source` with `{mode: 'all' | 'selected', agent_ids: [], last_assigned_index}`.
