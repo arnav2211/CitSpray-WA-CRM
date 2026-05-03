@@ -22,6 +22,35 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 15 (Feb 2026) — Buyleads Routing + Internal Q&A + Leave Management
+- **Buyleads routing (per-source allow-list round-robin)**
+  - Collections: `buyleads_routing` keyed by `source` with `{mode: 'all' | 'selected', agent_ids: [], last_assigned_index}`.
+  - Helpers: `_is_buylead()` (IndiaMART `QUERY_TYPE=B`, ExportersIndia `enquiry_type=buyleads`), `_pick_buyleads_executive()` (round-robin across allow-list, skipping on-leave/inactive), `_get_buyleads_routing()`.
+  - Wired into `_create_lead_internal` → if the incoming lead qualifies as a buylead and admin has configured `mode=selected`, assignment goes to the next allow-listed agent; otherwise falls back to `pick_next_executive()`. Existing already-assigned leads are untouched on config change.
+  - Endpoints: `GET /api/settings/buyleads-routing` (configs + executives), `PUT /api/settings/buyleads-routing/{source}` (source must be `IndiaMART` or `ExportersIndia`, validates mode and that agent_ids are active executives).
+  - UI (`Settings.jsx` → `BuyleadsRoutingPanel`): two source cards, toggle `All agents` / `Selected agents`, clickable agent pills for the allow-list, save per source.
+
+- **Leave / Holiday management (admin CRUD + soft-logout)**
+  - Collection: `leaves` with `{id, user_id, start_date, end_date, reason, cancelled, created_at/by, updated_at/by, cancelled_at/by}`.
+  - Helper `_is_user_on_leave(user_id)` — returns the active leave doc when `start_date <= today <= end_date AND cancelled != true`.
+  - Soft-logout: `get_current_user()` returns HTTP 401 with `detail.code='user_on_leave'` for executives on active leave. Admins are never blocked.
+  - Block login: `POST /api/auth/login` returns HTTP 403 with `detail.code='user_on_leave'` for executives on active leave.
+  - Assignment exclusions: `pick_next_executive()` filters out leave; `_pick_buyleads_executive()` filters out leave; IndiaMART `_find_user_for_receiver()` match (PNS route) is ignored when the matched user is on leave (falls back to round-robin).
+  - Endpoints: `GET /api/leaves?user_id?&active_only?`, `POST /api/leaves`, `PATCH /api/leaves/{id}`, `POST /api/leaves/{id}/cancel`, `DELETE /api/leaves/{id}` (alias for cancel).
+  - UI (`Settings.jsx` → `LeaveManagementPanel`): add-leave form (agent / start / end / reason), segmented sections for Active / Upcoming / Past with Modify + Cancel inline actions.
+  - Frontend global interceptor (`AuthContext.jsx`): any 401 with a token present clears localStorage + hard-redirects to `/login` with a contextual toast (special message when `code=user_on_leave`). Effective within one 4-second poll cycle.
+
+- **Internal Admin ↔ Agent Q&A chat (per-lead, per-agent isolation)**
+  - Collection: `internal_messages` with `{id, lead_id, agent_id (thread key), from_user_id, from_role, body, quoted, read_by[], at}`.
+  - Endpoints:
+    - `POST /api/internal-chat/send` — Agent can send only on their own leads (→ 403 otherwise); sent under `agent_id=self`. Admin must supply `to_user_id` (an active executive) → message persists under `agent_id=to_user_id`. Agent↔agent is forbidden. Optional `message_id` quotes the referenced WA message.
+    - `GET /api/internal-chat/{lead_id}` — Executive: strict 403 unless they own the lead, else returns only their thread. Admin: without `agent_id` → grouped threads per agent with unread-for-admin counts + last preview; with `agent_id` → full thread.
+    - `POST /api/internal-chat/{lead_id}/mark-read?agent_id?` — marks messages as read by the caller.
+    - `GET /api/internal-chat/inbox/unread` — unread count for the current user (badge hook).
+  - UI (`Chat.jsx`): right-side lead info panel is now a tabbed interface (`Details` | `Internal Q&A`). Per-message `?` hover button on WA bubbles lets an executive "Ask admin" with that message pre-quoted. Admin sees per-agent thread list inside the tab plus a "Start thread with" picker; clicking a thread opens it with a back-to-list control. WhatsApp customer NEVER sees internal messages (separate collection, never hits `send_flow_message`).
+
+- **Testing**: 22/22 new pytest regression suite at `/app/backend/tests/test_iteration7_routing_leaves_internal.py` (testing-agent-authored, self-cleans buyleads config and cancels its own leaves on teardown). Previous iter7+iter8 regression remains 39/39 green.
+
 ### Iteration 14 (Feb 2026) — ExportersIndia Pull API (scheduled poll)
 - **Switched from push webhook to pull** — we now poll `https://members.exportersindia.com/api-inquiry-detail.php?k=<api_key>&email=<email>&date_from=<yyyy-mm-dd>` on a configurable interval (default 1 minute; 10-second minimum enforced). Uses `last_success_at - 1 day` as `date_from` to catch late-arriving enquiries; dedup via `inq_id` and phone handles repeats.
 - **APScheduler job `exportersindia_pull`** — scheduled at boot if the admin has enabled it; rescheduled in-place on config changes (no service restart needed). Skips ticks automatically if key/email are missing.
