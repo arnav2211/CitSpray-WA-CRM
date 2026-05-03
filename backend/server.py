@@ -2642,7 +2642,11 @@ async def start_flow(flow_id: str, body: FlowStartInput, admin: dict = Depends(r
         if not start:
             raise HTTPException(status_code=400, detail="Flow has no start node — mark one first.")
         node_id = start["id"]
-    return await send_flow_message(body.phone, node_id)
+    result = await send_flow_message(body.phone, node_id)
+    # Surface build errors as 400 so the UI can distinguish them from successful sends
+    if result.get("error") and not result.get("status"):
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
 
 
 @api.get("/chat-sessions")

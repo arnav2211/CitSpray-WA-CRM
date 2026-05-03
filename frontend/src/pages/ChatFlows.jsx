@@ -71,8 +71,10 @@ export default function ChatFlows() {
         <div className="border border-gray-200 bg-white" data-testid="flows-list">
           {flows.length === 0 && <div className="p-6 text-center text-xs uppercase tracking-widest text-gray-400">No flows yet</div>}
           {flows.map(f => (
-            <button key={f.id} onClick={() => setSelectedFlowId(f.id)}
-              className={`w-full text-left px-4 py-3 border-b border-gray-100 ${selectedFlowId === f.id ? "bg-gray-50 border-l-2 border-l-[#002FA7]" : ""}`}
+            <div key={f.id} onClick={() => setSelectedFlowId(f.id)}
+              role="button" tabIndex={0}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setSelectedFlowId(f.id); } }}
+              className={`cursor-pointer text-left px-4 py-3 border-b border-gray-100 ${selectedFlowId === f.id ? "bg-gray-50 border-l-2 border-l-[#002FA7]" : ""}`}
               data-testid={`flow-row-${f.id}`}>
               <div className="flex items-center justify-between gap-2">
                 <div className="font-semibold text-sm truncate">{f.name}</div>
@@ -80,12 +82,12 @@ export default function ChatFlows() {
               </div>
               {f.description && <div className="text-xs text-gray-500 mt-0.5 truncate">{f.description}</div>}
               <div className="text-[10px] text-gray-400 mt-1 flex items-center gap-2">
-                <button onClick={(e) => { e.stopPropagation(); toggleActive(f); }} className="uppercase tracking-widest font-bold hover:underline" data-testid={`toggle-active-${f.id}`}>
+                <button type="button" onClick={(e) => { e.stopPropagation(); toggleActive(f); }} className="uppercase tracking-widest font-bold hover:underline" data-testid={`toggle-active-${f.id}`}>
                   {f.is_active ? "Deactivate" : "Activate"}
                 </button>
-                <button onClick={(e) => { e.stopPropagation(); deleteFlow(f); }} className="text-[#E60000] hover:underline" data-testid={`delete-flow-${f.id}`}>Delete</button>
+                <button type="button" onClick={(e) => { e.stopPropagation(); deleteFlow(f); }} className="text-[#E60000] hover:underline" data-testid={`delete-flow-${f.id}`}>Delete</button>
               </div>
-            </button>
+            </div>
           ))}
         </div>
 

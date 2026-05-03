@@ -22,6 +22,15 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 7 (May 2026) — Chatbot flow engine (WATI / AiSensy-style)
+- **Data model** — `chat_flows`, `chat_nodes`, `chat_options`, `chat_sessions` (phone_key unique).
+- **Flow engine** — `send_flow_message(phone, node_id)` reads node + options, renders the right WhatsApp payload (text / interactive-button / interactive-list), sends via the existing WA abstraction (cfg['api_version'] dynamic, never hardcoded), logs to messages with `flow_id` + `flow_node_id`, and upserts the per-user session. Button/list nodes gated by the 24-hour window; text nodes are not.
+- **Webhook dispatcher** — `/api/webhooks/whatsapp` now detects interactive replies, looks up the user's session, matches `button_reply.id` / `list_reply.id` against the current node's options, and auto-sends the `next_node_id`. If no session exists but an active flow is configured, the start node's options become the entry point. End-of-flow clears the session.
+- **Admin CRUD** — `/api/chatflows`, `/api/chatflows/{id}/nodes`, `/api/chatflows/{id}/nodes/{node_id}/options` (replace semantics), `/api/chatflows/{id}/start` (test-send — returns 400 on build failures), `/api/chat-sessions`. Admin-only. `_build_interactive_payload` enforces max-3-buttons and required body.
+- **Frontend admin UI** at `/chatflows` — flows list + create modal, node list per flow, node editor (name, type, header, body, footer, list button text, start toggle, inline options with next-node dropdown), "Send start" test harness. All data-testids exposed for automation. Nested-button hydration warning fixed by switching flow-row to a div with role="button".
+- **Sidebar entry** — "Chatbot Flows" nav for admins.
+- **Regression safe** — 22/22 new + 37/37 prior backend tests pass.
+
 ### Iteration 5 (May 2026) — Duplicate-lead prevention + phone standardization
 - **Phone canonicalization** — new helpers `normalize_phone_display` (Indian → bare 10-digit, e.g. `8790934618`; international → `+<digits>`) and `phone_match_pattern` (last-10-digit suffix regex). One-shot startup migration tags each lead with `_phones_canonicalized=true` after rewriting `phone`/`phones`.
 - **Cross-source dedup by phone** — `_find_lead_by_phone(phone, exclude_id?)` matches stored canonical phone OR phones[] suffix-aware. Used by `_create_lead_internal` (returns existing instead of creating), `POST /api/leads/{id}/phones` (rejects cross-lead duplicates with structured 409), and `POST /api/inbox/start-chat`.
