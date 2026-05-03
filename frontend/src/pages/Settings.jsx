@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
-import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck, Copy, Link as LinkIcon, Phone, Plus, Trash, Lightning } from "@phosphor-icons/react";
+import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck, Copy, Link as LinkIcon, Phone, Plus, Trash, Lightning, Users as UsersIcon, Calendar, X } from "@phosphor-icons/react";
 import { fmtIST } from "@/lib/format";
 
 const FIELDS = [
@@ -98,6 +98,10 @@ export default function Settings() {
       </div>
 
       {hooks && <WebhooksPanel hooks={hooks} />}
+
+      <BuyleadsRoutingPanel />
+
+      <LeaveManagementPanel />
 
       <ExportersIndiaPanel onChanged={load} />
 
@@ -512,3 +516,304 @@ function ExportersIndiaPanel({ onChanged }) {
 }
 
 
+
+
+// ---------------- Buyleads Routing (admin) ----------------
+function BuyleadsRoutingPanel() {
+  const [configs, setConfigs] = useState([]);
+  const [execs, setExecs] = useState([]);
+  const [draft, setDraft] = useState({}); // { IndiaMART: {mode, agent_ids}, ExportersIndia: {...} }
+  const [busy, setBusy] = useState(false);
+
+  const load = async () => {
+    try {
+      const { data } = await api.get("/settings/buyleads-routing");
+      setConfigs(data.configs || []);
+      setExecs(data.executives || []);
+      const d = {};
+      (data.configs || []).forEach((c) => {
+        d[c.source] = { mode: c.mode || "all", agent_ids: c.agent_ids || [] };
+      });
+      setDraft(d);
+    } catch (e) { toast.error(errMsg(e)); }
+  };
+  useEffect(() => { load(); }, []);
+
+  const toggleAgent = (source, agentId) => {
+    setDraft((d) => {
+      const cur = d[source] || { mode: "selected", agent_ids: [] };
+      const has = cur.agent_ids.includes(agentId);
+      return {
+        ...d,
+        [source]: { ...cur, agent_ids: has ? cur.agent_ids.filter((x) => x !== agentId) : [...cur.agent_ids, agentId] },
+      };
+    });
+  };
+
+  const save = async (source) => {
+    const cur = draft[source];
+    if (!cur) return;
+    if (cur.mode === "selected" && cur.agent_ids.length === 0) {
+      toast.error("Select at least one agent — or switch to All agents");
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.put(`/settings/buyleads-routing/${source}`, cur);
+      toast.success(`${source} buyleads routing saved`);
+      await load();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setBusy(false); }
+  };
+
+  const setMode = (source, mode) => {
+    setDraft((d) => ({ ...d, [source]: { ...(d[source] || { agent_ids: [] }), mode } }));
+  };
+
+  return (
+    <div className="border border-gray-200 bg-white" data-testid="buyleads-routing-panel">
+      <div className="px-5 py-4 border-b border-gray-200">
+        <h2 className="font-chivo font-bold text-lg flex items-center gap-2">
+          <UsersIcon size={18} weight="bold" /> Buyleads Routing
+        </h2>
+        <p className="text-xs text-gray-500 mt-1 leading-relaxed">
+          Route high-intent buyleads to a specific set of agents per source (round-robin).
+          IndiaMART buyleads = <span className="kbd">QUERY_TYPE = B</span>.
+          ExportersIndia buyleads = <span className="kbd">inq_type = "buyleads"</span>.
+          All other leads continue to use the default round-robin.
+        </p>
+      </div>
+      <div className="divide-y divide-gray-200">
+        {configs.map((cfg) => {
+          const d = draft[cfg.source] || { mode: "all", agent_ids: [] };
+          return (
+            <div key={cfg.source} className="px-5 py-4" data-testid={`buyleads-${cfg.source}`}>
+              <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+                <div className="font-chivo font-bold">{cfg.source}</div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setMode(cfg.source, "all")}
+                    className={`px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold ${d.mode === "all" ? "bg-[#002FA7] text-white" : "border border-gray-300 hover:bg-gray-100"}`}
+                    data-testid={`buyleads-mode-all-${cfg.source}`}
+                  >All agents</button>
+                  <button
+                    onClick={() => setMode(cfg.source, "selected")}
+                    className={`px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold ${d.mode === "selected" ? "bg-[#002FA7] text-white" : "border border-gray-300 hover:bg-gray-100"}`}
+                    data-testid={`buyleads-mode-selected-${cfg.source}`}
+                  >Selected agents</button>
+                </div>
+              </div>
+              {d.mode === "selected" && (
+                <div className="flex flex-wrap gap-2 mb-3">
+                  {execs.length === 0 && <span className="text-xs text-gray-400 italic">No active executives yet.</span>}
+                  {execs.map((e) => {
+                    const on = (d.agent_ids || []).includes(e.id);
+                    return (
+                      <button
+                        key={e.id}
+                        onClick={() => toggleAgent(cfg.source, e.id)}
+                        className={`px-3 py-1.5 text-xs border ${on ? "bg-[#25D366] text-white border-[#25D366]" : "border-gray-300 hover:bg-gray-50"}`}
+                        data-testid={`buyleads-agent-${cfg.source}-${e.username}`}
+                      >
+                        {on ? "✓ " : ""}{e.name} <span className="text-[10px] opacity-70">@{e.username}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div className="text-[10px] uppercase tracking-widest text-gray-400 font-bold">
+                  {d.mode === "selected"
+                    ? `${d.agent_ids.length} agent${d.agent_ids.length === 1 ? "" : "s"} selected`
+                    : "Using default round-robin across all active executives"}
+                  {cfg.updated_at && <span className="ml-2 normal-case tracking-normal">· last saved {fmtIST(cfg.updated_at)}</span>}
+                </div>
+                <button
+                  onClick={() => save(cfg.source)}
+                  disabled={busy}
+                  className="bg-[#002FA7] hover:bg-[#002288] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 disabled:opacity-50"
+                  data-testid={`buyleads-save-${cfg.source}`}
+                >
+                  <FloppyDisk size={12} weight="bold" /> Save
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---------------- Leave / Holiday management (admin) ----------------
+function LeaveManagementPanel() {
+  const [leaves, setLeaves] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [form, setForm] = useState({ user_id: "", start_date: "", end_date: "", reason: "" });
+  const [editId, setEditId] = useState(null);
+  const [edit, setEdit] = useState({ start_date: "", end_date: "", reason: "" });
+
+  const today = new Date().toISOString().slice(0, 10);
+
+  const load = async () => {
+    try {
+      const [{ data: lvs }, { data: us }] = await Promise.all([
+        api.get("/leaves"),
+        api.get("/users"),
+      ]);
+      setLeaves(lvs || []);
+      setUsers((us || []).filter((u) => u.role === "executive"));
+    } catch (e) { toast.error(errMsg(e)); }
+  };
+  useEffect(() => { load(); }, []);
+
+  const addLeave = async (e) => {
+    e.preventDefault();
+    if (!form.user_id || !form.start_date || !form.end_date) {
+      toast.error("Agent and dates are required");
+      return;
+    }
+    if (form.start_date > form.end_date) {
+      toast.error("Start date cannot be after end date");
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.post("/leaves", form);
+      toast.success("Leave saved — agent will be logged out on next poll if active");
+      setForm({ user_id: "", start_date: "", end_date: "", reason: "" });
+      await load();
+    } catch (e2) { toast.error(errMsg(e2)); }
+    finally { setBusy(false); }
+  };
+
+  const cancelLeave = async (id) => {
+    if (!window.confirm("Cancel this leave? The agent will regain access immediately.")) return;
+    setBusy(true);
+    try {
+      await api.post(`/leaves/${id}/cancel`);
+      toast.success("Leave cancelled");
+      await load();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setBusy(false); }
+  };
+
+  const startEdit = (lv) => {
+    setEditId(lv.id);
+    setEdit({ start_date: lv.start_date, end_date: lv.end_date, reason: lv.reason || "" });
+  };
+
+  const saveEdit = async (id) => {
+    if (edit.start_date > edit.end_date) { toast.error("Start date cannot be after end date"); return; }
+    setBusy(true);
+    try {
+      await api.patch(`/leaves/${id}`, edit);
+      toast.success("Leave updated");
+      setEditId(null);
+      await load();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setBusy(false); }
+  };
+
+  const active = leaves.filter((l) => l.is_active);
+  const upcoming = leaves.filter((l) => !l.is_active && l.start_date > today);
+  const past = leaves.filter((l) => !l.is_active && l.end_date < today);
+
+  const renderRow = (lv) => (
+    <div key={lv.id} className="px-5 py-3 flex flex-wrap items-center gap-3 border-b border-gray-100" data-testid={`leave-row-${lv.id}`}>
+      <div className="flex-1 min-w-[200px]">
+        <div className="font-semibold text-sm">
+          {lv.user_name || lv.user_username || lv.user_id}
+          {lv.is_active && <span className="ml-2 bg-[#E60000] text-white px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-widest">On leave</span>}
+        </div>
+        <div className="text-[10px] uppercase tracking-widest text-gray-500 font-mono">@{lv.user_username}</div>
+      </div>
+      {editId === lv.id ? (
+        <>
+          <input type="date" value={edit.start_date} onChange={(e) => setEdit((s) => ({ ...s, start_date: e.target.value }))} className="border border-gray-300 px-2 py-1 text-xs" data-testid={`edit-start-${lv.id}`} />
+          <span className="text-gray-400">→</span>
+          <input type="date" value={edit.end_date} onChange={(e) => setEdit((s) => ({ ...s, end_date: e.target.value }))} className="border border-gray-300 px-2 py-1 text-xs" data-testid={`edit-end-${lv.id}`} />
+          <input type="text" placeholder="reason" value={edit.reason} onChange={(e) => setEdit((s) => ({ ...s, reason: e.target.value }))} className="border border-gray-300 px-2 py-1 text-xs flex-1 min-w-[140px]" data-testid={`edit-reason-${lv.id}`} />
+          <button onClick={() => saveEdit(lv.id)} disabled={busy} className="bg-[#002FA7] hover:bg-[#002288] text-white px-2 py-1 text-[10px] uppercase tracking-widest font-bold" data-testid={`edit-save-${lv.id}`}>Save</button>
+          <button onClick={() => setEditId(null)} className="border border-gray-300 px-2 py-1 text-[10px] uppercase tracking-widest font-bold">Cancel</button>
+        </>
+      ) : (
+        <>
+          <div className="text-xs font-mono">{lv.start_date} → {lv.end_date}</div>
+          {lv.reason && <div className="text-xs text-gray-600 italic max-w-xs truncate">"{lv.reason}"</div>}
+          <div className="flex items-center gap-2">
+            <button onClick={() => startEdit(lv)} disabled={busy} className="border border-gray-300 hover:bg-gray-100 px-2 py-1 text-[10px] uppercase tracking-widest font-bold" data-testid={`leave-edit-${lv.id}`}>
+              Modify
+            </button>
+            <button onClick={() => cancelLeave(lv.id)} disabled={busy} className="text-[#E60000] hover:bg-[#E60000] hover:text-white border border-[#E60000] px-2 py-1 text-[10px] uppercase tracking-widest font-bold" data-testid={`leave-cancel-${lv.id}`}>
+              Cancel
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="border border-gray-200 bg-white" data-testid="leave-panel">
+      <div className="px-5 py-4 border-b border-gray-200">
+        <h2 className="font-chivo font-bold text-lg flex items-center gap-2">
+          <Calendar size={18} weight="bold" /> Leave / Holiday Management
+        </h2>
+        <p className="text-xs text-gray-500 mt-1 leading-relaxed">
+          Mark executives on leave. They won't receive any new leads (auto / manual / PNS) and are
+          soft-logged-out on their next API call. Past, current and future-dated leaves are all
+          supported — modify or cancel any time.
+        </p>
+      </div>
+
+      <form onSubmit={addLeave} className="px-5 py-4 border-b border-gray-200 bg-gray-50 grid grid-cols-1 md:grid-cols-5 gap-2 items-end" data-testid="leave-add-form">
+        <label className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Agent</div>
+          <select required value={form.user_id} onChange={(e) => setForm((s) => ({ ...s, user_id: e.target.value }))} className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="leave-user-select">
+            <option value="">— Select agent —</option>
+            {users.map((u) => <option key={u.id} value={u.id}>{u.name} (@{u.username})</option>)}
+          </select>
+        </label>
+        <label className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Start</div>
+          <input required type="date" value={form.start_date} onChange={(e) => setForm((s) => ({ ...s, start_date: e.target.value }))} className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="leave-start-date" />
+        </label>
+        <label className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">End</div>
+          <input required type="date" value={form.end_date} onChange={(e) => setForm((s) => ({ ...s, end_date: e.target.value }))} className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="leave-end-date" />
+        </label>
+        <label className="block md:col-span-1">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Reason (optional)</div>
+          <input type="text" value={form.reason} onChange={(e) => setForm((s) => ({ ...s, reason: e.target.value }))} placeholder="e.g. wedding" className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="leave-reason" />
+        </label>
+        <button type="submit" disabled={busy} className="bg-[#002FA7] hover:bg-[#002288] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center justify-center gap-1 disabled:opacity-50" data-testid="leave-add-btn">
+          <Plus size={12} weight="bold" /> Add leave
+        </button>
+      </form>
+
+      {active.length > 0 && (
+        <div>
+          <div className="px-5 pt-3 pb-1 text-[10px] uppercase tracking-widest text-[#E60000] font-bold">Active now ({active.length})</div>
+          {active.map(renderRow)}
+        </div>
+      )}
+      {upcoming.length > 0 && (
+        <div>
+          <div className="px-5 pt-3 pb-1 text-[10px] uppercase tracking-widest text-[#002FA7] font-bold">Upcoming ({upcoming.length})</div>
+          {upcoming.map(renderRow)}
+        </div>
+      )}
+      {past.length > 0 && (
+        <div>
+          <div className="px-5 pt-3 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Past ({past.length})</div>
+          {past.map(renderRow)}
+        </div>
+      )}
+      {leaves.length === 0 && (
+        <div className="px-5 py-8 text-xs uppercase tracking-widest text-gray-400 font-bold text-center">No leaves on record yet.</div>
+      )}
+    </div>
+  );
+}

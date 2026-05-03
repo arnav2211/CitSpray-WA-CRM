@@ -7,7 +7,7 @@ import {
   MagnifyingGlass, PaperPlaneRight, ChatCircleDots, Phone, ArrowsClockwise, Plus, ArrowLeft,
   Funnel, Lightning, ArrowsLeftRight, X, Tag, NotePencil, Info,
   Paperclip, Image as ImageIcon, VideoCamera, FileText, Microphone, MapPin, IdentificationCard, Stop,
-  DownloadSimple,
+  DownloadSimple, Question, ChatTeardropText, CaretLeft,
 } from "@phosphor-icons/react";
 import { fmtIST, fmtISTTime } from "@/lib/format";
 import { StatusBadge, SourceBadge } from "@/components/Badges";
@@ -85,15 +85,26 @@ export default function Chat() {
     api.get("/users").then(({ data }) => setExecs(data.filter(u => u.role === "executive" || u.role === "admin"))).catch(() => {});
   }, [isAdmin]);
 
-  // Sync active lead id to URL
+  // Sync active lead id to URL — preserve tab/agent deep-link params if present
+  // so links from /qa remain shareable (copy-paste URL still restores the panel state).
   useEffect(() => {
     const p = {};
     if (activeId) p.lead = activeId;
+    const tab = params.get("tab");
+    const agent = params.get("agent");
+    if (tab) p.tab = tab;
+    if (agent) p.agent = agent;
     setParams(p, { replace: true });
-  }, [activeId, setParams]);
+  }, [activeId, setParams]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const activeConv = useMemo(() => convs.find(c => c.id === activeId), [convs, activeId]);
   const totalUnread = convs.reduce((s, c) => s + (c.unread || 0), 0);
+  // Capture the initial deep-link params ONCE so the URL-sync effect below doesn't
+  // strip them before ChatThread mounts (convs are loaded async).
+  const initialDeeplink = useMemo(() => ({
+    tab: params.get("tab"),
+    agent: params.get("agent"),
+  }), []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="h-full flex bg-[#EFEAE2]" data-testid="chat-page">
@@ -163,6 +174,8 @@ export default function Chat() {
             execs={execs}
             onClose={() => setActiveId(null)}
             onChanged={fetchConvs}
+            initialTab={initialDeeplink.tab}
+            initialAgentId={initialDeeplink.agent}
           />
         ) : (
           <EmptyState />
@@ -226,6 +239,16 @@ function ConvRow({ c, active, onClick, execs }) {
           {c.unreplied && (
             <span className="text-[9px] uppercase tracking-widest text-[#E60000] font-bold">Reply pending</span>
           )}
+          {c.internal_qa_status === "pending" && (
+            <span className="inline-flex items-center gap-1 bg-[#FFF4E5] border border-[#E67E00] text-[#B85F00] text-[9px] uppercase tracking-widest font-bold px-1.5 py-0.5" data-testid={`qa-tag-pending-${c.id}`}>
+              Question Asked
+            </span>
+          )}
+          {c.internal_qa_status === "answered" && (
+            <span className="inline-flex items-center gap-1 bg-[#E7F7E6] border border-[#008A00] text-[#005F00] text-[9px] uppercase tracking-widest font-bold px-1.5 py-0.5" data-testid={`qa-tag-answered-${c.id}`}>
+              Answered
+            </span>
+          )}
         </div>
       </div>
     </button>
@@ -255,7 +278,7 @@ function EmptyState() {
 }
 
 // ---------------- Chat thread ----------------
-function ChatThread({ conv, user, execs, onClose, onChanged }) {
+function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initialAgentId }) {
   const isAdmin = user.role === "admin";
   const canMessage = isAdmin || conv.assigned_to === user.id;
   const [messages, setMessages] = useState([]);
@@ -263,7 +286,10 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
   const [sending, setSending] = useState(false);
   const [showQR, setShowQR] = useState(false);
   const [showTpl, setShowTpl] = useState(false);
-  const [showInfo, setShowInfo] = useState(false);
+  const [showInfo, setShowInfo] = useState(initialTab === "internal");
+  const [panelTab, setPanelTab] = useState(initialTab === "internal" ? "internal" : "details"); // 'details' | 'internal'
+  const [internalQuote, setInternalQuote] = useState(null); // WA message selected to ask admin about
+  const [internalPreselectAgent, setInternalPreselectAgent] = useState(initialAgentId || null);
   const [quickReplies, setQuickReplies] = useState([]);
   const [templates, setTemplates] = useState([]);
   const [savingMeta, setSavingMeta] = useState(false);
@@ -629,6 +655,17 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
                 })}
                 onResend={canMessage ? resendMessage : null}
                 onReact={canMessage ? reactToMessage : null}
+                onAskAdmin={canMessage && user.role === "executive" ? ((target) => {
+                  setInternalQuote({
+                    id: target.id,
+                    preview: (target.caption || target.body || "").slice(0, 120),
+                    direction: target.direction,
+                    at: target.at,
+                    msg_type: target.msg_type,
+                  });
+                  setShowInfo(true);
+                  setPanelTab("internal");
+                }) : null}
               />
             ))}
           </div>
@@ -746,14 +783,32 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
         {/* Right info panel — slides over on mobile, side-by-side on lg+ */}
         {showInfo && (
           <aside
-            className="fixed inset-y-0 right-0 z-30 w-full sm:w-[360px] lg:relative lg:inset-auto lg:w-[300px] lg:z-auto shrink-0 bg-white border-l border-gray-200 overflow-y-auto"
+            className="fixed inset-y-0 right-0 z-30 w-full sm:w-[360px] lg:relative lg:inset-auto lg:w-[340px] lg:z-auto shrink-0 bg-white border-l border-gray-200 overflow-y-auto flex flex-col"
             data-testid="lead-info-panel"
           >
-            <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
+            <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between shrink-0">
               <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Lead Details</div>
               <button onClick={() => setShowInfo(false)} className="text-gray-400 hover:text-gray-900"><X size={14} /></button>
             </div>
-            <div className="p-4 space-y-4 text-sm">
+            {/* Tabs */}
+            <div className="flex border-b border-gray-200 shrink-0" data-testid="lead-panel-tabs">
+              <button
+                onClick={() => setPanelTab("details")}
+                className={`flex-1 px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center justify-center gap-1 ${panelTab === "details" ? "bg-[#002FA7] text-white" : "hover:bg-gray-100 text-gray-600"}`}
+                data-testid="tab-details"
+              >
+                <Info size={12} /> Details
+              </button>
+              <button
+                onClick={() => { setPanelTab("internal"); }}
+                className={`flex-1 px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center justify-center gap-1 ${panelTab === "internal" ? "bg-[#002FA7] text-white" : "hover:bg-gray-100 text-gray-600"}`}
+                data-testid="tab-internal"
+              >
+                <ChatTeardropText size={12} /> Internal Q&amp;A
+              </button>
+            </div>
+            {panelTab === "details" ? (
+            <div className="p-4 space-y-4 text-sm overflow-y-auto">
               <InfoRow label="Customer">{conv.customer_name || "—"}</InfoRow>
               <InfoRow label="Phone"><span className="font-mono">{conv.phone || "—"}</span></InfoRow>
               {conv.email && <InfoRow label="Email"><span className="font-mono text-xs break-all">{conv.email}</span></InfoRow>}
@@ -809,6 +864,18 @@ function ChatThread({ conv, user, execs, onClose, onChanged }) {
                 )}
               </div>
             </div>
+            ) : (
+            <InternalChat
+              leadId={conv.id}
+              currentUser={user}
+              assignedTo={conv.assigned_to}
+              execs={execs}
+              quote={internalQuote}
+              clearQuote={() => setInternalQuote(null)}
+              preselectAgentId={internalPreselectAgent}
+              onPreselectConsumed={() => setInternalPreselectAgent(null)}
+            />
+            )}
           </aside>
         )}
       </div>
@@ -900,7 +967,7 @@ function InfoRow({ label, children }) {
   );
 }
 
-function Bubble({ m, allMessages = [], onReply, onResend, onReact, canMessage = true, currentUserId = null }) {
+function Bubble({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, canMessage = true, currentUserId = null }) {
   const isOut = m.direction === "out";
   const isSystem = m.direction === "system";
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -946,6 +1013,11 @@ function Bubble({ m, allMessages = [], onReply, onResend, onReact, canMessage = 
           <button onClick={() => onReply(m)} className="text-gray-500 hover:text-[#25D366] text-[10px] uppercase tracking-widest font-bold px-1" title="Reply" data-testid={`reply-btn-${m.id}`}>
             ↩
           </button>
+          {onAskAdmin && (
+            <button onClick={() => onAskAdmin(m)} className="text-gray-500 hover:text-[#002FA7] text-[10px] uppercase tracking-widest font-bold px-1" title="Ask admin about this message" data-testid={`ask-admin-btn-${m.id}`}>
+              <Question size={13} weight="bold" />
+            </button>
+          )}
         </div>
       )}
       <div className={`max-w-[75%] ${media ? "p-1.5" : "px-3 py-2"} ${isOut ? "bg-[#D9FDD3]" : "bg-white"} text-sm shadow-sm relative`}>
@@ -1008,6 +1080,11 @@ function Bubble({ m, allMessages = [], onReply, onResend, onReact, canMessage = 
           {onReply && (
             <button onClick={() => onReply(m)} className="text-gray-500 hover:text-[#25D366] text-[10px] uppercase tracking-widest font-bold px-1" title="Reply" data-testid={`reply-btn-${m.id}`}>
               ↩
+            </button>
+          )}
+          {onAskAdmin && (
+            <button onClick={() => onAskAdmin(m)} className="text-gray-500 hover:text-[#002FA7] text-[10px] uppercase tracking-widest font-bold px-1" title="Ask admin about this message" data-testid={`ask-admin-btn-${m.id}`}>
+              <Question size={13} weight="bold" />
             </button>
           )}
         </div>
@@ -1296,5 +1373,204 @@ function Field({ label, children }) {
       <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">{label}</div>
       {children}
     </label>
+  );
+}
+
+
+// ---------------- Internal Admin ↔ Agent Q&A ----------------
+function InternalChat({ leadId, currentUser, assignedTo, execs, quote, clearQuote, preselectAgentId, onPreselectConsumed }) {
+  const isAdmin = currentUser?.role === "admin";
+  const [threads, setThreads] = useState([]); // admin view
+  const [activeAgentId, setActiveAgentId] = useState(preselectAgentId || null); // admin: selected thread
+  const [msgs, setMsgs] = useState([]);
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const scrollRef = useRef(null);
+
+  // Consume the preselect on mount (admin deep-link from /qa)
+  useEffect(() => {
+    if (preselectAgentId && !activeAgentId) {
+      setActiveAgentId(preselectAgentId);
+    }
+    if (preselectAgentId) onPreselectConsumed?.();
+    // eslint-disable-next-line
+  }, [preselectAgentId]);
+
+  const canPost = isAdmin ? !!activeAgentId : (assignedTo === currentUser?.id);
+
+  const load = useCallback(async () => {
+    if (!leadId) return;
+    try {
+      if (isAdmin && !activeAgentId) {
+        const { data } = await api.get(`/internal-chat/${leadId}`);
+        setThreads(data.threads || []);
+        return;
+      }
+      const params = isAdmin ? { agent_id: activeAgentId } : {};
+      const { data } = await api.get(`/internal-chat/${leadId}`, { params });
+      setMsgs(data.thread || []);
+      try { await api.post(`/internal-chat/${leadId}/mark-read`, null, { params: isAdmin ? { agent_id: activeAgentId } : {} }); } catch { /* ignore */ }
+    } catch (e) {
+      const msg = errMsg(e, "");
+      if (msg && !msg.toLowerCase().includes("network")) toast.error(msg);
+    }
+  }, [leadId, isAdmin, activeAgentId]);
+
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const id = setInterval(load, POLL_MS);
+    return () => clearInterval(id);
+  }, [load]);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [msgs.length]);
+
+  const send = async () => {
+    if (!draft.trim() || !canPost) return;
+    setSending(true);
+    try {
+      const payload = { lead_id: leadId, body: draft };
+      if (isAdmin) payload.to_user_id = activeAgentId;
+      if (quote?.id) payload.message_id = quote.id;
+      await api.post("/internal-chat/send", payload);
+      setDraft("");
+      clearQuote?.();
+      await load();
+    } catch (e) { toast.error(errMsg(e, "Failed to send")); }
+    finally { setSending(false); }
+  };
+
+  if (isAdmin && !activeAgentId) {
+    return (
+      <div className="flex-1 overflow-y-auto p-4" data-testid="internal-admin-thread-list">
+        <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-3">Private Q&amp;A threads</div>
+        {threads.length === 0 && (
+          <div className="text-xs text-gray-400 italic">
+            No agents have started a private conversation on this lead yet.
+            Agents can ask a question by clicking the <Question size={10} className="inline" weight="bold" /> icon on any WhatsApp message.
+          </div>
+        )}
+        <div className="mt-3">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Start thread with</div>
+          <select
+            onChange={(e) => e.target.value && setActiveAgentId(e.target.value)}
+            value=""
+            className="w-full border border-gray-300 px-2 py-2 text-sm"
+            data-testid="internal-admin-start-with"
+          >
+            <option value="">— Select agent —</option>
+            {execs.filter((x) => x.role === "executive").map((x) => (
+              <option key={x.id} value={x.id}>{x.name} (@{x.username})</option>
+            ))}
+          </select>
+        </div>
+        <div className="mt-4 space-y-2">
+          {threads.map((t) => (
+            <button
+              key={t.agent_id}
+              onClick={() => setActiveAgentId(t.agent_id)}
+              className="w-full text-left border border-gray-200 hover:border-[#002FA7] hover:bg-[#002FA7]/5 p-3"
+              data-testid={`internal-thread-${t.agent_username}`}
+            >
+              <div className="flex items-center justify-between">
+                <div className="font-semibold text-sm">{t.agent_name || t.agent_username || t.agent_id}</div>
+                {t.unread_for_admin > 0 && (
+                  <span className="bg-[#E60000] text-white text-[10px] px-1.5 py-0.5 font-bold rounded-full">{t.unread_for_admin}</span>
+                )}
+              </div>
+              <div className="text-xs text-gray-600 truncate mt-1">{t.last_body || "—"}</div>
+              <div className="text-[10px] text-gray-400 font-mono mt-1">{t.last_at ? fmtIST(t.last_at) : ""} · {t.count} msg{t.count === 1 ? "" : "s"}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  const headerName = isAdmin
+    ? (execs.find((x) => x.id === activeAgentId)?.name || "Agent")
+    : "Admin";
+
+  return (
+    <div className="flex flex-col flex-1 min-h-0" data-testid="internal-chat-thread">
+      <div className="px-4 py-2 border-b border-gray-200 shrink-0 flex items-center gap-2">
+        {isAdmin && (
+          <button onClick={() => { setActiveAgentId(null); clearQuote?.(); }} className="text-gray-500 hover:text-gray-900" title="Back to threads" data-testid="internal-back-btn">
+            <CaretLeft size={14} weight="bold" />
+          </button>
+        )}
+        <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">
+          Private with {headerName} · invisible to customer
+        </div>
+      </div>
+      <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 space-y-2 bg-[#F7F7F5]" data-testid="internal-messages-area">
+        {msgs.length === 0 && (
+          <div className="text-center text-xs text-gray-400 italic py-6">No messages yet — start the conversation.</div>
+        )}
+        {msgs.map((m) => {
+          const mine = m.from_user_id === currentUser?.id;
+          return (
+            <div key={m.id} className={`flex ${mine ? "justify-end" : "justify-start"}`} data-testid={`internal-msg-${m.id}`}>
+              <div className={`max-w-[85%] px-3 py-2 text-sm shadow-sm ${mine ? "bg-[#D6E4FF] border border-[#002FA7]/20" : "bg-white border border-gray-200"}`}>
+                {m.quoted && (
+                  <div className="mb-1 border-l-[3px] pl-2 py-1 text-[11px] bg-black/5" style={{ borderColor: m.quoted.direction === "out" ? "#25D366" : "#002FA7" }}>
+                    <div className="text-[9px] uppercase tracking-widest font-bold" style={{ color: m.quoted.direction === "out" ? "#128C7E" : "#002FA7" }}>
+                      {m.quoted.direction === "out" ? "You (WA)" : "Customer"}
+                    </div>
+                    <div className="text-gray-700 truncate">{m.quoted.body || "(media)"}</div>
+                  </div>
+                )}
+                <div className="whitespace-pre-wrap break-words">{m.body}</div>
+                <div className="text-[10px] text-gray-500 font-mono mt-1 flex items-center justify-between gap-2">
+                  <span>{m.from_role === "admin" ? "Admin" : "Agent"}</span>
+                  <span>{fmtISTTime(m.at)}</span>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {canPost ? (
+        <div className="border-t border-gray-200 bg-white shrink-0">
+          {quote && (
+            <div className="px-3 pt-2 flex items-start gap-2" data-testid="internal-quote-preview">
+              <div className="flex-1 min-w-0 border-l-[3px] pl-2 py-1 text-xs bg-black/5" style={{ borderColor: quote.direction === "out" ? "#25D366" : "#002FA7" }}>
+                <div className="text-[9px] uppercase tracking-widest font-bold" style={{ color: quote.direction === "out" ? "#128C7E" : "#002FA7" }}>
+                  Asking about {quote.direction === "out" ? "your message" : "customer message"}
+                </div>
+                <div className="text-gray-700 truncate">{quote.preview || "(media)"}</div>
+              </div>
+              <button onClick={clearQuote} className="text-gray-500 hover:text-gray-900 p-1" data-testid="internal-quote-cancel">
+                <X size={12} />
+              </button>
+            </div>
+          )}
+          <div className="p-2 flex items-end gap-2">
+            <textarea
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+              placeholder={isAdmin ? "Reply privately to agent…" : "Ask admin privately…"}
+              rows={1}
+              className="flex-1 resize-none border border-gray-300 px-3 py-2 text-sm outline-none focus:border-[#002FA7]"
+              data-testid="internal-chat-input"
+            />
+            <button
+              onClick={send}
+              disabled={!draft.trim() || sending}
+              className="bg-[#002FA7] hover:bg-[#002288] text-white p-2 disabled:opacity-50"
+              data-testid="internal-send-btn"
+            >
+              <PaperPlaneRight size={16} weight="fill" />
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="border-t border-[#E60000] bg-[#FFE9E9] text-[#E60000] text-xs p-3 text-center shrink-0">
+          You can only use internal Q&amp;A on leads assigned to you.
+        </div>
+      )}
+    </div>
   );
 }

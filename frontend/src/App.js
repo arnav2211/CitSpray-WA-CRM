@@ -19,6 +19,7 @@ import Settings from "@/pages/Settings";
 import Chat from "@/pages/Chat";
 import QuickReplies from "@/pages/QuickReplies";
 import ChatFlows from "@/pages/ChatFlows";
+import InternalQA from "@/pages/InternalQA";
 
 export default function App() {
   return (
@@ -35,6 +36,7 @@ export default function App() {
               <Route path="/leads" element={<Leads />} />
               <Route path="/leads/:id" element={<><Leads /><LeadDetail /></>} />
               <Route path="/followups" element={<Followups />} />
+              <Route path="/qa" element={<InternalQA />} />
               <Route path="/users" element={<AdminOnly><UsersPage /></AdminOnly>} />
               <Route path="/routing" element={<AdminOnly><RoutingRules /></AdminOnly>} />
               <Route path="/integrations" element={<AdminOnly><Integrations /></AdminOnly>} />
