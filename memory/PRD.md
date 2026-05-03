@@ -22,6 +22,19 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 8 (Feb 2026) — Visual Canvas + Media Nodes
+- **Visual Flow Designer** — `/app/frontend/src/pages/ChatFlows.jsx` fully rewritten on `@xyflow/react`. Custom `<FlowNodeCard />` with colour-banded left border per type, icon, body preview, option list, Start flag, source/target handles (one per option for button/list/carousel so edges render per-option).
+- **Drag & Drop** — nodes drag freely; positions auto-save 600 ms after drop via `PUT /api/chatflows/{flow_id}/positions`. MiniMap + Controls + `fitView`.
+- **Connect-by-drag** — drag from an option's right-edge handle to another node creates an edge, saved via `PUT /chatflows/{flow_id}/nodes/{src}/options` (writes `next_node_id` of the matching option).
+- **Node Inspector (right-side panel)** — all fields rebuild per-selected node: name, type, body/header/footer/button_text (text/button/list), media_url/caption/filename (image/video/document), cards editor (carousel), options editor (button/list), start-node checkbox. Save does a combined node PATCH + options PUT.
+- **Media Types** — `image`, `video`, `document` nodes now actually send via `wa_send_media` (image+video accept caption, document accepts filename). `send_flow_message` no longer raises ValueError for these.
+- **Carousel (pseudo)** — sequential image sends (one per card with title+subtitle caption), followed by a single WhatsApp interactive-button prompt built from the node's `chat_options` so existing webhook routing works unchanged. Max 3 cards enforced. Adding a card auto-adds a matching option with `option_id = card_N`.
+- **Media Upload** — `POST /api/chatflows/upload-media` accepts multipart file (50 MB cap), writes to `/app/backend/uploads/<uuid><ext>`, returns `/api/media/<stored_name>` URL. `GET /api/media/{stored_name}` serves the file. Upload button in inspector + per-card. URL field is still editable for admin-hosted CDN URLs.
+- **Default x/y stagger** — new nodes land at `80 + col*320, 80 + row*220` instead of piling at (0,0).
+- **Build-error contract tightened** — `POST /chatflows/{id}/start` now returns HTTP 400 with `{detail}` for validation failures (missing body, >3 buttons, 0 options, missing media_url) instead of `200 + {error}`.
+- **Regression** — 17/17 new tests + 22/22 iter7 regression = 39/39.
+- **Files**: `/app/backend/server.py` (send_flow_message, wa_send_media, POST upload-media, GET /media/{name}, stagger in create_chat_node), `/app/frontend/src/pages/ChatFlows.jsx` (full rewrite). `/app/backend/tests/test_iteration8_canvas_media.py`.
+
 ### Iteration 7 (May 2026) — Chatbot flow engine (WATI / AiSensy-style)
 - **Data model** — `chat_flows`, `chat_nodes`, `chat_options`, `chat_sessions` (phone_key unique).
 - **Flow engine** — `send_flow_message(phone, node_id)` reads node + options, renders the right WhatsApp payload (text / interactive-button / interactive-list), sends via the existing WA abstraction (cfg['api_version'] dynamic, never hardcoded), logs to messages with `flow_id` + `flow_node_id`, and upserts the per-user session. Button/list nodes gated by the 24-hour window; text nodes are not.
