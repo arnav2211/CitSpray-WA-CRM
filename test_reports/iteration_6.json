@@ -1,0 +1,48 @@
+{
+  "summary": "Iteration-8 (Visual canvas + media nodes upgrade) full backend + frontend verification. NEW pytest file /app/backend/tests/test_iteration8_canvas_media.py = 17/17 PASS. Iter7 regression also clean (22/22 PASS) after updating two tests to expect HTTP 400 (the iter5 action item — start_flow now surfaces _build_interactive_payload errors as 4xx instead of 200+{error}). Frontend /chatflows verified end-to-end with Playwright as admin: created flow → added IMAGE node (media_url + caption) → React Flow canvas rendered the custom FlowNodeCard with proper colour-banded type → clicked node → right-side NodeInspector panel opened with all the right fields → added CAROUSEL node → clicked it → add-card-btn x2 → filled card-image-url-{0,1}/card-title-{0,1}/card-button-label-{0,1} → save-node-btn → flow-test-phone + flow-test-send-btn → delete-flow cleanup. Visual canvas, inspector, media URL/caption fields, carousel cards editor, save, test-send and cleanup all functional.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration8_canvas_media.py",
+    "/app/backend/tests/test_iteration7_chatflows.py",
+    "/app/test_reports/pytest/iter8_results.xml"
+  ],
+  "action_items": [
+    "(Optional) Trim server.py — now ~3,557 lines. Chatflow engine + media upload (~470 lines) is a clean extraction candidate to /app/backend/chatflows.py.",
+    "(Optional, carried from iter7) ChatFlows.jsx flow-row still uses <button> wrapping inner action <button>s — invalid HTML producing React hydration warnings. Replace outer button with <div role='button' tabIndex=0>. Functionally inert."
+  ],
+  "critical_code_review_comments": [
+    "send_flow_message correctly routes image/video/document via wa_send_media (server.py L2443-2459) — no ValueError; missing media_url returns structured {error:'... requires media_url'} which start_flow correctly upgrades to HTTP 400.",
+    "Carousel branch (L2460-2490): pseudo-carousel implementation is correct — sequential image sends with title/subtitle caption, then a final interactive button built from chat_options[:3] with same option_id mapping so webhook routing for {button_reply} continues to work unchanged. 24h-window check is enforced when a lead is known.",
+    "wa_send_media (L2340) validates media_type ∈ {image,video,document}; caption only attached for image/video/document; filename only for document. Mock path returns {mock:true,status:'sent_mock'} when WA disabled — verified in tests.",
+    "PUT /chatflows/{flow_id}/positions (L2678) validates flow exists → 404; admin-gated; iterates body.positions and bulk-updates {x,y} per node. Test confirms persistence via subsequent GET.",
+    "POST /chatflows/upload-media (L2702) validates kind ∈ {image,video,document} → 400; reads file bytes (50 MB cap → 413); writes to /app/backend/uploads/<uuid><suffix>; returns /api/media/<stored_name> URL. GET /media/{stored_name} (L2737) sanitises path and 404s on missing — verified.",
+    "Default x/y stagger on create_chat_node (L2638-2639) gives 80/400/720/1040 across columns × 220 row pitch — confirmed exact values in test_default_xy_stagger_for_first_few_nodes.",
+    "delete_chat_node still clears next_node_id refs in OTHER nodes' options ($set:None) — regression intact.",
+    "Frontend (ChatFlows.jsx): React Flow canvas wires a drag-end handler that POSTs PUT /chatflows/{id}/positions (auto-save). Inspector binds to currently-selected canvas-node-{id}. Carousel cards editor renders one card row per content.cards entry with linked option-row index — UI verified renders 2 cards each with image_url/title/subtitle/button_label/next-select select.",
+    "iter7 build-error contract was tightened: /chatflows/{id}/start now returns HTTP 400 + {detail:'Node body is required' / 'WhatsApp allows a maximum of 3 buttons' / 'List nodes require at least one option'}. Two iter7 tests updated to assert this (was 200+{error}).",
+    "Tests confirm carousel cards round-trip: chat_options PUT links {option_id:card_0,next_node_id:t1} ↔ {option_id:card_1,next_node_id:t2} and GET /chatflows/{id} returns them embedded in node.options."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration8_canvas_media.py (NEW: 17 tests)",
+    "/app/backend/tests/test_iteration7_chatflows.py (2 tests updated to expect HTTP 400 per iter5 action item)",
+    "/app/test_reports/pytest/iter8_results.xml"
+  ],
+  "success_rate": {
+    "backend": "100% (17/17 iter8 + 22/22 iter7 regression = 39/39)",
+    "frontend": "100% on all critical canvas+media flows exercised via Playwright"
+  },
+  "test_credentials": "admin/Admin@123 verified working. ravi/Exec@123 used for 401/403 RBAC checks on upload-media + positions endpoints.",
+  "seed_data_creation": "Module-scoped autouse fixture creates and deletes TEST_IT8_* flows (canvas/positions/upload/img/vid/doc/car/conn/reg/btnlist). Final state: only seeded 'Sales Qualification' flow remains.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Run via: `REACT_APP_BACKEND_URL=$(grep REACT_APP_BACKEND_URL /app/frontend/.env|cut -d= -f2) pytest /app/backend/tests/test_iteration8_canvas_media.py /app/backend/tests/test_iteration7_chatflows.py -v` (env var is needed because the conftest rstrips it). WA is in MOCK mode — outbound returns status='sent_mock' with no wamid. The /api/webhooks/whatsapp/_debug/simulate endpoint is admin-only and is what we use to open the 24h window before button/list/carousel sends. start_flow now returns HTTP 400 (was 200+{error}) when _build_interactive_payload throws or the node is missing required content (e.g. image without media_url, carousel with 0 cards, button >3 options, list with 0 options).",
+  "rca_of_the_issue": "No bugs blocking iter-8 acceptance. The previously reported iter5 action item (start_flow returning 200+{error} for build-time validation failures) has been correctly fixed — endpoint now raises HTTP 400 with structured {detail:...}. Old iter7 tests were updated to assert this new contract; not a regression. The remaining iter5 ui-bug (nested <button> in flow-row) still exists in ChatFlows.jsx and continues to log a React hydration warning — non-blocking, listed in action_items."
+}

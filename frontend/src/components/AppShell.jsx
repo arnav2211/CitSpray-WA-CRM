@@ -54,6 +54,7 @@ export default function AppShell() {
 }
 
 function pageTitle(path) {
+  if (path.startsWith("/chatflows")) return "Chatbot Flows";
   if (path.startsWith("/chat")) return "WhatsApp";
   if (path.startsWith("/leads")) return "Leads";
   if (path.startsWith("/followups")) return "Follow-ups";

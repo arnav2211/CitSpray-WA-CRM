@@ -17,8 +17,9 @@ import bcrypt
 import jwt
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Query, UploadFile, File, Form
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, ConfigDict
@@ -162,7 +163,7 @@ async def _resolve_template_meta(template_name: str, lang_code: Optional[str] = 
     }
 
 
-async def wa_send_text(to_phone: str, body: str) -> Dict[str, Any]:
+async def wa_send_text(to_phone: str, body: str, reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
     cfg = await get_wa_config()
     if not cfg["enabled"]:
         return {"mock": True, "status": "sent_mock", "wamid": None}
@@ -177,11 +178,28 @@ async def wa_send_text(to_phone: str, body: str) -> Dict[str, Any]:
         "type": "text",
         "text": {"preview_url": False, "body": body},
     }
-    async with httpx.AsyncClient(timeout=20.0) as cli:
-        r = await cli.post(url, json=payload, headers={
-            "Authorization": f"Bearer {cfg['access_token']}",
-            "Content-Type": "application/json",
-        })
+    if reply_to_wamid:
+        payload["context"] = {"message_id": reply_to_wamid}
+
+    async def _post(p: Dict[str, Any]) -> Any:
+        async with httpx.AsyncClient(timeout=20.0) as cli:
+            return await cli.post(url, json=p, headers={
+                "Authorization": f"Bearer {cfg['access_token']}",
+                "Content-Type": "application/json",
+            })
+
+    r = await _post(payload)
+    # Meta returns 131009 / similar when context message_id is stale or from a different chat.
+    # Spec asks us to fall back to a plain send in that case.
+    if r.status_code >= 400 and reply_to_wamid:
+        try:
+            err = (r.json().get("error") or {})
+        except Exception:
+            err = {}
+        if err.get("code") in (131009, 100, 131026) or "context" in (err.get("message") or "").lower():
+            logger.info(f"Reply-context failed ({err.get('code')}); retrying without context")
+            payload.pop("context", None)
+            r = await _post(payload)
     try:
         data = r.json()
     except Exception:
@@ -384,6 +402,7 @@ class WhatsAppSendInput(BaseModel):
     template_name: Optional[str] = None
     template_lang: Optional[str] = None
     template_params: Optional[List[str]] = None  # explicit body params; if omitted backend infers
+    reply_to_message_id: Optional[str] = None  # local UUID of the message being replied to
 
 class TemplateCreate(BaseModel):
     name: str
@@ -1261,7 +1280,21 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
                 status_code=400,
                 detail="Outside the 24-hour customer service window — please use a template message",
             )
-        api_result = await wa_send_text(to_phone=target_phone, body=body.body)
+        # Resolve reply context: must reference a message on the SAME lead.
+        reply_ctx_wamid: Optional[str] = None
+        reply_ctx_local_id: Optional[str] = None
+        reply_ctx_preview: Optional[str] = None
+        if body.reply_to_message_id:
+            src = await db.messages.find_one(
+                {"id": body.reply_to_message_id, "lead_id": body.lead_id},
+                {"_id": 0, "id": 1, "wamid": 1, "body": 1, "caption": 1, "direction": 1},
+            )
+            if src and src.get("wamid"):
+                reply_ctx_wamid = src["wamid"]
+                reply_ctx_local_id = src["id"]
+                reply_ctx_preview = (src.get("caption") or src.get("body") or "")[:120]
+            # If src not found or has no wamid (e.g. mock), we skip the context — fallback to plain send.
+        api_result = await wa_send_text(to_phone=target_phone, body=body.body, reply_to_wamid=reply_ctx_wamid)
 
     msg = {
         "id": str(uuid.uuid4()),
@@ -1277,6 +1310,15 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
         "at": iso(now_utc()),
         "by_user_id": user["id"],
     }
+    # Attach reply-context metadata so the chat bubble can render a quoted preview
+    if not body.template_name and body.reply_to_message_id:
+        # Use the same resolved ids from the block above (still in scope)
+        if 'reply_ctx_local_id' in locals() and reply_ctx_local_id:
+            msg["reply_to_message_id"] = reply_ctx_local_id
+        if 'reply_ctx_wamid' in locals() and reply_ctx_wamid:
+            msg["reply_to_wamid"] = reply_ctx_wamid
+        if 'reply_ctx_preview' in locals() and reply_ctx_preview:
+            msg["reply_to_preview"] = reply_ctx_preview
     await db.messages.insert_one(msg.copy())
     update_lead = {"last_action_at": iso(now_utc())}
     if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
@@ -1293,6 +1335,246 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
         # Surface the Meta error so the executive sees what to fix
         raise HTTPException(status_code=400, detail=msg["error"] or "WhatsApp send failed")
     return strip_mongo(msg)
+
+
+# ------------- Rich-media composer endpoints (image / video / document / audio / location / contact / resend) -------------
+
+class WAComposerBase(BaseModel):
+    lead_id: str
+    reply_to_message_id: Optional[str] = None
+
+
+class WASendMedia(WAComposerBase):
+    media_type: Literal["image", "video", "document", "audio"]
+    media_url: str
+    caption: Optional[str] = None
+    filename: Optional[str] = None  # document only
+
+
+class WASendLocation(WAComposerBase):
+    latitude: float
+    longitude: float
+    name: Optional[str] = None
+    address: Optional[str] = None
+
+
+class WAContactPhone(BaseModel):
+    phone: str
+    type: Optional[str] = "CELL"
+
+
+class WAContactEmail(BaseModel):
+    email: str
+    type: Optional[str] = "WORK"
+
+
+class WASendContact(WAComposerBase):
+    name: str  # formatted display name
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phones: List[WAContactPhone]
+    emails: Optional[List[WAContactEmail]] = None
+    organization: Optional[str] = None
+
+
+async def _assert_chat_permitted(user: dict, lead_id: str) -> dict:
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    target_phone = lead.get("active_wa_phone") or lead.get("phone")
+    if not target_phone:
+        raise HTTPException(status_code=400, detail="Lead has no phone number")
+    last_in = lead.get("last_user_message_at")
+    within = False
+    if last_in:
+        try:
+            d = datetime.fromisoformat(last_in.replace("Z", "+00:00"))
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            within = (now_utc() - d) < timedelta(hours=24)
+        except Exception:
+            within = False
+    if not within:
+        raise HTTPException(status_code=400, detail="Outside the 24-hour customer service window — please use a template message")
+    return {"lead": lead, "target_phone": target_phone}
+
+
+async def _resolve_reply_context(lead_id: str, reply_to_message_id: Optional[str]) -> Dict[str, Optional[str]]:
+    if not reply_to_message_id:
+        return {"wamid": None, "local_id": None, "preview": None}
+    src = await db.messages.find_one({"id": reply_to_message_id, "lead_id": lead_id},
+                                      {"_id": 0, "id": 1, "wamid": 1, "body": 1, "caption": 1})
+    if not src or not src.get("wamid"):
+        return {"wamid": None, "local_id": None, "preview": None}
+    return {
+        "wamid": src["wamid"],
+        "local_id": src["id"],
+        "preview": (src.get("caption") or src.get("body") or "")[:120],
+    }
+
+
+async def _record_sent_message(lead_id: str, user_id: str, target_phone: str, body_preview: str,
+                                api_result: Dict[str, Any], extra: Dict[str, Any],
+                                reply_ctx: Dict[str, Optional[str]]) -> Dict[str, Any]:
+    msg = {
+        "id": str(uuid.uuid4()),
+        "lead_id": lead_id,
+        "direction": "out",
+        "body": body_preview,
+        "to_phone": target_phone,
+        "status": api_result.get("status", "failed"),
+        "wamid": api_result.get("wamid"),
+        "error": api_result.get("error"),
+        "error_code": api_result.get("code"),
+        "at": iso(now_utc()),
+        "by_user_id": user_id,
+        **extra,
+    }
+    if reply_ctx.get("local_id"):
+        msg["reply_to_message_id"] = reply_ctx["local_id"]
+    if reply_ctx.get("wamid"):
+        msg["reply_to_wamid"] = reply_ctx["wamid"]
+    if reply_ctx.get("preview"):
+        msg["reply_to_preview"] = reply_ctx["preview"]
+    await db.messages.insert_one(msg.copy())
+    update_lead = {"last_action_at": iso(now_utc())}
+    if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
+        update_lead["has_whatsapp"] = True
+    await db.leads.update_one({"id": lead_id}, {"$set": update_lead})
+    if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
+        await _set_wa_status(lead_id, target_phone, True)
+    return msg
+
+
+@api.post("/whatsapp/send-media")
+async def whatsapp_send_media(body: WASendMedia, user: dict = Depends(get_current_user)):
+    """Send an image/video/document/audio message to the lead. Media must be a public HTTPS URL
+    (use POST /chatflows/upload-media first if uploading a local file)."""
+    ctx = await _assert_chat_permitted(user, body.lead_id)
+    target_phone = ctx["target_phone"]
+    reply_ctx = await _resolve_reply_context(body.lead_id, body.reply_to_message_id)
+    if body.media_type == "audio":
+        api_result = await wa_send_audio(to_phone=target_phone, url=body.media_url, reply_to_wamid=reply_ctx["wamid"])
+        preview = "[voice note]"
+    else:
+        api_result = await wa_send_media(
+            to_phone=target_phone, media_type=body.media_type, url=body.media_url,
+            caption=body.caption, filename=body.filename, reply_to_wamid=reply_ctx["wamid"],
+        )
+        if body.media_type == "image":
+            preview = f"[image] {body.caption or ''}".rstrip()
+        elif body.media_type == "video":
+            preview = f"[video] {body.caption or ''}".rstrip()
+        else:
+            preview = f"[document: {body.filename or 'file'}] {body.caption or ''}".rstrip()
+    extra = {"media_type": body.media_type, "media_url": body.media_url}
+    if body.caption:
+        extra["caption"] = body.caption
+    if body.filename:
+        extra["filename"] = body.filename
+    msg = await _record_sent_message(body.lead_id, user["id"], target_phone, preview, api_result, extra, reply_ctx)
+    await log_activity(user["id"], "whatsapp_sent", body.lead_id,
+                       {"status": msg["status"], "wamid": msg["wamid"], "media_type": body.media_type})
+    if msg["status"] == "failed":
+        raise HTTPException(status_code=400, detail=msg.get("error") or "WhatsApp media send failed")
+    return strip_mongo(msg)
+
+
+@api.post("/whatsapp/send-location")
+async def whatsapp_send_location(body: WASendLocation, user: dict = Depends(get_current_user)):
+    ctx = await _assert_chat_permitted(user, body.lead_id)
+    target_phone = ctx["target_phone"]
+    reply_ctx = await _resolve_reply_context(body.lead_id, body.reply_to_message_id)
+    api_result = await wa_send_location(
+        to_phone=target_phone, latitude=body.latitude, longitude=body.longitude,
+        name=body.name, address=body.address, reply_to_wamid=reply_ctx["wamid"],
+    )
+    preview = f"[location] {body.name or ''} ({body.latitude:.4f}, {body.longitude:.4f})".strip()
+    extra = {"msg_type": "location", "location": {
+        "latitude": body.latitude, "longitude": body.longitude,
+        "name": body.name, "address": body.address,
+    }}
+    msg = await _record_sent_message(body.lead_id, user["id"], target_phone, preview, api_result, extra, reply_ctx)
+    if msg["status"] == "failed":
+        raise HTTPException(status_code=400, detail=msg.get("error") or "WhatsApp location send failed")
+    return strip_mongo(msg)
+
+
+@api.post("/whatsapp/send-contact")
+async def whatsapp_send_contact(body: WASendContact, user: dict = Depends(get_current_user)):
+    ctx = await _assert_chat_permitted(user, body.lead_id)
+    target_phone = ctx["target_phone"]
+    reply_ctx = await _resolve_reply_context(body.lead_id, body.reply_to_message_id)
+    contact_payload: Dict[str, Any] = {
+        "name": {
+            "formatted_name": body.name,
+            "first_name": body.first_name or body.name.split(" ")[0],
+            **({"last_name": body.last_name} if body.last_name else {}),
+        },
+        "phones": [{"phone": p.phone, "type": (p.type or "CELL").upper()} for p in body.phones],
+    }
+    if body.emails:
+        contact_payload["emails"] = [{"email": e.email, "type": (e.type or "WORK").upper()} for e in body.emails]
+    if body.organization:
+        contact_payload["org"] = {"company": body.organization}
+    api_result = await wa_send_contacts(to_phone=target_phone, contacts=[contact_payload], reply_to_wamid=reply_ctx["wamid"])
+    phones_str = ", ".join(p.phone for p in body.phones)
+    preview = f"[contact] {body.name} · {phones_str}"
+    extra = {"msg_type": "contacts", "contacts": [contact_payload]}
+    msg = await _record_sent_message(body.lead_id, user["id"], target_phone, preview, api_result, extra, reply_ctx)
+    if msg["status"] == "failed":
+        raise HTTPException(status_code=400, detail=msg.get("error") or "WhatsApp contact send failed")
+    return strip_mongo(msg)
+
+
+class ResendInput(BaseModel):
+    message_id: str
+
+
+@api.post("/whatsapp/resend")
+async def whatsapp_resend(body: ResendInput, user: dict = Depends(get_current_user)):
+    """Retry sending a previously-failed outbound message. Picks up every field from the
+    original message doc (text / media / location / contacts / reply context) and re-sends."""
+    src = await db.messages.find_one({"id": body.message_id}, {"_id": 0})
+    if not src:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if src.get("direction") != "out":
+        raise HTTPException(status_code=400, detail="Only outbound messages can be resent")
+    if src.get("status") not in ("failed",):
+        raise HTTPException(status_code=400, detail=f"Only failed messages can be resent (current status: {src.get('status')})")
+    ctx = await _assert_chat_permitted(user, src["lead_id"])
+    target_phone = ctx["target_phone"]
+    reply_to_wamid = src.get("reply_to_wamid")
+    if src.get("media_type") in ("image", "video", "document"):
+        api_result = await wa_send_media(target_phone, src["media_type"], src.get("media_url"),
+                                         caption=src.get("caption"), filename=src.get("filename"),
+                                         reply_to_wamid=reply_to_wamid)
+    elif src.get("media_type") == "audio":
+        api_result = await wa_send_audio(target_phone, src.get("media_url"), reply_to_wamid=reply_to_wamid)
+    elif src.get("msg_type") == "location":
+        loc = src.get("location") or {}
+        api_result = await wa_send_location(target_phone, loc.get("latitude"), loc.get("longitude"),
+                                             loc.get("name"), loc.get("address"), reply_to_wamid=reply_to_wamid)
+    elif src.get("msg_type") == "contacts":
+        api_result = await wa_send_contacts(target_phone, src.get("contacts") or [], reply_to_wamid=reply_to_wamid)
+    else:
+        api_result = await wa_send_text(target_phone, src.get("body") or "", reply_to_wamid=reply_to_wamid)
+    await db.messages.update_one({"id": src["id"]}, {"$set": {
+        "status": api_result.get("status", "failed"),
+        "wamid": api_result.get("wamid"),
+        "error": api_result.get("error"),
+        "error_code": api_result.get("code"),
+        "resent_at": iso(now_utc()),
+    }})
+    updated = await db.messages.find_one({"id": src["id"]}, {"_id": 0})
+    if updated.get("status") == "failed":
+        raise HTTPException(status_code=400, detail=updated.get("error") or "Resend failed")
+    return strip_mongo(updated)
+
+
+
 
 @api.get("/whatsapp/templates")
 async def list_templates(user: dict = Depends(get_current_user)):
@@ -2279,6 +2561,1003 @@ async def _find_lead_by_phone_legacy(phone_digits: str) -> Optional[dict]:
     return None
 
 
+# ------------- Chatbot flow engine -------------
+class ChatFlowInput(BaseModel):
+    name: str
+    is_active: bool = False
+    description: Optional[str] = None
+
+
+class ChatFlowUpdate(BaseModel):
+    name: Optional[str] = None
+    is_active: Optional[bool] = None
+    description: Optional[str] = None
+
+
+class ChatNodeInput(BaseModel):
+    name: str
+    message_type: Literal["text", "button", "list", "image", "video", "document", "carousel"]
+    message_content: Dict[str, Any] = {}
+    is_start_node: bool = False
+
+
+class ChatNodeUpdate(BaseModel):
+    name: Optional[str] = None
+    message_type: Optional[Literal["text", "button", "list", "image", "video", "document", "carousel"]] = None
+    message_content: Optional[Dict[str, Any]] = None
+    is_start_node: Optional[bool] = None
+    x: Optional[float] = None  # canvas position
+    y: Optional[float] = None
+
+
+class ChatOptionInput(BaseModel):
+    option_id: str
+    label: str
+    next_node_id: Optional[str] = None
+    position: int = 0
+    section_title: Optional[str] = None
+    description: Optional[str] = None
+
+
+async def _is_within_24h_window(lead: dict) -> bool:
+    last_in = lead.get("last_user_message_at")
+    if not last_in:
+        return False
+    try:
+        d = datetime.fromisoformat(last_in.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return (now_utc() - d) < timedelta(hours=24)
+    except Exception:
+        return False
+
+
+async def wa_send_interactive(to_phone: str, interactive_payload: Dict[str, Any], reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
+    """Send a WA interactive message (button / list) using the existing WA abstraction.
+    cfg['api_version'] is read dynamically — never hardcoded."""
+    return await _wa_send_typed(to_phone, {"type": "interactive", "interactive": interactive_payload}, reply_to_wamid=reply_to_wamid)
+
+
+async def wa_send_media(to_phone: str, media_type: str, url: str, caption: Optional[str] = None, filename: Optional[str] = None, reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
+    """Send an image, video, or document message via the existing WA abstraction.
+    `media_type` is one of 'image','video','document'. `url` must be public HTTPS.
+    Caption supported on image/video; filename on document."""
+    if media_type not in ("image", "video", "document"):
+        return {"error": f"invalid media_type {media_type}", "status": "failed"}
+    media_block: Dict[str, Any] = {"link": url}
+    if caption and media_type in ("image", "video", "document"):
+        media_block["caption"] = caption
+    if filename and media_type == "document":
+        media_block["filename"] = filename
+    return await _wa_send_typed(to_phone, {"type": media_type, media_type: media_block}, reply_to_wamid=reply_to_wamid)
+
+
+async def wa_send_audio(to_phone: str, url: str, reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
+    """Send an audio/voice note. WA Cloud API does not accept caption/filename for audio."""
+    return await _wa_send_typed(to_phone, {"type": "audio", "audio": {"link": url}}, reply_to_wamid=reply_to_wamid)
+
+
+async def wa_send_location(to_phone: str, latitude: float, longitude: float, name: Optional[str] = None, address: Optional[str] = None, reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
+    loc: Dict[str, Any] = {"latitude": float(latitude), "longitude": float(longitude)}
+    if name:
+        loc["name"] = name
+    if address:
+        loc["address"] = address
+    return await _wa_send_typed(to_phone, {"type": "location", "location": loc}, reply_to_wamid=reply_to_wamid)
+
+
+async def wa_send_contacts(to_phone: str, contacts: List[Dict[str, Any]], reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
+    """Send one or more contact cards. Each contact must include a `name.formatted_name` and at least one phone."""
+    return await _wa_send_typed(to_phone, {"type": "contacts", "contacts": contacts}, reply_to_wamid=reply_to_wamid)
+
+
+async def _wa_send_typed(to_phone: str, payload_extra: Dict[str, Any], reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
+    """Shared transport for non-text WhatsApp messages. Keeps version, auth, error shape
+    identical to the other wa_send_* helpers."""
+    cfg = await get_wa_config()
+    if not cfg["enabled"]:
+        return {"mock": True, "status": "sent_mock", "wamid": None}
+    to = _normalize_phone(to_phone)
+    if not to:
+        return {"error": "no_phone", "status": "failed"}
+    url = f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['phone_number_id']}/messages"
+    body_payload: Dict[str, Any] = {"messaging_product": "whatsapp", "recipient_type": "individual", "to": to, **payload_extra}
+    if reply_to_wamid:
+        body_payload["context"] = {"message_id": reply_to_wamid}
+    headers = {"Authorization": f"Bearer {cfg['access_token']}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(url, json=body_payload, headers=headers)
+            # Invalid/stale context → retry once without it
+            if r.status_code >= 400 and reply_to_wamid:
+                try:
+                    err = (r.json().get("error") or {})
+                except Exception:
+                    err = {}
+                if err.get("code") in (131009, 100, 131026) or "context" in (err.get("message") or "").lower():
+                    logger.info(f"Reply-context failed ({err.get('code')}); retrying without context")
+                    body_payload.pop("context", None)
+                    r = await client.post(url, json=body_payload, headers=headers)
+        data = r.json() if r.content else {}
+        if r.status_code >= 400:
+            err = (data.get("error") or {})
+            return {"error": err.get("message") or r.text, "code": err.get("code"), "status": "failed"}
+        wamid = None
+        try:
+            wamid = data["messages"][0]["id"]
+        except Exception:
+            pass
+        return {"status": "sent", "wamid": wamid, "raw": data}
+    except Exception as e:
+        logger.exception(f"WA typed send failed: {e}")
+        return {"error": str(e), "status": "failed"}
+
+
+# ────────────── Inbound media download (Meta) ──────────────
+_WA_MIME_EXT = {
+    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+    "image/gif": ".gif", "video/mp4": ".mp4", "video/3gpp": ".3gp", "video/quicktime": ".mov",
+    "application/pdf": ".pdf",
+    "audio/ogg": ".ogg", "audio/opus": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
+    "audio/amr": ".amr", "audio/aac": ".aac", "audio/webm": ".webm",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/msword": ".doc", "text/plain": ".txt",
+}
+
+
+def _ext_for_mime(mime: Optional[str], fallback: str = "") -> str:
+    if not mime:
+        return fallback or ".bin"
+    mime = mime.split(";", 1)[0].strip().lower()
+    if mime in _WA_MIME_EXT:
+        return _WA_MIME_EXT[mime]
+    import mimetypes
+    ext = mimetypes.guess_extension(mime)
+    return ext or (fallback or ".bin")
+
+
+async def _download_wa_media(media_id: str, mime_hint: Optional[str] = None, request: Optional[Request] = None) -> Optional[Dict[str, Any]]:
+    """Fetch an inbound WhatsApp media blob from Meta and store it locally so the
+    chat UI can render it. Returns {stored_name, url, mime} on success, None on failure.
+    Two-step flow per Meta docs: (1) GET /{media_id} → {"url": ...}, (2) GET that URL
+    with the same Bearer token → bytes."""
+    cfg = await get_wa_config()
+    if not cfg.get("enabled"):
+        return None
+    token = cfg.get("access_token")
+    api_version = cfg.get("api_version")
+    if not token or not media_id:
+        return None
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r1 = await client.get(f"{WA_BASE_URL}/{api_version}/{media_id}", headers=headers)
+            if r1.status_code >= 400:
+                logger.warning(f"WA media lookup failed {r1.status_code}: {r1.text[:200]}")
+                return None
+            meta = r1.json() or {}
+            download_url = meta.get("url")
+            mime_type = meta.get("mime_type") or mime_hint
+            if not download_url:
+                return None
+            r2 = await client.get(download_url, headers=headers)
+            if r2.status_code >= 400:
+                logger.warning(f"WA media blob fetch failed {r2.status_code}")
+                return None
+            content_bytes = r2.content
+    except Exception as e:
+        logger.warning(f"WA media download error: {e}")
+        return None
+    if len(content_bytes) > 100 * 1024 * 1024:
+        logger.warning("WA media too large — skipping local cache")
+        return None
+    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    ext = _ext_for_mime(mime_type)
+    stored_name = f"{uuid.uuid4().hex}{ext}"
+    (UPLOAD_ROOT / stored_name).write_bytes(content_bytes)
+    # Persist metadata so /api/media/{name}?download=1 can set a proper filename.
+    try:
+        await db.media_files.update_one(
+            {"stored_name": stored_name},
+            {"$set": {
+                "stored_name": stored_name,
+                "original_filename": f"whatsapp_{stored_name}",
+                "mime_type": mime_type,
+                "size": len(content_bytes),
+                "kind": "inbound",
+                "uploaded_at": iso(now_utc()),
+                "source": "whatsapp_webhook",
+            }},
+            upsert=True,
+        )
+    except Exception:
+        pass
+    # Build absolute URL
+    base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+    if not base and request is not None:
+        fwd_proto = request.headers.get("x-forwarded-proto")
+        fwd_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        if fwd_host:
+            base = f"{fwd_proto or request.url.scheme}://{fwd_host}"
+        else:
+            base = str(request.base_url).rstrip("/")
+    public_url = f"{base}/api/media/{stored_name}" if base else f"/api/media/{stored_name}"
+    return {"stored_name": stored_name, "url": public_url, "mime": mime_type, "size": len(content_bytes)}
+
+
+
+
+def _build_interactive_payload(node: dict, options: List[dict]) -> Dict[str, Any]:
+    content = node.get("message_content") or {}
+    body_text = (content.get("body") or "").strip()
+    if not body_text:
+        raise ValueError("Node body is required")
+    block: Dict[str, Any] = {"body": {"text": body_text}}
+    if content.get("header"):
+        block["header"] = {"type": "text", "text": content["header"]}
+    if content.get("footer"):
+        block["footer"] = {"text": content["footer"]}
+    if node["message_type"] == "button":
+        if not options:
+            raise ValueError("Button nodes require at least one option")
+        if len(options) > 3:
+            raise ValueError("WhatsApp allows a maximum of 3 buttons")
+        block["type"] = "button"
+        block["action"] = {"buttons": [
+            {"type": "reply", "reply": {"id": o["option_id"], "title": o["label"][:20]}}
+            for o in options
+        ]}
+    elif node["message_type"] == "list":
+        if not options:
+            raise ValueError("List nodes require at least one option")
+        button_text = (content.get("button_text") or "Choose").strip()[:20]
+        sections_map: Dict[str, List[Dict[str, Any]]] = {}
+        sections_order: List[str] = []
+        for o in options:
+            title = (o.get("section_title") or "Options").strip()
+            if title not in sections_map:
+                sections_map[title] = []
+                sections_order.append(title)
+            row = {"id": o["option_id"], "title": o["label"][:24]}
+            if o.get("description"):
+                row["description"] = o["description"][:72]
+            sections_map[title].append(row)
+        sections = [{"title": t[:24], "rows": sections_map[t]} for t in sections_order]
+        block["type"] = "list"
+        block["action"] = {"button": button_text, "sections": sections}
+    else:
+        raise ValueError(f"Unsupported interactive type {node['message_type']}")
+    return block
+
+
+async def send_flow_message(to_phone: str, node_id: str, lead: Optional[dict] = None) -> Dict[str, Any]:
+    node = await db.chat_nodes.find_one({"id": node_id}, {"_id": 0})
+    if not node:
+        return {"error": "node_not_found"}
+    if not lead:
+        lead = await _find_lead_by_phone(to_phone)
+    options: List[Dict[str, Any]] = []
+    if node["message_type"] in ("button", "list", "carousel"):
+        options = await db.chat_options.find({"node_id": node_id}, {"_id": 0}).sort("position", 1).to_list(50)
+        if lead and not await _is_within_24h_window(lead):
+            return {"status": "skipped_outside_24h"}
+    content = node.get("message_content") or {}
+    msg_body_preview = content.get("body") or f"[flow:{node['message_type']}]"
+    mtype = node["message_type"]
+    if mtype == "text":
+        api_result = await wa_send_text(to_phone=to_phone, body=msg_body_preview)
+    elif mtype in ("image", "video", "document"):
+        url = (content.get("media_url") or "").strip()
+        if not url:
+            return {"error": f"{mtype} node requires media_url"}
+        api_result = await wa_send_media(
+            to_phone=to_phone,
+            media_type=mtype,
+            url=url,
+            caption=content.get("caption") or None,
+            filename=content.get("filename") or None,
+        )
+        if mtype == "image":
+            msg_body_preview = f"[image] {content.get('caption','')}".strip()
+        elif mtype == "video":
+            msg_body_preview = f"[video] {content.get('caption','')}".strip()
+        else:
+            msg_body_preview = f"[document: {content.get('filename','file')}] {content.get('caption','')}".strip()
+    elif mtype == "carousel":
+        # Pseudo-carousel: sequential images, then a single interactive button whose
+        # reply IDs match chat_options (so webhook routing works unchanged).
+        cards = content.get("cards") or []
+        if not cards:
+            return {"error": "Carousel node requires at least one card"}
+        if lead and not await _is_within_24h_window(lead):
+            return {"status": "skipped_outside_24h"}
+        last_result: Dict[str, Any] = {"status": "sent"}
+        for card in cards:
+            img_url = (card.get("image_url") or "").strip()
+            cap_parts = [card.get("title") or "", card.get("subtitle") or ""]
+            # Preserve the caption exactly — join non-empty parts with a newline, no outer strip.
+            cap = "\n".join([p for p in cap_parts if p]) or None
+            if img_url:
+                last_result = await wa_send_media(to_phone=to_phone, media_type="image", url=img_url, caption=cap)
+            elif cap:
+                last_result = await wa_send_text(to_phone=to_phone, body=cap)
+        # Build the final button prompt from chat_options (same mechanism as 'button' nodes).
+        # The UI ensures each card has a corresponding option row so that `next_node_id` works.
+        if options:
+            temp_node = {
+                "message_type": "button",
+                "message_content": {"body": content.get("body") or "Choose an option"},
+            }
+            try:
+                interactive = _build_interactive_payload(temp_node, options[:3])
+                last_result = await wa_send_interactive(to_phone=to_phone, interactive_payload=interactive)
+            except ValueError as e:
+                return {"error": str(e)}
+        api_result = last_result
+        msg_body_preview = f"[carousel] {len(cards)} cards"
+    else:
+        try:
+            interactive = _build_interactive_payload(node, options)
+        except ValueError as e:
+            return {"error": str(e)}
+        api_result = await wa_send_interactive(to_phone=to_phone, interactive_payload=interactive)
+    if lead:
+        msg_doc = {
+            "id": str(uuid.uuid4()),
+            "lead_id": lead["id"],
+            "direction": "out",
+            "body": msg_body_preview,
+            "to_phone": to_phone,
+            "flow_id": node.get("flow_id"),
+            "flow_node_id": node_id,
+            "status": api_result.get("status", "failed"),
+            "wamid": api_result.get("wamid"),
+            "error": api_result.get("error"),
+            "at": iso(now_utc()),
+            "by_user_id": None,
+        }
+        # Attach media metadata so the chat thread can render an inline preview.
+        if mtype in ("image", "video", "document"):
+            msg_doc["media_type"] = mtype
+            msg_doc["media_url"] = content.get("media_url") or ""
+            if content.get("caption"):
+                msg_doc["caption"] = content.get("caption")
+            if mtype == "document" and content.get("filename"):
+                msg_doc["filename"] = content.get("filename")
+        elif mtype == "carousel":
+            msg_doc["media_type"] = "carousel"
+            msg_doc["cards"] = content.get("cards") or []
+        await db.messages.insert_one(msg_doc)
+        if api_result.get("status") in ("sent", "sent_mock"):
+            await db.leads.update_one({"id": lead["id"]}, {"$set": {"has_whatsapp": True, "last_action_at": iso(now_utc())}})
+    target_phone = _normalize_phone(to_phone)[-10:]
+    if target_phone and api_result.get("status") in ("sent", "sent_mock"):
+        await db.chat_sessions.update_one(
+            {"phone_key": target_phone},
+            {"$set": {
+                "phone_key": target_phone,
+                "phone": to_phone,
+                "current_flow_id": node.get("flow_id"),
+                "current_node_id": node_id,
+                "last_interaction_at": iso(now_utc()),
+                "lead_id": (lead or {}).get("id"),
+            }},
+            upsert=True,
+        )
+    return {"status": api_result.get("status"), "wamid": api_result.get("wamid"), "node_id": node_id}
+
+
+async def handle_flow_inbound(from_phone: str, interactive: Dict[str, Any], lead: Optional[dict]) -> Optional[Dict[str, Any]]:
+    selected_id: Optional[str] = None
+    kind = interactive.get("type")
+    if kind == "button_reply":
+        selected_id = (interactive.get("button_reply") or {}).get("id")
+    elif kind == "list_reply":
+        selected_id = (interactive.get("list_reply") or {}).get("id")
+    if not selected_id:
+        return None
+    phone_key = _normalize_phone(from_phone or "")[-10:]
+    session = await db.chat_sessions.find_one({"phone_key": phone_key}, {"_id": 0}) if phone_key else None
+    if not session or not session.get("current_node_id"):
+        flow = await db.chat_flows.find_one({"is_active": True}, {"_id": 0})
+        if not flow:
+            return {"status": "no_active_flow"}
+        start_node = await db.chat_nodes.find_one({"flow_id": flow["id"], "is_start_node": True}, {"_id": 0})
+        if not start_node:
+            return {"status": "no_start_node"}
+        option = await db.chat_options.find_one({"node_id": start_node["id"], "option_id": selected_id}, {"_id": 0})
+        if not option:
+            return {"status": "unknown_option_on_start"}
+        if option.get("next_node_id"):
+            return await send_flow_message(from_phone, option["next_node_id"], lead=lead)
+        return {"status": "flow_ended"}
+    option = await db.chat_options.find_one({"node_id": session["current_node_id"], "option_id": selected_id}, {"_id": 0})
+    if not option:
+        return {"status": "no_match"}
+    if option.get("next_node_id"):
+        return await send_flow_message(from_phone, option["next_node_id"], lead=lead)
+    await db.chat_sessions.delete_one({"phone_key": phone_key})
+    return {"status": "flow_ended"}
+
+
+# ────────────── Flow templates ──────────────
+# Each template is a self-contained blueprint: nodes[] + per-node options[] referenced
+# by local `ref` (e.g. "greet") so we don't need to know DB uuids up front. At import
+# time we materialise real uuids and resolve every `next_ref` → `next_node_id`.
+FLOW_TEMPLATES: List[Dict[str, Any]] = [
+    {
+        "id": "lead_qualification",
+        "name": "Lead Qualification",
+        "description": "Greet new enquirers, ask if they are ready to buy or just enquiring, and route to a human handoff.",
+        "category": "Sales",
+        "nodes": [
+            {
+                "ref": "greet", "name": "Greet", "is_start_node": True,
+                "message_type": "button", "x": 80, "y": 80,
+                "message_content": {"body": "Hi 👋 Welcome! Are you looking to buy or just enquiring?"},
+                "options": [
+                    {"option_id": "buy", "label": "Ready to buy", "next_ref": "handoff"},
+                    {"option_id": "enq", "label": "Just enquiring", "next_ref": "enquiry_ack"},
+                ],
+            },
+            {
+                "ref": "handoff", "name": "Buying handoff",
+                "message_type": "text", "x": 480, "y": 20,
+                "message_content": {"body": "Great — a sales executive will call you within 15 minutes."},
+                "options": [],
+            },
+            {
+                "ref": "enquiry_ack", "name": "Enquiry acknowledged",
+                "message_type": "text", "x": 480, "y": 200,
+                "message_content": {"body": "Thanks for reaching out! Our team will share details shortly."},
+                "options": [],
+            },
+        ],
+    },
+    {
+        "id": "after_hours",
+        "name": "After-hours autoresponder",
+        "description": "A single friendly note sent automatically outside business hours.",
+        "category": "Support",
+        "nodes": [
+            {
+                "ref": "autoresp", "name": "After hours", "is_start_node": True,
+                "message_type": "text", "x": 80, "y": 80,
+                "message_content": {"body": "Thanks for your message! Our team is offline right now. We'll get back to you first thing tomorrow (9 AM IST)."},
+                "options": [],
+            },
+        ],
+    },
+    {
+        "id": "feedback_survey",
+        "name": "Feedback Survey (CSAT)",
+        "description": "Ask a 3-option CSAT after service, thank the user, and log the score.",
+        "category": "Support",
+        "nodes": [
+            {
+                "ref": "ask", "name": "Ask CSAT", "is_start_node": True,
+                "message_type": "button", "x": 80, "y": 80,
+                "message_content": {"body": "How was your experience with us today?"},
+                "options": [
+                    {"option_id": "good", "label": "Great", "next_ref": "thanks_good"},
+                    {"option_id": "ok", "label": "Okay", "next_ref": "thanks_ok"},
+                    {"option_id": "bad", "label": "Poor", "next_ref": "thanks_bad"},
+                ],
+            },
+            {"ref": "thanks_good", "name": "Thanks (Great)", "message_type": "text", "x": 480, "y": -20,
+             "message_content": {"body": "Thanks - glad you had a great experience!"}, "options": []},
+            {"ref": "thanks_ok", "name": "Thanks (Okay)", "message_type": "text", "x": 480, "y": 160,
+             "message_content": {"body": "Thanks for the feedback - we'll keep improving."}, "options": []},
+            {"ref": "thanks_bad", "name": "Thanks (Poor)", "message_type": "text", "x": 480, "y": 340,
+             "message_content": {"body": "Sorry we fell short. A team lead will reach out to make it right."}, "options": []},
+        ],
+    },
+    {
+        "id": "product_catalog",
+        "name": "Product Catalog (List)",
+        "description": "Show a list of product categories and route to each category's details.",
+        "category": "Sales",
+        "nodes": [
+            {
+                "ref": "menu", "name": "Catalog menu", "is_start_node": True,
+                "message_type": "list", "x": 80, "y": 80,
+                "message_content": {
+                    "body": "Pick a category to see our bestsellers:",
+                    "button_text": "Categories",
+                },
+                "options": [
+                    {"option_id": "oils", "label": "Essential Oils", "section_title": "Wellness", "next_ref": "oils_info"},
+                    {"option_id": "fragrance", "label": "Fragrance Oils", "section_title": "Wellness", "next_ref": "fragrance_info"},
+                    {"option_id": "talk", "label": "Talk to an expert", "section_title": "Support", "next_ref": "expert_info"},
+                ],
+            },
+            {"ref": "oils_info", "name": "Oils info", "message_type": "text", "x": 480, "y": -20,
+             "message_content": {"body": "Our essential oils - lavender, tea tree, eucalyptus - starting at Rs.249."}, "options": []},
+            {"ref": "fragrance_info", "name": "Fragrance info", "message_type": "text", "x": 480, "y": 160,
+             "message_content": {"body": "Our fragrance oils - jasmine, rose, sandalwood - starting at Rs.199."}, "options": []},
+            {"ref": "expert_info", "name": "Expert handoff", "message_type": "text", "x": 480, "y": 340,
+             "message_content": {"body": "A product expert will call you within the hour."}, "options": []},
+        ],
+    },
+]
+
+
+@api.get("/chatflows/templates")
+async def list_chatflow_templates(admin: dict = Depends(require_admin)):
+    """Return the built-in template gallery so the admin UI can render it."""
+    return [
+        {
+            "id": t["id"], "name": t["name"],
+            "description": t.get("description", ""),
+            "category": t.get("category", ""),
+            "node_count": len(t["nodes"]),
+            "types": sorted({n["message_type"] for n in t["nodes"]}),
+        }
+        for t in FLOW_TEMPLATES
+    ]
+
+
+class ImportTemplateInput(BaseModel):
+    template_id: str
+    name: Optional[str] = None
+    is_active: bool = False
+
+
+@api.post("/chatflows/import-template")
+async def import_chatflow_template(body: ImportTemplateInput, admin: dict = Depends(require_admin)):
+    """Materialise a built-in template into real DB docs (flow + nodes + options)."""
+    template = next((t for t in FLOW_TEMPLATES if t["id"] == body.template_id), None)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    if body.is_active:
+        await db.chat_flows.update_many({"is_active": True}, {"$set": {"is_active": False}})
+    flow_id = str(uuid.uuid4())
+    await db.chat_flows.insert_one({
+        "id": flow_id,
+        "name": body.name or template["name"],
+        "description": template.get("description", ""),
+        "is_active": body.is_active,
+        "source_template": template["id"],
+        "created_at": iso(now_utc()),
+        "updated_at": iso(now_utc()),
+    })
+    ref_to_id: Dict[str, str] = {}
+    for n in template["nodes"]:
+        nid = str(uuid.uuid4())
+        ref_to_id[n["ref"]] = nid
+        await db.chat_nodes.insert_one({
+            "id": nid,
+            "flow_id": flow_id,
+            "name": n["name"],
+            "message_type": n["message_type"],
+            "message_content": n.get("message_content", {}),
+            "is_start_node": bool(n.get("is_start_node")),
+            "x": float(n.get("x", 80)),
+            "y": float(n.get("y", 80)),
+            "created_at": iso(now_utc()),
+        })
+    for n in template["nodes"]:
+        node_id = ref_to_id[n["ref"]]
+        opts = n.get("options") or []
+        if not opts:
+            continue
+        docs = []
+        for i, o in enumerate(opts):
+            next_ref = o.get("next_ref")
+            docs.append({
+                "id": str(uuid.uuid4()),
+                "node_id": node_id,
+                "option_id": o["option_id"],
+                "label": o["label"],
+                "next_node_id": ref_to_id.get(next_ref) if next_ref else None,
+                "position": i,
+                "section_title": o.get("section_title"),
+                "description": o.get("description"),
+            })
+        await db.chat_options.insert_many([d.copy() for d in docs])
+    nodes = await db.chat_nodes.find({"flow_id": flow_id}, {"_id": 0}).sort("is_start_node", -1).to_list(500)
+    options = await db.chat_options.find({"node_id": {"$in": [n["id"] for n in nodes]}}, {"_id": 0}).sort("position", 1).to_list(2000)
+    opts_by_node: Dict[str, List[Dict[str, Any]]] = {}
+    for o in options:
+        opts_by_node.setdefault(o["node_id"], []).append(o)
+    for n in nodes:
+        n["options"] = opts_by_node.get(n["id"], [])
+    flow_doc = await db.chat_flows.find_one({"id": flow_id}, {"_id": 0})
+    return {**flow_doc, "nodes": nodes}
+
+
+
+
+@api.get("/chatflows")
+async def list_chatflows(admin: dict = Depends(require_admin)):
+    return await db.chat_flows.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+
+@api.post("/chatflows")
+async def create_chatflow(body: ChatFlowInput, admin: dict = Depends(require_admin)):
+    if body.is_active:
+        await db.chat_flows.update_many({"is_active": True}, {"$set": {"is_active": False}})
+    doc = {
+        "id": str(uuid.uuid4()),
+        "name": body.name,
+        "description": body.description,
+        "is_active": body.is_active,
+        "created_at": iso(now_utc()),
+        "updated_at": iso(now_utc()),
+    }
+    await db.chat_flows.insert_one(doc.copy())
+    return strip_mongo(doc)
+
+
+@api.get("/chatflows/{flow_id}")
+async def get_chatflow(flow_id: str, admin: dict = Depends(require_admin)):
+    flow = await db.chat_flows.find_one({"id": flow_id}, {"_id": 0})
+    if not flow:
+        raise HTTPException(status_code=404, detail="Flow not found")
+    nodes = await db.chat_nodes.find({"flow_id": flow_id}, {"_id": 0}).sort("is_start_node", -1).to_list(500)
+    options = await db.chat_options.find({"node_id": {"$in": [n["id"] for n in nodes]}}, {"_id": 0}).sort("position", 1).to_list(2000)
+    opts_by_node: Dict[str, List[Dict[str, Any]]] = {}
+    for o in options:
+        opts_by_node.setdefault(o["node_id"], []).append(o)
+    for n in nodes:
+        n["options"] = opts_by_node.get(n["id"], [])
+    return {**flow, "nodes": nodes}
+
+
+@api.patch("/chatflows/{flow_id}")
+async def update_chatflow(flow_id: str, body: ChatFlowUpdate, admin: dict = Depends(require_admin)):
+    flow = await db.chat_flows.find_one({"id": flow_id}, {"_id": 0})
+    if not flow:
+        raise HTTPException(status_code=404, detail="Flow not found")
+    upd: Dict[str, Any] = {"updated_at": iso(now_utc())}
+    if body.name is not None:
+        upd["name"] = body.name
+    if body.description is not None:
+        upd["description"] = body.description
+    if body.is_active is not None:
+        if body.is_active:
+            await db.chat_flows.update_many({"id": {"$ne": flow_id}, "is_active": True}, {"$set": {"is_active": False}})
+        upd["is_active"] = body.is_active
+    await db.chat_flows.update_one({"id": flow_id}, {"$set": upd})
+    return await db.chat_flows.find_one({"id": flow_id}, {"_id": 0})
+
+
+@api.delete("/chatflows/{flow_id}")
+async def delete_chatflow(flow_id: str, admin: dict = Depends(require_admin)):
+    node_ids: List[str] = []
+    async for n in db.chat_nodes.find({"flow_id": flow_id}, {"_id": 0, "id": 1}):
+        node_ids.append(n["id"])
+    if node_ids:
+        await db.chat_options.delete_many({"node_id": {"$in": node_ids}})
+    await db.chat_nodes.delete_many({"flow_id": flow_id})
+    await db.chat_flows.delete_one({"id": flow_id})
+    return {"ok": True}
+
+
+@api.post("/chatflows/{flow_id}/nodes")
+async def create_chat_node(flow_id: str, body: ChatNodeInput, admin: dict = Depends(require_admin)):
+    if not await db.chat_flows.find_one({"id": flow_id}):
+        raise HTTPException(status_code=404, detail="Flow not found")
+    if body.is_start_node:
+        await db.chat_nodes.update_many({"flow_id": flow_id, "is_start_node": True}, {"$set": {"is_start_node": False}})
+    existing_count = await db.chat_nodes.count_documents({"flow_id": flow_id})
+    # Stagger default positions so newly created nodes don't overlap on the canvas
+    default_x = 80.0 + (existing_count % 4) * 320.0
+    default_y = 80.0 + (existing_count // 4) * 220.0
+    doc = {
+        "id": str(uuid.uuid4()),
+        "flow_id": flow_id,
+        "name": body.name,
+        "message_type": body.message_type,
+        "message_content": body.message_content,
+        "is_start_node": body.is_start_node,
+        "x": default_x,
+        "y": default_y,
+        "created_at": iso(now_utc()),
+    }
+    await db.chat_nodes.insert_one(doc.copy())
+    return strip_mongo(doc)
+
+
+@api.patch("/chatflows/{flow_id}/nodes/{node_id}")
+async def update_chat_node(flow_id: str, node_id: str, body: ChatNodeUpdate, admin: dict = Depends(require_admin)):
+    node = await db.chat_nodes.find_one({"id": node_id, "flow_id": flow_id}, {"_id": 0})
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    upd: Dict[str, Any] = {}
+    for f in ["name", "message_type", "message_content", "x", "y"]:
+        v = getattr(body, f)
+        if v is not None:
+            upd[f] = v
+    if body.is_start_node is not None:
+        if body.is_start_node:
+            await db.chat_nodes.update_many({"flow_id": flow_id, "is_start_node": True, "id": {"$ne": node_id}}, {"$set": {"is_start_node": False}})
+        upd["is_start_node"] = body.is_start_node
+    if upd:
+        await db.chat_nodes.update_one({"id": node_id}, {"$set": upd})
+    return await db.chat_nodes.find_one({"id": node_id}, {"_id": 0})
+
+
+class BulkNodePositions(BaseModel):
+    positions: Dict[str, Dict[str, float]]  # { node_id: {x,y} }
+
+
+@api.put("/chatflows/{flow_id}/positions")
+async def save_node_positions(flow_id: str, body: BulkNodePositions, admin: dict = Depends(require_admin)):
+    """Persist canvas coordinates for many nodes at once (used by the drag-to-layout UI)."""
+    if not await db.chat_flows.find_one({"id": flow_id}):
+        raise HTTPException(status_code=404, detail="Flow not found")
+    count = 0
+    for nid, pos in body.positions.items():
+        if "x" not in pos or "y" not in pos:
+            continue
+        res = await db.chat_nodes.update_one(
+            {"id": nid, "flow_id": flow_id},
+            {"$set": {"x": float(pos["x"]), "y": float(pos["y"])}},
+        )
+        count += res.modified_count
+    return {"updated": count}
+
+
+# -------- Media upload for flow nodes --------
+UPLOAD_ROOT = Path("/app/backend/uploads")
+UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_MEDIA_KINDS = {"image", "video", "document", "audio"}
+
+
+@api.post("/chatflows/upload-media")
+async def upload_flow_media(
+    request: Request,
+    file: UploadFile = File(...),
+    kind: str = Form("document"),
+    admin: dict = Depends(require_admin),
+):
+    """Accept a local file upload and return an ABSOLUTE publicly accessible URL.
+    For audio/video we transcode (remux) to a WhatsApp-supported container/codec so
+    Meta's recipient side can decode it. Meta requires a fully-qualified HTTPS URL,
+    so we return e.g. `https://<host>/api/media/<uuid>.jpg`."""
+    if kind not in ALLOWED_MEDIA_KINDS:
+        raise HTTPException(status_code=400, detail=f"kind must be one of {sorted(ALLOWED_MEDIA_KINDS)}")
+    original = (file.filename or "upload.bin").strip().replace("/", "_").replace("\\", "_")
+    original_ct = (file.content_type or "").lower()
+    content_bytes = await file.read()
+    if len(content_bytes) > 50 * 1024 * 1024:  # 50 MB cap
+        raise HTTPException(status_code=413, detail="File too large (max 50 MB)")
+
+    suffix_in = Path(original).suffix.lower()
+    # Transcode to a WhatsApp-supported format if needed (audio/video only).
+    final_bytes = content_bytes
+    final_ext = suffix_in
+    final_mime = original_ct
+    if kind == "audio":
+        final_bytes, final_ext, final_mime = _prepare_audio_for_whatsapp(content_bytes, suffix_in, original_ct)
+    elif kind == "video":
+        final_bytes, final_ext, final_mime = _prepare_video_for_whatsapp(content_bytes, suffix_in, original_ct)
+    elif kind == "image":
+        # WhatsApp supports jpeg / png only. If caller sent heic/webp/gif → convert to jpeg.
+        final_bytes, final_ext, final_mime = _prepare_image_for_whatsapp(content_bytes, suffix_in, original_ct)
+
+    stored_name = f"{uuid.uuid4().hex}{final_ext or '.bin'}"
+    dest = UPLOAD_ROOT / stored_name
+    try:
+        dest.write_bytes(final_bytes)
+    except Exception as e:
+        logger.exception(f"upload failed: {e}")
+        raise HTTPException(status_code=500, detail="Upload failed")
+
+    # Persist original filename mapping so downloads preserve the name.
+    await db.media_files.update_one(
+        {"stored_name": stored_name},
+        {"$set": {
+            "stored_name": stored_name,
+            "original_filename": original,
+            "mime_type": final_mime,
+            "size": len(final_bytes),
+            "kind": kind,
+            "uploaded_at": iso(now_utc()),
+            "uploaded_by": admin["id"],
+        }},
+        upsert=True,
+    )
+
+    base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+    if not base:
+        fwd_proto = request.headers.get("x-forwarded-proto")
+        fwd_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        base = f"{fwd_proto or request.url.scheme}://{fwd_host}" if fwd_host else str(request.base_url).rstrip("/")
+    public_url = f"{base}/api/media/{stored_name}"
+    return {
+        "url": public_url,
+        "filename": original,
+        "stored_name": stored_name,
+        "size": len(final_bytes),
+        "original_size": len(content_bytes),
+        "kind": kind,
+        "mime_type": final_mime,
+        "transcoded": len(content_bytes) != len(final_bytes) or (suffix_in != final_ext),
+    }
+
+
+def _run_ffmpeg(args: List[str], input_bytes: bytes, timeout: int = 60) -> Optional[bytes]:
+    """Invoke ffmpeg with stdin input bytes, return stdout bytes or None on error."""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args],
+            input=input_bytes, capture_output=True, timeout=timeout, check=False,
+        )
+        if proc.returncode != 0:
+            logger.warning(f"ffmpeg failed (rc={proc.returncode}): {proc.stderr[:500].decode('utf-8', 'ignore')}")
+            return None
+        return proc.stdout
+    except FileNotFoundError:
+        logger.warning("ffmpeg not installed")
+        return None
+    except Exception as e:
+        logger.warning(f"ffmpeg error: {e}")
+        return None
+
+
+_WA_AUDIO_OK_MIMES = {"audio/aac", "audio/mp4", "audio/mpeg", "audio/amr", "audio/ogg"}
+_WA_AUDIO_OK_EXTS = {".aac", ".m4a", ".mp3", ".amr", ".ogg"}
+_WA_VIDEO_OK_MIMES = {"video/mp4", "video/3gpp"}
+_WA_VIDEO_OK_EXTS = {".mp4", ".3gp"}
+
+
+def _prepare_audio_for_whatsapp(raw: bytes, suffix: str, mime: str) -> tuple:
+    """Return (bytes, ext, mime) — transcoded to ogg/opus if input isn't supported.
+    Browsers' MediaRecorder default is audio/webm;codecs=opus, which WhatsApp rejects.
+    Since the opus payload is already there, we remux the container without re-encoding."""
+    mime_l = (mime or "").split(";", 1)[0].lower().strip()
+    if mime_l in _WA_AUDIO_OK_MIMES or suffix in _WA_AUDIO_OK_EXTS:
+        return raw, suffix or ".ogg", mime_l or "audio/ogg"
+    # Common input: audio/webm;codecs=opus (.webm) → remux to ogg/opus
+    # Use ffmpeg to transcode (copy opus stream into ogg, re-encode to opus if necessary)
+    out = _run_ffmpeg(["-i", "pipe:0", "-vn", "-c:a", "libopus", "-b:a", "64k", "-f", "ogg", "pipe:1"], raw)
+    if out:
+        return out, ".ogg", "audio/ogg"
+    # Fallback: encode to mp3 which WA also accepts
+    out = _run_ffmpeg(["-i", "pipe:0", "-vn", "-c:a", "libmp3lame", "-b:a", "96k", "-f", "mp3", "pipe:1"], raw)
+    if out:
+        return out, ".mp3", "audio/mpeg"
+    # Last resort: hand the file back untouched (will likely fail on Meta side)
+    logger.warning("audio transcode failed — returning original bytes")
+    return raw, suffix or ".bin", mime_l or "application/octet-stream"
+
+
+def _prepare_video_for_whatsapp(raw: bytes, suffix: str, mime: str) -> tuple:
+    """Return (bytes, ext, mime) — transcoded to H.264/AAC MP4 if input is not mp4/3gp.
+    MP4 mux needs seekable output so we transcode via temp files (input + output)."""
+    mime_l = (mime or "").split(";", 1)[0].lower().strip()
+    if mime_l in _WA_VIDEO_OK_MIMES or suffix in _WA_VIDEO_OK_EXTS:
+        return raw, suffix or ".mp4", mime_l or "video/mp4"
+    import tempfile, subprocess
+    with tempfile.NamedTemporaryFile(suffix=suffix or ".bin", delete=False) as tf_in:
+        tf_in.write(raw)
+        in_path = tf_in.name
+    out_path = in_path + ".out.mp4"
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-i", in_path,
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-c:a", "aac", "-b:a", "128k",
+             "-movflags", "+faststart",
+             out_path],
+            capture_output=True, timeout=300, check=False,
+        )
+        if proc.returncode == 0 and Path(out_path).exists():
+            data = Path(out_path).read_bytes()
+            return data, ".mp4", "video/mp4"
+        logger.warning(f"video transcode failed rc={proc.returncode}: {proc.stderr[:400].decode('utf-8','ignore')}")
+    except FileNotFoundError:
+        logger.warning("ffmpeg not installed — returning original video")
+    except Exception as e:
+        logger.warning(f"video transcode error: {e}")
+    finally:
+        for p in (in_path, out_path):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+    return raw, suffix or ".bin", mime_l or "application/octet-stream"
+
+
+def _prepare_image_for_whatsapp(raw: bytes, suffix: str, mime: str) -> tuple:
+    """WhatsApp accepts image/jpeg and image/png only. Convert others (webp/gif/heic) → jpeg."""
+    mime_l = (mime or "").split(";", 1)[0].lower().strip()
+    if mime_l in ("image/jpeg", "image/png") or suffix in (".jpg", ".jpeg", ".png"):
+        return raw, suffix or ".jpg", mime_l or "image/jpeg"
+    # Transcode to jpeg via ffmpeg
+    out = _run_ffmpeg(["-i", "pipe:0", "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "3", "pipe:1"], raw)
+    if out:
+        return out, ".jpg", "image/jpeg"
+    return raw, suffix or ".bin", mime_l or "application/octet-stream"
+
+
+@api.get("/media/{stored_name}")
+async def serve_flow_media(stored_name: str, download: bool = False):
+    """Serve files uploaded by admins or cached from WhatsApp. Public (no auth) so Meta
+    can fetch on send and so `<img>` tags work from the chat UI. Pass `?download=1` to
+    force `Content-Disposition: attachment` with the original filename preserved."""
+    safe = stored_name.replace("..", "").replace("/", "").replace("\\", "")
+    path = UPLOAD_ROOT / safe
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+    meta = await db.media_files.find_one({"stored_name": safe}, {"_id": 0})
+    from fastapi.responses import FileResponse
+    filename = (meta or {}).get("original_filename") or safe
+    mime_type = (meta or {}).get("mime_type")
+    headers = {}
+    if download:
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    else:
+        # Inline preview by default
+        headers["Content-Disposition"] = f'inline; filename="{filename}"'
+    headers["Cache-Control"] = "public, max-age=86400"
+    return FileResponse(str(path), media_type=mime_type, headers=headers, filename=filename)
+
+
+@api.delete("/chatflows/{flow_id}/nodes/{node_id}")
+async def delete_chat_node(flow_id: str, node_id: str, admin: dict = Depends(require_admin)):
+    await db.chat_options.delete_many({"node_id": node_id})
+    await db.chat_options.update_many({"next_node_id": node_id}, {"$set": {"next_node_id": None}})
+    await db.chat_nodes.delete_one({"id": node_id, "flow_id": flow_id})
+    return {"ok": True}
+
+
+@api.put("/chatflows/{flow_id}/nodes/{node_id}/options")
+async def replace_node_options(flow_id: str, node_id: str, options: List[ChatOptionInput], admin: dict = Depends(require_admin)):
+    if not await db.chat_nodes.find_one({"id": node_id, "flow_id": flow_id}):
+        raise HTTPException(status_code=404, detail="Node not found")
+    await db.chat_options.delete_many({"node_id": node_id})
+    docs = [{
+        "id": str(uuid.uuid4()),
+        "node_id": node_id,
+        "option_id": o.option_id.strip(),
+        "label": o.label.strip(),
+        "next_node_id": o.next_node_id,
+        "position": o.position,
+        "section_title": o.section_title,
+        "description": o.description,
+    } for o in options]
+    if docs:
+        await db.chat_options.insert_many([d.copy() for d in docs])
+    return [strip_mongo(d) for d in docs]
+
+
+class FlowStartInput(BaseModel):
+    phone: str
+    node_id: Optional[str] = None
+
+
+@api.post("/chatflows/{flow_id}/start")
+async def start_flow(flow_id: str, body: FlowStartInput, admin: dict = Depends(require_admin)):
+    flow = await db.chat_flows.find_one({"id": flow_id}, {"_id": 0})
+    if not flow:
+        raise HTTPException(status_code=404, detail="Flow not found")
+    node_id = body.node_id
+    if not node_id:
+        start = await db.chat_nodes.find_one({"flow_id": flow_id, "is_start_node": True}, {"_id": 0})
+        if not start:
+            raise HTTPException(status_code=400, detail="Flow has no start node — mark one first.")
+        node_id = start["id"]
+    result = await send_flow_message(body.phone, node_id)
+    # Surface build errors as 400 so the UI can distinguish them from successful sends
+    if result.get("error") and not result.get("status"):
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@api.get("/chat-sessions")
+async def list_chat_sessions(admin: dict = Depends(require_admin), limit: int = 200):
+    return await db.chat_sessions.find({}, {"_id": 0}).sort("last_interaction_at", -1).to_list(limit)
+
+
+
+
 @api.post("/webhooks/whatsapp")
 async def webhook_whatsapp(request: Request):
     """Receive incoming WhatsApp messages and delivery status updates from Meta."""
@@ -2306,27 +3585,68 @@ async def webhook_whatsapp(request: Request):
                     from_phone = m.get("from")  # digits, e.g. "919876543210"
                     msg_type = m.get("type")
                     wamid = m.get("id")
+                    inbound_context_wamid: Optional[str] = None
+                    # Meta sends `context.id` when the user taps "Reply" and quotes one of our messages.
+                    try:
+                        inbound_context_wamid = (m.get("context") or {}).get("id")
+                    except Exception:
+                        inbound_context_wamid = None
                     body_text = ""
+                    inbound_media_type = None
+                    inbound_media_id = None
+                    inbound_caption = None
+                    inbound_filename = None
+                    inbound_mime = None
                     if msg_type == "text":
                         body_text = ((m.get("text") or {}).get("body")) or ""
                     elif msg_type == "image":
                         img = m.get("image") or {}
                         body_text = f"[image] {img.get('caption','')}".strip()
+                        inbound_media_type = "image"
+                        inbound_media_id = img.get("id")
+                        inbound_caption = img.get("caption")
+                        inbound_mime = img.get("mime_type")
                     elif msg_type == "document":
                         doc = m.get("document") or {}
                         body_text = f"[document: {doc.get('filename','file')}] {doc.get('caption','')}".strip()
+                        inbound_media_type = "document"
+                        inbound_media_id = doc.get("id")
+                        inbound_caption = doc.get("caption")
+                        inbound_filename = doc.get("filename")
+                        inbound_mime = doc.get("mime_type")
                     elif msg_type == "audio":
-                        body_text = "[audio message]"
+                        aud = m.get("audio") or {}
+                        body_text = "[voice note]" if aud.get("voice") else "[audio message]"
+                        inbound_media_type = "audio"
+                        inbound_media_id = aud.get("id")
+                        inbound_mime = aud.get("mime_type")
                     elif msg_type == "video":
-                        body_text = f"[video] {(m.get('video') or {}).get('caption','')}".strip()
+                        vid = m.get("video") or {}
+                        body_text = f"[video] {vid.get('caption','')}".strip()
+                        inbound_media_type = "video"
+                        inbound_media_id = vid.get("id")
+                        inbound_caption = vid.get("caption")
+                        inbound_mime = vid.get("mime_type")
                     elif msg_type == "location":
                         loc = m.get("location") or {}
                         body_text = f"[location: {loc.get('latitude')},{loc.get('longitude')}]"
+                    elif msg_type == "contacts":
+                        cc = m.get("contacts") or []
+                        first_name = ""
+                        if cc:
+                            first_name = (cc[0].get("name") or {}).get("formatted_name") or ""
+                        body_text = f"[contact] {first_name}".strip() or "[contact]"
                     elif msg_type == "button":
                         body_text = f"[button reply] {(m.get('button') or {}).get('text','')}"
                     elif msg_type == "interactive":
                         ia = m.get("interactive") or {}
-                        body_text = f"[interactive] {json.dumps(ia)[:200]}"
+                        ia_type = ia.get("type")
+                        if ia_type == "button_reply":
+                            body_text = f"[button] {(ia.get('button_reply') or {}).get('title','')}".strip()
+                        elif ia_type == "list_reply":
+                            body_text = f"[list] {(ia.get('list_reply') or {}).get('title','')}".strip()
+                        else:
+                            body_text = f"[interactive] {json.dumps(ia)[:200]}"
                     else:
                         body_text = f"[{msg_type}]"
 
@@ -2359,6 +3679,55 @@ async def webhook_whatsapp(request: Request):
                         "at": iso(now_utc()),
                         "by_user_id": None,
                     }
+                    # Quoted-reply context from the customer
+                    if inbound_context_wamid:
+                        quoted = await db.messages.find_one(
+                            {"wamid": inbound_context_wamid, "lead_id": lead["id"]},
+                            {"_id": 0, "id": 1, "body": 1, "caption": 1, "direction": 1},
+                        )
+                        msg_doc["reply_to_wamid"] = inbound_context_wamid
+                        if quoted:
+                            msg_doc["reply_to_message_id"] = quoted["id"]
+                            msg_doc["reply_to_preview"] = (quoted.get("caption") or quoted.get("body") or "")[:120]
+                    if inbound_media_type:
+                        msg_doc["media_type"] = inbound_media_type
+                        if inbound_media_id:
+                            msg_doc["media_id"] = inbound_media_id
+                        if inbound_caption:
+                            msg_doc["caption"] = inbound_caption
+                        if inbound_filename:
+                            msg_doc["filename"] = inbound_filename
+                        if inbound_mime:
+                            msg_doc["mime_type"] = inbound_mime
+                        # Download the blob from Meta and re-serve it from /api/media
+                        # so the chat UI can render the actual image/video/document/audio.
+                        if inbound_media_id:
+                            try:
+                                dl = await _download_wa_media(inbound_media_id, mime_hint=inbound_mime, request=request)
+                                if dl and dl.get("url"):
+                                    msg_doc["media_url"] = dl["url"]
+                                    msg_doc["media_stored_name"] = dl.get("stored_name")
+                                    # If WhatsApp gave us a real filename for documents, overwrite the default
+                                    if inbound_filename and dl.get("stored_name"):
+                                        await db.media_files.update_one(
+                                            {"stored_name": dl["stored_name"]},
+                                            {"$set": {"original_filename": inbound_filename}},
+                                        )
+                            except Exception as _e:
+                                logger.warning(f"Inbound media cache failed: {_e}")
+                    # Structured location / contacts payload
+                    if msg_type == "location":
+                        loc = m.get("location") or {}
+                        msg_doc["msg_type"] = "location"
+                        msg_doc["location"] = {
+                            "latitude": loc.get("latitude"),
+                            "longitude": loc.get("longitude"),
+                            "name": loc.get("name"),
+                            "address": loc.get("address"),
+                        }
+                    elif msg_type == "contacts":
+                        msg_doc["msg_type"] = "contacts"
+                        msg_doc["contacts"] = m.get("contacts") or []
                     await db.messages.insert_one(msg_doc.copy())
                     await db.leads.update_one(
                         {"id": lead["id"]},
@@ -2370,6 +3739,14 @@ async def webhook_whatsapp(request: Request):
                         }},
                     )
                     created_msgs += 1
+                    # ---- Flow engine dispatch (interactive replies) ----
+                    if msg_type == "interactive":
+                        try:
+                            flow_res = await handle_flow_inbound(from_phone or "", m.get("interactive") or {}, lead)
+                            if flow_res:
+                                logger.info(f"Flow dispatch for {from_phone}: {flow_res}")
+                        except Exception as e:
+                            logger.exception(f"Flow dispatch failed: {e}")
 
                 # ---- Delivery status updates ----
                 for s in (value.get("statuses") or []):
@@ -2938,6 +4315,11 @@ async def seed_data():
     await db.call_logs.create_index([("lead_id", 1), ("at", -1)])
     await db.call_logs.create_index([("by_user_id", 1), ("at", -1)])
     await db.call_logs.create_index("outcome")
+    await db.chat_flows.create_index("is_active")
+    await db.chat_nodes.create_index([("flow_id", 1), ("is_start_node", -1)])
+    await db.chat_options.create_index([("node_id", 1), ("position", 1)])
+    await db.chat_options.create_index([("node_id", 1), ("option_id", 1)])
+    await db.chat_sessions.create_index("phone_key", unique=True)
     # Phone canonicalization migration (one-shot per cold-start). Iterates through any
     # lead whose phone/phones haven't been flagged migrated yet and rewrites them in
     # canonical form (Indian → 10-digit national, others → +<digits>). Idempotent.

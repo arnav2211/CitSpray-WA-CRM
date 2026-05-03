@@ -79,6 +79,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
               <Item to="/routing" icon={Gear} testId="nav-routing" onNavigate={handleNavigate}>Routing Rules</Item>
               <Item to="/integrations" icon={Plug} testId="nav-integrations" onNavigate={handleNavigate}>Integrations</Item>
               <Item to="/templates" icon={ChatCircleDots} testId="nav-templates" onNavigate={handleNavigate}>WA Templates</Item>
+              <Item to="/chatflows" icon={ChatTeardropDots} testId="nav-chatflows" onNavigate={handleNavigate}>Chatbot Flows</Item>
               <Item to="/quick-replies" icon={Lightning} testId="nav-quick-replies" onNavigate={handleNavigate}>Quick Replies</Item>
               <Item to="/settings" icon={Sliders} testId="nav-settings" onNavigate={handleNavigate}>Settings</Item>
               <Item to="/reports" icon={PaperPlaneTilt} testId="nav-reports" onNavigate={handleNavigate}>Reports</Item>

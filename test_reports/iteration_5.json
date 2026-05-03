@@ -1,0 +1,48 @@
+{
+  "summary": "Iteration-7 (LeadOrbit chatbot flow engine) full backend + frontend verification. 22/22 NEW pytest cases PASS in /app/backend/tests/test_iteration7_chatflows.py; iter4 + iter5 regression also clean (37/37 PASS). Frontend /chatflows page verified end-to-end via Playwright as admin: nav-chatflows → flows-list → new-flow-btn + new-flow-name-input + create-flow-submit-btn → flow-editor → new-node-btn / NewNodeModal (name/type/body/start/submit) → NodeEditor (name/header/body/footer/start) → add-option-btn + per-row option-id/option-label/option-next-select → save-node-btn → flow-test-phone + flow-test-send-btn ALL render and function. Cleaned up the test flow + re-activated the seeded 'Sales Qualification' flow at the end.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/chatflows/{id}/start", "issue": "When _build_interactive_payload throws (e.g. button >3 options, list with 0 options), the endpoint returns HTTP 200 with body {error: '...'} instead of 4xx. Functionally it surfaces the failure but UX-wise frontend cannot distinguish from a real send: consider returning 400 with structured detail."},
+      {"endpoint": "POST /api/chatflows/{id}/start (text node, lead exists, no inbound)", "issue": "Confirmed working — text nodes still send (status='sent'/'sent_mock') even when last_user_message_at is unset. Only button/list nodes are gated by 24h. This matches the spec; no fix needed."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "ChatFlows.jsx flow-row", "issue": "Hydration warning: <button data-testid=flow-row-...> contains nested <button data-testid=toggle-active-...> + <button data-testid=delete-flow-...>. React logs 'In HTML, <button> cannot be a descendant of <button>'. Replace the outer <button> with a <div role=\"button\" tabIndex=0 onClick=...> or move the inner buttons out of the click target. Functionally still works but produces console errors and is invalid HTML.", "selector": "[data-testid^='flow-row-']", "priority": "MEDIUM"}
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration7_chatflows.py",
+    "/app/test_reports/pytest/iter7_results.xml"
+  ],
+  "action_items": [
+    "Fix nested <button> in ChatFlows.jsx flow-row (replace outer button with div+role=button) to clear React hydration warning.",
+    "Optional: change /api/chatflows/{id}/start to return HTTP 400 with structured detail when _build_interactive_payload throws (>3 buttons, empty list options). Currently returns 200 + {error:''} — works but inconsistent with other 4xx contracts.",
+    "Optional: split server.py — now 3406 lines. The chatflow engine alone is ~370 lines (2282–2650) and is a clean candidate for /app/backend/chatflows.py."
+  ],
+  "critical_code_review_comments": [
+    "API version IS dynamic — wa_send_interactive uses cfg['api_version'] (line 2340). Source-grep confirms zero hardcoded 'v19.0' / 'v20.0' / 'v21.0' literals outside the WHATSAPP_API_VERSION env default at line 49. Verified by automated test test_no_hardcoded_v_prefixed_versions_in_server.",
+    "Cascade on flow delete is correct: delete_chatflow loops nodes → bulk-deletes options → deletes nodes → deletes flow.",
+    "Node delete correctly clears next_node_id refs in *other* options via update_many({next_node_id: node_id}, {$set: {next_node_id: None}}) (line 2604) — verified by test_node_delete_clears_next_node_refs.",
+    "handle_flow_inbound covers all four spec branches: (a) session present + matching option → advance, (b) session present + unknown option → keep session (returns {status:'no_match'}), (c) no session + matching start-option → auto-start advance, (d) no session + no flow → {status:'no_active_flow'}. All four paths are covered by tests.",
+    "_is_within_24h_window uses datetime.fromisoformat with Z→+00:00 normalization and tz-aware comparison — robust.",
+    "send_flow_message persists flow_id + flow_node_id on outbound message and upserts chat_sessions atomically on (sent|sent_mock) — correct ordering: insert message → set has_whatsapp → upsert session.",
+    "Minor: button title is truncated to 20 chars and list row title to 24 chars (Meta limits) — matches spec; section title also clipped to 24.",
+    "Frontend NodeEditor save logic is atomic (PATCH node THEN PUT options THEN reload) — race-free since both are admin-only single-user edits.",
+    "ChatFlows.jsx outer flow-row uses <button> wrapping inner action <button>s — invalid HTML, see frontend_issues.ui_bugs."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration7_chatflows.py (NEW: 22 tests for iter-7 chatflow engine)",
+    "/app/test_reports/pytest/iter7_results.xml (junit output)"
+  ],
+  "success_rate": {"backend": "100% (22/22 iter7 + 37/37 regression)", "frontend": "100% on testid coverage and create→edit→options→save→test-send flow exercised manually via Playwright"},
+  "test_credentials": "admin/Admin@123 (verified working). ravi/Exec@123 used for 403 RBAC checks.",
+  "seed_data_creation": "Test fixtures auto-create then auto-delete TEST_IT7_* flows + nodes + options + a small number of TEST_IT7_BTN_* / TEST_IT7_RR-style leads via existing /api/leads. Module-scoped autouse fixture _cleanup deletes every flow it created. After the run only the seeded 'Sales Qualification' flow remains (re-activated post-test).",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Run via: `REACT_APP_BACKEND_URL=https://crm-lead-mgmt-3.preview.emergentagent.com pytest /app/backend/tests/test_iteration7_chatflows.py /app/backend/tests/test_iteration5.py /app/backend/tests/test_iteration4.py -v` (env var is needed because conftest.py rstrips it). The seeded 'Sales Qualification' flow id 96806721-76bc-46a1-8d4f-506e8682abce is currently is_active=True; do not delete it. Webhook simulate endpoint /api/webhooks/whatsapp/_debug/simulate is admin-only; use it to open the 24h window for any test phone before button/list start. Real WA creds are configured so wa_send_interactive returns status='sent' with a wamid (mock path 'sent_mock' only kicks in if creds are cleared).",
+  "rca_of_the_issue": "No bugs blocking iter-7 acceptance. One MEDIUM-priority React hydration warning logged (nested <button> inside flow-row); functionally inert but should be fixed. One minor API-shape comment: build-payload validation errors come back as HTTP 200 + {error} from /chatflows/{id}/start instead of 4xx — works but inconsistent."
+}
