@@ -219,10 +219,10 @@ class TestPayloadValidation:
                       json={"from_phone": phone, "name": "T", "body": "hi"}, timeout=30)
         r = requests.post(f"{API}/chatflows/{f['id']}/start", headers=_h(admin_token),
                           json={"phone": phone}, timeout=30)
-        assert r.status_code == 200
+        # iter8: build errors now surface as HTTP 400 (was 200+{error}) per iter5 action item
+        assert r.status_code == 400, r.text
         d = r.json()
-        # Should surface error about max 3 buttons
-        assert d.get("error") and "3" in str(d["error"]), f"expected 3-button error, got {d}"
+        assert "3" in str(d.get("detail", "")), f"expected 3-button error, got {d}"
 
     def test_list_node_no_options_fails_on_start(self, admin_token):
         f = _create_flow(admin_token, f"TEST_IT7_LISTEMPTY_{uuid.uuid4().hex[:6]}")
@@ -233,9 +233,10 @@ class TestPayloadValidation:
                       json={"from_phone": phone, "name": "T", "body": "hi"}, timeout=30)
         r = requests.post(f"{API}/chatflows/{f['id']}/start", headers=_h(admin_token),
                           json={"phone": phone}, timeout=30)
-        assert r.status_code == 200
+        # iter8: build errors now surface as HTTP 400 per iter5 action item
+        assert r.status_code == 400, r.text
         d = r.json()
-        assert d.get("error") and "option" in d["error"].lower()
+        assert "option" in str(d.get("detail", "")).lower()
 
 
 # ---------- Flow start ----------

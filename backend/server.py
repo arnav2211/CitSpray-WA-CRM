@@ -17,8 +17,9 @@ import bcrypt
 import jwt
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Query, UploadFile, File, Form
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, ConfigDict
@@ -2430,13 +2431,63 @@ async def send_flow_message(to_phone: str, node_id: str, lead: Optional[dict] = 
     if not lead:
         lead = await _find_lead_by_phone(to_phone)
     options: List[Dict[str, Any]] = []
-    if node["message_type"] in ("button", "list"):
+    if node["message_type"] in ("button", "list", "carousel"):
         options = await db.chat_options.find({"node_id": node_id}, {"_id": 0}).sort("position", 1).to_list(50)
         if lead and not await _is_within_24h_window(lead):
             return {"status": "skipped_outside_24h"}
-    msg_body_preview = (node.get("message_content") or {}).get("body") or f"[flow:{node['message_type']}]"
-    if node["message_type"] == "text":
+    content = node.get("message_content") or {}
+    msg_body_preview = content.get("body") or f"[flow:{node['message_type']}]"
+    mtype = node["message_type"]
+    if mtype == "text":
         api_result = await wa_send_text(to_phone=to_phone, body=msg_body_preview)
+    elif mtype in ("image", "video", "document"):
+        url = (content.get("media_url") or "").strip()
+        if not url:
+            return {"error": f"{mtype} node requires media_url"}
+        api_result = await wa_send_media(
+            to_phone=to_phone,
+            media_type=mtype,
+            url=url,
+            caption=content.get("caption") or None,
+            filename=content.get("filename") or None,
+        )
+        if mtype == "image":
+            msg_body_preview = f"[image] {content.get('caption','')}".strip()
+        elif mtype == "video":
+            msg_body_preview = f"[video] {content.get('caption','')}".strip()
+        else:
+            msg_body_preview = f"[document: {content.get('filename','file')}] {content.get('caption','')}".strip()
+    elif mtype == "carousel":
+        # Pseudo-carousel: sequential images, then a single interactive button whose
+        # reply IDs match chat_options (so webhook routing works unchanged).
+        cards = content.get("cards") or []
+        if not cards:
+            return {"error": "Carousel node requires at least one card"}
+        if lead and not await _is_within_24h_window(lead):
+            return {"status": "skipped_outside_24h"}
+        last_result: Dict[str, Any] = {"status": "sent"}
+        for card in cards:
+            img_url = (card.get("image_url") or "").strip()
+            cap_parts = [card.get("title") or "", card.get("subtitle") or ""]
+            cap = "\n".join([p for p in cap_parts if p]).strip() or None
+            if img_url:
+                last_result = await wa_send_media(to_phone=to_phone, media_type="image", url=img_url, caption=cap)
+            elif cap:
+                last_result = await wa_send_text(to_phone=to_phone, body=cap)
+        # Build the final button prompt from chat_options (same mechanism as 'button' nodes).
+        # The UI ensures each card has a corresponding option row so that `next_node_id` works.
+        if options:
+            temp_node = {
+                "message_type": "button",
+                "message_content": {"body": content.get("body") or "Choose an option"},
+            }
+            try:
+                interactive = _build_interactive_payload(temp_node, options[:3])
+                last_result = await wa_send_interactive(to_phone=to_phone, interactive_payload=interactive)
+            except ValueError as e:
+                return {"error": str(e)}
+        api_result = last_result
+        msg_body_preview = f"[carousel] {len(cards)} cards"
     else:
         try:
             interactive = _build_interactive_payload(node, options)
@@ -2582,6 +2633,10 @@ async def create_chat_node(flow_id: str, body: ChatNodeInput, admin: dict = Depe
         raise HTTPException(status_code=404, detail="Flow not found")
     if body.is_start_node:
         await db.chat_nodes.update_many({"flow_id": flow_id, "is_start_node": True}, {"$set": {"is_start_node": False}})
+    existing_count = await db.chat_nodes.count_documents({"flow_id": flow_id})
+    # Stagger default positions so newly created nodes don't overlap on the canvas
+    default_x = 80.0 + (existing_count % 4) * 320.0
+    default_y = 80.0 + (existing_count // 4) * 220.0
     doc = {
         "id": str(uuid.uuid4()),
         "flow_id": flow_id,
@@ -2589,6 +2644,8 @@ async def create_chat_node(flow_id: str, body: ChatNodeInput, admin: dict = Depe
         "message_type": body.message_type,
         "message_content": body.message_content,
         "is_start_node": body.is_start_node,
+        "x": default_x,
+        "y": default_y,
         "created_at": iso(now_utc()),
     }
     await db.chat_nodes.insert_one(doc.copy())
@@ -2633,6 +2690,59 @@ async def save_node_positions(flow_id: str, body: BulkNodePositions, admin: dict
         )
         count += res.modified_count
     return {"updated": count}
+
+
+# -------- Media upload for flow nodes --------
+UPLOAD_ROOT = Path("/app/backend/uploads")
+UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_MEDIA_KINDS = {"image", "video", "document"}
+
+
+@api.post("/chatflows/upload-media")
+async def upload_flow_media(
+    file: UploadFile = File(...),
+    kind: str = Form("document"),
+    admin: dict = Depends(require_admin),
+):
+    """Accept a local file upload and return a publicly accessible URL. Admins paste this
+    URL (or the returned filename) into a flow node's `media_url`. Files are served from
+    /api/media/<filename> so they travel through the same ingress as the rest of the API."""
+    if kind not in ALLOWED_MEDIA_KINDS:
+        raise HTTPException(status_code=400, detail=f"kind must be one of {sorted(ALLOWED_MEDIA_KINDS)}")
+    original = (file.filename or "upload.bin").strip().replace("/", "_").replace("\\", "_")
+    suffix = Path(original).suffix.lower()
+    stored_name = f"{uuid.uuid4().hex}{suffix}"
+    dest = UPLOAD_ROOT / stored_name
+    try:
+        content_bytes = await file.read()
+        if len(content_bytes) > 50 * 1024 * 1024:  # 50 MB cap
+            raise HTTPException(status_code=413, detail="File too large (max 50 MB)")
+        dest.write_bytes(content_bytes)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"upload failed: {e}")
+        raise HTTPException(status_code=500, detail="Upload failed")
+    public_url = f"/api/media/{stored_name}"
+    return {
+        "url": public_url,
+        "filename": original,
+        "stored_name": stored_name,
+        "size": len(content_bytes),
+        "kind": kind,
+    }
+
+
+@api.get("/media/{stored_name}")
+async def serve_flow_media(stored_name: str):
+    """Serve files previously uploaded by admins. Public so WhatsApp can fetch them."""
+    safe = stored_name.replace("..", "").replace("/", "").replace("\\", "")
+    path = UPLOAD_ROOT / safe
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+    from fastapi.responses import FileResponse
+    return FileResponse(str(path))
 
 
 @api.delete("/chatflows/{flow_id}/nodes/{node_id}")
