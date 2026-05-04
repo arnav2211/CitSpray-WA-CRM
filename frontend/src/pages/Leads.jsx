@@ -162,8 +162,13 @@ export default function Leads() {
               const ageMin = Math.floor((Date.now() - new Date(l.created_at).getTime()) / 60000);
               const overdue = unread && ageMin > 15;
               return (
-                <button key={l.id} onClick={() => setOpenId(l.id)}
-                  className={`w-full text-left border border-gray-200 bg-white p-3 hover:border-gray-900 transition-colors ${overdue ? "border-l-2 border-l-[#E60000]" : ""}`}
+                <div
+                  key={l.id}
+                  onClick={() => setOpenId(l.id)}
+                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setOpenId(l.id); } }}
+                  role="button"
+                  tabIndex={0}
+                  className={`block w-full text-left border border-gray-200 bg-white p-3 hover:border-gray-900 transition-colors cursor-pointer ${overdue ? "border-l-2 border-l-[#E60000]" : ""}`}
                   data-testid={`lead-card-${l.id}`}>
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0 flex-1">
@@ -198,7 +203,7 @@ export default function Leads() {
                     </span>
                   </div>
                   <div className="text-[10px] text-gray-400 font-mono mt-1">{fmtIST(l.created_at)}</div>
-                </button>
+                </div>
               );
             })}
           </div>
