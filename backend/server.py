@@ -2364,6 +2364,9 @@ async def sync_templates(admin: dict = Depends(require_admin)):
     data = r.json()
     upserted = 0
     for t in data.get("data", []):
+        # Skip Meta's sample hello_world template
+        if (t.get("name") or "").lower() == "hello_world":
+            continue
         body = ""
         try:
             for c in (t.get("components") or []):
@@ -5540,53 +5543,9 @@ async def seed_data():
                 {"$set": {"password_hash": hash_password(admin_password), "role": "admin", "active": True}},
             )
 
-    # default template
-    if not await db.whatsapp_templates.find_one({"name": "welcome_lead"}):
-        body_w = "Hi {{name}}, thanks for your interest. Our team will connect with you shortly. — LeadOrbit"
-        await db.whatsapp_templates.insert_one({
-            "id": str(uuid.uuid4()),
-            "name": "welcome_lead",
-            "category": "utility",
-            "body": body_w,
-            "params_required": count_template_placeholders(body_w),
-            "created_at": iso(now_utc()),
-        })
-    if not await db.whatsapp_templates.find_one({"name": "followup_reminder"}):
-        body_f = "Hi {{name}}, just checking in regarding your enquiry. Let us know a good time to connect."
-        await db.whatsapp_templates.insert_one({
-            "id": str(uuid.uuid4()),
-            "name": "followup_reminder",
-            "category": "utility",
-            "body": body_f,
-            "params_required": count_template_placeholders(body_f),
-            "created_at": iso(now_utc()),
-        })
-    # Backfill params_required for any existing templates that don't have it (one-shot)
-    cursor = db.whatsapp_templates.find({"params_required": {"$exists": False}}, {"_id": 0, "id": 1, "body": 1})
-    async for t in cursor:
-        await db.whatsapp_templates.update_one(
-            {"id": t["id"]},
-            {"$set": {"params_required": count_template_placeholders(t.get("body") or "")}},
-        )
+
     # default routing rules
     await get_routing_rules()
-    # default quick replies
-    if not await db.quick_replies.find_one({}):
-        defaults = [
-            ("Greeting", "Hi {{name}}, thanks for reaching out — how can we help you today?"),
-            ("Will call shortly", "Thanks for your enquiry! Our team will call you in the next 30 minutes."),
-            ("Price request", "Could you please share the quantity and delivery location so we can share an accurate quote?"),
-            ("Send brochure", "Here's our brochure with pricing and specifications. Let me know if any product catches your eye."),
-            ("Follow-up", "Just checking in on our previous conversation — is now a good time to discuss next steps?"),
-        ]
-        for title, text in defaults:
-            await db.quick_replies.insert_one({
-                "id": str(uuid.uuid4()),
-                "title": title,
-                "text": text,
-                "created_by": None,
-                "created_at": iso(now_utc()),
-            })
     # indexes
     await db.users.create_index("username", unique=True)
     await db.leads.create_index("dedup_hash")
