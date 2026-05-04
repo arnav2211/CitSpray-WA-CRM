@@ -479,10 +479,9 @@ export default function LeadDrawer({ leadId, onClose }) {
             </section>
           </div>
 
-          {/* Right: WhatsApp panel — matches /chat behavior (24h, templates as templates,
-              quick replies, smart timestamps, sticky day separators, per-phone filter). */}
-          <div className="lg:col-span-2 wa-panel flex flex-col min-h-[560px]">
-            <div className="px-5 py-3 border-b border-white/10 flex items-center justify-between gap-2 flex-wrap">
+          {/* Right: WhatsApp panel */}
+          <div className="lg:col-span-2 wa-panel flex flex-col h-[600px] lg:h-auto lg:max-h-[calc(100vh-220px)] lg:sticky lg:top-0">
+            <div className="px-5 py-3 border-b border-white/10 flex items-center justify-between">
               <div className="text-[10px] uppercase tracking-widest font-bold text-white/60 flex items-center gap-1">
                 <WhatsappLogo size={12} /> WhatsApp Thread
               </div>
