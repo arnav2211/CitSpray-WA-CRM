@@ -22,6 +22,28 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 17 (Feb 2026) — Dedup + Sticky reassign + Smart template + Multi-Gmail
+- **Phone-based cross-source deduplication** — `_create_lead_internal` already returned the existing lead on phone match; now ALSO calls new helper `_handle_repeat_enquiry()` which:
+  - keeps the existing assignee when still active + not-on-leave (sticky),
+  - reassigns via `_pick_buyleads_executive` (if the new payload qualifies as a buylead) or `pick_next_executive(exclude=prev_owner)` when the previous owner is on leave / inactive / missing,
+  - bumps `last_action_at` + `last_enquiry_source` + `last_enquiry_at` on every re-entry,
+  - emits `repeat_enquiry` or `repeat_enquiry_reassigned` activity log entries.
+  - Also wired into the manual `POST /api/leads` early-return branch, so manual re-entries go through the same sticky pipeline (not just webhooks).
+
+- **Gmail-id deduplication** — every polled email is checked against `db.email_logs.gmail_id` BEFORE processing; duplicates bump `skipped_dupe` counter and mark-read only. Prevents cross-slot re-ingestion when the same Justdial email arrives in both connected inboxes.
+
+- **Smart WhatsApp welcome-template skip** — `auto_send_whatsapp_on_create` queries `db.messages` for any `direction='in'` record either on the lead-id OR on the phone-suffix pattern before firing. If the customer has already replied at any time, the template is NOT sent and a log warning is emitted. Protects against welcoming an already-engaged customer.
+
+- **Manual Justdial phone-add triggers welcome template** — `POST /api/leads/{lead_id}/phones` now auto-fires `auto_send_whatsapp_on_create` when the lead's source is `Justdial` AND this is the first-ever phone being attached. The smart-skip above guards against double-sending when the customer has already replied.
+
+- **Multi-Gmail (2 accounts)** — `gmail_connections` schema now keyed by slot (`primary` / `secondary`). Auto-migration: legacy `key='default'` docs are promoted to `key='primary'` on first read.
+  - All Gmail endpoints accept optional `?slot=primary|secondary` — status, auth init, callback, disconnect, sync-now. Callback rejects with `duplicate_account` if the SAME Google email is already connected on the other slot.
+  - Poller (`gmail_poll_task`) loops over `GMAIL_SLOTS = ('primary','secondary')`, calls `_gmail_poll_one_slot()` for each. Per-slot summaries stored at `db.gmail_polls` key `last:{slot}`; combined summary at `last` with `slots` dict.
+  - Shared parse / dedup / create-lead pipeline — both accounts use the same extraction, phone-dedup, and assignment logic.
+  - Frontend `Integrations.jsx` rewritten with two side-by-side slot panels (`gmail-slot-primary` / `gmail-slot-secondary`), per-slot Connect / Disconnect / Sync Now, plus a top-level "Sync all accounts" button.
+
+- **Tested**: 16/16 new pytest backend suite PASSED. Both slots connected live in the env (citronellaoilnagpur@gmail.com + citspray@gmail.com). Frontend Playwright verified all new data-testids. iter7+iter8 regression still green.
+
 ### Iteration 16 (Feb 2026) — Internal Q&A Tracker + Chat-list tags + Deep-links
 - **Centralized tracker page `/qa`** (`InternalQA.jsx`) — visible to both admin and executives via sidebar nav (`nav-qa`). Desktop table + mobile card grid.
   - Columns: Lead/Customer · Agent · Last Question + timestamp · Last Reply + timestamp · Replied By · Status chip · "Open chat" action button.

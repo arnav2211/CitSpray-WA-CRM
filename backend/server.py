@@ -1577,8 +1577,14 @@ async def create_lead(body: LeadCreate, user: dict = Depends(get_current_user)):
             if existing:
                 owner_id = existing.get("assigned_to")
                 if user["role"] == "admin" or not owner_id or owner_id == user["id"]:
-                    # Surface the existing lead — caller will open it
-                    return {**existing, "duplicate": True, "existed": True}
+                    # Surface the existing lead — also apply sticky re-enquiry handling
+                    # (bump last_action_at, reassign if the current owner is on leave, log activity).
+                    try:
+                        await _handle_repeat_enquiry(existing, {**data, "source": data.get("source") or "Manual"})
+                    except Exception as e:
+                        logger.warning(f"manual repeat-enquiry handling failed: {e}")
+                    refreshed = await db.leads.find_one({"id": existing["id"]}, {"_id": 0})
+                    return {**(refreshed or existing), "duplicate": True, "existed": True}
                 # Different executive owns the lead → block create
                 owner = await db.users.find_one({"id": owner_id}, {"_id": 0, "id": 1, "name": 1, "username": 1}) or {}
                 raise HTTPException(
