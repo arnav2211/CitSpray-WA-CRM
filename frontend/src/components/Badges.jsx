@@ -61,6 +61,19 @@ export function EnquiryTypeBadge({ lead }) {
   // Prefer the explicit free-text enquiry_type, then fall back to IndiaMART's QUERY_TYPE code.
   const freeText = (lead.enquiry_type || "").trim();
   if (freeText) {
+    // IndiaMART leads store the raw QUERY_TYPE code (W/B/P/BIZ/WA) into enquiry_type.
+    // Map these to human-readable labels with proper colors.
+    const mapped = queryTypeInfo(freeText);
+    if (mapped && mapped.label !== freeText) {
+      return (
+        <span className={`inline-flex items-center px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest ${mapped.color}`}
+          title={mapped.label}
+          data-testid={`enquiry-type-badge-${freeText.toLowerCase()}`}>
+          {mapped.label}
+        </span>
+      );
+    }
+    // Free-text enquiry types (ExportersIndia, etc.)
     const key = freeText.toLowerCase().replace(/[^a-z]/g, "");
     const cls = FREE_TYPE_COLORS[key] || "bg-gray-100 text-gray-800";
     return (
