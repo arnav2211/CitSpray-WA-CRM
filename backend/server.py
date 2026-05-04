@@ -1256,6 +1256,22 @@ async def auto_send_whatsapp_on_create(lead: dict):
         return
     if not lead.get("phone"):
         return  # cannot send without a recipient
+    # Smart skip: if the customer has ever replied to us on this lead OR on this phone,
+    # do NOT send the welcome template — they are already in an active conversation.
+    try:
+        phone_or: List[Dict[str, Any]] = [{"lead_id": lead["id"]}]
+        phone_pat = phone_match_pattern(lead.get("phone") or "")
+        if phone_pat:
+            phone_or.append({"from": {"$regex": phone_pat}})
+        prior_inbound = await db.messages.find_one(
+            {"direction": "in", "$or": phone_or},
+            {"_id": 0, "id": 1},
+        )
+        if prior_inbound:
+            logger.info(f"Skipping welcome template for lead {lead['id']} — customer already replied on WhatsApp.")
+            return
+    except Exception as e:
+        logger.warning(f"auto-send smart-skip check failed; proceeding with send: {e}")
     cfg = await get_wa_config()
     tpl_name = cfg["default_template"]
     tpl_meta = await _resolve_template_meta(tpl_name, cfg["default_template_lang"])
@@ -1315,6 +1331,75 @@ async def _find_lead_by_phone(phone: str, exclude_id: Optional[str] = None) -> O
     return await db.leads.find_one(query, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})
 
 
+async def _handle_repeat_enquiry(existing: dict, new_data: dict) -> None:
+    """A lead with this phone already exists — the same customer is enquiring again.
+    Apply the 'sticky' reassignment rule across all sources:
+      - If the existing assignee is active and NOT on leave → keep them.
+      - If the assignee is on leave / inactive / missing → reassign to next eligible exec.
+      - Always bump `last_action_at` + push a 'repeat_enquiry' activity entry so the
+        inbox resurfaces the lead and admins can see the re-inquiry.
+    We never touch the lead's customer_name / requirement — the original payload is
+    preserved; only assignment + timestamps + activity are updated.
+    """
+    lead_id = existing["id"]
+    current_uid = existing.get("assigned_to")
+    new_source = (new_data.get("source") or "").strip() or existing.get("source") or "Manual"
+    # Determine if the current assignee is still eligible
+    keep_owner = False
+    if current_uid:
+        u = await db.users.find_one({"id": current_uid, "active": True}, {"_id": 0, "id": 1, "role": 1})
+        if u and not await _is_user_on_leave(current_uid):
+            keep_owner = True
+
+    update_ops: Dict[str, Any] = {"$set": {"last_action_at": iso(now_utc()), "last_enquiry_source": new_source, "last_enquiry_at": iso(now_utc())}}
+    if keep_owner:
+        # Retain existing assignment — no change needed; just touch timestamps.
+        await db.leads.update_one({"id": lead_id}, update_ops)
+        await log_activity(None, "repeat_enquiry", lead_id, {
+            "source": new_source,
+            "assigned_to": current_uid,
+            "sticky": True,
+            "previous_owner_kept": True,
+        })
+        return
+
+    # Assignee is on leave / inactive / unassigned → pick a fresh eligible executive.
+    target_uid: Optional[str] = None
+    try:
+        if _is_buylead({**new_data, "source": new_source}):
+            chosen_bl = await _pick_buyleads_executive(new_source)
+            if chosen_bl:
+                target_uid = chosen_bl["id"]
+        if not target_uid:
+            chosen = await pick_next_executive(exclude_user_id=current_uid)
+            if chosen:
+                target_uid = chosen["id"]
+    except Exception as e:
+        logger.warning(f"repeat-enquiry reassign pick failed: {e}")
+
+    if target_uid:
+        update_ops["$set"]["assigned_to"] = target_uid
+        update_ops["$set"]["last_assignment_at"] = iso(now_utc())
+        update_ops["$set"]["opened_at"] = None
+        update_ops["$push"] = {"assignment_history": {"user_id": target_uid, "at": iso(now_utc()), "by": None, "reason": "repeat_enquiry_sticky_fallback"}}
+        await db.leads.update_one({"id": lead_id}, update_ops)
+        await log_activity(None, "repeat_enquiry_reassigned", lead_id, {
+            "source": new_source,
+            "from": current_uid,
+            "to": target_uid,
+            "reason": "previous_agent_unavailable",
+        })
+    else:
+        # Nobody eligible — keep timestamps fresh; do not strand the lead silently.
+        await db.leads.update_one({"id": lead_id}, update_ops)
+        await log_activity(None, "repeat_enquiry", lead_id, {
+            "source": new_source,
+            "assigned_to": current_uid,
+            "sticky": False,
+            "reassign_failed": "no_eligible_executive",
+        })
+
+
 async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) -> dict:
     # Normalize phones to canonical storage format BEFORE dedup so all downstream
     # comparisons are consistent.
@@ -1335,11 +1420,23 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         data["phones"] = unique
 
     # Phone-based dedup (cross-source). If a lead with this number already exists,
-    # we return it so callers can decide whether to surface or 409.
+    # we return it so callers can decide whether to surface or 409. On a repeat
+    # enquiry we ALSO:
+    #  - keep the lead's existing assignee if they are active & not-on-leave
+    #  - reassign to the next eligible executive if the assignee is on leave / inactive
+    #    or if the lead was somehow unassigned
+    #  - bump last_action_at so the conversation resurfaces in the inbox
+    #  - log an activity entry so admins can see the repeat
     if data.get("phone"):
         existing_by_phone = await _find_lead_by_phone(data["phone"])
         if existing_by_phone:
-            return existing_by_phone
+            try:
+                await _handle_repeat_enquiry(existing_by_phone, data)
+            except Exception as e:
+                logger.warning(f"repeat-enquiry handling failed: {e}")
+            # Re-fetch so callers receive the updated assignment/timestamps.
+            refreshed = await db.leads.find_one({"id": existing_by_phone["id"]}, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})
+            return refreshed or existing_by_phone
 
     # Legacy hash dedup (kept for IndiaMART unique-id style payloads)
     dhash = data.get("dedup_hash")
@@ -1595,14 +1692,25 @@ async def add_phone(lead_id: str, body: PhoneInput, user: dict = Depends(get_cur
             },
         )
     update: Dict[str, Any] = {"last_action_at": iso(now_utc())}
-    if not lead.get("phone"):
+    is_first_phone = not lead.get("phone")
+    if is_first_phone:
         update["phone"] = new_phone  # first-ever phone → becomes primary
     else:
         existing_phones.append(new_phone)
         update["phones"] = existing_phones
     await db.leads.update_one({"id": lead_id}, {"$set": update})
     await log_activity(user["id"], "phone_added", lead_id, {"phone": new_phone})
-    return await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    updated = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    # Justdial leads often arrive without a mobile number — when the agent later
+    # adds one manually, fire the welcome template so the customer gets contacted
+    # immediately. The smart-skip in auto_send_whatsapp_on_create protects us from
+    # double-sending if the customer has already replied.
+    if is_first_phone and (updated or {}).get("source") == "Justdial":
+        try:
+            await auto_send_whatsapp_on_create(updated)
+        except Exception as e:
+            logger.warning(f"auto whatsapp on manual phone-add failed: {e}")
+    return updated
 
 
 @api.delete("/leads/{lead_id}/phones")
@@ -4994,18 +5102,59 @@ GMAIL_SCOPES = [
 GMAIL_POLL_MINUTES = max(1, int(os.environ.get("GMAIL_POLL_INTERVAL_MINUTES", "2")))
 GMAIL_QUERY = os.environ.get("GMAIL_JUSTDIAL_QUERY", "from:instantemail@justdial.com is:unread newer_than:7d")
 GMAIL_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI)
+GMAIL_SLOTS = ("primary", "secondary")
+
+
+def _normalize_gmail_slot(slot: Optional[str]) -> str:
+    s = (slot or "primary").strip().lower()
+    if s == "default":  # legacy alias
+        return "primary"
+    if s not in GMAIL_SLOTS:
+        raise HTTPException(status_code=400, detail=f"slot must be one of {list(GMAIL_SLOTS)}")
+    return s
+
+
+async def _ensure_gmail_migrated():
+    """Migrate legacy single-connection docs (key='default') to slot='primary'.
+    Safe to call multiple times — no-op after first migration."""
+    legacy = await db.gmail_connections.find_one({"key": "default"}, {"_id": 0})
+    if legacy and not await db.gmail_connections.find_one({"key": "primary"}, {"_id": 0}):
+        legacy["key"] = "primary"
+        await db.gmail_connections.update_one({"key": "primary"}, {"$set": legacy}, upsert=True)
+        await db.gmail_connections.delete_one({"key": "default"})
+
 
 @api.get("/integrations/gmail/status")
-async def gmail_status(user: dict = Depends(get_current_user)):
+async def gmail_status(user: dict = Depends(get_current_user), slot: Optional[str] = None):
+    """Returns status for one slot (if `slot` is supplied) or BOTH slots otherwise.
+    Back-compat: legacy key='default' docs are migrated to 'primary' on first read."""
+    await _ensure_gmail_migrated()
     if not GMAIL_ENABLED:
         return {"enabled": False, "reason": "GOOGLE_CLIENT_ID/SECRET/REDIRECT_URI not configured"}
-    cfg = await db.gmail_connections.find_one({"key": "default"}, {"_id": 0, "access_token": 0, "refresh_token": 0})
+    if slot is None:
+        out = {"enabled": True, "slots": {}, "redirect_uri": GOOGLE_REDIRECT_URI, "poll_interval_minutes": GMAIL_POLL_MINUTES, "query": GMAIL_QUERY}
+        for s in GMAIL_SLOTS:
+            cfg = await db.gmail_connections.find_one({"key": s}, {"_id": 0, "access_token": 0, "refresh_token": 0})
+            last_poll = await db.gmail_polls.find_one({"key": f"last:{s}"}, {"_id": 0})
+            out["slots"][s] = {
+                "connected": bool(cfg),
+                "email": (cfg or {}).get("email"),
+                "connected_at": (cfg or {}).get("connected_at"),
+                "connected_by_user_id": (cfg or {}).get("connected_by"),
+                "scopes": (cfg or {}).get("scopes"),
+                "expires_at": (cfg or {}).get("expires_at"),
+                "last_poll": last_poll,
+            }
+        return out
+    s = _normalize_gmail_slot(slot)
+    cfg = await db.gmail_connections.find_one({"key": s}, {"_id": 0, "access_token": 0, "refresh_token": 0})
     if not cfg:
-        return {"enabled": True, "connected": False, "redirect_uri": GOOGLE_REDIRECT_URI}
-    last_poll = await db.gmail_polls.find_one({"key": "last"}, {"_id": 0})
+        return {"enabled": True, "connected": False, "slot": s, "redirect_uri": GOOGLE_REDIRECT_URI}
+    last_poll = await db.gmail_polls.find_one({"key": f"last:{s}"}, {"_id": 0})
     return {
         "enabled": True,
         "connected": True,
+        "slot": s,
         "email": cfg.get("email"),
         "connected_at": cfg.get("connected_at"),
         "connected_by_user_id": cfg.get("connected_by"),
@@ -5018,9 +5167,10 @@ async def gmail_status(user: dict = Depends(get_current_user)):
     }
 
 @api.get("/integrations/gmail/auth/init")
-async def gmail_auth_init(admin: dict = Depends(require_admin)):
+async def gmail_auth_init(admin: dict = Depends(require_admin), slot: Optional[str] = None):
     if not GMAIL_ENABLED:
         raise HTTPException(status_code=400, detail="Gmail integration not configured")
+    s = _normalize_gmail_slot(slot)
     # Plain server-side OAuth 2.0 authorization_code — NO PKCE.
     state = str(uuid.uuid4())
     from urllib.parse import urlencode
@@ -5038,10 +5188,11 @@ async def gmail_auth_init(admin: dict = Depends(require_admin)):
     await db.oauth_states.insert_one({
         "state": state,
         "user_id": admin["id"],
+        "slot": s,
         "created_at": iso(now_utc()),
         "expires_at": iso(now_utc() + timedelta(minutes=10)),
     })
-    return {"auth_url": auth_url}
+    return {"auth_url": auth_url, "slot": s}
 
 
 @api.get("/integrations/gmail/auth/callback")
@@ -5061,6 +5212,7 @@ async def gmail_auth_callback(request: Request):
     if not state_doc:
         raise HTTPException(status_code=400, detail="Invalid or expired state")
     await db.oauth_states.delete_one({"state": state})
+    slot = _normalize_gmail_slot(state_doc.get("slot") or "primary")
     try:
         # Exchange authorization code for tokens (standard server-side OAuth)
         async with httpx.AsyncClient(timeout=20.0) as cli:
@@ -5088,8 +5240,14 @@ async def gmail_auth_callback(request: Request):
                 headers={"Authorization": f"Bearer {access_token}"},
             )
             email_addr = (r.json() or {}).get("email", "") if r.status_code < 400 else ""
+        # Prevent the same Gmail account from occupying both slots
+        other_slot = "secondary" if slot == "primary" else "primary"
+        other_cfg = await db.gmail_connections.find_one({"key": other_slot}, {"_id": 0, "email": 1})
+        if other_cfg and (other_cfg.get("email") or "").lower() == (email_addr or "").lower() and email_addr:
+            return Response(status_code=302, headers={"Location": f"{redirect_target}?gmail_status=error&reason=duplicate_account&slot={slot}"})
         doc = {
-            "key": "default",
+            "key": slot,
+            "slot": slot,
             "email": email_addr,
             "access_token": access_token,
             "refresh_token": refresh_token,
@@ -5099,29 +5257,31 @@ async def gmail_auth_callback(request: Request):
             "connected_by": state_doc.get("user_id"),
             "connected_at": iso(now_utc()),
         }
-        await db.gmail_connections.update_one({"key": "default"}, {"$set": doc}, upsert=True)
-        return Response(status_code=302, headers={"Location": f"{redirect_target}?gmail_status=connected&email={email_addr}"})
+        await db.gmail_connections.update_one({"key": slot}, {"$set": doc}, upsert=True)
+        return Response(status_code=302, headers={"Location": f"{redirect_target}?gmail_status=connected&email={email_addr}&slot={slot}"})
     except Exception as e:
         logger.exception(f"Gmail OAuth callback failed: {e}")
-        return Response(status_code=302, headers={"Location": f"{redirect_target}?gmail_status=error&reason={str(e)[:140]}"})
+        return Response(status_code=302, headers={"Location": f"{redirect_target}?gmail_status=error&reason={str(e)[:140]}&slot={slot}"})
 
 @api.post("/integrations/gmail/disconnect")
-async def gmail_disconnect(admin: dict = Depends(require_admin)):
-    cfg = await db.gmail_connections.find_one({"key": "default"}, {"_id": 0})
+async def gmail_disconnect(admin: dict = Depends(require_admin), slot: Optional[str] = None):
+    await _ensure_gmail_migrated()
+    s = _normalize_gmail_slot(slot)
+    cfg = await db.gmail_connections.find_one({"key": s}, {"_id": 0})
     if cfg and cfg.get("access_token"):
         try:
             async with httpx.AsyncClient(timeout=10.0) as cli:
                 await cli.post("https://oauth2.googleapis.com/revoke", params={"token": cfg["access_token"]})
         except Exception:
             pass
-    await db.gmail_connections.delete_one({"key": "default"})
-    return {"ok": True}
+    await db.gmail_connections.delete_one({"key": s})
+    return {"ok": True, "slot": s}
 
-async def _get_gmail_service():
+async def _get_gmail_service(slot: str = "primary"):
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request as GoogleRequest
     from googleapiclient.discovery import build
-    cfg = await db.gmail_connections.find_one({"key": "default"}, {"_id": 0})
+    cfg = await db.gmail_connections.find_one({"key": slot}, {"_id": 0})
     if not cfg:
         return None, None
     creds = Credentials(
@@ -5146,14 +5306,14 @@ async def _get_gmail_service():
         try:
             creds.refresh(GoogleRequest())
             await db.gmail_connections.update_one(
-                {"key": "default"},
+                {"key": slot},
                 {"$set": {
                     "access_token": creds.token,
                     "expires_at": iso(creds.expiry.replace(tzinfo=timezone.utc)) if creds.expiry else None,
                 }},
             )
         except Exception as e:
-            logger.warning(f"Gmail token refresh failed: {e}")
+            logger.warning(f"Gmail token refresh failed for slot={slot}: {e}")
             return None, cfg
     service = build("gmail", "v1", credentials=creds, cache_discovery=False)
     return service, cfg
@@ -5197,20 +5357,32 @@ def _header(message: dict, name: str) -> str:
             return h.get("value", "")
     return ""
 
-async def gmail_poll_task():
-    """Poll Gmail for new Justdial enquiries and ingest them."""
-    if not GMAIL_ENABLED:
-        return
-    service, cfg = await _get_gmail_service()
+async def _gmail_poll_one_slot(slot: str) -> dict:
+    """Poll a single Gmail slot for Justdial enquiries. Returns a per-slot summary dict."""
+    summary = {"slot": slot, "ran_at": iso(now_utc()), "fetched": 0, "ingested": 0, "skipped_dupe": 0, "errors": 0}
+    service, cfg = await _get_gmail_service(slot)
     if not service:
-        return
-    summary = {"key": "last", "ran_at": iso(now_utc()), "fetched": 0, "ingested": 0, "errors": 0}
+        summary["error"] = "not_connected"
+        return summary
+    summary["email"] = (cfg or {}).get("email")
     try:
         resp = service.users().messages().list(userId="me", q=GMAIL_QUERY, maxResults=20).execute()
         ids = [m["id"] for m in (resp.get("messages") or [])]
         summary["fetched"] = len(ids)
         for mid in ids:
             try:
+                # Hard dedup: if we have ever processed this gmail_id (across either slot),
+                # skip silently. Protects against re-polling the same email after retries
+                # and against cross-slot duplicates (same message in two inboxes).
+                already = await db.email_logs.find_one({"gmail_id": mid}, {"_id": 0, "id": 1})
+                if already:
+                    summary["skipped_dupe"] += 1
+                    # Still mark read so we don't pull it again on the next tick
+                    try:
+                        service.users().messages().modify(userId="me", id=mid, body={"removeLabelIds": ["UNREAD"]}).execute()
+                    except Exception:
+                        pass
+                    continue
                 full = service.users().messages().get(userId="me", id=mid, format="full").execute()
                 bodies = _extract_email_bodies(full)
                 subject = _header(full, "Subject")
@@ -5230,6 +5402,8 @@ async def gmail_poll_task():
                         "processed": True,
                         "error": "unparseable",
                         "gmail_id": mid,
+                        "gmail_slot": slot,
+                        "gmail_account_email": (cfg or {}).get("email"),
                     })
                 else:
                     name = parsed.get("customer_name") or "Justdial Lead"
@@ -5262,7 +5436,7 @@ async def gmail_poll_task():
                         "phone": parsed.get("phone"),
                         "source": "Justdial",
                         "contact_link": parsed.get("contact_link"),
-                        "source_data": {"timestamp": ts, "subject": subject, "from": from_email, "gmail_id": mid},
+                        "source_data": {"timestamp": ts, "subject": subject, "from": from_email, "gmail_id": mid, "gmail_slot": slot, "gmail_account_email": (cfg or {}).get("email")},
                         "raw_email_html": bodies.get("html"),
                         "raw_email_text": bodies.get("text"),
                         "dedup_hash": dhash,
@@ -5279,24 +5453,51 @@ async def gmail_poll_task():
                         "processed": True,
                         "lead_id": lead["id"],
                         "gmail_id": mid,
+                        "gmail_slot": slot,
+                        "gmail_account_email": (cfg or {}).get("email"),
                     })
                     summary["ingested"] += 1
                 # Mark as read so we don't re-process
                 try:
                     service.users().messages().modify(userId="me", id=mid, body={"removeLabelIds": ["UNREAD"]}).execute()
                 except Exception as e:
-                    logger.warning(f"Could not mark Gmail msg {mid} read: {e}")
+                    logger.warning(f"Could not mark Gmail msg {mid} read (slot={slot}): {e}")
             except Exception as e:
                 summary["errors"] += 1
-                logger.exception(f"Gmail message processing failed for {mid}: {e}")
+                logger.exception(f"Gmail message processing failed for {mid} (slot={slot}): {e}")
     except Exception as e:
         summary["errors"] += 1
         summary["fatal"] = str(e)[:200]
-        logger.exception(f"Gmail poll task failed: {e}")
-    await db.gmail_polls.update_one({"key": "last"}, {"$set": summary}, upsert=True)
+        logger.exception(f"Gmail poll task failed for slot={slot}: {e}")
+    # Persist per-slot last poll AND keep a combined "last" for back-compat
+    await db.gmail_polls.update_one({"key": f"last:{slot}"}, {"$set": {**summary, "key": f"last:{slot}"}}, upsert=True)
+    return summary
+
+
+async def gmail_poll_task():
+    """Poll ALL connected Gmail slots for Justdial enquiries and ingest them.
+    Uses shared parse / dedup / assignment pipeline so every inbox is processed identically."""
+    if not GMAIL_ENABLED:
+        return
+    await _ensure_gmail_migrated()
+    combined = {"key": "last", "ran_at": iso(now_utc()), "fetched": 0, "ingested": 0, "skipped_dupe": 0, "errors": 0, "slots": {}}
+    for slot in GMAIL_SLOTS:
+        slot_summary = await _gmail_poll_one_slot(slot)
+        combined["slots"][slot] = slot_summary
+        combined["fetched"] += int(slot_summary.get("fetched") or 0)
+        combined["ingested"] += int(slot_summary.get("ingested") or 0)
+        combined["skipped_dupe"] += int(slot_summary.get("skipped_dupe") or 0)
+        combined["errors"] += int(slot_summary.get("errors") or 0)
+    await db.gmail_polls.update_one({"key": "last"}, {"$set": combined}, upsert=True)
 
 @api.post("/integrations/gmail/sync-now")
-async def gmail_sync_now(admin: dict = Depends(require_admin)):
+async def gmail_sync_now(admin: dict = Depends(require_admin), slot: Optional[str] = None):
+    """Sync all connected slots by default; sync a single slot when `slot=primary|secondary`."""
+    await _ensure_gmail_migrated()
+    if slot:
+        s = _normalize_gmail_slot(slot)
+        summary = await _gmail_poll_one_slot(s)
+        return {"ok": True, "last_poll": summary}
     await gmail_poll_task()
     last = await db.gmail_polls.find_one({"key": "last"}, {"_id": 0})
     return {"ok": True, "last_poll": last}
