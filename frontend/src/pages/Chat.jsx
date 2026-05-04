@@ -1137,7 +1137,7 @@ const DayGroup = React.memo(function DayGroup({
 });
 
 
-function _BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, canMessage = true, currentUserId = null, isHighlighted = false, isFocused = false, searchQuery = "" }) {
+function BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, canMessage = true, currentUserId = null, isHighlighted = false, isFocused = false, searchQuery = "" }) {
   const isOut = m.direction === "out";
   const isSystem = m.direction === "system";
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -1278,7 +1278,7 @@ function _BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdm
 // Memoize Bubble — re-render only when its specific message reference, search-state,
 // or callback set changes. Cuts ~80% of bubble re-renders during chat polling on
 // large histories (#5 perf).
-const Bubble = React.memo(_BubbleImpl, (prev, next) => {
+const Bubble = React.memo(BubbleImpl, (prev, next) => {
   if (prev.m !== next.m) return false;
   if (prev.isHighlighted !== next.isHighlighted) return false;
   if (prev.isFocused !== next.isFocused) return false;
