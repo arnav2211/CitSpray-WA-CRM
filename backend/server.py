@@ -1780,13 +1780,26 @@ async def lead_activity(lead_id: str, user: dict = Depends(get_current_user)):
 
 # ------------- Messages (WhatsApp mock) -------------
 @api.get("/leads/{lead_id}/messages")
-async def list_messages(lead_id: str, user: dict = Depends(get_current_user)):
+async def list_messages(lead_id: str, user: dict = Depends(get_current_user), phone: Optional[str] = None):
+    """List WhatsApp messages for a lead. When `phone` is supplied, restrict the
+    result to only messages addressed to/from that specific phone (matched by
+    last-10-digit suffix). This lets the lead drawer show a per-number chat
+    history when an agent toggles between primary/secondary numbers — without
+    merging conversations across multiple numbers."""
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
-    msgs = await db.messages.find({"lead_id": lead_id}, {"_id": 0}).sort("at", 1).to_list(500)
+    query: Dict[str, Any] = {"lead_id": lead_id}
+    if phone:
+        pat = phone_match_pattern(phone)
+        if pat:
+            query["$or"] = [
+                {"to_phone": {"$regex": pat}},
+                {"from": {"$regex": pat}},
+            ]
+    msgs = await db.messages.find(query, {"_id": 0}).sort("at", 1).to_list(2000)
     return msgs
 
 

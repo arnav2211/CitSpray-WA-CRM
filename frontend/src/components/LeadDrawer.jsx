@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { api, errMsg } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { toast } from "sonner";
 import { StatusBadge, SourceBadge, QueryTypeBadge } from "@/components/Badges";
-import { X, Phone, EnvelopeSimple, MapPin, ArrowSquareOut, PaperPlaneRight, Clock, CalendarBlank, NotePencil, Plus, Trash, Info, PhoneCall, WhatsappLogo, Star, PencilSimple, Check } from "@phosphor-icons/react";
-import { fmtIST, fmtISTTime, queryTypeInfo } from "@/lib/format";
+import { X, Phone, EnvelopeSimple, MapPin, ArrowSquareOut, PaperPlaneRight, Clock, CalendarBlank, NotePencil, Plus, Trash, Info, PhoneCall, WhatsappLogo, Star, PencilSimple, Check, Lightning, MagnifyingGlass } from "@phosphor-icons/react";
+import { fmtIST, fmtISTTime, fmtTime12, fmtSmartLong, fmtDaySeparator, istDayKey, queryTypeInfo } from "@/lib/format";
 
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
 
@@ -28,12 +29,18 @@ const OUTCOME_COLOR = {
 
 export default function LeadDrawer({ leadId, onClose }) {
   const { user } = useAuth();
+  const nav = useNavigate();
   const [lead, setLead] = useState(null);
   const [messages, setMessages] = useState([]);
   const [activity, setActivity] = useState([]);
   const [calls, setCalls] = useState([]);
   const [execs, setExecs] = useState([]);
   const [tpl, setTpl] = useState([]);
+  const [quickReplies, setQuickReplies] = useState([]);
+  const [showTplPanel, setShowTplPanel] = useState(false);
+  const [showQrPanel, setShowQrPanel] = useState(false);
+  const [phoneFilter, setPhoneFilter] = useState(""); // per-number history filter
+  const [savingTpl, setSavingTpl] = useState(false);
   const [noteText, setNoteText] = useState("");
   const [waText, setWaText] = useState("");
   const [fuDate, setFuDate] = useState("");
@@ -52,9 +59,10 @@ export default function LeadDrawer({ leadId, onClose }) {
 
   const loadAll = async () => {
     try {
+      const params = phoneFilter ? { phone: phoneFilter } : {};
       const [{ data: L }, { data: M }, { data: A }, { data: C }] = await Promise.all([
         api.get(`/leads/${leadId}`),
-        api.get(`/leads/${leadId}/messages`),
+        api.get(`/leads/${leadId}/messages`, { params }),
         api.get(`/leads/${leadId}/activity`),
         api.get(`/leads/${leadId}/calls`),
       ]);
@@ -66,17 +74,33 @@ export default function LeadDrawer({ leadId, onClose }) {
   useEffect(() => {
     (async () => {
       try {
-        const [{ data: U }, { data: T }] = await Promise.all([
+        const [{ data: U }, { data: T }, { data: Q }] = await Promise.all([
           api.get("/users"),
           api.get("/whatsapp/templates"),
+          api.get("/quick-replies"),
         ]);
         setExecs(U.filter((u) => u.role === "executive" || u.role === "admin"));
-        setTpl(T);
+        // Match /chat: only show APPROVED templates (or local non-Meta-synced)
+        setTpl(T.filter((t) => !t.status || t.status === "APPROVED" || !t.synced_from_meta));
+        setQuickReplies(Q || []);
       } catch { /* empty */ }
     })();
     loadAll();
     // eslint-disable-next-line
   }, [leadId]);
+
+  // Reload messages when the per-phone filter changes — independent of leadId.
+  useEffect(() => {
+    if (!lead) return;
+    (async () => {
+      try {
+        const params = phoneFilter ? { phone: phoneFilter } : {};
+        const { data: M } = await api.get(`/leads/${leadId}/messages`, { params });
+        setMessages(M);
+      } catch (e) { toast.error(errMsg(e)); }
+    })();
+    // eslint-disable-next-line
+  }, [phoneFilter]);
 
   if (!lead) {
     return (
@@ -152,9 +176,51 @@ export default function LeadDrawer({ leadId, onClose }) {
     } catch (e) { toast.error(errMsg(e)); }
   };
 
+  // Send a real WhatsApp template — matches /chat behavior. The backend renders
+  // template variables server-side; here we just need the template name + lang.
+  const sendTemplate = async (t) => {
+    if (savingTpl) return;
+    setSavingTpl(true);
+    try {
+      // Build template params: replace {{name}} or {{1}} with the customer name when present.
+      const placeholderCount = (t.body || "").match(/\{\{[^}]+\}\}/g)?.length || 0;
+      const params = placeholderCount > 0 ? Array(placeholderCount).fill(lead.customer_name || "there") : [];
+      await api.post("/whatsapp/send", {
+        lead_id: leadId,
+        template_name: t.name,
+        template_language: t.language || "en_US",
+        template_params: params,
+      });
+      setShowTplPanel(false);
+      loadAll();
+      toast.success(`Template sent: ${t.name}`);
+    } catch (e) { toast.error(errMsg(e, "Template send failed")); }
+    finally { setSavingTpl(false); }
+  };
+
+  const applyQuickReply = (qr) => {
+    const text = (qr.text || "").replace("{{name}}", lead?.customer_name || "");
+    setWaText((cur) => cur ? `${cur}\n${text}` : text);
+    setShowQrPanel(false);
+  };
+
+  // 24h-window status — matches /chat. WA Business policy lets free-text messages
+  // go out only within 24h of the last inbound. Outside the window, only
+  // pre-approved templates may be sent.
+  const within24h = (() => {
+    const last = lead?.last_user_message_at;
+    if (!last) return false;
+    try {
+      const t = new Date(last).getTime();
+      return Number.isFinite(t) && (Date.now() - t) < 24 * 60 * 60 * 1000;
+    } catch { return false; }
+  })();
+
   const applyTemplate = (t) => {
+    // Old behavior: fill the input. Kept for click-to-edit-then-send.
     const body = (t.body || "").replace("{{name}}", lead.customer_name || "");
     setWaText(body);
+    setShowTplPanel(false);
   };
 
   const reassign = async (userId) => {
@@ -402,43 +468,156 @@ export default function LeadDrawer({ leadId, onClose }) {
             </section>
           </div>
 
-          {/* Right: WhatsApp panel */}
+          {/* Right: WhatsApp panel — matches /chat behavior (24h, templates as templates,
+              quick replies, smart timestamps, sticky day separators, per-phone filter). */}
           <div className="lg:col-span-2 wa-panel flex flex-col min-h-[560px]">
-            <div className="px-5 py-3 border-b border-white/10 flex items-center justify-between">
+            <div className="px-5 py-3 border-b border-white/10 flex items-center justify-between gap-2 flex-wrap">
               <div className="text-[10px] uppercase tracking-widest font-bold text-white/60 flex items-center gap-1">
                 <WhatsappLogo size={12} /> WhatsApp Thread
               </div>
-              <div className="text-[10px] uppercase tracking-widest font-bold text-white/60 font-mono">
-                {lead.active_wa_phone || lead.phone || "—"}
+              <div className="flex items-center gap-2">
+                <div className="text-[10px] uppercase tracking-widest font-bold text-white/60 font-mono">
+                  {lead.active_wa_phone || lead.phone || "—"}
+                </div>
+                <button
+                  onClick={() => nav(`/chat?lead=${leadId}${(lead.active_wa_phone || lead.phone) ? `&phone=${encodeURIComponent(lead.active_wa_phone || lead.phone)}` : ""}`)}
+                  className="text-[10px] uppercase tracking-widest font-bold text-white/80 hover:text-white border border-white/20 hover:border-white/60 px-2 py-1 flex items-center gap-1"
+                  data-testid="open-full-chat-btn"
+                >
+                  <ArrowSquareOut size={11} /> Open in /chat
+                </button>
               </div>
             </div>
-            <div className="flex-1 overflow-y-auto p-4 space-y-2">
-              {messages.map((m) => (
-                <div key={m.id} className={`flex ${m.direction === "out" ? "justify-end" : "justify-start"}`}>
-                  <div className={`${m.direction === "out" ? "wa-bubble-out" : "wa-bubble-in"} max-w-[75%] px-3 py-2 text-sm`} data-testid={`wa-msg-${m.id}`}>
-                    {m.template_name && <div className="text-[9px] uppercase tracking-widest opacity-70 mb-1">Template · {m.template_name}</div>}
-                    <div>{m.body}</div>
-                    <div className="text-[9px] opacity-70 mt-1 font-mono">{fmtISTTime(m.at)}</div>
-                  </div>
-                </div>
-              ))}
-              {messages.length === 0 && <div className="text-xs uppercase tracking-widest text-white/40 text-center py-10">No messages yet</div>}
-            </div>
-            {tpl.length > 0 && (
-              <div className="px-3 pt-2 flex flex-wrap gap-1 border-t border-white/10">
-                {tpl.map((t) => (
-                  <button key={t.id} onClick={() => applyTemplate(t)} className="text-[10px] uppercase tracking-widest font-bold border border-white/20 px-2 py-1 hover:bg-white/10" data-testid={`wa-tpl-${t.name}`}>
-                    {t.name}
-                  </button>
-                ))}
+
+            {/* 24h-window banner — matches /chat */}
+            {!within24h && (
+              <div className="bg-[#7A4500] text-white px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold flex items-center gap-2" data-testid="wa-24h-banner">
+                <Clock size={12} /> Outside 24-hour window — only approved templates can be sent
               </div>
             )}
-            <div className="p-3 border-t border-white/10 flex gap-2">
-              <input value={waText} onChange={(e) => setWaText(e.target.value)} placeholder="Type a message…"
-                className="flex-1 bg-[#1E293B] text-white border border-white/10 px-3 py-2 text-sm outline-none" data-testid="wa-input" />
-              <button onClick={sendWA} className="bg-[#008A00] text-white px-3 py-2 flex items-center gap-1 text-[10px] uppercase tracking-widest font-bold" data-testid="wa-send-btn">
-                <PaperPlaneRight size={14} /> Send
-              </button>
+
+            {/* Per-phone filter banner */}
+            {phoneFilter && (
+              <div className="bg-[#FFF4E5] text-[#B85F00] px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold flex items-center gap-2" data-testid="wa-phone-filter-banner">
+                <Phone size={12} /> Showing only: <span className="font-mono normal-case">{phoneFilter}</span>
+                <button onClick={() => setPhoneFilter("")} className="ml-auto underline" data-testid="wa-phone-filter-clear">Show all</button>
+              </div>
+            )}
+
+            <div className="flex-1 overflow-y-auto p-4 space-y-1.5" style={{ contain: "strict" }} data-testid="wa-messages-area">
+              {messages.length === 0 && (
+                <div className="text-xs uppercase tracking-widest text-white/40 text-center py-10">No messages yet</div>
+              )}
+              {(() => {
+                // Group messages by IST day for sticky day separators (#2 from /chats spec)
+                const groups = [];
+                let lastKey = "";
+                for (const m of messages) {
+                  const k = istDayKey(m.at);
+                  if (k !== lastKey) { groups.push({ dayKey: k, items: [] }); lastKey = k; }
+                  groups[groups.length - 1].items.push(m);
+                }
+                return groups.map((g) => (
+                  <div key={g.dayKey} className="space-y-1.5" data-testid={`wa-day-group-${g.dayKey}`}>
+                    <div className="sticky top-0 z-10 flex justify-center pointer-events-none py-1.5" data-testid={`wa-day-separator-${g.dayKey}`}>
+                      <span className="bg-[#1E293B]/90 backdrop-blur-sm text-white/80 text-[10px] font-bold uppercase tracking-widest px-3 py-1 rounded-full border border-white/10">
+                        {fmtDaySeparator(g.dayKey)}
+                      </span>
+                    </div>
+                    {g.items.map((m) => (
+                      <div key={m.id} className={`flex ${m.direction === "out" ? "justify-end" : "justify-start"}`}>
+                        <div className={`${m.direction === "out" ? "wa-bubble-out" : "wa-bubble-in"} max-w-[75%] px-3 py-2 text-sm`} data-testid={`wa-msg-${m.id}`}>
+                          {m.template_name && <div className="text-[9px] uppercase tracking-widest opacity-70 mb-1">Template · {m.template_name}</div>}
+                          <div className="whitespace-pre-wrap break-words">{m.body || m.caption}</div>
+                          <div className="text-[9px] opacity-70 mt-1 font-mono" title={fmtSmartLong(m.at)}>{fmtTime12(m.at)}</div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ));
+              })()}
+            </div>
+
+            {/* Templates panel — clicking now SENDS the template (not fills input) */}
+            {showTplPanel && tpl.length > 0 && (
+              <div className="border-t border-white/10 bg-[#0F172A] p-3 max-h-48 overflow-y-auto" data-testid="wa-template-panel">
+                <div className="text-[10px] uppercase tracking-widest font-bold text-white/60 mb-2">Approved Templates · click to send</div>
+                <div className="space-y-1">
+                  {tpl.map((t) => (
+                    <button
+                      key={t.id}
+                      onClick={() => sendTemplate(t)}
+                      disabled={savingTpl}
+                      className="w-full text-left text-xs border border-white/10 hover:border-[#25D366] hover:bg-white/5 p-2 disabled:opacity-50"
+                      data-testid={`wa-tpl-send-${t.name}`}
+                    >
+                      <div className="text-[10px] uppercase tracking-widest font-bold text-[#25D366]">{t.name}</div>
+                      <div className="text-white/80 mt-0.5 line-clamp-2 whitespace-pre-wrap">{t.body}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Quick replies panel */}
+            {showQrPanel && quickReplies.length > 0 && (
+              <div className="border-t border-white/10 bg-[#0F172A] p-3 max-h-48 overflow-y-auto" data-testid="wa-qr-panel">
+                <div className="text-[10px] uppercase tracking-widest font-bold text-white/60 mb-2">Quick Replies · click to insert</div>
+                <div className="space-y-1">
+                  {quickReplies.map((q) => (
+                    <button
+                      key={q.id}
+                      onClick={() => applyQuickReply(q)}
+                      className="w-full text-left text-xs border border-white/10 hover:border-[#FF8800] hover:bg-white/5 p-2"
+                      data-testid={`wa-qr-${q.title || q.id}`}
+                    >
+                      {q.title && <div className="text-[10px] uppercase tracking-widest font-bold text-[#FF8800]">{q.title}</div>}
+                      <div className="text-white/80 line-clamp-2 whitespace-pre-wrap">{q.text}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="p-3 border-t border-white/10 flex flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => { setShowTplPanel(v => !v); setShowQrPanel(false); }}
+                  className={`text-[10px] uppercase tracking-widest font-bold border px-2 py-1 ${showTplPanel ? "bg-[#25D366] text-white border-[#25D366]" : "border-white/20 text-white/80 hover:bg-white/10"}`}
+                  data-testid="wa-tpl-toggle"
+                >
+                  Templates ({tpl.length})
+                </button>
+                <button
+                  onClick={() => { setShowQrPanel(v => !v); setShowTplPanel(false); }}
+                  className={`text-[10px] uppercase tracking-widest font-bold border px-2 py-1 flex items-center gap-1 ${showQrPanel ? "bg-[#FF8800] text-white border-[#FF8800]" : "border-white/20 text-white/80 hover:bg-white/10"}`}
+                  data-testid="wa-qr-toggle"
+                >
+                  <Lightning size={11} weight="bold" /> Quick ({quickReplies.length})
+                </button>
+                <div className="ml-auto text-[9px] uppercase tracking-widest font-bold text-white/40">
+                  {within24h ? "Free-text OK · 24h window open" : "Templates only · window closed"}
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <input
+                  value={waText}
+                  onChange={(e) => setWaText(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendWA(); } }}
+                  placeholder={within24h ? "Type a message…" : "Outside 24h — pick a template above"}
+                  disabled={!within24h}
+                  className="flex-1 bg-[#1E293B] text-white border border-white/10 px-3 py-2 text-sm outline-none disabled:opacity-40"
+                  data-testid="wa-input"
+                />
+                <button
+                  onClick={sendWA}
+                  disabled={!waText.trim() || !within24h}
+                  className="bg-[#008A00] hover:bg-[#005F00] text-white px-3 py-2 flex items-center gap-1 text-[10px] uppercase tracking-widest font-bold disabled:opacity-40"
+                  data-testid="wa-send-btn"
+                >
+                  <PaperPlaneRight size={14} /> Send
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -587,6 +766,7 @@ function DetailRow({ k, v, mono, testId }) {
 }
 
 function PhonesRow({ lead, canEdit, onChanged }) {
+  const nav = useNavigate();
   const [adding, setAdding] = React.useState(false);
   const [val, setVal] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -656,6 +836,18 @@ function PhonesRow({ lead, canEdit, onChanged }) {
             {wa === undefined && (
               <span className="text-[9px] uppercase tracking-widest font-bold text-gray-300" title="WA status unknown — send once to detect">?</span>
             )}
+            {/* Direct WhatsApp redirect — opens the lead in /chat with this number selected */}
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                nav(`/chat?lead=${lead.id}&phone=${encodeURIComponent(p)}`);
+              }}
+              className="text-[#25D366] hover:bg-[#25D366] hover:text-white p-1 rounded transition-colors"
+              title="Open this number in WhatsApp"
+              data-testid={`open-whatsapp-${p}`}
+            >
+              <WhatsappLogo size={12} weight="fill" />
+            </button>
             {isActiveWa ? (
               <span className="text-[9px] uppercase tracking-widest font-bold text-[#FF8800] flex items-center gap-0.5" title="WhatsApp messages will go to this number" data-testid={`wa-active-${p}`}>
                 <Star size={10} weight="fill" /> Active
