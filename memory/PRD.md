@@ -22,6 +22,16 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 20 (Feb 2026) — /leads number-tab strip rewrite (deterministic per-number chat)
+- **Problem (user-reported)**: had to open the lead twice for the per-number filter to take effect, and tab-switching often left messages from another number visible. Root cause: race between three separate effects (`loadAll` writing messages, `useEffect` watching `lead.active_wa_phone` writing `phoneFilter`, and a third effect re-fetching messages on `phoneFilter`) — they could fire in any order and clobber each other on rapid switches.
+- **Fix — single source of truth**:
+  - One state `phoneFilter` in `LeadDrawer`, initialized from `lead.active_wa_phone || lead.phone` ONCE (when `lead.id` first arrives). Reset to `""` only when `leadId` changes.
+  - Auto-tracking effect REMOVED. The user's selection is never overwritten on subsequent lead refetches.
+  - One dedicated effect `useEffect([leadId, phoneFilter])` does all message fetching with cancellation-safe write. `loadAll()` no longer fetches messages.
+  - New explicit handler `selectPhone(p)` updates `phoneFilter` synchronously (instant UI response) and fires `PUT /leads/{id}/active-wa-phone` in the background to mirror to backend (so future automated outbound also targets this number). UI does not block on the PUT.
+- **UX — number-tab strip**: replaced the awkward "Showing chat for: X · Show all numbers" banner with a clean WhatsApp-style tab row at the top of the WA panel (`data-testid='wa-phone-tabs'` with one button per `data-testid='wa-phone-tab-{phone}'`). The active tab is colored `#25D366`. Tab strip auto-hides when the lead has only one phone.
+- **Verified**: rapid back-and-forth tab switching now flips messages deterministically every click — confirmed via Playwright (in-A-1/in-A-2 vs in-B-1/in-B-2 on a 2-number test lead). No "open twice" repro.
+
 ### Iteration 19 (Feb 2026) — /leads ↔ /chats redirect cleanup + inbound msg attribution
 - **Backend bug fix (HIGH from iter11)** — WhatsApp inbound webhook now stores `from` (customer phone) and `to_phone` (business `display_phone_number`) on every message doc. Previously these were missing, causing the per-phone history filter to surface ZERO inbound messages even when present.
 - **WA-icon redirect from /leads no longer filters /chat** — clicking the green WA icon next to a phone (in table row, card view, or lead-drawer phone row) now navigates to `/chat?lead={id}` ONLY. /chat shows the full global inbox; the selected lead is opened/focused but no `?phone=` filter is applied. The "Open in /chat" button inside the lead-drawer WA panel header behaves the same.

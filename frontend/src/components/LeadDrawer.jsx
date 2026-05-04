@@ -39,7 +39,7 @@ export default function LeadDrawer({ leadId, onClose }) {
   const [quickReplies, setQuickReplies] = useState([]);
   const [showTplPanel, setShowTplPanel] = useState(false);
   const [showQrPanel, setShowQrPanel] = useState(false);
-  const [phoneFilter, setPhoneFilter] = useState(""); // per-number history filter (auto-tracks active_wa_phone)
+  const [phoneFilter, setPhoneFilter] = useState(""); // selected number — drives the WA panel and message reload
   const [savingTpl, setSavingTpl] = useState(false);
   const [noteText, setNoteText] = useState("");
   const [waText, setWaText] = useState("");
@@ -59,14 +59,16 @@ export default function LeadDrawer({ leadId, onClose }) {
 
   const loadAll = async () => {
     try {
-      const params = phoneFilter ? { phone: phoneFilter } : {};
-      const [{ data: L }, { data: M }, { data: A }, { data: C }] = await Promise.all([
+      // Messages are reloaded by the dedicated effect keyed on (leadId, phoneFilter)
+      // so we only fetch lead+activity+calls here. This eliminates the race
+      // condition where loadAll() and the phone-filter effect would both write
+      // setMessages() out of order.
+      const [{ data: L }, { data: A }, { data: C }] = await Promise.all([
         api.get(`/leads/${leadId}`),
-        api.get(`/leads/${leadId}/messages`, { params }),
         api.get(`/leads/${leadId}/activity`),
         api.get(`/leads/${leadId}/calls`),
       ]);
-      setLead(L); setMessages(M); setActivity(A); setCalls(C);
+      setLead(L); setActivity(A); setCalls(C);
       if (!callPhone) setCallPhone(L.phone || "");
     } catch (e) { toast.error(errMsg(e)); onClose?.(); }
   };
@@ -89,29 +91,50 @@ export default function LeadDrawer({ leadId, onClose }) {
     // eslint-disable-next-line
   }, [leadId]);
 
-  // Auto-track active_wa_phone — whenever the admin switches the lead's primary
-  // WA number (via PhonesRow's 'Use this' toggle), automatically restrict the
-  // in-drawer WA history to that number. This is the /leads-only "number-specific
-  // chat" behavior; /chat remains global and unaffected.
+  // ONE source of truth for the per-number chat view.
+  // - Initialize phoneFilter from the lead's primary/active number on first load.
+  // - When the user picks a different number via the WA-panel tab strip, that
+  //   handler updates phoneFilter directly. There is no auto-effect that
+  //   overwrites the user's selection on subsequent lead refetches.
   useEffect(() => {
     if (!lead) return;
-    const newPhone = lead.active_wa_phone || lead.phone || "";
-    setPhoneFilter(newPhone);
+    setPhoneFilter((cur) => cur || lead.active_wa_phone || lead.phone || "");
     // eslint-disable-next-line
-  }, [lead?.active_wa_phone, lead?.phone]);
+  }, [lead?.id]);
 
-  // Reload messages when the per-phone filter changes — independent of leadId.
+  // Reset phoneFilter when switching to a different lead.
   useEffect(() => {
-    if (!lead) return;
+    setPhoneFilter("");
+  }, [leadId]);
+
+  // (Re)load messages whenever the (lead, phoneFilter) pair changes. Only this
+  // effect writes to setMessages — no race with loadAll().
+  useEffect(() => {
+    if (!leadId) return;
+    let cancelled = false;
     (async () => {
       try {
         const params = phoneFilter ? { phone: phoneFilter } : {};
         const { data: M } = await api.get(`/leads/${leadId}/messages`, { params });
-        setMessages(M);
-      } catch (e) { toast.error(errMsg(e)); }
+        if (!cancelled) setMessages(M);
+      } catch (e) {
+        if (!cancelled) toast.error(errMsg(e));
+      }
     })();
-    // eslint-disable-next-line
-  }, [phoneFilter]);
+    return () => { cancelled = true; };
+  }, [leadId, phoneFilter]);
+
+  // Pick a number from the WA-panel tab strip:
+  //   - update phoneFilter (drives history reload + which number outbound goes to)
+  //   - mirror to backend so future automated/PNS sends use this number too
+  //   - fire-and-forget; UI doesn't wait
+  const selectPhone = (p) => {
+    if (!p || p === phoneFilter) return;
+    setPhoneFilter(p);
+    api.put(`/leads/${leadId}/active-wa-phone`, { phone: p })
+      .then(() => loadAll())
+      .catch((e) => toast.error(errMsg(e, "Couldn't update active WhatsApp number")));
+  };
 
   if (!lead) {
     return (
@@ -479,39 +502,58 @@ export default function LeadDrawer({ leadId, onClose }) {
             </section>
           </div>
 
-          {/* Right: WhatsApp panel */}
-          <div className="lg:col-span-2 wa-panel flex flex-col h-[600px] lg:h-auto lg:max-h-[calc(100vh-220px)] lg:sticky lg:top-0">
-            <div className="px-5 py-3 border-b border-white/10 flex items-center justify-between">
+          {/* Right: WhatsApp panel — matches /chat behavior (24h, templates as templates,
+              quick replies, smart timestamps, sticky day separators). When the lead has
+              multiple numbers, a tab strip lets the agent hop between them; the chat
+              history is filtered to the selected number ONLY (no merging across numbers). */}
+          <div className="lg:col-span-2 wa-panel flex flex-col min-h-[560px]">
+            <div className="px-5 py-3 border-b border-white/10 flex items-center justify-between gap-2 flex-wrap">
               <div className="text-[10px] uppercase tracking-widest font-bold text-white/60 flex items-center gap-1">
                 <WhatsappLogo size={12} /> WhatsApp Thread
               </div>
-              <div className="flex items-center gap-2">
-                <div className="text-[10px] uppercase tracking-widest font-bold text-white/60 font-mono">
-                  {lead.active_wa_phone || lead.phone || "—"}
-                </div>
-                <button
-                  onClick={() => nav(`/chat?lead=${leadId}`)}
-                  className="text-[10px] uppercase tracking-widest font-bold text-white/80 hover:text-white border border-white/20 hover:border-white/60 px-2 py-1 flex items-center gap-1"
-                  data-testid="open-full-chat-btn"
-                >
-                  <ArrowSquareOut size={11} /> Open in /chat
-                </button>
-              </div>
+              <button
+                onClick={() => nav(`/chat?lead=${leadId}`)}
+                className="text-[10px] uppercase tracking-widest font-bold text-white/80 hover:text-white border border-white/20 hover:border-white/60 px-2 py-1 flex items-center gap-1"
+                data-testid="open-full-chat-btn"
+              >
+                <ArrowSquareOut size={11} /> Open in /chat
+              </button>
             </div>
+
+            {/* Number-picker tab strip — only rendered when the lead has >1 phone */}
+            {(() => {
+              const allPhones = [lead.phone, ...(lead.phones || [])].filter(Boolean);
+              if (allPhones.length < 2) return null;
+              return (
+                <div className="bg-[#0F172A] border-b border-white/10 flex items-stretch overflow-x-auto" data-testid="wa-phone-tabs">
+                  {allPhones.map((p, idx) => {
+                    const isActive = phoneFilter === p;
+                    return (
+                      <button
+                        key={p}
+                        onClick={() => selectPhone(p)}
+                        className={`px-4 py-2 text-xs font-mono whitespace-nowrap border-r border-white/10 last:border-r-0 transition-colors ${
+                          isActive
+                            ? "bg-[#25D366] text-white font-bold"
+                            : "text-white/70 hover:bg-white/5"
+                        }`}
+                        data-testid={`wa-phone-tab-${p}`}
+                      >
+                        <span className="flex items-center gap-1.5">
+                          {idx === 0 && <Star size={10} weight={isActive ? "fill" : "regular"} />}
+                          {p}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            })()}
 
             {/* 24h-window banner — matches /chat */}
             {!within24h && (
               <div className="bg-[#7A4500] text-white px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold flex items-center gap-2" data-testid="wa-24h-banner">
                 <Clock size={12} /> Outside 24-hour window — only approved templates can be sent
-              </div>
-            )}
-
-            {/* Per-number chat-history banner — /leads-only behavior:
-                shows only the chat history for the currently-active WhatsApp number. */}
-            {phoneFilter && (
-              <div className="bg-[#FFF4E5] text-[#B85F00] px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold flex items-center gap-2" data-testid="wa-phone-filter-banner">
-                <Phone size={12} /> Showing chat for: <span className="font-mono normal-case">{phoneFilter}</span>
-                <button onClick={() => setPhoneFilter("")} className="ml-auto underline" data-testid="wa-phone-filter-clear">Show all numbers</button>
               </div>
             )}
 
