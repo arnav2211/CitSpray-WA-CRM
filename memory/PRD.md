@@ -22,6 +22,15 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 19 (Feb 2026) — /leads ↔ /chats redirect cleanup + inbound msg attribution
+- **Backend bug fix (HIGH from iter11)** — WhatsApp inbound webhook now stores `from` (customer phone) and `to_phone` (business `display_phone_number`) on every message doc. Previously these were missing, causing the per-phone history filter to surface ZERO inbound messages even when present.
+- **WA-icon redirect from /leads no longer filters /chat** — clicking the green WA icon next to a phone (in table row, card view, or lead-drawer phone row) now navigates to `/chat?lead={id}` ONLY. /chat shows the full global inbox; the selected lead is opened/focused but no `?phone=` filter is applied. The "Open in /chat" button inside the lead-drawer WA panel header behaves the same.
+- **Per-phone history filter remains in /leads only** — the lead-drawer WA panel auto-tracks `lead.active_wa_phone`. When the admin clicks "Use this" on a different phone in PhonesRow, `setPhoneFilter` is updated via a `useEffect` and the WA panel reloads with `?phone=...`. The banner text now says "Showing chat for: {phone}" with a "Show all numbers" toggle to clear the filter for the current session.
+- **/chat no longer mutates active_wa_phone on deep-link** — removed the `PUT /api/leads/{id}/active-wa-phone` side effect that was firing on `?phone=...` URL visits. /chat is now strictly view-only with respect to the persisted active phone. Direct deep-links `/chat?lead=X&phone=Y` still respect the filter for back-compat (banner + filtered messages), but /leads-originated redirects no longer trigger this.
+- **Mobile lead-card DOM nesting fix** — converted the outer `<button>` to a `<div role="button">` so the nested WA-icon `<button>` is no longer an HTML-invalid descendant. Eliminates the React hydration warning. Keyboard accessibility preserved via `tabIndex` + `Enter/Space` handler.
+
+- **Tested**: 14/14 backend pytest + 5/5 frontend Playwright cases green. Iter11's per-phone filter regression now passes (>=2 messages including inbound) due to the webhook fix.
+
 ### Iteration 18 (Feb 2026) — WhatsApp-style /chat polish
 - **Smart timestamp formatting** (`/app/frontend/src/lib/format.js`):
   - `fmtSmartShort(iso)` → 'Today' time / 'Yesterday' / weekday (within 7d) / `12 Feb` / `12 Feb 2024`. Used in chat-list row timestamps.

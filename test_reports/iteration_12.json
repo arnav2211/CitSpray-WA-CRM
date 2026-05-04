@@ -1,0 +1,42 @@
+{
+  "summary": "Iter12 fully verified. All 4 review-request items pass. Backend bug-fix confirmed: inbound WhatsApp webhook now persists `from` (customer phone) and `to_phone` (display_phone_number) on each msg_doc, and per-phone filter now surfaces inbound messages (>=2 instead of 0). Frontend /leads-originated WA-icon redirects use `/chat?lead={id}` only — no `phone=` parameter, no banner. Direct deep-link `/chat?lead=X&phone=Y` still respects the filter (back-compat). /chat no longer mutates lead.active_wa_phone on visit.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Leads.jsx (mobile cards)", "issue": "React DOM nesting hydration warning: <button data-testid='leads-card-wa-...'> is nested inside the parent <button data-testid='lead-card-...'>. Browser logs 'In HTML, <button> cannot be a descendant of <button>'. Functionally works (e.stopPropagation prevents double trigger) but produces console errors. Same pattern in desktop row (leads-row-wa-* inside lead-row-* tr — that one is fine since tr is not a button).", "selector": "[data-testid^='leads-card-wa-']", "priority": "LOW"}
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration11_wa_phone_filter.py",
+    "/app/backend/tests/test_iteration12_chat_no_mutation.py",
+    "/app/test_reports/pytest/iter12_results.xml"
+  ],
+  "action_items": [
+    "(LOW) Refactor Leads.jsx mobile card so the WA-icon button is not nested inside the parent <button>. Make the parent a clickable <div role='button'> or move the WA action outside the card click target."
+  ],
+  "critical_code_review_comments": [
+    "Backend webhook `msg_doc` correctly persists both `from` and `to_phone` (server.py L4891-4892). Inbound media branch and quoted-reply branch preserve these fields.",
+    "Chat.jsx no longer issues an auto-PUT to /api/leads/{id}/active-wa-phone on initialPhone deep-link (verified by grep). phoneFilter state still drives ?phone= on /messages.",
+    "LeadDrawer's open-full-chat-btn and PhonesRow's open-whatsapp-{phone} both use /chat?lead=${id} only (no phone). leads-row-wa-* and leads-card-wa-* in Leads.jsx ditto.",
+    "phone_match_pattern + $or:[to_phone, from] correctly handles last-10-digit suffix matching (test_phone_invalid_no_500 confirms no 500 on garbage input)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration11_wa_phone_filter.py (replaced legacy test_phone_b_returns_only_b which documented the bug; new test_phone_b_returns_only_b_inbound_fixed asserts >=2 inbound messages match phone_b filter; added test_inbound_msg_has_from_and_to_phone)",
+    "/app/backend/tests/test_iteration12_chat_no_mutation.py (NEW — webhook persists from+to_phone, phone filter returns inbound, active_wa_phone not mutated by GET /messages?phone=)"
+  ],
+  "success_rate": {"backend": "100% (14/14 pytest)", "frontend": "100% (5/5 playwright)"},
+  "test_credentials": "admin/Admin@123 (used). ravi/Exec@123 and priya/Exec@123 not exercised — admin coverage was sufficient for this iteration's scope.",
+  "seed_data_creation": "Created TEST_iter12_* lead with 1 inbound webhook msg. test_iteration11 module also creates TEST_iter11_* leads with 4 inbound msgs across 2 phones. Cleanup not performed (TEST_ prefix preserved for traceability).",
+  "retest_needed": false,
+  "main_agent_can_self_test": false,
+  "context_for_next_testing_agent": "iter12 complete. Test files ready for regression: test_iteration11_wa_phone_filter.py (10 tests) + test_iteration12_chat_no_mutation.py (4 tests). Run with `export REACT_APP_BACKEND_URL=https://crm-lead-mgmt-3.preview.emergentagent.com && pytest backend/tests/test_iteration11_wa_phone_filter.py backend/tests/test_iteration12_chat_no_mutation.py -v`. The only carryover issue is the cosmetic <button>-in-<button> hydration warning in Leads.jsx mobile cards.",
+  "playwright_tests_executed": {
+    "test1_leads_row_wa_redirects_to_chat_no_phone": "PASS",
+    "test2_no_chat_phone_filter_banner_after_redirect": "PASS",
+    "test3_direct_deeplink_chat_lead_phone_shows_banner": "PASS — banner reads 'Showing only:+919999999999 Show all numbers'",
+    "test4_active_wa_phone_not_mutated_by_chat_deeplink": "PASS — initial=None, after=None",
+    "test5_open_full_chat_btn_redirects_to_chat_no_phone": "PASS"
+  }
+}

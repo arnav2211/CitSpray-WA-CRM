@@ -85,15 +85,17 @@ export default function Chat() {
     api.get("/users").then(({ data }) => setExecs(data.filter(u => u.role === "executive" || u.role === "admin"))).catch(() => {});
   }, [isAdmin]);
 
-  // Sync active lead id to URL — preserve tab/agent deep-link params if present
-  // so links from /qa remain shareable (copy-paste URL still restores the panel state).
+  // Sync active lead id to URL — preserve tab/agent/phone deep-link params if present
+  // so links from /qa or /leads remain shareable (copy-paste URL still restores state).
   useEffect(() => {
     const p = {};
     if (activeId) p.lead = activeId;
     const tab = params.get("tab");
     const agent = params.get("agent");
+    const phone = params.get("phone");
     if (tab) p.tab = tab;
     if (agent) p.agent = agent;
+    if (phone) p.phone = phone;
     setParams(p, { replace: true });
   }, [activeId, setParams]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -104,6 +106,7 @@ export default function Chat() {
   const initialDeeplink = useMemo(() => ({
     tab: params.get("tab"),
     agent: params.get("agent"),
+    phone: params.get("phone"),
   }), []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
@@ -176,6 +179,7 @@ export default function Chat() {
             onChanged={fetchConvs}
             initialTab={initialDeeplink.tab}
             initialAgentId={initialDeeplink.agent}
+            initialPhone={initialDeeplink.phone}
           />
         ) : (
           <EmptyState />
@@ -286,7 +290,7 @@ function EmptyState() {
 }
 
 // ---------------- Chat thread ----------------
-function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initialAgentId }) {
+function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initialAgentId, initialPhone }) {
   const isAdmin = user.role === "admin";
   const canMessage = isAdmin || conv.assigned_to === user.id;
   const [messages, setMessages] = useState([]);
@@ -317,10 +321,17 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
 
   const exec = execs.find(e => e.id === conv.assigned_to);
   const within24h = !!conv.within_24h;
+  // Per-phone filter (#3 from /leads parity spec). When deep-linked from /leads
+  // with `?phone=…`, this filters the WA history to only the conversations
+  // addressed to/from that specific number — never merging across phones.
+  // NOTE: /chat itself does NOT alter the lead's active_wa_phone — that's a
+  // /leads-only concern. The filter here is purely a view-side restriction.
+  const [phoneFilter, setPhoneFilter] = useState(initialPhone || "");
 
   const loadMessages = useCallback(async () => {
     try {
-      const { data } = await api.get(`/leads/${conv.id}/messages`);
+      const params = phoneFilter ? { phone: phoneFilter } : {};
+      const { data } = await api.get(`/leads/${conv.id}/messages`, { params });
       // Stable-identity merge: keep the previous object reference for any message
       // whose body hasn't changed since the last poll. This lets React.memo bail
       // out of re-rendering thousands of bubbles on every 4-second poll. We use
@@ -341,7 +352,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
       const msg = errMsg(e, "");
       if (msg && !msg.toLowerCase().includes("network")) toast.error(msg);
     }
-  }, [conv.id]);
+  }, [conv.id, phoneFilter]);
 
   useEffect(() => { loadMessages(); }, [loadMessages]);
   useEffect(() => {
@@ -733,6 +744,19 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
       <div className="flex-1 flex min-h-0 overflow-hidden">
         {/* Messages column */}
         <div className="flex-1 min-w-0 flex flex-col">
+          {/* Per-phone filter banner — when deep-linked from /leads with ?phone=… */}
+          {phoneFilter && (
+            <div className="bg-[#FFF4E5] border-b border-[#E67E00] px-3 py-1.5 flex items-center gap-2 text-xs" data-testid="chat-phone-filter-banner">
+              <Phone size={12} className="text-[#B85F00]" />
+              <span className="text-[#B85F00] font-bold uppercase tracking-widest text-[10px]">Showing only:</span>
+              <span className="font-mono text-[#B85F00]">{phoneFilter}</span>
+              <button
+                onClick={() => setPhoneFilter("")}
+                className="ml-auto text-[10px] uppercase tracking-widest text-[#B85F00] hover:underline font-bold"
+                data-testid="chat-phone-filter-clear"
+              >Show all numbers</button>
+            </div>
+          )}
           {/* In-chat search bar (#4) */}
           {showInChatSearch && (
             <div className="bg-[#F0F2F5] border-b border-gray-200 px-3 py-2 flex items-center gap-2" data-testid="in-chat-search-bar">

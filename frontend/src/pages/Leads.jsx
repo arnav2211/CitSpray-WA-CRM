@@ -1,10 +1,10 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useSearchParams, useNavigate } from "react-router-dom";
 import { StatusBadge, SourceBadge, EnquiryTypeBadge } from "@/components/Badges";
 import { toast } from "sonner";
-import { Kanban, Table, Plus, MagnifyingGlass, FileX } from "@phosphor-icons/react";
+import { Kanban, Table, Plus, MagnifyingGlass, FileX, WhatsappLogo } from "@phosphor-icons/react";
 import LeadDrawer from "@/components/LeadDrawer";
 import { fmtIST } from "@/lib/format";
 
@@ -13,6 +13,7 @@ const SOURCES = ["IndiaMART", "ExportersIndia", "Justdial", "Manual", "WhatsApp"
 
 export default function Leads() {
   const { user } = useAuth();
+  const nav = useNavigate();
   const [params, setParams] = useSearchParams();
   const [leads, setLeads] = useState([]);
   const [execs, setExecs] = useState([]);
@@ -161,15 +162,28 @@ export default function Leads() {
               const ageMin = Math.floor((Date.now() - new Date(l.created_at).getTime()) / 60000);
               const overdue = unread && ageMin > 15;
               return (
-                <button key={l.id} onClick={() => setOpenId(l.id)}
-                  className={`w-full text-left border border-gray-200 bg-white p-3 hover:border-gray-900 transition-colors ${overdue ? "border-l-2 border-l-[#E60000]" : ""}`}
+                <div
+                  key={l.id}
+                  onClick={() => setOpenId(l.id)}
+                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setOpenId(l.id); } }}
+                  role="button"
+                  tabIndex={0}
+                  className={`block w-full text-left border border-gray-200 bg-white p-3 hover:border-gray-900 transition-colors cursor-pointer ${overdue ? "border-l-2 border-l-[#E60000]" : ""}`}
                   data-testid={`lead-card-${l.id}`}>
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0 flex-1">
                       <div className={`truncate ${unread ? "font-bold" : "font-semibold"}`}>{l.customer_name}</div>
                       {l.phone && (
-                        <div className="text-xs text-gray-500 font-mono mt-0.5">
-                          {l.phone}
+                        <div className="text-xs text-gray-500 font-mono mt-0.5 flex items-center gap-1.5">
+                          <span>{l.phone}</span>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); nav(`/chat?lead=${l.id}`); }}
+                            className="text-[#25D366] hover:bg-[#25D366] hover:text-white p-0.5 rounded transition-colors"
+                            title="Open WhatsApp chat for this lead"
+                            data-testid={`leads-card-wa-${l.id}`}
+                          >
+                            <WhatsappLogo size={11} weight="fill" />
+                          </button>
                           {l.phones?.length > 0 && (
                             <span className="ml-1 text-[10px] uppercase tracking-widest text-[#002FA7] font-bold">+{l.phones.length}</span>
                           )}
@@ -189,7 +203,7 @@ export default function Leads() {
                     </span>
                   </div>
                   <div className="text-[10px] text-gray-400 font-mono mt-1">{fmtIST(l.created_at)}</div>
-                </button>
+                </div>
               );
             })}
           </div>
@@ -223,8 +237,16 @@ export default function Leads() {
                     <td className="px-4 py-3">
                       <div className={`${unread ? "font-bold" : ""}`}>{l.customer_name}</div>
                       {l.phone && (
-                        <div className="text-xs text-gray-500 font-mono flex items-center gap-1">
+                        <div className="text-xs text-gray-500 font-mono flex items-center gap-1.5">
                           <span>{l.phone}</span>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); nav(`/chat?lead=${l.id}`); }}
+                            className="text-[#25D366] hover:bg-[#25D366] hover:text-white p-0.5 rounded transition-colors"
+                            title="Open WhatsApp chat for this lead"
+                            data-testid={`leads-row-wa-${l.id}`}
+                          >
+                            <WhatsappLogo size={11} weight="fill" />
+                          </button>
                           {l.phones?.length > 0 && (
                             <span className="text-[10px] uppercase tracking-widest text-[#002FA7] font-bold">
                               +{l.phones.length}
