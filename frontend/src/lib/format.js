@@ -20,7 +20,7 @@ export function fmtIST(iso) {
   const d = _parse(iso);
   if (!d) return "—";
   const p = DTF_IST.formatToParts(d).reduce((o, x) => (o[x.type] = x.value, o), {});
-  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute} IST`;
+  return `${p.day}-${p.month}-${p.year} ${p.hour}:${p.minute} IST`;
 }
 
 export function fmtISTTime(iso) {
