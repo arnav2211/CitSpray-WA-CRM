@@ -4884,6 +4884,12 @@ async def webhook_whatsapp(request: Request):
                         "status": "received",
                         "at": iso(now_utc()),
                         "by_user_id": None,
+                        # Phone attribution — required for /leads per-phone history
+                        # filter to surface inbound messages too. `from` is the
+                        # customer's number; `to_phone` is our business number that
+                        # received it (display_phone_number from the webhook).
+                        "from": from_phone or "",
+                        "to_phone": (value.get("metadata") or {}).get("display_phone_number") or "",
                     }
                     # Quoted-reply context from the customer
                     if inbound_context_wamid:

@@ -120,11 +120,10 @@ class TestPerPhoneMessageFilter:
             target = (m.get("to_phone") or "") + " " + (m.get("from") or "")
             assert suffix_b not in target, f"message {m.get('id')} leaked phone B"
 
-    def test_phone_b_returns_only_b(self, auth_headers, seeded_lead):
-        """KNOWN BACKEND BUG: inbound webhook messages don't store a `from` field
-        on the msg_doc, so the per-phone filter (which checks $or:[to_phone, from])
-        cannot match inbound messages. Outbound messages with to_phone do match.
-        This test asserts current behavior (empty/outbound-only) and documents the gap.
+    def test_phone_b_returns_only_b_inbound_fixed(self, auth_headers, seeded_lead):
+        """ITER12 BUG FIX: inbound webhook messages NOW store a `from` field on
+        msg_doc, so the per-phone filter ($or:[to_phone, from]) surfaces inbound
+        messages. We seeded 2 inbound messages from phone_b — expect >=2 matches.
         """
         lead_id = seeded_lead["lead_id"]
         phone_b = seeded_lead["phone_b"]
@@ -133,11 +132,26 @@ class TestPerPhoneMessageFilter:
         msgs = r.json()
         suffix_b = phone_b.lstrip("+")[-10:]
         suffix_a = seeded_lead["phone_a"].lstrip("+")[-10:]
-        # No phone_a leakage on whatever messages do appear
+        # iter12: must contain at least the 2 inbound messages we seeded for phone_b
+        assert len(msgs) >= 2, f"expected >=2 messages (inbound from phone_b), got {len(msgs)}: {msgs}"
         for m in msgs:
             target = (m.get("to_phone") or "") + " " + (m.get("from") or "")
-            if target.strip():
-                assert suffix_a not in target, f"message leaked phone A in B-filter: {m}"
+            assert suffix_b in target, f"message {m.get('id')} doesn't match phone_b suffix: {m}"
+            assert suffix_a not in target, f"message leaked phone A in B-filter: {m}"
+
+    def test_inbound_msg_has_from_and_to_phone(self, auth_headers, seeded_lead):
+        """ITER12 explicit assertion: each seeded inbound message must have both
+        `from` (customer phone) and `to_phone` (business display_phone_number)."""
+        lead_id = seeded_lead["lead_id"]
+        r = requests.get(f"{API}/leads/{lead_id}/messages", headers=auth_headers)
+        assert r.status_code == 200
+        msgs = r.json()
+        inbound = [m for m in msgs if m.get("direction") == "in"]
+        assert len(inbound) >= 4, f"seeded 4 inbound, got {len(inbound)}"
+        for m in inbound:
+            assert m.get("from"), f"inbound msg missing 'from': {m}"
+            # to_phone should be present (display_phone_number=0000 from webhook)
+            assert "to_phone" in m, f"inbound msg missing 'to_phone' key: {m}"
 
     def test_phone_invalid_no_500(self, auth_headers, seeded_lead):
         lead_id = seeded_lead["lead_id"]

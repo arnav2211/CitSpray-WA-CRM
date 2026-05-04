@@ -172,9 +172,9 @@ export default function Leads() {
                         <div className="text-xs text-gray-500 font-mono mt-0.5 flex items-center gap-1.5">
                           <span>{l.phone}</span>
                           <button
-                            onClick={(e) => { e.stopPropagation(); nav(`/chat?lead=${l.id}&phone=${encodeURIComponent(l.phone)}`); }}
+                            onClick={(e) => { e.stopPropagation(); nav(`/chat?lead=${l.id}`); }}
                             className="text-[#25D366] hover:bg-[#25D366] hover:text-white p-0.5 rounded transition-colors"
-                            title="Open WhatsApp chat for this number"
+                            title="Open WhatsApp chat for this lead"
                             data-testid={`leads-card-wa-${l.id}`}
                           >
                             <WhatsappLogo size={11} weight="fill" />
@@ -235,9 +235,9 @@ export default function Leads() {
                         <div className="text-xs text-gray-500 font-mono flex items-center gap-1.5">
                           <span>{l.phone}</span>
                           <button
-                            onClick={(e) => { e.stopPropagation(); nav(`/chat?lead=${l.id}&phone=${encodeURIComponent(l.phone)}`); }}
+                            onClick={(e) => { e.stopPropagation(); nav(`/chat?lead=${l.id}`); }}
                             className="text-[#25D366] hover:bg-[#25D366] hover:text-white p-0.5 rounded transition-colors"
-                            title="Open WhatsApp chat for this number"
+                            title="Open WhatsApp chat for this lead"
                             data-testid={`leads-row-wa-${l.id}`}
                           >
                             <WhatsappLogo size={11} weight="fill" />

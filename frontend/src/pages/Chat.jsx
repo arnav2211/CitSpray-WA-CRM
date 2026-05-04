@@ -324,21 +324,9 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   // Per-phone filter (#3 from /leads parity spec). When deep-linked from /leads
   // with `?phone=…`, this filters the WA history to only the conversations
   // addressed to/from that specific number — never merging across phones.
+  // NOTE: /chat itself does NOT alter the lead's active_wa_phone — that's a
+  // /leads-only concern. The filter here is purely a view-side restriction.
   const [phoneFilter, setPhoneFilter] = useState(initialPhone || "");
-
-  // When the URL says `?phone=…`, also tell the backend to switch the lead's
-  // active_wa_phone so future outbound messages target this number. Done once
-  // on mount; subsequent active-wa changes go through the existing PhonesRow UI.
-  useEffect(() => {
-    if (!initialPhone || !canMessage) return;
-    const cur = (conv.active_wa_phone || conv.phone || "").replace(/\D+/g, "").slice(-10);
-    const want = initialPhone.replace(/\D+/g, "").slice(-10);
-    if (cur === want) return;
-    api.put(`/leads/${conv.id}/active-wa-phone`, { phone: initialPhone }).then(() => {
-      onChanged?.();
-    }).catch(() => { /* ignore — keep current active phone if patch fails */ });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [conv.id]);
 
   const loadMessages = useCallback(async () => {
     try {

@@ -39,7 +39,7 @@ export default function LeadDrawer({ leadId, onClose }) {
   const [quickReplies, setQuickReplies] = useState([]);
   const [showTplPanel, setShowTplPanel] = useState(false);
   const [showQrPanel, setShowQrPanel] = useState(false);
-  const [phoneFilter, setPhoneFilter] = useState(""); // per-number history filter
+  const [phoneFilter, setPhoneFilter] = useState(""); // per-number history filter (auto-tracks active_wa_phone)
   const [savingTpl, setSavingTpl] = useState(false);
   const [noteText, setNoteText] = useState("");
   const [waText, setWaText] = useState("");
@@ -88,6 +88,17 @@ export default function LeadDrawer({ leadId, onClose }) {
     loadAll();
     // eslint-disable-next-line
   }, [leadId]);
+
+  // Auto-track active_wa_phone — whenever the admin switches the lead's primary
+  // WA number (via PhonesRow's 'Use this' toggle), automatically restrict the
+  // in-drawer WA history to that number. This is the /leads-only "number-specific
+  // chat" behavior; /chat remains global and unaffected.
+  useEffect(() => {
+    if (!lead) return;
+    const newPhone = lead.active_wa_phone || lead.phone || "";
+    setPhoneFilter(newPhone);
+    // eslint-disable-next-line
+  }, [lead?.active_wa_phone, lead?.phone]);
 
   // Reload messages when the per-phone filter changes — independent of leadId.
   useEffect(() => {
@@ -480,7 +491,7 @@ export default function LeadDrawer({ leadId, onClose }) {
                   {lead.active_wa_phone || lead.phone || "—"}
                 </div>
                 <button
-                  onClick={() => nav(`/chat?lead=${leadId}${(lead.active_wa_phone || lead.phone) ? `&phone=${encodeURIComponent(lead.active_wa_phone || lead.phone)}` : ""}`)}
+                  onClick={() => nav(`/chat?lead=${leadId}`)}
                   className="text-[10px] uppercase tracking-widest font-bold text-white/80 hover:text-white border border-white/20 hover:border-white/60 px-2 py-1 flex items-center gap-1"
                   data-testid="open-full-chat-btn"
                 >
@@ -496,11 +507,12 @@ export default function LeadDrawer({ leadId, onClose }) {
               </div>
             )}
 
-            {/* Per-phone filter banner */}
+            {/* Per-number chat-history banner — /leads-only behavior:
+                shows only the chat history for the currently-active WhatsApp number. */}
             {phoneFilter && (
               <div className="bg-[#FFF4E5] text-[#B85F00] px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold flex items-center gap-2" data-testid="wa-phone-filter-banner">
-                <Phone size={12} /> Showing only: <span className="font-mono normal-case">{phoneFilter}</span>
-                <button onClick={() => setPhoneFilter("")} className="ml-auto underline" data-testid="wa-phone-filter-clear">Show all</button>
+                <Phone size={12} /> Showing chat for: <span className="font-mono normal-case">{phoneFilter}</span>
+                <button onClick={() => setPhoneFilter("")} className="ml-auto underline" data-testid="wa-phone-filter-clear">Show all numbers</button>
               </div>
             )}
 
@@ -836,14 +848,15 @@ function PhonesRow({ lead, canEdit, onChanged }) {
             {wa === undefined && (
               <span className="text-[9px] uppercase tracking-widest font-bold text-gray-300" title="WA status unknown — send once to detect">?</span>
             )}
-            {/* Direct WhatsApp redirect — opens the lead in /chat with this number selected */}
+            {/* Direct WhatsApp redirect — opens the lead's chat in /chat (full
+                global chat list visible; we do NOT filter /chat by this number). */}
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                nav(`/chat?lead=${lead.id}&phone=${encodeURIComponent(p)}`);
+                nav(`/chat?lead=${lead.id}`);
               }}
               className="text-[#25D366] hover:bg-[#25D366] hover:text-white p-1 rounded transition-colors"
-              title="Open this number in WhatsApp"
+              title="Open this lead in /chat"
               data-testid={`open-whatsapp-${p}`}
             >
               <WhatsappLogo size={12} weight="fill" />
