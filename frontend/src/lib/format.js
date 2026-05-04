@@ -37,11 +37,11 @@ export function fmtISTShort(iso) {
 }
 
 export const QUERY_TYPE_MAP = {
-  W:   { label: "Direct Enquiry",    short: "Direct",   color: "bg-[#002FA7] text-white" },
-  B:   { label: "Buy-Lead",          short: "Buy",      color: "bg-[#008A00] text-white" },
-  P:   { label: "PNS Call",          short: "PNS",      color: "bg-[#E60000] text-white" },
-  BIZ: { label: "Catalog View",      short: "Catalog",  color: "bg-gray-200 text-gray-900" },
-  WA:  { label: "WhatsApp Enquiry",  short: "WhatsApp", color: "bg-[#FFCC00] text-gray-900" },
+  W: { label: "Direct", short: "Direct", color: "bg-[#002FA7] text-white" },
+  B: { label: "Buylead", short: "Buylead", color: "bg-[#008A00] text-white" },
+  P: { label: "PNS", short: "PNS", color: "bg-[#E60000] text-white" },
+  BIZ: { label: "Catalog", short: "Catalog", color: "bg-gray-200 text-gray-900" },
+  WA: { label: "WhatsApp", short: "WhatsApp", color: "bg-[#FFCC00] text-gray-900" },
 };
 
 export function queryTypeInfo(code) {
