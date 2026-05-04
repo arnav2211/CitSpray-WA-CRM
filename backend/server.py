@@ -1712,13 +1712,17 @@ async def log_call(lead_id: str, body: CallLogInput, user: dict = Depends(get_cu
         "at": iso(now_utc()),
     }
     await db.call_logs.insert_one(doc.copy())
+    update_fields: Dict[str, Any] = {
+        "last_call_outcome": body.outcome,
+        "last_call_at": doc["at"],
+        "last_action_at": doc["at"],
+    }
+    # Auto-promote status: if lead is still "new", move to "contacted" on first call log
+    if lead.get("status") == "new":
+        update_fields["status"] = "contacted"
     await db.leads.update_one(
         {"id": lead_id},
-        {"$set": {
-            "last_call_outcome": body.outcome,
-            "last_call_at": doc["at"],
-            "last_action_at": doc["at"],
-        }},
+        {"$set": update_fields},
     )
     await log_activity(user["id"], "call_logged", lead_id, {"outcome": body.outcome, "phone": body.phone})
     return strip_mongo(doc)
