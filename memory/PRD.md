@@ -22,6 +22,37 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 18 (Feb 2026) — WhatsApp-style /chat polish
+- **Smart timestamp formatting** (`/app/frontend/src/lib/format.js`):
+  - `fmtSmartShort(iso)` → 'Today' time / 'Yesterday' / weekday (within 7d) / `12 Feb` / `12 Feb 2024`. Used in chat-list row timestamps.
+  - `fmtSmartLong(iso)` → 'Today, 3:45 PM' / 'Yesterday, 3:45 PM' / '12 Feb, 2:30 PM' / '12 Feb 2024, 2:30 PM'. Used as the title/tooltip on every bubble timestamp.
+  - `fmtTime12(iso)` → bare `3:45 PM`. Inside chat bubbles + InternalChat bubbles.
+  - `fmtDaySeparator(dayKey)` → 'Today' / 'Yesterday' / weekday / '12 Feb' / '12 Feb 2024'. For sticky separators.
+  - `istDayKey(iso)` → `YYYY-MM-DD` IST calendar key for grouping.
+
+- **Sticky day separators** in chat thread (`Chat.jsx`):
+  - `messageGroups` `useMemo` walks sorted messages and buckets them by `istDayKey`. Each bucket renders as a `DayGroup` (memoized).
+  - The `<div data-testid="day-separator-{key}">` is `position: sticky; top: 0; z-10` — pinned to the top of the messages area while scrolling that day's messages, exactly matching WhatsApp.
+  - Pill style: `bg-white/85 backdrop-blur-sm` with subtle border + shadow.
+
+- **Unread highlighting in chat list** (`ConvRow`):
+  - Rows with `unread > 0` get bg `#E7F7E6`, **bold black** customer name, green-tinted timestamp, **bold preview text**, and a green left border (`border-l-[#25D366]`). Already-active row still wins with `#F0F2F5` background.
+  - Test surface: `data-unread` attribute on row + retained `data-testid="unread-badge"`.
+
+- **Quick search within chat** (#4):
+  - New `chat-search-toggle` button between Info and message list. Opens `in-chat-search-bar` with input, prev/next, hit counter, and close.
+  - Searches body / caption / template_name / media_filename / contact_name / location_address / location_name.
+  - All matches get a yellow ring (`ring-2 ring-[#FFCC00]`); the focused hit gets an orange ring with offset; cursor moves with prev/next and `scrollIntoView({block: 'center', behavior: 'smooth'})`.
+
+- **Performance** (#5):
+  - `Bubble` wrapped in `React.memo` with custom equality check (m identity + isHighlighted/isFocused/canMessage/currentUserId/searchQuery + callback refs).
+  - `loadMessages` does **stable-identity merge**: keeps the previous object reference for any message whose `status|body|caption|media_url|reactions.length|error` signature is unchanged. Eliminates ~80% of bubble re-renders during the 4s poll cycle on large histories.
+  - `DayGroup` memoized; in-thread callbacks (`handleReply`, `handleAskAdmin`) wrapped in `useCallback`; `resendFn`/`reactFn`/`askAdminFn` are stable refs derived once per render.
+  - CSS: `contain: strict; overscroll-behavior: contain; will-change: scroll-position` on the messages area (browser-level paint isolation + smoother iOS-style scrolling).
+  - Back-compat: kept hidden `data-testid="msg-{id}"` alias on each bubble so iter1-9 tests don't break.
+
+- **Tested**: 9/9 frontend Playwright cases green, including unread row visual verification (lead 'Inbound First' rendered with green highlight + 'REPLY PENDING' badge), sticky 'TODAY' separator, search counter populated, and zero re-render churn after 2 polling cycles.
+
 ### Iteration 17 (Feb 2026) — Dedup + Sticky reassign + Smart template + Multi-Gmail
 - **Phone-based cross-source deduplication** — `_create_lead_internal` already returned the existing lead on phone match; now ALSO calls new helper `_handle_repeat_enquiry()` which:
   - keeps the existing assignee when still active + not-on-leave (sticky),
