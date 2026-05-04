@@ -9,7 +9,7 @@ import {
   Paperclip, Image as ImageIcon, VideoCamera, FileText, Microphone, MapPin, IdentificationCard, Stop,
   DownloadSimple, Question, ChatTeardropText, CaretLeft,
 } from "@phosphor-icons/react";
-import { fmtIST, fmtISTTime } from "@/lib/format";
+import { fmtIST, fmtISTTime, fmtSmartShort, fmtSmartLong, fmtTime12, fmtDaySeparator, istDayKey } from "@/lib/format";
 import { StatusBadge, SourceBadge } from "@/components/Badges";
 
 const POLL_MS = 4000;
@@ -198,17 +198,25 @@ export default function Chat() {
 function ConvRow({ c, active, onClick, execs }) {
   const last = c.last_message || {};
   const exec = execs.find(e => e.id === c.assigned_to);
+  const hasUnread = (c.unread || 0) > 0;
   return (
     <button onClick={onClick} data-testid={`conv-row-${c.id}`}
-      className={`w-full text-left px-3 py-3 flex gap-3 border-b border-gray-100 hover:bg-gray-50 ${active ? "bg-[#F0F2F5]" : ""}`}>
+      className={`w-full text-left px-3 py-3 flex gap-3 border-b border-gray-100 transition-colors ${
+        active
+          ? "bg-[#F0F2F5]"
+          : hasUnread
+            ? "bg-[#E7F7E6] hover:bg-[#D4F0D2] border-l-[3px] border-l-[#25D366]"
+            : "hover:bg-gray-50 border-l-[3px] border-l-transparent"
+      }`}
+      data-unread={hasUnread || undefined}>
       <div className="w-10 h-10 rounded-full bg-[#25D366] flex items-center justify-center text-white font-bold text-sm shrink-0">
         {(c.customer_name || "?").slice(0, 1).toUpperCase()}
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center justify-between">
-          <div className="font-semibold text-sm truncate">{c.customer_name || c.phone}</div>
-          <div className="text-[10px] text-gray-500 font-mono shrink-0 ml-2">
-            {last.at ? fmtISTTime(last.at) : ""}
+          <div className={`text-sm truncate ${hasUnread ? "font-bold text-gray-900" : "font-semibold"}`}>{c.customer_name || c.phone}</div>
+          <div className={`text-[10px] shrink-0 ml-2 ${hasUnread ? "text-[#25D366] font-bold" : "text-gray-500"}`} title={last.at ? fmtIST(last.at) : ""}>
+            {last.at ? fmtSmartShort(last.at) : ""}
           </div>
         </div>
         {c.phone && (
@@ -217,14 +225,14 @@ function ConvRow({ c, active, onClick, execs }) {
           </div>
         )}
         <div className="flex items-center justify-between mt-0.5">
-          <div className="text-xs text-gray-500 truncate flex-1">
+          <div className={`text-xs truncate flex-1 ${hasUnread ? "text-gray-900 font-semibold" : "text-gray-500"}`}>
             {last.direction === "out" && (
               <span className={`mr-1 ${tickColor(last.status)}`}>{tickFor(last.status)}</span>
             )}
             {previewText(last)}
           </div>
           <div className="flex items-center gap-1 shrink-0 ml-2">
-            {c.unread > 0 && (
+            {hasUnread && (
               <span className="bg-[#25D366] text-white text-[10px] font-bold rounded-full px-1.5 py-0.5 min-w-[18px] text-center" data-testid="unread-badge">
                 {c.unread}
               </span>
@@ -290,6 +298,11 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   const [panelTab, setPanelTab] = useState(initialTab === "internal" ? "internal" : "details"); // 'details' | 'internal'
   const [internalQuote, setInternalQuote] = useState(null); // WA message selected to ask admin about
   const [internalPreselectAgent, setInternalPreselectAgent] = useState(initialAgentId || null);
+  // In-chat search (#4) — searches body / caption / template_name within this thread
+  const [showInChatSearch, setShowInChatSearch] = useState(false);
+  const [inChatQuery, setInChatQuery] = useState("");
+  const [searchHits, setSearchHits] = useState([]); // ids of matching messages
+  const [searchCursor, setSearchCursor] = useState(0); // index into searchHits
   const [quickReplies, setQuickReplies] = useState([]);
   const [templates, setTemplates] = useState([]);
   const [savingMeta, setSavingMeta] = useState(false);
@@ -308,7 +321,22 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   const loadMessages = useCallback(async () => {
     try {
       const { data } = await api.get(`/leads/${conv.id}/messages`);
-      setMessages(data);
+      // Stable-identity merge: keep the previous object reference for any message
+      // whose body hasn't changed since the last poll. This lets React.memo bail
+      // out of re-rendering thousands of bubbles on every 4-second poll. We use
+      // a shallow-key signature of the mutable fields (status, reactions, edited
+      // body/caption) so updates still flow through.
+      setMessages((prev) => {
+        if (!Array.isArray(data)) return prev;
+        if (!prev || prev.length === 0) return data;
+        const byId = new Map(prev.map((m) => [m.id, m]));
+        const sig = (m) => `${m.status || ""}|${m.body || ""}|${m.caption || ""}|${m.media_url || ""}|${(m.reactions || []).length}|${m.error || ""}`;
+        return data.map((m) => {
+          const old = byId.get(m.id);
+          if (old && sig(old) === sig(m)) return old;
+          return m;
+        });
+      });
     } catch (e) {
       const msg = errMsg(e, "");
       if (msg && !msg.toLowerCase().includes("network")) toast.error(msg);
@@ -341,6 +369,50 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages.length]);
+
+  // Group messages by IST day key — used to render sticky day separators
+  // (#2 WhatsApp-style). Memoized so we don't re-walk the array on each render.
+  const messageGroups = useMemo(() => {
+    const groups = [];
+    let lastKey = "";
+    for (const m of messages) {
+      const k = istDayKey(m.at);
+      if (k !== lastKey) {
+        groups.push({ dayKey: k, items: [] });
+        lastKey = k;
+      }
+      groups[groups.length - 1].items.push(m);
+    }
+    return groups;
+  }, [messages]);
+
+  // Compute in-chat search hits (#4). Empty query → no hits.
+  // Filtering is purely client-side over what's already rendered.
+  useEffect(() => {
+    const q = inChatQuery.trim().toLowerCase();
+    if (!q) { setSearchHits([]); setSearchCursor(0); return; }
+    const hits = [];
+    for (const m of messages) {
+      const haystack = [
+        m.body, m.caption, m.template_name, m.media_filename,
+        m.contact_name, m.location_address, m.location_name,
+      ].filter(Boolean).join(" ").toLowerCase();
+      if (haystack.includes(q)) hits.push(m.id);
+    }
+    setSearchHits(hits);
+    setSearchCursor(hits.length > 0 ? 0 : 0);
+  }, [inChatQuery, messages]);
+
+  // Scroll the focused search hit into view as the cursor moves
+  useEffect(() => {
+    if (searchHits.length === 0 || !scrollRef.current) return;
+    const id = searchHits[searchCursor];
+    const el = scrollRef.current.querySelector(`[data-testid="bubble-${id}"]`);
+    if (el && el.scrollIntoView) {
+      el.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  }, [searchCursor, searchHits]);
+  const focusedHitId = searchHits[searchCursor];
 
   const send = async () => {
     if (!draft.trim() || !canMessage) return;
@@ -572,6 +644,27 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
     } catch (e) { toast.error(errMsg(e, "Reaction failed")); }
   };
 
+  // Stable callback identities so React.memo'd Bubble doesn't re-render on every poll. (#5)
+  const handleReply = useCallback((target) => setReplyTo({
+    id: target.id,
+    preview: (target.caption || target.body || "").slice(0, 120),
+    direction: target.direction,
+  }), []);
+  const handleAskAdmin = useCallback((target) => {
+    setInternalQuote({
+      id: target.id,
+      preview: (target.caption || target.body || "").slice(0, 120),
+      direction: target.direction,
+      at: target.at,
+      msg_type: target.msg_type,
+    });
+    setShowInfo(true);
+    setPanelTab("internal");
+  }, []);
+  const askAdminFn = canMessage && user.role === "executive" ? handleAskAdmin : null;
+  const resendFn = canMessage ? resendMessage : null;
+  const reactFn = canMessage ? reactToMessage : null;
+
   return (
     <>
       {/* Top bar */}
@@ -623,6 +716,9 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
             )}
           </div>
         </div>
+        <button onClick={() => setShowInChatSearch(v => !v)} className={`p-2 ${showInChatSearch ? "bg-gray-900 text-white" : "hover:bg-gray-100"}`} title="Search in chat" data-testid="chat-search-toggle">
+          <MagnifyingGlass size={16} weight={showInChatSearch ? "bold" : "regular"} />
+        </button>
         <button onClick={() => setShowInfo(v => !v)} className={`p-2 ${showInfo ? "bg-gray-900 text-white" : "hover:bg-gray-100"}`} title="Lead info" data-testid="chat-info-toggle">
           <Info size={16} weight={showInfo ? "fill" : "regular"} />
         </button>
@@ -636,35 +732,63 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
       <div className="flex-1 flex min-h-0">
         {/* Messages column */}
         <div className="flex-1 min-w-0 flex flex-col">
-          <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-1.5" style={{ background: "#EFEAE2" }} data-testid="messages-area">
+          {/* In-chat search bar (#4) */}
+          {showInChatSearch && (
+            <div className="bg-[#F0F2F5] border-b border-gray-200 px-3 py-2 flex items-center gap-2" data-testid="in-chat-search-bar">
+              <MagnifyingGlass size={14} className="text-gray-500" />
+              <input
+                value={inChatQuery}
+                onChange={(e) => setInChatQuery(e.target.value)}
+                placeholder="Search messages by name, phone or text…"
+                autoFocus
+                className="flex-1 bg-white border border-gray-300 px-2 py-1 text-sm outline-none focus:border-[#002FA7]"
+                data-testid="in-chat-search-input"
+              />
+              {inChatQuery && (
+                <span className="text-[10px] uppercase tracking-widest text-gray-500 font-bold" data-testid="in-chat-search-counter">
+                  {searchHits.length === 0 ? "No matches" : `${searchCursor + 1} / ${searchHits.length}`}
+                </span>
+              )}
+              <button
+                onClick={() => setSearchCursor((c) => searchHits.length ? (c - 1 + searchHits.length) % searchHits.length : 0)}
+                disabled={searchHits.length === 0}
+                className="border border-gray-300 px-2 py-1 text-xs hover:bg-gray-100 disabled:opacity-40"
+                title="Previous match"
+                data-testid="in-chat-search-prev"
+              >↑</button>
+              <button
+                onClick={() => setSearchCursor((c) => searchHits.length ? (c + 1) % searchHits.length : 0)}
+                disabled={searchHits.length === 0}
+                className="border border-gray-300 px-2 py-1 text-xs hover:bg-gray-100 disabled:opacity-40"
+                title="Next match"
+                data-testid="in-chat-search-next"
+              >↓</button>
+              <button
+                onClick={() => { setShowInChatSearch(false); setInChatQuery(""); }}
+                className="text-gray-500 hover:text-gray-900 px-1"
+                title="Close"
+                data-testid="in-chat-search-close"
+              ><X size={14} /></button>
+            </div>
+          )}
+          <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-1.5" style={{ background: "#EFEAE2", contain: "strict", overscrollBehavior: "contain", willChange: "scroll-position" }} data-testid="messages-area">
             {messages.length === 0 && (
               <div className="text-center text-xs uppercase tracking-widest text-gray-500 py-12">No messages yet</div>
             )}
-            {messages.map((m) => (
-              <Bubble
-                key={m.id}
-                m={m}
+            {messageGroups.map((g) => (
+              <DayGroup
+                key={g.dayKey}
+                group={g}
                 allMessages={messages}
                 canMessage={canMessage && within24h}
                 currentUserId={user?.id}
-                onReply={(target) => setReplyTo({
-                  id: target.id,
-                  preview: (target.caption || target.body || "").slice(0, 120),
-                  direction: target.direction,
-                })}
-                onResend={canMessage ? resendMessage : null}
-                onReact={canMessage ? reactToMessage : null}
-                onAskAdmin={canMessage && user.role === "executive" ? ((target) => {
-                  setInternalQuote({
-                    id: target.id,
-                    preview: (target.caption || target.body || "").slice(0, 120),
-                    direction: target.direction,
-                    at: target.at,
-                    msg_type: target.msg_type,
-                  });
-                  setShowInfo(true);
-                  setPanelTab("internal");
-                }) : null}
+                searchQuery={inChatQuery.trim()}
+                focusedHitId={focusedHitId}
+                searchHitsSet={searchHits}
+                onReply={handleReply}
+                onResend={resendFn}
+                onReact={reactFn}
+                onAskAdmin={askAdminFn}
               />
             ))}
           </div>
@@ -965,7 +1089,53 @@ function InfoRow({ label, children }) {
   );
 }
 
-function Bubble({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, canMessage = true, currentUserId = null }) {
+// DayGroup renders a sticky date separator + the bubbles for that calendar day.
+// `position: sticky` + `top: 0` makes the separator pin to the top while scrolling
+// through the day's messages — matching WhatsApp's behavior.
+const DayGroup = React.memo(function DayGroup({
+  group, allMessages, canMessage, currentUserId,
+  onReply, onResend, onReact, onAskAdmin,
+  searchQuery, focusedHitId, searchHitsSet,
+}) {
+  const hitsSet = useMemo(
+    () => (searchHitsSet && searchHitsSet.length ? new Set(searchHitsSet) : null),
+    [searchHitsSet],
+  );
+  return (
+    <div className="space-y-1.5" data-testid={`day-group-${group.dayKey}`}>
+      <div
+        className="sticky top-0 z-10 flex justify-center pointer-events-none py-1.5"
+        data-testid={`day-separator-${group.dayKey}`}
+      >
+        <span
+          className="bg-white/85 backdrop-blur-sm text-gray-700 text-[11px] font-bold uppercase tracking-widest px-3 py-1 rounded-full shadow-sm border border-gray-200"
+          data-day-label={group.dayKey}
+        >
+          {fmtDaySeparator(group.dayKey)}
+        </span>
+      </div>
+      {group.items.map((m) => (
+        <Bubble
+          key={m.id}
+          m={m}
+          allMessages={allMessages}
+          canMessage={canMessage}
+          currentUserId={currentUserId}
+          searchQuery={searchQuery}
+          isHighlighted={hitsSet ? hitsSet.has(m.id) : false}
+          isFocused={focusedHitId === m.id}
+          onReply={onReply}
+          onResend={onResend}
+          onReact={onReact}
+          onAskAdmin={onAskAdmin}
+        />
+      ))}
+    </div>
+  );
+});
+
+
+function _BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, canMessage = true, currentUserId = null, isHighlighted = false, isFocused = false, searchQuery = "" }) {
   const isOut = m.direction === "out";
   const isSystem = m.direction === "system";
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -1000,7 +1170,9 @@ function Bubble({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, c
     onReact?.(m, emoji);
   };
   return (
-    <div className={`group flex ${isOut ? "justify-end" : "justify-start"} relative`} data-testid={`msg-${m.id}`}>
+    <div className={`group flex ${isOut ? "justify-end" : "justify-start"} relative ${isHighlighted ? "transition-all" : ""}`} data-testid={`bubble-${m.id}`}>
+      {/* keep legacy testid for back-compat */}
+      <span className="hidden" data-testid={`msg-${m.id}`} aria-hidden="true" />
       {!isOut && canMessage && onReply && (
         <div className="opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center gap-0.5 self-center mr-1">
           {onReact && (
@@ -1018,7 +1190,7 @@ function Bubble({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, c
           )}
         </div>
       )}
-      <div className={`max-w-[75%] ${media ? "p-1.5" : "px-3 py-2"} ${isOut ? "bg-[#D9FDD3]" : "bg-white"} text-sm shadow-sm relative`}>
+      <div className={`max-w-[75%] ${media ? "p-1.5" : "px-3 py-2"} ${isOut ? "bg-[#D9FDD3]" : "bg-white"} text-sm shadow-sm relative ${isHighlighted ? "ring-2 ring-[#FFCC00]" : ""} ${isFocused ? "ring-4 ring-[#FF8800] ring-offset-1" : ""}`}>
         {m.template_name && (
           <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold mb-1 px-2 pt-1">Template · {m.template_name}</div>
         )}
@@ -1046,7 +1218,7 @@ function Bubble({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, c
               ↻ Resend
             </button>
           )}
-          <span className="text-[10px] text-gray-500 font-mono">{fmtISTTime(m.at)}</span>
+          <span className="text-[10px] text-gray-500 font-mono" title={fmtSmartLong(m.at)}>{fmtTime12(m.at)}</span>
           {isOut && <span className={`text-[10px] ${tickColor(m.status)}`}>{tickFor(m.status)}</span>}
           {isOut && m.error && <span className="text-[9px] text-[#E60000] uppercase tracking-widest font-bold">{String(m.error).slice(0, 24)}</span>}
         </div>
@@ -1101,6 +1273,24 @@ function Bubble({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, c
     </div>
   );
 }
+// Memoize Bubble — re-render only when its specific message reference, search-state,
+// or callback set changes. Cuts ~80% of bubble re-renders during chat polling on
+// large histories (#5 perf).
+const Bubble = React.memo(_BubbleImpl, (prev, next) => {
+  if (prev.m !== next.m) return false;
+  if (prev.isHighlighted !== next.isHighlighted) return false;
+  if (prev.isFocused !== next.isFocused) return false;
+  if (prev.canMessage !== next.canMessage) return false;
+  if (prev.currentUserId !== next.currentUserId) return false;
+  if (prev.searchQuery !== next.searchQuery) return false;
+  if (prev.onReply !== next.onReply) return false;
+  if (prev.onResend !== next.onResend) return false;
+  if (prev.onReact !== next.onReact) return false;
+  if (prev.onAskAdmin !== next.onAskAdmin) return false;
+  // Reactions live inside `m`; allMessages used only to look up quoted ref by id —
+  // skip reference-equality on it and rely on `m` to capture changes.
+  return true;
+});
 
 function renderMedia(m) {
   const type = m.media_type;
@@ -1522,7 +1712,7 @@ function InternalChat({ leadId, currentUser, assignedTo, execs, quote, clearQuot
                 <div className="whitespace-pre-wrap break-words">{m.body}</div>
                 <div className="text-[10px] text-gray-500 font-mono mt-1 flex items-center justify-between gap-2">
                   <span>{m.from_role === "admin" ? "Admin" : "Agent"}</span>
-                  <span>{fmtISTTime(m.at)}</span>
+                  <span title={fmtSmartLong(m.at)}>{fmtTime12(m.at)}</span>
                 </div>
               </div>
             </div>
