@@ -2,18 +2,25 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight,
 } from "@phosphor-icons/react";
+import { useEffect, useState } from "react";
+import { api } from "@/lib/api";
 
 const navBase = "flex items-center gap-3 px-4 py-3 md:py-2.5 text-sm border-l-2 border-transparent hover:bg-gray-100 transition-colors";
 const navActive = "bg-white border-l-2 border-[#002FA7] text-gray-900 font-semibold";
 
-function Item({ to, icon: Icon, children, testId, onNavigate }) {
+function Item({ to, icon: Icon, children, testId, onNavigate, badge }) {
   return (
     <NavLink to={to} data-testid={testId} onClick={onNavigate}
       className={({ isActive }) => `${navBase} ${isActive ? navActive : "text-gray-700"}`}>
       <Icon size={18} weight="regular" />
-      <span>{children}</span>
+      <span className="flex-1">{children}</span>
+      {badge > 0 && (
+        <span className="bg-[#E60000] text-white rounded-full px-1.5 text-[10px] font-bold min-w-[18px] text-center" data-testid={`${testId}-badge`}>
+          {badge > 99 ? "99+" : badge}
+        </span>
+      )}
     </NavLink>
   );
 }
@@ -22,6 +29,23 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
   const { user, logout } = useAuth();
   const nav = useNavigate();
   const isAdmin = user?.role === "admin";
+  const [pendingTransfers, setPendingTransfers] = useState(0);
+
+  // Poll the transfer-request count so admins see a badge with pending approvals.
+  // Executives see their own pending requests count instead.
+  useEffect(() => {
+    if (!user) return;
+    let stop = false;
+    const tick = async () => {
+      try {
+        const { data } = await api.get("/inbox/transfer-requests?status=pending");
+        if (!stop) setPendingTransfers((data || []).length);
+      } catch { /* ignore */ }
+    };
+    tick();
+    const id = setInterval(tick, 15000);
+    return () => { stop = true; clearInterval(id); };
+  }, [user?.id]);
 
   // When a nav item is clicked on mobile, close the drawer
   const handleNavigate = () => { if (mobileOpen && onClose) onClose(); };
@@ -73,6 +97,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
           <Item to="/leads" icon={Kanban} testId="nav-leads" onNavigate={handleNavigate}>Leads</Item>
           <Item to="/followups" icon={Bell} testId="nav-followups" onNavigate={handleNavigate}>Follow-ups</Item>
           <Item to="/qa" icon={ChatTeardropText} testId="nav-qa" onNavigate={handleNavigate}>Internal Q&amp;A</Item>
+          <Item to="/transfer-requests" icon={ArrowsLeftRight} testId="nav-transfer-requests" onNavigate={handleNavigate} badge={pendingTransfers}>Reassign Requests</Item>
           {isAdmin && (
             <>
               <div className="px-5 pt-4 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Admin</div>

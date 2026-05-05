@@ -2629,7 +2629,13 @@ async def reports_my(user: dict = Depends(get_current_user)):
 # ------------- Inbox / Conversations / Quick Replies -------------
 class QuickReplyInput(BaseModel):
     title: str
-    text: str
+    text: Optional[str] = ""
+    # Optional media attachment — an admin-pre-approved image / video / document
+    # that can be sent as part of the canned reply (within the 24-hour window).
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None  # 'image' | 'video' | 'document' | 'audio'
+    media_filename: Optional[str] = None
+    caption: Optional[str] = None  # used when media has a caption distinct from `text`
 
 class StartChatInput(BaseModel):
     phone: str
@@ -2896,10 +2902,16 @@ async def list_quick_replies(user: dict = Depends(get_current_user)):
 
 @api.post("/quick-replies")
 async def create_quick_reply(body: QuickReplyInput, admin: dict = Depends(require_admin)):
+    if body.media_url and body.media_type not in ("image", "video", "document", "audio"):
+        raise HTTPException(status_code=400, detail="media_type must be image|video|document|audio when media_url is set")
     doc = {
         "id": str(uuid.uuid4()),
         "title": body.title.strip(),
-        "text": body.text,
+        "text": (body.text or "").strip(),
+        "media_url": body.media_url or None,
+        "media_type": body.media_type or None,
+        "media_filename": body.media_filename or None,
+        "caption": (body.caption or "").strip() or None,
         "created_by": admin["id"],
         "created_at": iso(now_utc()),
     }
@@ -2909,9 +2921,19 @@ async def create_quick_reply(body: QuickReplyInput, admin: dict = Depends(requir
 
 @api.put("/quick-replies/{qr_id}")
 async def update_quick_reply(qr_id: str, body: QuickReplyInput, admin: dict = Depends(require_admin)):
+    if body.media_url and body.media_type not in ("image", "video", "document", "audio"):
+        raise HTTPException(status_code=400, detail="media_type must be image|video|document|audio when media_url is set")
     res = await db.quick_replies.update_one(
         {"id": qr_id},
-        {"$set": {"title": body.title.strip(), "text": body.text, "updated_at": iso(now_utc())}},
+        {"$set": {
+            "title": body.title.strip(),
+            "text": (body.text or "").strip(),
+            "media_url": body.media_url or None,
+            "media_type": body.media_type or None,
+            "media_filename": body.media_filename or None,
+            "caption": (body.caption or "").strip() or None,
+            "updated_at": iso(now_utc()),
+        }},
     )
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Quick reply not found")
@@ -5001,11 +5023,15 @@ async def auto_reassign_task():
         noaction_mins = int(rules.get("no_action_reassign_minutes") or 60)
         unopened_cutoff = iso(now_utc() - timedelta(minutes=unopened_mins))
         noaction_cutoff = iso(now_utc() - timedelta(minutes=noaction_mins))
+        # Auto-reassign ONLY for leads still in 'new' status. The moment an
+        # executive moves a lead off 'new' (to contacted / qualified / quoted /
+        # won / lost / etc.), the cron leaves it alone — that human action is
+        # the explicit signal that the agent is engaged with the lead.
         # Unopened: assigned but not opened within X minutes
         cursor = db.leads.find({
             "assigned_to": {"$ne": None},
             "opened_at": None,
-            "status": {"$in": ["new", "contacted"]},
+            "status": "new",
             "last_assignment_at": {"$lt": unopened_cutoff},
         }, {"_id": 0})
         count = 0
@@ -5021,10 +5047,10 @@ async def auto_reassign_task():
                 count += 1
             if count >= 20:
                 break
-        # No action: opened but no activity
+        # No action: opened but no activity (still status='new')
         cursor2 = db.leads.find({
             "assigned_to": {"$ne": None},
-            "status": {"$in": ["new", "contacted"]},
+            "status": "new",
             "last_action_at": {"$lt": noaction_cutoff},
             "opened_at": {"$ne": None},
         }, {"_id": 0}).limit(20)

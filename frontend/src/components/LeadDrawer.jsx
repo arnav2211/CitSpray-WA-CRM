@@ -766,6 +766,7 @@ function CallLogSection({ lead, calls, canEdit, callOutcome, setCallOutcome, cal
 function ActivityPanel({ activity, isAdmin, lead, execs, onClose }) {
   const execMap = Object.fromEntries((execs || []).map(e => [e.id, e.name]));
   const enriched = activity.map(a => ({ ...a, _meta: a.meta || {} }));
+  const history = Array.isArray(lead.assignment_history) ? lead.assignment_history : [];
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-black/50" onClick={onClose} data-testid="activity-panel">
       <div className="w-full max-w-md bg-white border-l border-gray-200 overflow-y-auto" onClick={(e) => e.stopPropagation()}>
@@ -781,7 +782,52 @@ function ActivityPanel({ activity, isAdmin, lead, execs, onClose }) {
             <X size={18} />
           </button>
         </div>
+
+        {/* Assignment History — admin only, derived from lead.assignment_history[] */}
+        {isAdmin && (
+          <div className="p-4 border-b border-gray-200 bg-gray-50" data-testid="assignment-history-section">
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2">
+              Assignment History ({history.length})
+            </div>
+            {history.length === 0 ? (
+              <div className="text-xs text-gray-400 uppercase tracking-widest">No assignments yet</div>
+            ) : (
+              <ol className="space-y-2">
+                {history.map((h, i) => {
+                  const toName = execMap[h.user_id] || (h.user_id ? `${h.user_id.slice(0, 6)}…` : "Unassigned");
+                  const byName = h.by ? (execMap[h.by] || `${h.by.slice(0, 6)}…`) : "System";
+                  const isFirst = i === 0;
+                  const prev = i > 0 ? history[i - 1] : null;
+                  const fromName = prev ? (execMap[prev.user_id] || `${prev.user_id.slice(0, 6)}…`) : null;
+                  return (
+                    <li key={`${h.user_id}-${h.at}-${i}`} className="border-l-2 border-[#002FA7] pl-3 py-1" data-testid={`assignment-history-row-${i}`}>
+                      <div className="text-xs">
+                        {isFirst ? (
+                          <>
+                            <span className="font-bold uppercase tracking-widest text-[#002FA7]">Initial</span>
+                            <span className="text-gray-700"> → assigned to <b>{toName}</b></span>
+                          </>
+                        ) : (
+                          <>
+                            <span className="font-bold uppercase tracking-widest text-[#7C3AED]">Reassigned</span>
+                            <span className="text-gray-700"> from <b>{fromName}</b> → <b>{toName}</b></span>
+                          </>
+                        )}
+                      </div>
+                      <div className="text-[10px] text-gray-500 font-mono mt-0.5">
+                        {fmtIST(h.at)} · by {byName}
+                        {h.reason && <span className="text-gray-400"> · {h.reason}</span>}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ol>
+            )}
+          </div>
+        )}
+
         <div className="p-4 space-y-2">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Activity Log</div>
           {enriched.length === 0 && <div className="text-xs text-gray-400 uppercase tracking-widest">No activity</div>}
           {enriched.map(a => {
             const isAssign = a.action === "lead_assigned" || a.action === "auto_reassigned_unopened" || a.action === "auto_reassigned_noaction";
