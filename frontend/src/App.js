@@ -20,6 +20,7 @@ import Chat from "@/pages/Chat";
 import QuickReplies from "@/pages/QuickReplies";
 import ChatFlows from "@/pages/ChatFlows";
 import InternalQA from "@/pages/InternalQA";
+import TransferRequests from "@/pages/TransferRequests";
 
 export default function App() {
   return (
@@ -37,6 +38,7 @@ export default function App() {
               <Route path="/leads/:id" element={<><Leads /><LeadDetail /></>} />
               <Route path="/followups" element={<Followups />} />
               <Route path="/qa" element={<InternalQA />} />
+              <Route path="/transfer-requests" element={<TransferRequests />} />
               <Route path="/users" element={<AdminOnly><UsersPage /></AdminOnly>} />
               <Route path="/routing" element={<AdminOnly><RoutingRules /></AdminOnly>} />
               <Route path="/integrations" element={<AdminOnly><Integrations /></AdminOnly>} />
