@@ -318,3 +318,7 @@ credentials.json
 *.pem
 *.key
 .credentials
+frontend/node_modules/.cache/default-development/31.pack
+frontend/node_modules/.cache/default-development/31.pack
+frontend/node_modules/.cache/default-development/29.pack
+frontend/node_modules/.cache/default-development/29.pack
