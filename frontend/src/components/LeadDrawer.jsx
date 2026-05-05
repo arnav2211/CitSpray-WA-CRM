@@ -921,7 +921,15 @@ function PhonesRow({ lead, canEdit, onChanged }) {
         return (
           <span key={p} className="flex items-center gap-1 text-xs text-gray-700 bg-gray-50 border border-gray-200 px-2 py-1" data-testid={`lead-phone-${p}`}>
             <Phone size={11} weight={i === 0 ? "fill" : "regular"} className={i === 0 ? "text-[#002FA7]" : "text-gray-400"} />
-            <span className={i === 0 ? "font-semibold" : ""}>{p}</span>
+            <a
+              href={`tel:${(p || "").replace(/\s+/g, "")}`}
+              onClick={(e) => e.stopPropagation()}
+              className={`${i === 0 ? "font-semibold" : ""} hover:text-[#002FA7] hover:underline active:text-[#002FA7]`}
+              title={`Call ${p}`}
+              data-testid={`call-phone-${p}`}
+            >
+              {p}
+            </a>
             {i === 0 && <span className="text-[9px] uppercase tracking-widest text-gray-400 font-bold">Primary</span>}
             {/* WA detection badge */}
             {wa === true && (

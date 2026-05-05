@@ -22,6 +22,23 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 22 (Feb 2026) — Tap-to-call on mobile lead drawer
+- **`PhonesRow` (`LeadDrawer.jsx`)** — phone number text in each phone chip is now an `<a href="tel:{digits}">` anchor with `data-testid="call-phone-{phone}"`. Stopping propagation so tapping the number doesn't fall through to the row click handler. Spaces are stripped from the href so iOS/Android dialers handle `+91 98765 43210` cleanly. Hover/active state colors the link `#002FA7` with underline. WA button, Use-for-WA, Active badge, and Remove buttons remain unchanged.
+- Works on desktop too (no-op or OS phone handler), but primary use case is mobile where tapping a number opens the dialer.
+
+### Iteration 21 (Feb 2026) — Quick Reply UX in /chat + Lead Assignment History UI + Transfer Requests E2E
+- **`/chat` Quick Reply dropdown rewrite (`Chat.jsx`)**:
+  - Added `qr-search-input` autoFocus search box at top of dropdown (`qr-dropdown`); filters by title/text/caption/media_filename (case-insensitive).
+  - Each row now shows a **1-line truncated preview** (`qr-preview-{id}`, CSS `truncate`) instead of multi-line raw text.
+  - Media QRs render a green `qr-media-badge-{id}` chip showing media type (image/video/document/audio).
+  - Empty state: shows "No quick replies — create them in /quick-replies" or "No matches" depending on context.
+  - QR list refreshes when dropdown opens (so admin's newly-created QRs appear without page reload).
+- **Media-enabled Quick Replies — direct send (`applyQR`)**: clicking a QR with `media_url` + `media_type` now POSTs `/whatsapp/send-media` immediately with `{lead_id, media_type, media_url, caption?, filename?, reply_to_message_id?}`. Caption resolves `{{name}}` placeholder. Within24h gate enforced (toast error otherwise). Text-only QRs still append text into the composer for editing (unchanged behavior).
+- **Lead Assignment History UI (`LeadDrawer.jsx` `ActivityPanel`)**: admin-only section `assignment-history-section` rendered above the activity log. Lists `lead.assignment_history[]` chronologically as `Initial → assigned to X` then `Reassigned: from A → B`, with timestamp + actor (`by`) + optional reason. Each row has `assignment-history-row-{i}` testid. Hidden for executives.
+- **Auto-reassign already filters status='new'** — both unopened and noaction cursors in `auto_reassign_task` (server.py L5024-L5049) explicitly filter `status: "new"` per spec. Verified via pytest regression.
+- **Transfer Requests admin UI** — `/transfer-requests` page wired with Pending/Approved/Rejected tabs, polling badge in sidebar (`nav-transfer-requests`), and per-row `tr-approve-{id}` / `tr-reject-{id}` buttons. Backend endpoints `POST /api/inbox/transfer-requests/{id}/approve|reject` flip `lead.assigned_to` correctly via `assign_lead()` (which $pushes to `assignment_history`).
+- **Tested**: 15/15 pytest backend (test_iteration13_qr_transfer_history.py) + 11/11 Playwright frontend assertions green.
+
 ### Iteration 20 (Feb 2026) — /leads number-tab strip rewrite (deterministic per-number chat)
 - **Problem (user-reported)**: had to open the lead twice for the per-number filter to take effect, and tab-switching often left messages from another number visible. Root cause: race between three separate effects (`loadAll` writing messages, `useEffect` watching `lead.active_wa_phone` writing `phoneFilter`, and a third effect re-fetching messages on `phoneFilter`) — they could fire in any order and clobber each other on rapid switches.
 - **Fix — single source of truth**:
