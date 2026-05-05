@@ -5555,13 +5555,7 @@ async def seed_data():
             "created_at": iso(now_utc()),
         })
         logger.info("Seeded admin user")
-    else:
-        # ensure password matches .env
-        if not verify_password(admin_password, existing.get("password_hash", "")):
-            await db.users.update_one(
-                {"username": admin_username},
-                {"$set": {"password_hash": hash_password(admin_password), "role": "admin", "active": True}},
-            )
+  
 
 
     # default routing rules
