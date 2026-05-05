@@ -308,6 +308,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   const [searchHits, setSearchHits] = useState([]); // ids of matching messages
   const [searchCursor, setSearchCursor] = useState(0); // index into searchHits
   const [quickReplies, setQuickReplies] = useState([]);
+  const [qrSearch, setQrSearch] = useState("");
   const [templates, setTemplates] = useState([]);
   const [savingMeta, setSavingMeta] = useState(false);
   const [newNote, setNewNote] = useState("");
@@ -373,6 +374,13 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
     api.get("/quick-replies").then(({ data }) => setQuickReplies(data)).catch(() => {});
     api.get("/whatsapp/templates").then(({ data }) => setTemplates(data.filter(t => !t.status || t.status === "APPROVED" || !t.synced_from_meta))).catch(() => {});
   }, []);
+
+  // Refresh QR list when dropdown opens
+  useEffect(() => {
+    if (showQR) {
+      api.get("/quick-replies").then(({ data }) => setQuickReplies(data)).catch(() => {});
+    }
+  }, [showQR]);
 
   // Scroll to bottom on new messages
   useEffect(() => {
@@ -480,10 +488,45 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
     } finally { setSending(false); }
   };
 
-  const applyQR = (qr) => {
+  const applyQR = async (qr) => {
+    // Media QR → send immediately (image/video/document/audio + optional caption)
+    if (qr.media_url && qr.media_type) {
+      if (!within24h) {
+        toast.error("Outside 24-hour window — cannot send media");
+        return;
+      }
+      setSending(true);
+      try {
+        const cap = (qr.caption || qr.text || "").replace("{{name}}", conv.customer_name || "");
+        const payload = {
+          lead_id: conv.id,
+          media_type: qr.media_type,
+          media_url: qr.media_url,
+        };
+        if (cap.trim() && (qr.media_type === "image" || qr.media_type === "video" || qr.media_type === "document")) {
+          payload.caption = cap.trim();
+        }
+        if (qr.media_type === "document" && qr.media_filename) payload.filename = qr.media_filename;
+        if (replyTo?.id) payload.reply_to_message_id = replyTo.id;
+        await api.post("/whatsapp/send-media", payload);
+        setReplyTo(null);
+        toast.success(`Sent ${qr.media_type}`);
+        loadMessages();
+        onChanged?.();
+      } catch (e) {
+        toast.error(errMsg(e, "Quick reply send failed"));
+      } finally {
+        setSending(false);
+        setShowQR(false);
+        setQrSearch("");
+      }
+      return;
+    }
+    // Text-only QR → append to draft for editing
     const text = (qr.text || "").replace("{{name}}", conv.customer_name || "");
     setDraft((d) => (d ? d + " " : "") + text);
     setShowQR(false);
+    setQrSearch("");
   };
 
   const requestTransfer = async () => {
@@ -818,14 +861,63 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
           </div>
 
           {/* Quick reply dropdown */}
-          {showQR && quickReplies.length > 0 && (
-            <div className="bg-white border-t border-gray-200 max-h-48 overflow-y-auto">
-              {quickReplies.map(qr => (
-                <button key={qr.id} onClick={() => applyQR(qr)} className="w-full text-left px-4 py-2 hover:bg-gray-50 border-b border-gray-100" data-testid={`qr-${qr.id}`}>
-                  <div className="text-xs font-bold uppercase tracking-widest text-gray-500">{qr.title}</div>
-                  <div className="text-sm text-gray-800">{qr.text}</div>
-                </button>
-              ))}
+          {showQR && (
+            <div className="bg-white border-t border-gray-200 max-h-64 overflow-hidden flex flex-col" data-testid="qr-dropdown">
+              <div className="px-3 py-2 border-b border-gray-100 bg-gray-50">
+                <input
+                  autoFocus
+                  type="text"
+                  value={qrSearch}
+                  onChange={(e) => setQrSearch(e.target.value)}
+                  placeholder="Search quick replies…"
+                  className="w-full border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-[#25D366]"
+                  data-testid="qr-search-input"
+                />
+              </div>
+              <div className="overflow-y-auto flex-1">
+                {(() => {
+                  const q = qrSearch.trim().toLowerCase();
+                  const filtered = q
+                    ? quickReplies.filter((qr) =>
+                        (qr.title || "").toLowerCase().includes(q) ||
+                        (qr.text || "").toLowerCase().includes(q) ||
+                        (qr.caption || "").toLowerCase().includes(q) ||
+                        (qr.media_filename || "").toLowerCase().includes(q)
+                      )
+                    : quickReplies;
+                  if (filtered.length === 0) {
+                    return (
+                      <div className="px-4 py-6 text-xs uppercase tracking-widest text-gray-400 text-center" data-testid="qr-empty">
+                        {quickReplies.length === 0 ? "No quick replies — create them in /quick-replies" : "No matches"}
+                      </div>
+                    );
+                  }
+                  return filtered.map((qr) => {
+                    const previewText = (qr.text || qr.caption || (qr.media_filename ? `[${qr.media_type}] ${qr.media_filename}` : "")).replace(/\s+/g, " ").trim();
+                    return (
+                      <button
+                        key={qr.id}
+                        onClick={() => applyQR(qr)}
+                        disabled={sending}
+                        className="w-full text-left px-4 py-2 hover:bg-gray-50 border-b border-gray-100 disabled:opacity-50"
+                        data-testid={`qr-${qr.id}`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <div className="text-xs font-bold uppercase tracking-widest text-gray-500 truncate flex-1">{qr.title}</div>
+                          {qr.media_url && qr.media_type && (
+                            <span className="bg-[#25D366] text-white px-1.5 py-0.5 text-[8px] uppercase tracking-widest font-bold shrink-0" data-testid={`qr-media-badge-${qr.id}`}>
+                              {qr.media_type}
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-sm text-gray-800 truncate" data-testid={`qr-preview-${qr.id}`}>
+                          {previewText || <span className="text-gray-400 italic">(no text)</span>}
+                        </div>
+                      </button>
+                    );
+                  });
+                })()}
+              </div>
             </div>
           )}
           {showTpl && (
