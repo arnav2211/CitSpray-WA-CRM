@@ -4487,12 +4487,13 @@ async def upload_flow_media(
     request: Request,
     file: UploadFile = File(...),
     kind: str = Form("document"),
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(get_current_user),
 ):
     """Accept a local file upload and return an ABSOLUTE publicly accessible URL.
-    For audio/video we transcode (remux) to a WhatsApp-supported container/codec so
-    Meta's recipient side can decode it. Meta requires a fully-qualified HTTPS URL,
-    so we return e.g. `https://<host>/api/media/<uuid>.jpg`."""
+    Any authenticated user (admin or executive) can upload — this is the common
+    entry point for WhatsApp voice notes, images, videos, documents, and chatflow
+    builder assets. Per-lead send permission is enforced separately in the
+    downstream /whatsapp/send-media endpoint via _assert_chat_permitted."""
     if kind not in ALLOWED_MEDIA_KINDS:
         raise HTTPException(status_code=400, detail=f"kind must be one of {sorted(ALLOWED_MEDIA_KINDS)}")
     original = (file.filename or "upload.bin").strip().replace("/", "_").replace("\\", "_")
@@ -4532,7 +4533,7 @@ async def upload_flow_media(
             "size": len(final_bytes),
             "kind": kind,
             "uploaded_at": iso(now_utc()),
-            "uploaded_by": admin["id"],
+            "uploaded_by": user["id"],
         }},
         upsert=True,
     )
