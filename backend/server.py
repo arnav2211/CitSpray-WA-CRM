@@ -5316,15 +5316,47 @@ def _render_email_var(text: str, lead: Dict[str, Any], to_email: str = "") -> st
     return out
 
 
+def _looks_like_html(text: str) -> bool:
+    """Heuristic: body is HTML if it contains common HTML tags."""
+    if not text:
+        return False
+    sample = text.lower()
+    return bool(re.search(r"<\s*(html|body|table|div|p|h[1-6]|br|img|a|span|strong|em|ul|ol|li|tr|td|tbody)[\s>]", sample))
+
+
+def _html_to_plain(html: str) -> str:
+    """Strip HTML tags for the text/plain alternative part."""
+    if not html:
+        return ""
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup.find_all(["br", "p", "tr", "li", "div"]):
+            tag.append("\n")
+        text = soup.get_text(" ")
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n+", "\n", text).strip()
+        return text
+    except Exception:
+        return re.sub(r"<[^>]+>", "", html)
+
+
 def _smtp_send_blocking(cfg: Dict[str, Any], to_email: str, subject: str, body: str, attachments: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Synchronous SMTP send executed in a thread. Returns {ok, error?}."""
+    """Synchronous SMTP send executed in a thread. Returns {ok, error?}.
+    Auto-detects HTML in `body` and sends as multipart/alternative with a
+    plain-text fallback. Plain-text bodies are sent as text/plain."""
     msg = EmailMessage()
     from_name = (cfg.get("from_name") or "").strip()
     sender_email = (cfg.get("email") or "").strip()
     msg["From"] = f'"{from_name}" <{sender_email}>' if from_name else sender_email
     msg["To"] = to_email
     msg["Subject"] = subject or ""
-    msg.set_content(body or "", subtype="plain")
+    is_html = _looks_like_html(body or "")
+    if is_html:
+        # Set plain-text fallback first, then add HTML alternative.
+        msg.set_content(_html_to_plain(body or "") or " ", subtype="plain")
+        msg.add_alternative(body or "", subtype="html")
+    else:
+        msg.set_content(body or "", subtype="plain")
     # Attach files from /app/backend/uploads/<stored_name>
     for att in attachments or []:
         try:

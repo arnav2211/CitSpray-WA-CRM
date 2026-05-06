@@ -22,6 +22,23 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 26 (Feb 2026) — Email Auto-Send: HTML body support + preview
+- **Backend HTML auto-detect** (`server.py`): `_looks_like_html()` heuristic + `_html_to_plain()` BeautifulSoup-based plain-text extractor. `_smtp_send_blocking` now sets HTML bodies as multipart/alternative — `text/plain` (auto-stripped fallback) + `text/html` (the original markup). Plain-text bodies still send as text/plain only. Variable substitution (`{{name}}` etc.) works inside HTML markup unchanged.
+- **Frontend Settings preview pane** (`Settings.jsx → EmailAutoSendPanel`): added `Edit | Preview` tab toggle next to the Body label. Preview renders the substituted (sample-value) body inside a sandboxed `<iframe srcDoc>` for HTML, or a `<pre>`-style block for plain text. Auto-detects HTML using the same heuristic as the backend so the user knows whether it'll send as HTML. Sample vars: name=Akash, requirement=Pumps, phone=+91 99999 00001, email=akash@example.com, source=Manual.
+- **Verified live**: PUT template with `<html>…<h2>Hello {{name}}</h2>…<strong>{{requirement}}</strong>…</html>` → POST /api/settings/email/test-send → SMTP delivered to aroma@citspray.com with substituted values (`<h2>Hello Test User</h2><strong>Sample requirement</strong>`).
+
+### Iteration 25 (Feb 2026) — Email Auto-Send (SMTP + template + per-lead emails[])
+- **SMTP config** in `system_settings.email_smtp`: host (default smtp.hostinger.com) / port (465) / security (ssl|tls|none) / email / password (masked + eye-toggle in UI) / from_name / enabled. Blank password keeps existing; empty string clears.
+- **Email template** in `system_settings.email_template`: subject + body + attachments[] (uploaded via existing `/chatflows/upload-media`).
+- **Variable substitution** (`_render_email_var`): `{{name}}`, `{{requirement}}`, `{{phone}}`, `{{email}}`, `{{source}}` in subject AND body.
+- **Per-lead `emails[]` array** + `email_sent_to[]` dedup tracker. Endpoints: `POST /api/leads/{id}/emails` (RBAC: admin or assigned-exec; 409 on duplicate; first email becomes primary, subsequent go to emails[]; auto-fires SMTP for the new address). `DELETE /api/leads/{id}/emails?email=X` (auto-promotes next email[] to primary if removing the primary).
+- **Auto-send triggers** (`auto_send_email_on_create` + `auto_send_email_to_address`): fires on `_create_lead_internal` AND on add-email endpoint. Idempotent — each address mailed at most once per lead (refreshes `email_sent_to` from DB before sending). Best-effort — failures are logged in `email_send_logs` but never block lead creation.
+- **Test send** endpoint `POST /api/settings/email/test-send` — admin only, fakes a lead with sample values, fires the SMTP path, returns 502 with detail on failure.
+- **Live verified** against `smtp.hostinger.com:465 SSL` with `aroma@citspray.com` — test-send returned `{ok: true}`. Lead create with email auto-populated `lead.email_sent_to` and `last_email_sent_at`.
+- **Frontend `Settings.jsx` → `EmailAutoSendPanel`** — full SMTP form (host/port/security/email/from_name/password with eye toggle/enabled), template form (subject + body + attachment uploader with remove), Test send. All `data-testid`'d.
+- **Frontend `LeadDrawer.jsx` → `EmailsRow`** — primary email + emails[] rendered as pills with mailto: links, "Mailed" green badge for addresses in `email_sent_to`, Add/Remove inline. Removed the simple `email` line from the lead header (replaced by this row).
+- **Tested**: 15/15 pytest backend + 100% frontend Playwright assertions (iter15 testing-agent run).
+
 ### Iteration 24 (Feb 2026) — Manual lead creator owns the lead
 - **`POST /api/leads`** (`server.py` ~L1602): when an executive creates a lead manually, force-assign it to themselves (overrides any `assigned_to` payload value, skips round-robin). Admins are unaffected — they can still pass an explicit assignee or let `_create_lead_internal` route via round-robin / buyleads rules. Verified via curl: exec→self (match), exec sneaking `assigned_to=other`→still self, admin→round-robin still picks an agent.
 
