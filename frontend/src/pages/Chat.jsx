@@ -45,12 +45,37 @@ export default function Chat() {
   const [search, setSearch] = useState("");
   const [filterUnread, setFilterUnread] = useState(false);
   const [filterUnreplied, setFilterUnreplied] = useState(false);
+  const [filterReplied, setFilterReplied] = useState(false);
   const [filterStatus, setFilterStatus] = useState("");
   const [filterAssignee, setFilterAssignee] = useState("");
   const [execs, setExecs] = useState([]);
   const [showNewChat, setShowNewChat] = useState(false);
 
   const isAdmin = user.role === "admin";
+
+  // Mobile detection — used to wire the phone back-button to "close current
+  // chat" instead of navigating away from /chat entirely.
+  const isMobilePage = useMemo(() => {
+    if (typeof window === "undefined") return false;
+    const touch = (("ontouchstart" in window) || (navigator.maxTouchPoints > 0));
+    const narrow = window.matchMedia ? window.matchMedia("(max-width: 767px)").matches : window.innerWidth < 768;
+    return touch && narrow;
+  }, []);
+
+  // On mobile, when the user opens a chat (activeId set) push a synthetic
+  // history entry so the browser back-button pops the chat-thread view back
+  // to the chat list instead of leaving /chat altogether.
+  useEffect(() => {
+    if (!isMobilePage) return;
+    if (!activeId) return;
+    window.history.pushState({ chatOpen: activeId }, "");
+    const onPop = () => {
+      // back button pressed while a chat is open on mobile → close chat
+      setActiveId(null);
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, [isMobilePage, activeId]);
 
   const fetchConvs = useCallback(async () => {
     try {
@@ -59,17 +84,26 @@ export default function Chat() {
           q: search || undefined,
           only_unread: filterUnread || undefined,
           only_unreplied: filterUnreplied || undefined,
+          only_replied: filterReplied || undefined,
           status: filterStatus || undefined,
           assigned_to: filterAssignee || undefined,
         },
       });
-      setConvs(data);
+      // Sort by last_message timestamp DESC (full ISO datetime → lexicographic
+      // comparison is correct because ISO-8601 sorts chronologically). Falls
+      // back to last_in_at, last_out_at, then last_action_at.
+      const sorted = [...data].sort((a, b) => {
+        const ta = a.last_message?.at || a.last_in_at || a.last_out_at || a.last_action_at || "";
+        const tb = b.last_message?.at || b.last_in_at || b.last_out_at || b.last_action_at || "";
+        return tb.localeCompare(ta);
+      });
+      setConvs(sorted);
     } catch (e) {
       // silent; toast on hard fail
       const msg = errMsg(e, "");
       if (msg && !msg.toLowerCase().includes("network")) toast.error(msg);
     }
-  }, [search, filterUnread, filterUnreplied, filterStatus, filterAssignee]);
+  }, [search, filterUnread, filterUnreplied, filterReplied, filterStatus, filterAssignee]);
 
   // Initial + filter changes
   useEffect(() => { fetchConvs(); }, [fetchConvs]);
@@ -144,6 +178,7 @@ export default function Chat() {
           <div className="flex items-center gap-2 flex-wrap">
             <FilterChip active={filterUnread} onClick={() => setFilterUnread(v => !v)} testId="filter-unread">Unread</FilterChip>
             <FilterChip active={filterUnreplied} onClick={() => setFilterUnreplied(v => !v)} testId="filter-unreplied">Not replied</FilterChip>
+            <FilterChip active={filterReplied} onClick={() => setFilterReplied(v => !v)} testId="filter-replied">Replied</FilterChip>
             <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)} className="border border-gray-300 px-2 py-1 text-xs" data-testid="filter-status">
               <option value="">All status</option>
               {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
@@ -319,6 +354,15 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   const scrollRef = useRef(null);
   const fileInputRef = useRef(null);
   const fileKindRef = useRef("image");
+  const inputRef = useRef(null);
+
+  // Mobile detection — touch + small viewport. Re-evaluated on mount.
+  const isMobile = useMemo(() => {
+    if (typeof window === "undefined") return false;
+    const touch = (("ontouchstart" in window) || (navigator.maxTouchPoints > 0));
+    const narrow = window.matchMedia ? window.matchMedia("(max-width: 767px)").matches : window.innerWidth < 768;
+    return touch && narrow;
+  }, []);
 
   const exec = execs.find(e => e.id === conv.assigned_to);
   const within24h = !!conv.within_24h;
@@ -381,6 +425,18 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
       api.get("/quick-replies").then(({ data }) => setQuickReplies(data)).catch(() => {});
     }
   }, [showQR]);
+
+  // Auto-expand the message input as the user types (WhatsApp-style). Caps
+  // at ~6 lines; beyond that the textarea internally scrolls.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const max = 144; // ~6 lines @ 24px line-height
+    const next = Math.min(el.scrollHeight, max);
+    el.style.height = `${next}px`;
+    el.style.overflowY = el.scrollHeight > max ? "auto" : "hidden";
+  }, [draft]);
 
   // Scroll to bottom on new messages
   useEffect(() => {
@@ -996,13 +1052,26 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                   </button>
                 </div>
               ) : (
-                <textarea value={draft} onChange={(e) => setDraft(e.target.value)}
+                <textarea
+                  ref={inputRef}
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
                   disabled={!within24h}
-                  onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+                  onKeyDown={(e) => {
+                    // Desktop: Enter sends, Shift+Enter newline.
+                    // Mobile: Enter ALWAYS inserts a newline; only the Send button submits.
+                    if (e.key === "Enter" && !e.shiftKey && !isMobile) {
+                      e.preventDefault();
+                      send();
+                    }
+                  }}
                   placeholder={within24h ? "Type a message…" : "Outside 24-hour window — use a template (Tpl ↑)"}
                   rows={1}
-                  className="flex-1 resize-none border border-gray-300 px-3 py-2 text-sm outline-none focus:border-[#25D366] disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
-                  data-testid="chat-input" />
+                  style={{ maxHeight: 144 }}
+                  className="flex-1 resize-none border border-gray-300 px-3 py-2 text-sm leading-6 outline-none focus:border-[#25D366] disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
+                  data-testid="chat-input"
+                  data-mobile={isMobile ? "1" : "0"}
+                />
               )}
               {!recording && (
                 <button onClick={send} disabled={!draft.trim() || sending || !within24h}
