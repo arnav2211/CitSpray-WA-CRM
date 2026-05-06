@@ -1458,6 +1458,7 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         "enquiry_type": data.get("enquiry_type"),
         "source": data.get("source", "Manual"),
         "contact_link": data.get("contact_link"),
+        "justdial_profile_url": data.get("justdial_profile_url"),
         "source_data": data.get("source_data", {}),
         "raw_email_html": data.get("raw_email_html"),
         "raw_email_text": data.get("raw_email_text"),
@@ -1599,6 +1600,12 @@ async def create_lead(body: LeadCreate, user: dict = Depends(get_current_user)):
                     },
                 )
     data["dedup_hash"] = _lead_dedup_hash(data["customer_name"], iso(now_utc()), data.get("phone", "") or "")
+    # If an executive is creating a lead manually, force-assign it to themselves
+    # (don't run round-robin or honour any payload-supplied assignee). Admins
+    # retain the ability to either pass an explicit assignee or let
+    # _create_lead_internal route via round-robin / buyleads rules.
+    if user["role"] == "executive":
+        data["assigned_to"] = user["id"]
     lead = await _create_lead_internal(data, by_user_id=user["id"])
     return lead
 
@@ -1639,6 +1646,42 @@ async def update_lead(lead_id: str, body: LeadUpdate, user: dict = Depends(get_c
     await log_activity(user["id"], "lead_updated", lead_id, {"fields": list(updates.keys())})
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     return lead
+
+
+@api.delete("/leads/{lead_id}")
+async def delete_lead(lead_id: str, admin: dict = Depends(require_admin)):
+    """Admin-only hard-delete of a lead and its related data. Cascades:
+    messages, internal_messages, followups, call_logs, activity_logs,
+    transfer_requests. Email logs are kept (audit trail) but their lead_id
+    pointer is nulled."""
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    summary = {
+        "lead_id": lead_id,
+        "customer_name": lead.get("customer_name"),
+        "deleted_by": admin["id"],
+        "deleted_at": iso(now_utc()),
+    }
+    # Cascade
+    msgs = (await db.messages.delete_many({"lead_id": lead_id})).deleted_count
+    intms = (await db.internal_messages.delete_many({"lead_id": lead_id})).deleted_count
+    fups = (await db.followups.delete_many({"lead_id": lead_id})).deleted_count
+    calls = (await db.call_logs.delete_many({"lead_id": lead_id})).deleted_count
+    acts = (await db.activity_logs.delete_many({"lead_id": lead_id})).deleted_count
+    trs = (await db.transfer_requests.delete_many({"lead_id": lead_id})).deleted_count
+    await db.email_logs.update_many({"lead_id": lead_id}, {"$set": {"lead_id": None, "lead_deleted_at": iso(now_utc())}})
+    await db.leads.delete_one({"id": lead_id})
+    summary.update({
+        "messages_deleted": msgs,
+        "internal_messages_deleted": intms,
+        "followups_deleted": fups,
+        "call_logs_deleted": calls,
+        "activity_logs_deleted": acts,
+        "transfer_requests_deleted": trs,
+    })
+    logger.info(f"Lead deleted by admin {admin['id']}: {summary}")
+    return summary
 
 @api.post("/leads/{lead_id}/notes")
 async def add_note(lead_id: str, body: NoteInput, user: dict = Depends(get_current_user)):
@@ -1748,13 +1791,6 @@ async def reassign_lead(lead_id: str, body: ReassignInput, admin: dict = Depends
     await assign_lead(lead_id, target_user_id=body.assigned_to, by_user_id=admin["id"])
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     return lead
-
-@api.delete("/leads/{lead_id}")
-async def delete_lead(lead_id: str, admin: dict = Depends(require_admin)):
-    await db.leads.delete_one({"id": lead_id})
-    await db.messages.delete_many({"lead_id": lead_id})
-    await db.followups.delete_many({"lead_id": lead_id})
-    return {"ok": True}
 
 @api.get("/leads/{lead_id}/activity")
 async def lead_activity(lead_id: str, user: dict = Depends(get_current_user)):
@@ -2653,6 +2689,7 @@ async def list_conversations(
     q: Optional[str] = None,
     only_unread: bool = False,
     only_unreplied: bool = False,
+    only_replied: bool = False,
     status: Optional[str] = None,
     assigned_to: Optional[str] = None,
     include_all: bool = False,
@@ -2755,6 +2792,9 @@ async def list_conversations(
         if only_unread and (m.get("unread") or 0) == 0:
             continue
         if only_unreplied and not unreplied:
+            continue
+        # only_replied: customer has ever sent us at least one inbound message
+        if only_replied and not last_in_at:
             continue
         # Only show WhatsApp-active leads (has_whatsapp=true OR at least one message exchanged)
         is_wa_active = bool(ld.get("has_whatsapp")) or bool(last)
@@ -3374,6 +3414,33 @@ def parse_justdial_email(raw_text: str, raw_html: str) -> dict:
 
     return out
 
+def _normalize_justdial_link(url: Optional[str]) -> Optional[str]:
+    """Strip query/tracking params from a Justdial profile/contact link so the same
+    lead URL is recognised across emails (Justdial appends ?ref=… tokens)."""
+    if not url:
+        return None
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(url.strip())
+        # Keep scheme + host + path only — drop query + fragment + trailing slash.
+        host = (parts.netloc or "").lower()
+        path = (parts.path or "").rstrip("/")
+        norm = urlunsplit((parts.scheme.lower() or "https", host, path, "", ""))
+        return norm or None
+    except Exception:
+        return url.strip() or None
+
+
+async def _find_lead_by_justdial_link(url: Optional[str]) -> Optional[dict]:
+    norm = _normalize_justdial_link(url)
+    if not norm:
+        return None
+    return await db.leads.find_one(
+        {"justdial_profile_url": norm},
+        {"_id": 0, "id": 1, "customer_name": 1, "assigned_to": 1, "source": 1, "phone": 1},
+    )
+
+
 @api.post("/ingest/justdial")
 async def ingest_justdial(body: JustdialIngestInput):
     """Public endpoint that accepts a Justdial email payload.
@@ -3409,6 +3476,21 @@ async def ingest_justdial(body: JustdialIngestInput):
         except Exception:
             created_override = None
 
+    # Profile-URL based dedup — short-circuit BEFORE creating a new lead. If a
+    # lead already exists for the same Justdial profile link, return that lead
+    # and mark the email as a duplicate.
+    contact_link = parsed.get("contact_link")
+    profile_url = _normalize_justdial_link(contact_link)
+    if profile_url:
+        existing_by_url = await _find_lead_by_justdial_link(profile_url)
+        if existing_by_url:
+            await db.email_logs.update_one(
+                {"id": email_doc["id"]},
+                {"$set": {"processed": True, "lead_id": existing_by_url["id"], "duplicate": True, "dedup_reason": "justdial_profile_url"}},
+            )
+            await log_activity(None, "justdial_duplicate_profile_url", existing_by_url["id"], {"url": profile_url})
+            return {"ok": True, "lead_id": existing_by_url["id"], "duplicate": True, "dedup_reason": "justdial_profile_url"}
+
     data = {
         "customer_name": name,
         "requirement": parsed.get("requirement"),
@@ -3417,7 +3499,8 @@ async def ingest_justdial(body: JustdialIngestInput):
         "state": parsed.get("state"),
         "phone": parsed.get("phone"),
         "source": "Justdial",
-        "contact_link": parsed.get("contact_link"),
+        "contact_link": contact_link,
+        "justdial_profile_url": profile_url,
         "source_data": {"timestamp": ts},
         "raw_email_html": body.raw_email_html,
         "raw_email_text": body.raw_email_text,
@@ -5469,6 +5552,36 @@ async def _gmail_poll_one_slot(slot: str) -> dict:
                     ts = parsed.get("timestamp") or iso(now_utc())
                     content_hash = hashlib.sha256(((bodies.get("text") or "") + (bodies.get("html") or "")).encode("utf-8")).hexdigest()
                     dhash = _lead_dedup_hash(name, ts, content_hash[:16])
+                    # Profile-URL dedup — skip ingestion if the same Justdial profile link
+                    # already maps to an existing lead. Mark the email as processed/duplicate
+                    # but DO NOT create a new lead.
+                    contact_link = parsed.get("contact_link")
+                    profile_url = _normalize_justdial_link(contact_link)
+                    if profile_url:
+                        existing_by_url = await _find_lead_by_justdial_link(profile_url)
+                        if existing_by_url:
+                            await db.email_logs.insert_one({
+                                "id": str(uuid.uuid4()),
+                                "from": from_email,
+                                "subject": subject,
+                                "raw_html": bodies.get("html"),
+                                "raw_text": bodies.get("text"),
+                                "received_at": iso(now_utc()),
+                                "processed": True,
+                                "lead_id": existing_by_url["id"],
+                                "duplicate": True,
+                                "dedup_reason": "justdial_profile_url",
+                                "gmail_id": mid,
+                                "gmail_slot": slot,
+                                "gmail_account_email": (cfg or {}).get("email"),
+                            })
+                            await log_activity(None, "justdial_duplicate_profile_url", existing_by_url["id"], {"url": profile_url, "gmail_id": mid})
+                            summary["skipped_dupe"] = int(summary.get("skipped_dupe") or 0) + 1
+                            try:
+                                service.users().messages().modify(userId="me", id=mid, body={"removeLabelIds": ["UNREAD"]}).execute()
+                            except Exception as e:
+                                logger.warning(f"Could not mark Gmail msg {mid} read after URL-dedup (slot={slot}): {e}")
+                            continue
                     # Use Justdial's "Search Date & Time" (IST) as the lead's created_at.
                     # Fallback to Gmail's internalDate (the moment the email arrived).
                     created_override = None
@@ -5494,7 +5607,8 @@ async def _gmail_poll_one_slot(slot: str) -> dict:
                         "state": parsed.get("state"),
                         "phone": parsed.get("phone"),
                         "source": "Justdial",
-                        "contact_link": parsed.get("contact_link"),
+                        "contact_link": contact_link,
+                        "justdial_profile_url": profile_url,
                         "source_data": {"timestamp": ts, "subject": subject, "from": from_email, "gmail_id": mid, "gmail_slot": slot, "gmail_account_email": (cfg or {}).get("email")},
                         "raw_email_html": bodies.get("html"),
                         "raw_email_text": bodies.get("text"),
@@ -5589,6 +5703,7 @@ async def seed_data():
     # indexes
     await db.users.create_index("username", unique=True)
     await db.leads.create_index("dedup_hash")
+    await db.leads.create_index("justdial_profile_url")
     await db.leads.create_index("assigned_to")
     await db.leads.create_index("status")
     await db.leads.create_index("created_at")

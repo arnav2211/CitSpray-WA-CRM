@@ -265,6 +265,30 @@ export default function LeadDrawer({ leadId, onClose }) {
     } catch (e) { toast.error(errMsg(e)); }
   };
 
+  const deleteLead = async () => {
+    // Two-step confirmation. Both must be confirmed by the admin.
+    const customerName = lead?.customer_name || "this lead";
+    const ok1 = window.confirm(
+      `Delete lead "${customerName}" permanently?\n\n` +
+      `This will hard-delete the lead AND all related data:\n` +
+      `• WhatsApp messages\n• Internal Q&A messages\n• Call logs\n• Follow-ups\n• Activity logs\n• Transfer requests\n\n` +
+      `This action CANNOT be undone.`
+    );
+    if (!ok1) return;
+    const ok2 = window.confirm(
+      `Final warning — are you absolutely sure?\n\n` +
+      `Click OK to permanently delete "${customerName}". Click Cancel to keep the lead.`
+    );
+    if (!ok2) return;
+    try {
+      await api.delete(`/leads/${leadId}`);
+      toast.success(`Lead "${customerName}" deleted`);
+      onClose?.();
+    } catch (e) {
+      toast.error(errMsg(e, "Delete failed"));
+    }
+  };
+
   const scheduleFollowup = async () => {
     if (!fuDate) { toast.error("Pick a date/time"); return; }
     try {
@@ -380,6 +404,16 @@ export default function LeadDrawer({ leadId, onClose }) {
               <option value="">— Reassign —</option>
               {execs.map((x) => <option key={x.id} value={x.id}>{x.role === "admin" ? `${x.name} (admin)` : x.name}</option>)}
             </select>
+          )}
+          {isAdmin && (
+            <button
+              onClick={deleteLead}
+              className="border border-[#E60000] text-[#E60000] hover:bg-[#E60000] hover:text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1"
+              title="Delete this lead permanently"
+              data-testid="lead-delete-btn"
+            >
+              <Trash size={12} weight="bold" /> Delete
+            </button>
           )}
           <div className="text-xs text-gray-500 ml-auto flex items-center gap-1">
             <Clock size={12} />
