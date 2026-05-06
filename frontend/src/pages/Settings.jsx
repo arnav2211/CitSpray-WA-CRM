@@ -828,10 +828,28 @@ function EmailAutoSendPanel() {
   const [tpl, setTpl] = useState(null);
   const [tplForm, setTplForm] = useState({ subject: "", body: "", attachments: [] });
   const [savingTpl, setSavingTpl] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
   const [uploadingAtt, setUploadingAtt] = useState(false);
   const [testTo, setTestTo] = useState("");
   const [sendingTest, setSendingTest] = useState(false);
   const fileRef = React.useRef(null);
+
+  // Detect HTML in the current draft and produce a preview with sample
+  // variable substitution. Same heuristic as the backend.
+  const bodyIsHtml = React.useMemo(() => {
+    const s = (tplForm.body || "").toLowerCase();
+    return /<\s*(html|body|table|div|p|h[1-6]|br|img|a|span|strong|em|ul|ol|li|tr|td|tbody)[\s>]/.test(s);
+  }, [tplForm.body]);
+  const previewHtml = React.useMemo(() => {
+    const sample = { name: "Akash", requirement: "Pumps", phone: "+91 99999 00001", email: "akash@example.com", source: "Manual" };
+    const sub = (s) => (s || "")
+      .replaceAll("{{name}}", sample.name)
+      .replaceAll("{{requirement}}", sample.requirement)
+      .replaceAll("{{phone}}", sample.phone)
+      .replaceAll("{{email}}", sample.email)
+      .replaceAll("{{source}}", sample.source);
+    return sub(tplForm.body);
+  }, [tplForm.body]);
 
   const load = async () => {
     try {
@@ -1007,6 +1025,7 @@ function EmailAutoSendPanel() {
         <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Email template</div>
         <div className="text-xs text-gray-500">
           Variables: <span className="kbd">{"{{name}}"}</span> <span className="kbd">{"{{requirement}}"}</span> <span className="kbd">{"{{phone}}"}</span> <span className="kbd">{"{{email}}"}</span> <span className="kbd">{"{{source}}"}</span>
+          <span className="ml-2 text-gray-400">— HTML supported (auto-detected). Variables work inside HTML too.</span>
         </div>
         <label className="block">
           <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Subject</div>
@@ -1014,13 +1033,39 @@ function EmailAutoSendPanel() {
             placeholder="Thank you for your enquiry, {{name}}"
             className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="email-tpl-subject" />
         </label>
-        <label className="block">
-          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Body</div>
-          <textarea rows={8} value={tplForm.body} onChange={(e) => setTplForm((f) => ({ ...f, body: e.target.value }))}
-            placeholder="Hi {{name}},&#10;&#10;Thanks for your enquiry about {{requirement}}…"
-            className="w-full border border-gray-300 px-3 py-2 text-sm font-mono whitespace-pre-wrap"
-            data-testid="email-tpl-body" />
-        </label>
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Body</div>
+            <div className="flex items-center gap-1">
+              <button type="button" onClick={() => setShowPreview(false)} className={`px-2 py-1 text-[10px] uppercase tracking-widest font-bold border ${!showPreview ? "bg-gray-900 text-white border-gray-900" : "border-gray-300 hover:bg-gray-100"}`} data-testid="email-tpl-tab-edit">Edit</button>
+              <button type="button" onClick={() => setShowPreview(true)} className={`px-2 py-1 text-[10px] uppercase tracking-widest font-bold border ${showPreview ? "bg-gray-900 text-white border-gray-900" : "border-gray-300 hover:bg-gray-100"}`} data-testid="email-tpl-tab-preview">Preview</button>
+            </div>
+          </div>
+          {showPreview ? (
+            <div className="border border-gray-300 bg-white" data-testid="email-tpl-preview">
+              {bodyIsHtml ? (
+                <iframe
+                  title="email-preview"
+                  srcDoc={previewHtml}
+                  sandbox=""
+                  className="w-full"
+                  style={{ height: 480, border: 0 }}
+                  data-testid="email-tpl-preview-iframe"
+                />
+              ) : (
+                <div className="p-4 text-sm whitespace-pre-wrap font-mono">{previewHtml || <span className="text-gray-400 italic">(empty)</span>}</div>
+              )}
+              <div className="px-3 py-1.5 border-t border-gray-200 text-[10px] uppercase tracking-widest text-gray-400 bg-gray-50">
+                Detected: {bodyIsHtml ? "HTML" : "Plain text"} · variables substituted with sample values (Akash, Pumps, etc.)
+              </div>
+            </div>
+          ) : (
+            <textarea rows={12} value={tplForm.body} onChange={(e) => setTplForm((f) => ({ ...f, body: e.target.value }))}
+              placeholder="Hi {{name}},&#10;&#10;Thanks for your enquiry about {{requirement}}…&#10;&#10;HTML works too — paste full <table>…</table> markup."
+              className="w-full border border-gray-300 px-3 py-2 text-sm font-mono whitespace-pre-wrap"
+              data-testid="email-tpl-body" />
+          )}
+        </div>
         <div>
           <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Attachments ({tplForm.attachments.length})</div>
           {tplForm.attachments.length > 0 && (
