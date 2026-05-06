@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
 import {
@@ -7,19 +7,131 @@ import {
 
 const COLORS = ["#002FA7", "#008A00", "#FFCC00", "#E60000", "#0F172A"];
 
+// Quick-range presets. Returns YYYY-MM-DD pairs in IST.
+const istNow = () => {
+  // Today's IST date (rendered as a plain YYYY-MM-DD string).
+  const d = new Date();
+  // toLocaleDateString in en-CA gives YYYY-MM-DD format.
+  return d.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+};
+const istShift = (days) => {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+};
+const istMonthRange = (year, month) => {
+  // month: 1..12. End-of-month via day-0 of next month.
+  const last = new Date(Date.UTC(year, month, 0));
+  const lastDay = last.getUTCDate();
+  const ym = `${year}-${String(month).padStart(2, "0")}`;
+  return { from: `${ym}-01`, to: `${ym}-${String(lastDay).padStart(2, "0")}` };
+};
+
 export default function Reports() {
+  const today = useMemo(() => istNow(), []);
+  const [mode, setMode] = useState("today");          // today | yesterday | month | custom
+  const [dateFrom, setDateFrom] = useState(today);
+  const [dateTo, setDateTo] = useState(today);
+  const [monthYear, setMonthYear] = useState(today.slice(0, 7));  // YYYY-MM
   const [data, setData] = useState(null);
-  useEffect(() => { (async () => { try { const r = await api.get("/reports/overview"); setData(r.data); } catch (e) { toast.error(errMsg(e)); } })(); }, []);
-  if (!data) return <div className="p-8 text-xs uppercase tracking-widest text-gray-500">Loading…</div>;
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await api.get("/reports/overview", {
+        params: {
+          date_from: dateFrom || undefined,
+          date_to: dateTo || undefined,
+        },
+      });
+      setData(r.data);
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setLoading(false); }
+  }, [dateFrom, dateTo]);
+  useEffect(() => { load(); }, [load]);
+
+  const applyPreset = (m) => {
+    setMode(m);
+    if (m === "today") { setDateFrom(today); setDateTo(today); }
+    else if (m === "yesterday") { const y = istShift(-1); setDateFrom(y); setDateTo(y); }
+    else if (m === "month") {
+      const [y, mm] = monthYear.split("-").map(Number);
+      const { from, to } = istMonthRange(y, mm);
+      setDateFrom(from); setDateTo(to);
+    }
+    // 'custom' lets the user edit the inputs directly
+  };
+  // Whenever month picker changes (when in 'month' mode), refresh the range
+  useEffect(() => {
+    if (mode !== "month") return;
+    const [y, mm] = monthYear.split("-").map(Number);
+    if (!y || !mm) return;
+    const { from, to } = istMonthRange(y, mm);
+    setDateFrom(from); setDateTo(to);
+  }, [mode, monthYear]);
+
+  if (!data && loading) return <div className="p-8 text-xs uppercase tracking-widest text-gray-500">Loading…</div>;
+  if (!data) return null;
 
   const byStatus = Object.entries(data.by_status || {}).map(([k, v]) => ({ name: k, value: v }));
   const bySource = Object.entries(data.by_source || {}).map(([k, v]) => ({ name: k, value: v }));
 
   return (
     <div className="p-4 md:p-8 space-y-6">
-      <div>
-        <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Analytics</div>
-        <h1 className="font-chivo font-black text-2xl md:text-4xl">Reports</h1>
+      <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
+        <div>
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Analytics</div>
+          <h1 className="font-chivo font-black text-2xl md:text-4xl">Reports</h1>
+        </div>
+        {/* Date filter */}
+        <div className="flex flex-col gap-2" data-testid="reports-date-filter">
+          <div className="flex items-center gap-1 flex-wrap">
+            {[
+              { k: "today", label: "Today" },
+              { k: "yesterday", label: "Yesterday" },
+              { k: "month", label: "Select month" },
+              { k: "custom", label: "Custom" },
+            ].map((opt) => (
+              <button
+                key={opt.k}
+                onClick={() => applyPreset(opt.k)}
+                className={`px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold border ${mode === opt.k ? "bg-gray-900 text-white border-gray-900" : "bg-white border-gray-300 hover:border-gray-900"}`}
+                data-testid={`reports-preset-${opt.k}`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            {mode === "month" ? (
+              <input
+                type="month" value={monthYear} onChange={(e) => setMonthYear(e.target.value)}
+                className="border border-gray-300 px-2 py-1.5 text-sm font-mono"
+                data-testid="reports-month-input"
+              />
+            ) : (
+              <>
+                <input
+                  type="date" value={dateFrom}
+                  onChange={(e) => { setDateFrom(e.target.value); if (mode !== "custom") setMode("custom"); }}
+                  max={dateTo || undefined}
+                  className="border border-gray-300 px-2 py-1.5 text-sm font-mono"
+                  data-testid="reports-date-from"
+                />
+                <span className="text-gray-400 text-xs">→</span>
+                <input
+                  type="date" value={dateTo}
+                  onChange={(e) => { setDateTo(e.target.value); if (mode !== "custom") setMode("custom"); }}
+                  min={dateFrom || undefined}
+                  className="border border-gray-300 px-2 py-1.5 text-sm font-mono"
+                  data-testid="reports-date-to"
+                />
+              </>
+            )}
+            {loading && <span className="text-[10px] uppercase tracking-widest text-gray-400 font-bold">Loading…</span>}
+          </div>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">

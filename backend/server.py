@@ -2557,25 +2557,62 @@ async def update_rules(body: RoutingRulesUpdate, admin: dict = Depends(require_a
     return r
 
 # ------------- Reports -------------
+def _parse_ist_range(date_from: Optional[str], date_to: Optional[str]) -> Dict[str, str]:
+    """Build an inclusive ISO range (UTC) from two YYYY-MM-DD IST dates."""
+    if not date_from and not date_to:
+        return {}
+    from zoneinfo import ZoneInfo
+    ist = ZoneInfo("Asia/Kolkata")
+    out: Dict[str, str] = {}
+    if date_from:
+        d = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=ist)
+        out["$gte"] = iso(d.astimezone(timezone.utc))
+    if date_to:
+        d = datetime.strptime(date_to, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999000, tzinfo=ist)
+        out["$lte"] = iso(d.astimezone(timezone.utc))
+    return out
+
+
 @api.get("/reports/overview")
-async def reports_overview(admin: dict = Depends(require_admin)):
-    total = await db.leads.count_documents({})
-    by_status_cursor = db.leads.aggregate([{"$group": {"_id": "$status", "c": {"$sum": 1}}}])
+async def reports_overview(
+    admin: dict = Depends(require_admin),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+):
+    """Optional `date_from`/`date_to` (YYYY-MM-DD, IST, inclusive) narrow lead-creation,
+    call-log, message and followup counters to that window. Omitting both = all-time.
+    Conversion rate, source/status breakdown and the timeseries also respect the window."""
+    try:
+        date_range = _parse_ist_range(date_from, date_to)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date_from / date_to must be YYYY-MM-DD")
+    lead_q: Dict[str, Any] = {}
+    msg_q: Dict[str, Any] = {}
+    call_q: Dict[str, Any] = {}
+    fup_q: Dict[str, Any] = {}
+    if date_range:
+        lead_q["created_at"] = date_range
+        msg_q["at"] = date_range
+        call_q["at"] = date_range
+        fup_q["created_at"] = date_range
+    total = await db.leads.count_documents(lead_q)
+    by_status_cursor = db.leads.aggregate([{"$match": lead_q}, {"$group": {"_id": "$status", "c": {"$sum": 1}}}])
     by_status = {doc["_id"] or "unknown": doc["c"] async for doc in by_status_cursor}
-    by_source_cursor = db.leads.aggregate([{"$group": {"_id": "$source", "c": {"$sum": 1}}}])
+    by_source_cursor = db.leads.aggregate([{"$match": lead_q}, {"$group": {"_id": "$source", "c": {"$sum": 1}}}])
     by_source = {doc["_id"] or "unknown": doc["c"] async for doc in by_source_cursor}
     converted = by_status.get("converted", 0)
     conversion_rate = round((converted / total) * 100, 2) if total else 0
-    # reassigned = count leads with > 1 assignment history entry
-    reassigned = await db.leads.count_documents({"assignment_history.1": {"$exists": True}})
-    # missed = pending followups past due_at
+    # reassigned = count leads (in window) with > 1 assignment history entry
+    reassigned = await db.leads.count_documents({**lead_q, "assignment_history.1": {"$exists": True}})
+    # missed = pending followups past due_at (always cross-window — pending reflects current state)
     now_iso = iso(now_utc())
     missed_followups = await db.followups.count_documents({"status": "pending", "due_at": {"$lt": now_iso}})
     # per executive
     execs = await db.users.find({"role": "executive"}, {"_id": 0, "password_hash": 0}).to_list(500)
     per_exec = []
-    # Pre-aggregate calls by user × outcome
+    # Pre-aggregate calls (windowed) by user × outcome
     call_pipeline = [
+        {"$match": call_q} if call_q else {"$match": {}},
         {"$group": {"_id": {"user": "$by_user_id", "outcome": "$outcome"}, "c": {"$sum": 1}}},
     ]
     call_buckets: Dict[str, Dict[str, int]] = {}
@@ -2585,30 +2622,32 @@ async def reports_overview(admin: dict = Depends(require_admin)):
         if not u:
             continue
         call_buckets.setdefault(u, {})[oc] = d["c"]
-    # Pre-aggregate messages by user (sent count)
+    # Pre-aggregate messages (windowed) by user (sent count)
     msg_pipeline = [
-        {"$match": {"direction": "out", "by_user_id": {"$ne": None}}},
+        {"$match": {**msg_q, "direction": "out", "by_user_id": {"$ne": None}}},
         {"$group": {"_id": "$by_user_id", "c": {"$sum": 1}}},
     ]
     msgs_sent: Dict[str, int] = {}
     async for d in db.messages.aggregate(msg_pipeline):
         msgs_sent[d["_id"]] = d["c"]
     for e in execs:
-        count = await db.leads.count_documents({"assigned_to": e["id"]})
-        conv = await db.leads.count_documents({"assigned_to": e["id"], "status": "converted"})
-        qualified = await db.leads.count_documents({"assigned_to": e["id"], "status": "qualified"})
-        lost = await db.leads.count_documents({"assigned_to": e["id"], "status": "lost"})
-        contacted = await db.leads.count_documents({"assigned_to": e["id"], "status": "contacted"})
-        new_leads = await db.leads.count_documents({"assigned_to": e["id"], "status": "new"})
-        wa_threads = await db.leads.count_documents({"assigned_to": e["id"], "has_whatsapp": True})
-        # Followup completion rate
-        fu_total = await db.followups.count_documents({"executive_id": e["id"]})
-        fu_done = await db.followups.count_documents({"executive_id": e["id"], "status": "done"})
-        fu_pending = await db.followups.count_documents({"executive_id": e["id"], "status": "pending"})
+        base = {**lead_q, "assigned_to": e["id"]}
+        count = await db.leads.count_documents(base)
+        conv = await db.leads.count_documents({**base, "status": "converted"})
+        qualified = await db.leads.count_documents({**base, "status": "qualified"})
+        lost = await db.leads.count_documents({**base, "status": "lost"})
+        contacted = await db.leads.count_documents({**base, "status": "contacted"})
+        new_leads = await db.leads.count_documents({**base, "status": "new"})
+        wa_threads = await db.leads.count_documents({**base, "has_whatsapp": True})
+        # Followup completion rate (windowed)
+        fu_base = {**fup_q, "executive_id": e["id"]}
+        fu_total = await db.followups.count_documents(fu_base)
+        fu_done = await db.followups.count_documents({**fu_base, "status": "done"})
+        fu_pending = await db.followups.count_documents({**fu_base, "status": "pending"})
         fu_completion = round((fu_done / fu_total) * 100, 1) if fu_total else 0
-        # avg response = avg(opened_at - created_at) where both present
+        # avg response = avg(opened_at - created_at) where both present, windowed
         pipeline = [
-            {"$match": {"assigned_to": e["id"], "opened_at": {"$ne": None}}},
+            {"$match": {**lead_q, "assigned_to": e["id"], "opened_at": {"$ne": None}}},
             {"$project": {"delta": {"$subtract": [
                 {"$toDate": "$opened_at"}, {"$toDate": "$created_at"}
             ]}}},
@@ -2646,12 +2685,18 @@ async def reports_overview(admin: dict = Depends(require_admin)):
             "followup_pending": fu_pending,
             "followup_completion_pct": fu_completion,
         })
-    # last 14 days chart
+    # Timeseries — show 14 days ending at date_to (or today). Always windowed
+    # to whichever leads fall within (date_from..date_to) so the chart matches
+    # the rest of the page.
     from collections import Counter
-    leads_all = await db.leads.find({}, {"_id": 0, "created_at": 1, "source": 1}).to_list(10000)
+    leads_all = await db.leads.find(lead_q, {"_id": 0, "created_at": 1, "source": 1}).to_list(20000)
+    if date_to:
+        end = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    else:
+        end = now_utc()
     days: Dict[str, int] = {}
     for i in range(13, -1, -1):
-        d = (now_utc() - timedelta(days=i)).strftime("%Y-%m-%d")
+        d = (end - timedelta(days=i)).strftime("%Y-%m-%d")
         days[d] = 0
     for ld in leads_all:
         ca = (ld.get("created_at") or "")[:10]
@@ -2667,6 +2712,8 @@ async def reports_overview(admin: dict = Depends(require_admin)):
         "missed_followups": missed_followups,
         "per_executive": per_exec,
         "leads_timeseries": chart,
+        "date_from": date_from,
+        "date_to": date_to,
     }
 
 @api.get("/reports/my")

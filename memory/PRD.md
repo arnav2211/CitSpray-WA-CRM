@@ -22,6 +22,14 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 30 (Feb 2026) — Date filter on /reports (Today / Yesterday / Select Month / Custom)
+- **Backend `GET /api/reports/overview`** (`server.py`): added optional `date_from` + `date_to` (YYYY-MM-DD, IST, inclusive). New helper `_parse_ist_range` shared by the leads-list and reports endpoints. Windows ALL counters: total leads, by_status, by_source, conversion_rate, reassigned, per_executive (lead/call/message/followup counts), and the 14-day timeseries (which now ends at `date_to` if supplied). `missed_followups` stays cross-window (it reflects current overdue state). Returns 400 on bad format. `date_from`/`date_to` echoed in response.
+- **Frontend `Reports.jsx`** rewrite:
+  - Added quick-pick chips: **Today** (default), **Yesterday**, **Select Month** (with `<input type="month">` picker), **Custom** (two date inputs).
+  - Custom mode allows any `date_from`/`date_to` IST range; editing either input from a preset auto-switches mode to Custom.
+  - All test IDs: `reports-date-filter`, `reports-preset-today/yesterday/month/custom`, `reports-month-input`, `reports-date-from`, `reports-date-to`.
+- **Verified**: backend smoke — all-time total=613, single day 2026-05-06 → 3 leads, full month 2026-05 → 349 leads, bad date → 400.
+
 ### Iteration 29 (Feb 2026) — Date filter on /leads
 - **Backend `GET /api/leads`** (`server.py`): added optional `date_from` + `date_to` query params (YYYY-MM-DD, inclusive). Both interpreted in **IST (Asia/Kolkata)**: `date_from` snaps to 00:00:00 IST start, `date_to` snaps to 23:59:59 IST end, both converted to UTC for the Mongo `created_at` range. 400 on bad format. Backwards-compatible with all existing callers.
 - **Frontend `Leads.jsx`**: added two `<input type="date">` controls (testids `leads-date-from`, `leads-date-to`) inside `leads-date-filter` group, with clear (×) button (`leads-date-clear`) when either is set. State synced to URL params (`date_from`, `date_to`) so date-filtered URLs are bookmarkable. `min`/`max` mutual constraints prevent invalid ranges. Single-date selection = same value in both inputs.
