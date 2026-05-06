@@ -358,7 +358,6 @@ export default function LeadDrawer({ leadId, onClose }) {
               </div>
             )}
             <div className="text-xs text-gray-500 mt-1 flex flex-wrap gap-x-4 gap-y-1">
-              {lead.email && <span className="flex items-center gap-1"><EnvelopeSimple size={12} /> {lead.email}</span>}
               {(lead.area || lead.city || lead.state || lead.country) && (
                 <span className="flex items-center gap-1"><MapPin size={12} /> {[lead.area, lead.city, lead.state, lead.country].filter(Boolean).join(", ")}</span>
               )}
@@ -375,6 +374,7 @@ export default function LeadDrawer({ leadId, onClose }) {
               </span>
             </div>
             <PhonesRow lead={lead} canEdit={canEdit} onChanged={loadAll} />
+            <EmailsRow lead={lead} canEdit={canEdit} onChanged={loadAll} />
           </div>
           <div className="flex items-start gap-1 shrink-0">
             <button onClick={() => setShowActivity(true)} className="border border-gray-300 hover:bg-gray-100 p-2" title="Lead activity & history" data-testid="open-activity-btn">
@@ -1026,3 +1026,83 @@ function PhonesRow({ lead, canEdit, onChanged }) {
     </div>
   );
 }
+
+function EmailsRow({ lead, canEdit, onChanged }) {
+  const [adding, setAdding] = React.useState(false);
+  const [val, setVal] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+
+  const allEmails = [lead.email, ...(lead.emails || [])].filter(Boolean);
+  const sentSet = new Set(((lead.email_sent_to || []).map((e) => (e || "").toLowerCase())));
+
+  const add = async () => {
+    const trimmed = val.trim();
+    if (!trimmed) return;
+    setBusy(true);
+    try {
+      await api.post(`/leads/${lead.id}/emails`, { email: trimmed });
+      toast.success("Email added — auto-mail dispatched");
+      setVal("");
+      setAdding(false);
+      onChanged?.();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setBusy(false); }
+  };
+
+  const remove = async (em) => {
+    if (!window.confirm(`Remove ${em} from this lead?`)) return;
+    setBusy(true);
+    try {
+      await api.delete(`/leads/${lead.id}/emails`, { params: { email: em } });
+      toast.success("Email removed");
+      onChanged?.();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setBusy(false); }
+  };
+
+  if (allEmails.length === 0 && !canEdit) return null;
+
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5" data-testid="lead-emails-row">
+      {allEmails.map((em, i) => {
+        const sent = sentSet.has((em || "").toLowerCase());
+        return (
+          <span key={em} className="flex items-center gap-1 text-xs text-gray-700 bg-gray-50 border border-gray-200 px-2 py-1" data-testid={`lead-email-${em}`}>
+            <EnvelopeSimple size={11} weight={i === 0 ? "fill" : "regular"} className={i === 0 ? "text-[#002FA7]" : "text-gray-400"} />
+            <a href={`mailto:${em}`} onClick={(e) => e.stopPropagation()} className={`${i === 0 ? "font-semibold" : ""} hover:text-[#002FA7] hover:underline`} data-testid={`mailto-${em}`}>
+              {em}
+            </a>
+            {i === 0 && <span className="text-[9px] uppercase tracking-widest text-gray-400 font-bold">Primary</span>}
+            {sent && (
+              <span className="text-[9px] uppercase tracking-widest font-bold text-[#008A00] flex items-center gap-0.5" title="Auto-email sent" data-testid={`email-sent-${em}`}>
+                <Check size={10} weight="bold" /> Mailed
+              </span>
+            )}
+            {canEdit && (
+              <button onClick={() => remove(em)} className="text-gray-300 hover:text-[#E60000]" title="Remove" data-testid={`remove-email-${em}`}>
+                <Trash size={11} />
+              </button>
+            )}
+          </span>
+        );
+      })}
+      {canEdit && !adding && (
+        <button onClick={() => setAdding(true)} className="text-[10px] uppercase tracking-widest font-bold text-[#002FA7] hover:underline flex items-center gap-1" data-testid="add-email-btn">
+          <Plus size={12} weight="bold" /> {allEmails.length === 0 ? "Add email" : "Add another"}
+        </button>
+      )}
+      {canEdit && adding && (
+        <span className="flex items-center gap-1">
+          <input autoFocus type="email" value={val} onChange={(e) => setVal(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()}
+            placeholder="customer@example.com"
+            className="border border-gray-300 px-2 py-1 text-xs" data-testid="add-email-input" />
+          <button onClick={add} disabled={busy} className="bg-[#002FA7] hover:bg-[#002288] text-white px-2 py-1 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50" data-testid="add-email-save-btn">
+            Add
+          </button>
+          <button onClick={() => { setAdding(false); setVal(""); }} className="text-gray-400 hover:text-gray-900 p-1"><X size={12} /></button>
+        </span>
+      )}
+    </div>
+  );
+}
+

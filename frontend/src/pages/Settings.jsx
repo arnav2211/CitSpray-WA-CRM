@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
-import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck, Copy, Link as LinkIcon, Phone, Plus, Trash, Lightning, Users as UsersIcon, Calendar, X } from "@phosphor-icons/react";
+import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck, Copy, Link as LinkIcon, Phone, Plus, Trash, Lightning, Users as UsersIcon, Calendar, X, EnvelopeSimple, Paperclip, PaperPlaneTilt } from "@phosphor-icons/react";
 import { fmtIST } from "@/lib/format";
 
 const FIELDS = [
@@ -106,6 +106,8 @@ export default function Settings() {
       <ExportersIndiaPanel onChanged={load} />
 
       <CallRoutingPanel />
+
+      <EmailAutoSendPanel />
 
       <form onSubmit={submit} className="border border-gray-200 bg-white" data-testid="whatsapp-settings-form">
         <div className="px-5 py-4 border-b border-gray-200 flex items-center justify-between">
@@ -817,3 +819,245 @@ function LeaveManagementPanel() {
     </div>
   );
 }
+
+function EmailAutoSendPanel() {
+  const [smtp, setSmtp] = useState(null);
+  const [smtpForm, setSmtpForm] = useState({ host: "", port: 465, security: "ssl", email: "", password: "", from_name: "", enabled: false });
+  const [revealPw, setRevealPw] = useState(false);
+  const [savingSmtp, setSavingSmtp] = useState(false);
+  const [tpl, setTpl] = useState(null);
+  const [tplForm, setTplForm] = useState({ subject: "", body: "", attachments: [] });
+  const [savingTpl, setSavingTpl] = useState(false);
+  const [uploadingAtt, setUploadingAtt] = useState(false);
+  const [testTo, setTestTo] = useState("");
+  const [sendingTest, setSendingTest] = useState(false);
+  const fileRef = React.useRef(null);
+
+  const load = async () => {
+    try {
+      const [{ data: s }, { data: t }] = await Promise.all([
+        api.get("/settings/email"),
+        api.get("/settings/email-template"),
+      ]);
+      setSmtp(s);
+      setSmtpForm({
+        host: s.host || "smtp.hostinger.com",
+        port: s.port || 465,
+        security: s.security || "ssl",
+        email: s.email || "",
+        password: "", // never prefill — keeps current if blank
+        from_name: s.from_name || "",
+        enabled: !!s.enabled,
+      });
+      setTpl(t);
+      setTplForm({
+        subject: t.subject || "",
+        body: t.body || "",
+        attachments: t.attachments || [],
+      });
+    } catch (e) { toast.error(errMsg(e)); }
+  };
+  useEffect(() => { load(); }, []);
+
+  const saveSmtp = async (e) => {
+    e?.preventDefault?.();
+    setSavingSmtp(true);
+    try {
+      const patch = { ...smtpForm };
+      if (!patch.password) delete patch.password; // keep existing
+      patch.port = Number(patch.port) || 465;
+      await api.put("/settings/email", patch);
+      toast.success("SMTP settings saved");
+      await load();
+    } catch (err) { toast.error(errMsg(err)); }
+    finally { setSavingSmtp(false); }
+  };
+
+  const saveTpl = async (e) => {
+    e?.preventDefault?.();
+    setSavingTpl(true);
+    try {
+      await api.put("/settings/email-template", tplForm);
+      toast.success("Template saved");
+      await load();
+    } catch (err) { toast.error(errMsg(err)); }
+    finally { setSavingTpl(false); }
+  };
+
+  const onAttach = async (ev) => {
+    const file = ev.target.files?.[0];
+    if (!file) return;
+    if (file.size > 25 * 1024 * 1024) { toast.error("Max 25 MB per attachment"); return; }
+    setUploadingAtt(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("kind", "document");
+      const { data } = await api.post("/chatflows/upload-media", fd);
+      // Extract stored_name from absolute URL: /api/media/<stored_name>
+      const stored = (data.url || "").split("/api/media/").pop();
+      const next = [
+        ...(tplForm.attachments || []),
+        { stored_name: stored, original_filename: file.name, mime_type: file.type || "application/octet-stream" },
+      ];
+      setTplForm((f) => ({ ...f, attachments: next }));
+      toast.success(`${file.name} attached — remember to Save template`);
+    } catch (err) { toast.error(errMsg(err, "Upload failed")); }
+    finally {
+      setUploadingAtt(false);
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  };
+
+  const removeAtt = (idx) => {
+    setTplForm((f) => ({ ...f, attachments: f.attachments.filter((_, i) => i !== idx) }));
+  };
+
+  const testSend = async () => {
+    if (!testTo.trim()) { toast.error("Enter a recipient email"); return; }
+    setSendingTest(true);
+    try {
+      await api.post("/settings/email/test-send", { to: testTo.trim() });
+      toast.success(`Test email sent to ${testTo.trim()}`);
+    } catch (err) { toast.error(errMsg(err, "Test send failed")); }
+    finally { setSendingTest(false); }
+  };
+
+  if (!smtp || !tpl) return <div className="border border-gray-200 bg-white p-5 text-xs uppercase tracking-widest text-gray-400">Loading email settings…</div>;
+
+  return (
+    <div className="border border-gray-200 bg-white" data-testid="email-autosend-panel">
+      <div className="px-5 py-4 border-b border-gray-200 flex items-center justify-between">
+        <div>
+          <h2 className="font-chivo font-bold text-lg flex items-center gap-2"><EnvelopeSimple size={18} weight="bold" /> Email Auto-Send</h2>
+          <p className="text-xs text-gray-500 mt-1 max-w-2xl">
+            Sends a configured email to every lead's email address — at lead creation AND whenever a new email is added later.
+            Each address is mailed exactly once per lead.
+          </p>
+        </div>
+        <span className={`inline-flex items-center gap-1 px-2 py-1 text-[10px] uppercase tracking-widest font-bold ${smtpForm.enabled ? "bg-[#008A00] text-white" : "bg-gray-200 text-gray-700"}`}>
+          {smtpForm.enabled ? "Enabled" : "Disabled"}
+        </span>
+      </div>
+
+      {/* SMTP form */}
+      <form onSubmit={saveSmtp} className="px-5 py-4 grid grid-cols-1 md:grid-cols-2 gap-4 border-b border-gray-200">
+        <label className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">SMTP Host</div>
+          <input value={smtpForm.host} onChange={(e) => setSmtpForm((f) => ({ ...f, host: e.target.value }))}
+            placeholder="smtp.hostinger.com"
+            className="w-full border border-gray-300 px-3 py-2 text-sm font-mono"
+            data-testid="email-smtp-host" />
+        </label>
+        <label className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Port</div>
+          <input type="number" value={smtpForm.port} onChange={(e) => setSmtpForm((f) => ({ ...f, port: e.target.value }))}
+            className="w-full border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="email-smtp-port" />
+        </label>
+        <label className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Security</div>
+          <select value={smtpForm.security} onChange={(e) => setSmtpForm((f) => ({ ...f, security: e.target.value }))}
+            className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="email-smtp-security">
+            <option value="ssl">SSL (465)</option>
+            <option value="tls">TLS / STARTTLS (587)</option>
+            <option value="none">None</option>
+          </select>
+        </label>
+        <label className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">From email</div>
+          <input type="email" value={smtpForm.email} onChange={(e) => setSmtpForm((f) => ({ ...f, email: e.target.value }))}
+            placeholder="aroma@citspray.com"
+            className="w-full border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="email-smtp-email" />
+        </label>
+        <label className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">From name (optional)</div>
+          <input value={smtpForm.from_name} onChange={(e) => setSmtpForm((f) => ({ ...f, from_name: e.target.value }))}
+            placeholder="Aroma"
+            className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="email-smtp-fromname" />
+        </label>
+        <label className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1 flex items-center justify-between">
+            <span>Password</span>
+            {smtp.has_password && <span className="text-gray-400 normal-case">current: <span className="font-mono">{smtp.password_masked}</span></span>}
+          </div>
+          <div className="flex items-center gap-2">
+            <input type={revealPw ? "text" : "password"} value={smtpForm.password}
+              onChange={(e) => setSmtpForm((f) => ({ ...f, password: e.target.value }))}
+              placeholder={smtp.has_password ? "Leave blank to keep current" : "Enter password"}
+              className="flex-1 border border-gray-300 px-3 py-2 text-sm font-mono"
+              data-testid="email-smtp-password" />
+            <button type="button" onClick={() => setRevealPw((v) => !v)} className="border border-gray-300 p-2" title="Reveal">
+              {revealPw ? <EyeSlash size={14} /> : <Eye size={14} />}
+            </button>
+          </div>
+        </label>
+        <label className="md:col-span-2 flex items-center gap-2">
+          <input type="checkbox" checked={smtpForm.enabled} onChange={(e) => setSmtpForm((f) => ({ ...f, enabled: e.target.checked }))} data-testid="email-smtp-enabled" />
+          <span className="text-sm">Enable auto-send</span>
+        </label>
+        <div className="md:col-span-2 flex items-center justify-end gap-2">
+          <button type="submit" disabled={savingSmtp} className="bg-[#002FA7] hover:bg-[#002288] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 disabled:opacity-50" data-testid="email-smtp-save-btn">
+            <FloppyDisk size={12} weight="bold" /> {savingSmtp ? "Saving…" : "Save SMTP"}
+          </button>
+        </div>
+      </form>
+
+      {/* Template form */}
+      <form onSubmit={saveTpl} className="px-5 py-4 space-y-3 border-b border-gray-200">
+        <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Email template</div>
+        <div className="text-xs text-gray-500">
+          Variables: <span className="kbd">{"{{name}}"}</span> <span className="kbd">{"{{requirement}}"}</span> <span className="kbd">{"{{phone}}"}</span> <span className="kbd">{"{{email}}"}</span> <span className="kbd">{"{{source}}"}</span>
+        </div>
+        <label className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Subject</div>
+          <input value={tplForm.subject} onChange={(e) => setTplForm((f) => ({ ...f, subject: e.target.value }))}
+            placeholder="Thank you for your enquiry, {{name}}"
+            className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="email-tpl-subject" />
+        </label>
+        <label className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Body</div>
+          <textarea rows={8} value={tplForm.body} onChange={(e) => setTplForm((f) => ({ ...f, body: e.target.value }))}
+            placeholder="Hi {{name}},&#10;&#10;Thanks for your enquiry about {{requirement}}…"
+            className="w-full border border-gray-300 px-3 py-2 text-sm font-mono whitespace-pre-wrap"
+            data-testid="email-tpl-body" />
+        </label>
+        <div>
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Attachments ({tplForm.attachments.length})</div>
+          {tplForm.attachments.length > 0 && (
+            <ul className="space-y-1 mb-2" data-testid="email-tpl-attachments">
+              {tplForm.attachments.map((a, i) => (
+                <li key={i} className="flex items-center gap-2 text-xs border border-gray-200 px-2 py-1">
+                  <Paperclip size={11} className="text-[#475569] shrink-0" />
+                  <span className="font-mono truncate flex-1">{a.original_filename || a.stored_name}</span>
+                  <button type="button" onClick={() => removeAtt(i)} className="text-[#E60000] hover:underline text-[10px] uppercase tracking-widest font-bold" data-testid={`email-tpl-att-remove-${i}`}>
+                    Remove
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <input ref={fileRef} type="file" onChange={onAttach} disabled={uploadingAtt} className="hidden" id="email-tpl-att-file" data-testid="email-tpl-att-input" />
+          <label htmlFor="email-tpl-att-file" className="inline-block border border-gray-300 hover:border-gray-900 cursor-pointer px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold">
+            {uploadingAtt ? "Uploading…" : "Add attachment"}
+          </label>
+        </div>
+        <div className="flex items-center justify-end gap-2">
+          <button type="submit" disabled={savingTpl} className="bg-[#002FA7] hover:bg-[#002288] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 disabled:opacity-50" data-testid="email-tpl-save-btn">
+            <FloppyDisk size={12} weight="bold" /> {savingTpl ? "Saving…" : "Save template"}
+          </button>
+        </div>
+      </form>
+
+      {/* Test send */}
+      <div className="px-5 py-4 flex items-center gap-2 flex-wrap bg-gray-50">
+        <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mr-1">Test send:</div>
+        <input type="email" value={testTo} onChange={(e) => setTestTo(e.target.value)} placeholder="recipient@example.com"
+          className="border border-gray-300 px-3 py-2 text-sm font-mono flex-1 min-w-[220px]" data-testid="email-test-to" />
+        <button onClick={testSend} disabled={sendingTest || !smtpForm.email} className="border border-gray-900 hover:bg-gray-900 hover:text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 disabled:opacity-50" data-testid="email-test-send-btn">
+          <PaperPlaneTilt size={12} weight="bold" /> Send test
+        </button>
+      </div>
+    </div>
+  );
+}
+
