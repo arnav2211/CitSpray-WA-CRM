@@ -22,6 +22,11 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 29 (Feb 2026) — Date filter on /leads
+- **Backend `GET /api/leads`** (`server.py`): added optional `date_from` + `date_to` query params (YYYY-MM-DD, inclusive). Both interpreted in **IST (Asia/Kolkata)**: `date_from` snaps to 00:00:00 IST start, `date_to` snaps to 23:59:59 IST end, both converted to UTC for the Mongo `created_at` range. 400 on bad format. Backwards-compatible with all existing callers.
+- **Frontend `Leads.jsx`**: added two `<input type="date">` controls (testids `leads-date-from`, `leads-date-to`) inside `leads-date-filter` group, with clear (×) button (`leads-date-clear`) when either is set. State synced to URL params (`date_from`, `date_to`) so date-filtered URLs are bookmarkable. `min`/`max` mutual constraints prevent invalid ranges. Single-date selection = same value in both inputs.
+- **Verified**: backend curl smoke (total=349 with `date_from=2026-05-01`, total=0 with `2026-04-18..2026-04-18` because data is on Apr 19 IST; 400 on `2026/02/01`).
+
 ### Iteration 28 (Feb 2026) — Configurable Gmail/Justdial poll interval (default 60s)
 - **Backend** (`server.py`): poll default reduced from 120s (2 min) → **60s** via new `GMAIL_POLL_DEFAULT_SECONDS` env var. Added `_get_gmail_poll_seconds()` (DB override over default) + `_reschedule_gmail_poll()` (live job swap, mirrors `_reschedule_exportersindia_pull`). New `GET /api/settings/gmail-poll` and `PUT /api/settings/gmail-poll` (admin-only, min 10s). `gmail_status` endpoint now returns `poll_interval_seconds` (and computed `poll_interval_minutes` for back-compat).
 - **Frontend** (`Integrations.jsx`): replaced "every X minute(s)" copy with "every Xs". Added `PollIntervalEditor` widget under the description: shows current interval, "Change" button reveals a numeric input + Save/Cancel. Saves via `PUT /api/settings/gmail-poll` and reloads status; min validation enforced client-side too.

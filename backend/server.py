@@ -1524,6 +1524,8 @@ async def list_leads(
     assigned_to: Optional[str] = None,
     last_call_outcome: Optional[str] = None,
     q: Optional[str] = None,
+    date_from: Optional[str] = None,  # YYYY-MM-DD (IST) inclusive
+    date_to: Optional[str] = None,    # YYYY-MM-DD (IST) inclusive
     limit: int = 500,
     offset: int = 0,
     paginate: bool = False,
@@ -1531,7 +1533,9 @@ async def list_leads(
     """List leads with optional filters. Backwards-compatible:
     - Default returns a bare array (existing callers unchanged).
     - Pass `paginate=true&limit=25&offset=0` to receive `{items, total, limit, offset}`
-      so the UI can render page controls."""
+      so the UI can render page controls.
+    - Pass `date_from=YYYY-MM-DD` and/or `date_to=YYYY-MM-DD` (IST, inclusive) to
+      narrow by created_at."""
     query: Dict[str, Any] = {}
     if user["role"] == "executive":
         query["assigned_to"] = user["id"]
@@ -1546,6 +1550,22 @@ async def list_leads(
         if last_call_outcome not in CALL_OUTCOMES:
             raise HTTPException(status_code=400, detail=f"Invalid outcome. Must be one of {CALL_OUTCOMES}")
         query["last_call_outcome"] = last_call_outcome
+    if date_from or date_to:
+        try:
+            from zoneinfo import ZoneInfo
+            ist = ZoneInfo("Asia/Kolkata")
+            range_q: Dict[str, str] = {}
+            if date_from:
+                d_from = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=ist)
+                range_q["$gte"] = iso(d_from.astimezone(timezone.utc))
+            if date_to:
+                # Inclusive end-of-day in IST
+                d_to = datetime.strptime(date_to, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999000, tzinfo=ist)
+                range_q["$lte"] = iso(d_to.astimezone(timezone.utc))
+            if range_q:
+                query["created_at"] = range_q
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date_from / date_to must be YYYY-MM-DD")
     if q:
         import re as _re
         q_safe = _re.escape(q)
