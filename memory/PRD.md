@@ -22,6 +22,12 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 27 (Feb 2026) — Justdial dedup bug fix (preserve query string in profile URL)
+- **Root cause**: `_normalize_justdial_link` was stripping the query string from JD `contact_link` URLs. Real Justdial URLs all share the same path (`https://fapp1.justdial.com/CTIMEQM`) and differ ONLY in their `?id=…&fl=…` query — which encodes the unique enquiry token. Previous normalization collapsed every distinct enquiry to a single key, falsely dedup'ing them all to one lead.
+- **Fix** (`server.py`): keep the query string; only normalize host casing, drop fragment, strip trailing slash on path. Verified via curl: 3 ingest scenarios — different `?id=` → new lead, same exact URL → dedup with `dedup_reason='justdial_profile_url'`.
+- **Backfill**: 178 existing Justdial leads with `contact_link` had `justdial_profile_url=null` (predated the dedup field). One-shot script populated `justdial_profile_url` for all of them so future re-arrival of the same JD email reliably hits the same lead. Only 1 collision found post-backfill (acceptable — likely a genuine prior duplicate).
+- **Side observation**: primary Gmail slot was reporting `not_connected` — user needs to reconnect citronellaoilnagpur@gmail.com from `/integrations` to resume Justdial email ingestion. Secondary (citspray@gmail.com) connected but had 0 unread JD mails.
+
 ### Iteration 26 (Feb 2026) — Email Auto-Send: HTML body support + preview
 - **Backend HTML auto-detect** (`server.py`): `_looks_like_html()` heuristic + `_html_to_plain()` BeautifulSoup-based plain-text extractor. `_smtp_send_blocking` now sets HTML bodies as multipart/alternative — `text/plain` (auto-stripped fallback) + `text/html` (the original markup). Plain-text bodies still send as text/plain only. Variable substitution (`{{name}}` etc.) works inside HTML markup unchanged.
 - **Frontend Settings preview pane** (`Settings.jsx → EmailAutoSendPanel`): added `Edit | Preview` tab toggle next to the Body label. Preview renders the substituted (sample-value) body inside a sandboxed `<iframe srcDoc>` for HTML, or a `<pre>`-style block for plain text. Auto-detects HTML using the same heuristic as the backend so the user knows whether it'll send as HTML. Sample vars: name=Akash, requirement=Pumps, phone=+91 99999 00001, email=akash@example.com, source=Manual.

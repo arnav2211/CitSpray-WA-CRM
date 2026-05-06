@@ -3421,17 +3421,21 @@ def parse_justdial_email(raw_text: str, raw_html: str) -> dict:
     return out
 
 def _normalize_justdial_link(url: Optional[str]) -> Optional[str]:
-    """Strip query/tracking params from a Justdial profile/contact link so the same
-    lead URL is recognised across emails (Justdial appends ?ref=… tokens)."""
+    """Normalise a Justdial profile / contact link for dedup. We INTENTIONALLY
+    preserve the query string because Justdial encodes the unique enquiry id
+    inside `?id=…` / `?fl=…` — stripping them would falsely collapse every
+    distinct enquiry into one lead. Only the host casing + fragment + trailing
+    slash on the path get normalised."""
     if not url:
         return None
     try:
         from urllib.parse import urlsplit, urlunsplit
         parts = urlsplit(url.strip())
-        # Keep scheme + host + path only — drop query + fragment + trailing slash.
+        scheme = (parts.scheme or "https").lower()
         host = (parts.netloc or "").lower()
         path = (parts.path or "").rstrip("/")
-        norm = urlunsplit((parts.scheme.lower() or "https", host, path, "", ""))
+        query = parts.query or ""  # KEEP — uniquely identifies the enquiry
+        norm = urlunsplit((scheme, host, path, query, ""))  # drop fragment
         return norm or None
     except Exception:
         return url.strip() or None
