@@ -22,6 +22,20 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 23 (Feb 2026) — 7-feature batch (Justdial URL dedup + Delete + sort + replied filter + composer + mobile UX)
+- **Justdial profile-URL dedup** (`server.py`):
+  - New helper `_normalize_justdial_link(url)` lowercases scheme+host, strips query/fragment/trailing slash → stable key across `?ref=…` variants.
+  - `_find_lead_by_justdial_link(url)` looks up `db.leads.justdial_profile_url`.
+  - Both `/api/ingest/justdial` (manual) AND `_gmail_poll_one_slot` (Gmail poll) check the URL before creating a new lead. Match → return existing lead with `{duplicate: true, dedup_reason: 'justdial_profile_url'}`, log activity `justdial_duplicate_profile_url`, mark email as processed/duplicate. New leads persist `justdial_profile_url` (added to the canonical lead schema in `_create_lead_internal`). Indexed.
+- **Admin DELETE /api/leads/{id}**: cascade-deletes messages, internal_messages, followups, call_logs, activity_logs, transfer_requests; nulls `email_logs.lead_id` (preserves audit trail). Returns counter dict. RBAC: 403 for executive, 404 for missing id, idempotent.
+- **/chat sort by full ISO datetime DESC** (`Chat.jsx`): client-side sort of `convs` by `last_message.at || last_in_at || last_out_at || last_action_at` DESC using `localeCompare`. ISO-8601 sorts chronologically.
+- **`only_replied` filter** (backend) + **"Replied" chip** (`filter-replied`) in /chat sidebar — gates on `last_in_at` truthiness; admin/exec parity with existing filters.
+- **Auto-expanding composer** — `Chat.jsx` adds `inputRef` + `useEffect([draft])` that grows the textarea height to `scrollHeight` capped at 144px; beyond that internal scroll engages. WhatsApp-Web parity.
+- **Mobile keyboard behavior** — `isMobile` useMemo (touch + viewport ≤767px) controls textarea `onKeyDown`: desktop Enter sends, mobile Enter inserts newline. Send button (`chat-send-btn`) submits in both modes. `data-mobile="1|0"` exposed on the input for tests.
+- **Mobile back button** (`Chat.jsx`) — `isMobilePage` + `useEffect([activeId])` push a synthetic history entry whenever a chat opens; `popstate` listener sets `activeId=null`. Result: phone Back closes the thread and restores the chat list inside `/chat` instead of bouncing to `/dashboard`.
+- **Admin Delete Lead UI** (`LeadDrawer.jsx`) — `lead-delete-btn` red-bordered button in the action bar, admin-only. Two `window.confirm` prompts in sequence (full disclosure of cascade scope on 1st, final-warning on 2nd) before firing `DELETE /api/leads/{id}`.
+- **Tested**: 14/14 pytest backend + 23/23 Playwright (13 desktop + 10 mobile) green. iter12 + iter13 regression preserved.
+
 ### Iteration 22 (Feb 2026) — Tap-to-call on mobile lead drawer
 - **`PhonesRow` (`LeadDrawer.jsx`)** — phone number text in each phone chip is now an `<a href="tel:{digits}">` anchor with `data-testid="call-phone-{phone}"`. Stopping propagation so tapping the number doesn't fall through to the row click handler. Spaces are stripped from the href so iOS/Android dialers handle `+91 98765 43210` cleanly. Hover/active state colors the link `#002FA7` with underline. WA button, Use-for-WA, Active badge, and Remove buttons remain unchanged.
 - Works on desktop too (no-op or OS phone handler), but primary use case is mobile where tapping a number opens the dialer.
