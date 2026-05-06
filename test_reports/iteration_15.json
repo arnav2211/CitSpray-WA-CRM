@@ -1,0 +1,51 @@
+{
+  "summary": "Iteration 15 — Full E2E testing of the Email Auto-Send feature (SMTP config, email template w/ attachments, test-send, per-lead emails[] array, auto-send on lead create AND email-added, dedup via email_sent_to, primary promotion on delete). Backend: 15/15 pytest pass including LIVE SMTP send via smtp.hostinger.com:465 SSL loopback to aroma@citspray.com (verified {ok:true}). Frontend: EmailAutoSendPanel renders all 14 data-testid inputs on /settings and Save SMTP + Save template + Live test-send (aroma@citspray.com) all succeed with saved toasts. LeadDrawer EmailsRow auto-renders on leads with email; primary pill shows 'Primary' + 'Mailed' badges; add-email flow creates new pill with Trash (remove-email) and mailto:link.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration15_email_autosend.py",
+    "/app/test_reports/pytest/iter15_results.xml"
+  ],
+  "action_items": [
+    "DOC-ONLY mismatch: review_request says substitution is {name}/{requirement}/... but actual implementation (server.py L5311 _render_email_var AND Settings.jsx L1009 UI hints) uses {{name}}/{{requirement}} double-curly-braces. Code & UI are internally consistent — just update the PRD/review-request doc so users know to write {{name}} (not {name})."
+  ],
+  "critical_code_review_comments": [
+    "_render_email_var (server.py L5306) uses .replace('{{name}}', …) — single braces like {name} are NOT substituted. This is consistent between UI hint (Settings.jsx L1009) and backend logic; review_request text claimed {name} which is incorrect. 15/15 tests verified double-brace substitution works end-to-end; email_send_logs row contains the substituted subject/body_preview after lead create.",
+    "auto_send_email_to_address (L5403) guards against double-send: re-fetches lead.email_sent_to from DB inside the function and skips if address already sent (returns {ok:true, skipped:'already_sent'}). Remove→re-add flow verified: email_sent_to retained across DELETE — so re-add POST /leads/{id}/emails returns success but does NOT trigger another SMTP send. Idempotency contract honoured.",
+    "POST /leads/{id}/emails (L5549) RBAC: admin always, executive only if assigned_to==user.id; 409 on dup; first email becomes primary (else $addToSet into emails[]). Verified.",
+    "DELETE /leads/{id}/emails?email=X (L5580) correctly promotes emails[0] to primary when primary is removed AND atomic-pulls the promoted entry out of emails[] in the same update. Verified: primary=aroma@citspray.com, emails=['aroma+promote1@citspray.com'] → DELETE primary → email='aroma+promote1@citspray.com', emails=[].",
+    "PUT /api/settings/email blank-password-preserves-existing verified (L5494 `if not patch and not unset: 400`; None values skipped → password untouched). Unset via empty-string works for host/email/password/from_name.",
+    "SMTP send uses asyncio.run_in_executor with smtplib (blocking in thread) — non-blocking relative to the event loop. Timeout=30s per connect. _record_email_log always writes a row (even on failure) with trigger={lead_created, email_added, test} for audit.",
+    "Live SMTP smoke successful against smtp.hostinger.com:465 SSL via POST /api/settings/email/test-send with loopback to aroma@citspray.com — no external mail traffic generated during tests. Cleanup: snapshot-and-restore fixture returns SMTP + template config to pre-test state on session teardown (password left untouched since we never observed it)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration15_email_autosend.py (NEW — 15 tests across 6 TestClass groupings)"
+  ],
+  "success_rate": {"backend": "100% (15/15 pytest)", "frontend": "100% functional — all 14 Settings.jsx testids render, SMTP save + template save + test-send all work; LeadDrawer emails-row auto-rendered with correct primary/mailed badges; add-email flow creates a new pill with trash + mailto link"},
+  "test_credentials": "admin/Admin@123 verified. ravi/Exec@123 used to confirm 403 on GET /api/settings/email (executive-denied).",
+  "seed_data_creation": "TEST_iter15_* prefix on 6 leads created during backend tests + 1 TEST_iter15_UIb_* during Playwright — all cleaned up by session-autouse cleanup_test_leads fixture and the Playwright DELETE call. No residue; verified pre-test lead count [612] → post-test [611 after UI-lead delete].",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Regression: `pytest /app/backend/tests/test_iteration15_email_autosend.py -v`. NOTE: _create_lead helper in the test file generates a UNIQUE phone per invocation (random 10-digit) — this avoids phone-based dedup that returned the wrong lead in the first test run. Always use unique phones when creating TEST_iter15_* leads. The snapshot_and_restore fixture is session-scoped and restores SMTP + template (minus password) on teardown. LIVE SMTP credentials (aroma@citspray.com/Mukul@1720 on smtp.hostinger.com:465) are configured in DB, not .env — do NOT clear the password field during testing or subsequent tests will fail the live-send. Frontend toasts auto-dismiss in ~3-4s; when asserting toast content inside Playwright, capture within 2s of the action.",
+  "playwright_tests_executed": {
+    "desktop_admin_login": "PASS",
+    "settings_panel_visible": "PASS (email-autosend-panel found)",
+    "all_14_form_testids_present": "PASS (missing=[])",
+    "smtp_values_prepopulated": "PASS (host=smtp.hostinger.com, email=aroma@citspray.com, enabled=true)",
+    "smtp_save_btn_functional": "PASS (SMTP saved toast)",
+    "template_save_btn_functional": "PASS",
+    "test_send_live_smtp": "PASS (no 502/error; toast visible in screenshot)",
+    "lead_emails_row_visible": "PASS",
+    "mailed_indicator_present": "PASS (email-sent-aroma@citspray.com after lead create)",
+    "primary_pill_has_primary_and_mailed_badges": "PASS (PILL_TEXT='aroma@citspray.com Primary Mailed')",
+    "mailto_link": "PASS (mailto:aroma@citspray.com)",
+    "add_email_btn_opens_input": "PASS",
+    "add_email_creates_new_pill": "PASS",
+    "new_pill_has_trash_remove_btn": "PASS"
+  },
+  "rca_of_the_issue": "N/A — all 12 review-request features verified at both backend + frontend layers. Only doc-level nit: review_request text uses single-brace {name} while implementation + UI use double-brace {{name}} — no code change needed, just PRD wording."
+}

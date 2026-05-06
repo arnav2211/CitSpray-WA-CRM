@@ -10,6 +10,10 @@ import json
 import uuid
 import hashlib
 import logging
+import smtplib
+import ssl
+import asyncio
+from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal, Any, Dict
 
@@ -341,6 +345,7 @@ class LeadCreate(BaseModel):
     phone: Optional[str] = None
     phones: Optional[List[str]] = None
     email: Optional[str] = None
+    emails: Optional[List[str]] = None
     requirement: Optional[str] = None
     area: Optional[str] = None
     city: Optional[str] = None
@@ -358,6 +363,7 @@ class LeadUpdate(BaseModel):
     phones: Optional[List[str]] = None
     aliases: Optional[List[str]] = None
     email: Optional[str] = None
+    emails: Optional[List[str]] = None
     requirement: Optional[str] = None
     area: Optional[str] = None
     city: Optional[str] = None
@@ -1450,6 +1456,8 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         "phone": data.get("phone"),
         "phones": data.get("phones") or [],
         "email": data.get("email"),
+        "emails": data.get("emails") or [],
+        "email_sent_to": [],  # addresses we've already auto-emailed (dedup)
         "requirement": data.get("requirement"),
         "area": data.get("area"),
         "city": data.get("city"),
@@ -1501,6 +1509,11 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         await auto_send_whatsapp_on_create(lead)
     except Exception as e:
         logger.warning(f"auto whatsapp failed: {e}")
+    # auto email welcome (SMTP) — best-effort; never blocks lead creation
+    try:
+        await auto_send_email_on_create(lead)
+    except Exception as e:
+        logger.warning(f"auto email failed: {e}")
     return lead
 
 @api.get("/leads")
@@ -5218,6 +5231,378 @@ async def update_whatsapp_settings(body: WhatsAppSettingsInput, admin: dict = De
     effective = await get_wa_config()
     safe = {k: (_mask_token(v) if k in ("access_token", "app_secret") and isinstance(v, str) else v) for k, v in effective.items()}
     return {"ok": True, "effective": safe}
+
+
+# ------------- Email Auto-Send (SMTP) -------------
+EMAIL_DEFAULT_HOST = "smtp.hostinger.com"
+EMAIL_DEFAULT_PORT = 465
+EMAIL_DEFAULT_SECURITY = "ssl"  # ssl | tls | none
+_EMAIL_EDITABLE_FIELDS = ("host", "port", "security", "email", "password", "from_name", "enabled")
+
+
+class EmailSettingsInput(BaseModel):
+    host: Optional[str] = None
+    port: Optional[int] = None
+    security: Optional[Literal["ssl", "tls", "none"]] = None
+    email: Optional[str] = None
+    password: Optional[str] = None
+    from_name: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
+class EmailAttachmentInput(BaseModel):
+    stored_name: str
+    original_filename: str
+    mime_type: Optional[str] = None
+
+
+class EmailTemplateInput(BaseModel):
+    subject: Optional[str] = None
+    body: Optional[str] = None
+    attachments: Optional[List[EmailAttachmentInput]] = None
+
+
+class EmailTestSendInput(BaseModel):
+    to: str
+    subject: Optional[str] = None
+    body: Optional[str] = None
+
+
+class LeadEmailInput(BaseModel):
+    email: str
+
+
+async def _get_email_smtp_config() -> Dict[str, Any]:
+    """Returns the effective SMTP config — DB overrides over defaults. Password
+    returned in clear-text only for internal sender use; admin endpoints mask it."""
+    doc = await db.system_settings.find_one({"key": "email_smtp"}, {"_id": 0}) or {}
+    return {
+        "host": doc.get("host") or EMAIL_DEFAULT_HOST,
+        "port": int(doc.get("port") or EMAIL_DEFAULT_PORT),
+        "security": doc.get("security") or EMAIL_DEFAULT_SECURITY,
+        "email": doc.get("email") or "",
+        "password": doc.get("password") or "",
+        "from_name": doc.get("from_name") or "",
+        "enabled": bool(doc.get("enabled")),
+    }
+
+
+async def _get_email_template() -> Dict[str, Any]:
+    doc = await db.system_settings.find_one({"key": "email_template"}, {"_id": 0}) or {}
+    return {
+        "subject": doc.get("subject") or "",
+        "body": doc.get("body") or "",
+        "attachments": list(doc.get("attachments") or []),
+    }
+
+
+_EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+
+def _is_valid_email(value: Optional[str]) -> bool:
+    return bool(value) and bool(_EMAIL_REGEX.match((value or "").strip()))
+
+
+def _render_email_var(text: str, lead: Dict[str, Any], to_email: str = "") -> str:
+    """Substitute {{name}} {{requirement}} {{phone}} {{email}} {{source}} placeholders."""
+    if not text:
+        return ""
+    out = text
+    out = out.replace("{{name}}", (lead.get("customer_name") or "").strip())
+    out = out.replace("{{requirement}}", (lead.get("requirement") or "").strip())
+    out = out.replace("{{phone}}", (lead.get("phone") or "").strip())
+    out = out.replace("{{email}}", (to_email or lead.get("email") or "").strip())
+    out = out.replace("{{source}}", (lead.get("source") or "").strip())
+    return out
+
+
+def _smtp_send_blocking(cfg: Dict[str, Any], to_email: str, subject: str, body: str, attachments: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Synchronous SMTP send executed in a thread. Returns {ok, error?}."""
+    msg = EmailMessage()
+    from_name = (cfg.get("from_name") or "").strip()
+    sender_email = (cfg.get("email") or "").strip()
+    msg["From"] = f'"{from_name}" <{sender_email}>' if from_name else sender_email
+    msg["To"] = to_email
+    msg["Subject"] = subject or ""
+    msg.set_content(body or "", subtype="plain")
+    # Attach files from /app/backend/uploads/<stored_name>
+    for att in attachments or []:
+        try:
+            stored = (att.get("stored_name") or "").strip()
+            if not stored:
+                continue
+            path = ROOT_DIR / "uploads" / stored
+            if not path.exists():
+                logger.warning(f"Email attachment missing on disk: {stored}")
+                continue
+            with open(path, "rb") as fh:
+                data = fh.read()
+            mime = (att.get("mime_type") or "application/octet-stream").split("/", 1)
+            maintype = mime[0] if len(mime) > 0 else "application"
+            subtype = mime[1] if len(mime) > 1 else "octet-stream"
+            msg.add_attachment(
+                data,
+                maintype=maintype,
+                subtype=subtype,
+                filename=att.get("original_filename") or stored,
+            )
+        except Exception as e:
+            logger.warning(f"Skipping email attachment {att}: {e}")
+    host = cfg.get("host") or EMAIL_DEFAULT_HOST
+    port = int(cfg.get("port") or EMAIL_DEFAULT_PORT)
+    security = (cfg.get("security") or EMAIL_DEFAULT_SECURITY).lower()
+    user = (cfg.get("email") or "").strip()
+    password = (cfg.get("password") or "").strip()
+    try:
+        if security == "ssl":
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP_SSL(host, port, timeout=30, context=ctx) as smtp:
+                if user and password:
+                    smtp.login(user, password)
+                smtp.send_message(msg)
+        elif security == "tls":
+            with smtplib.SMTP(host, port, timeout=30) as smtp:
+                smtp.ehlo()
+                smtp.starttls(context=ssl.create_default_context())
+                smtp.ehlo()
+                if user and password:
+                    smtp.login(user, password)
+                smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=30) as smtp:
+                smtp.ehlo()
+                if user and password:
+                    smtp.login(user, password)
+                smtp.send_message(msg)
+        return {"ok": True}
+    except Exception as e:
+        logger.exception(f"SMTP send failed to {to_email}: {e}")
+        return {"ok": False, "error": str(e)[:300]}
+
+
+async def _smtp_send_async(cfg: Dict[str, Any], to_email: str, subject: str, body: str, attachments: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return await asyncio.get_event_loop().run_in_executor(
+        None, _smtp_send_blocking, cfg, to_email, subject, body, attachments
+    )
+
+
+async def _record_email_log(lead_id: Optional[str], to_email: str, subject: str, body: str, ok: bool, error: Optional[str], trigger: str) -> None:
+    await db.email_send_logs.insert_one({
+        "id": str(uuid.uuid4()),
+        "lead_id": lead_id,
+        "to": to_email,
+        "subject": subject,
+        "body_preview": (body or "")[:300],
+        "status": "sent" if ok else "failed",
+        "error": error,
+        "trigger": trigger,
+        "at": iso(now_utc()),
+    })
+
+
+async def auto_send_email_to_address(lead: Dict[str, Any], address: str, trigger: str = "lead_created") -> Optional[Dict[str, Any]]:
+    """Send the configured email template to one address for one lead. Idempotent —
+    skips if address is already in lead.email_sent_to. Returns the SMTP result."""
+    addr = (address or "").strip()
+    if not _is_valid_email(addr):
+        return None
+    cfg = await _get_email_smtp_config()
+    if not cfg.get("enabled"):
+        return None
+    if not (cfg.get("host") and cfg.get("email") and cfg.get("password")):
+        logger.info(f"Email auto-send skipped — SMTP not fully configured (lead={lead.get('id')})")
+        return None
+    # Refresh from DB so concurrent updates don't double-send
+    fresh = await db.leads.find_one({"id": lead["id"]}, {"_id": 0, "email_sent_to": 1}) or {}
+    already = set((fresh.get("email_sent_to") or []))
+    norm = addr.lower()
+    if norm in {a.lower() for a in already}:
+        return {"ok": True, "skipped": "already_sent"}
+    tpl = await _get_email_template()
+    subject = _render_email_var(tpl.get("subject") or "", lead, addr)
+    body = _render_email_var(tpl.get("body") or "", lead, addr)
+    if not subject and not body:
+        logger.info(f"Email auto-send skipped — empty template (lead={lead.get('id')})")
+        return None
+    res = await _smtp_send_async(cfg, addr, subject, body, tpl.get("attachments") or [])
+    await _record_email_log(lead.get("id"), addr, subject, body, bool(res.get("ok")), res.get("error"), trigger)
+    if res.get("ok"):
+        await db.leads.update_one(
+            {"id": lead["id"]},
+            {"$addToSet": {"email_sent_to": addr}, "$set": {"last_email_sent_at": iso(now_utc())}},
+        )
+    return res
+
+
+async def auto_send_email_on_create(lead: Dict[str, Any]) -> None:
+    """Send the configured template to lead.email + every entry in lead.emails[].
+    Triggered after _create_lead_internal. Best-effort — failures are logged
+    but never block lead creation."""
+    addresses: List[str] = []
+    if lead.get("email"):
+        addresses.append((lead.get("email") or "").strip())
+    for e in lead.get("emails") or []:
+        if e and e not in addresses:
+            addresses.append(e.strip())
+    addresses = [a for a in addresses if _is_valid_email(a)]
+    if not addresses:
+        return
+    for a in addresses:
+        try:
+            await auto_send_email_to_address(lead, a, trigger="lead_created")
+        except Exception as e:
+            logger.warning(f"auto_send_email_on_create failed for {a}: {e}")
+
+
+@api.get("/settings/email")
+async def get_email_settings(admin: dict = Depends(require_admin)):
+    cfg = await _get_email_smtp_config()
+    return {
+        "host": cfg["host"],
+        "port": cfg["port"],
+        "security": cfg["security"],
+        "email": cfg["email"],
+        "password_masked": _mask_token(cfg["password"] or ""),
+        "has_password": bool(cfg["password"]),
+        "from_name": cfg["from_name"],
+        "enabled": cfg["enabled"],
+    }
+
+
+@api.put("/settings/email")
+async def update_email_settings(body: EmailSettingsInput, admin: dict = Depends(require_admin)):
+    patch: Dict[str, Any] = {}
+    unset: Dict[str, Any] = {}
+    for f in _EMAIL_EDITABLE_FIELDS:
+        v = getattr(body, f)
+        if v is None:
+            continue
+        if isinstance(v, str):
+            v = v.strip()
+        if v == "" and f in ("password", "from_name", "email", "host"):
+            unset[f] = ""
+        elif f == "port":
+            patch[f] = int(v)
+        elif f == "security":
+            if v not in ("ssl", "tls", "none"):
+                raise HTTPException(status_code=400, detail="security must be ssl|tls|none")
+            patch[f] = v
+        elif f == "enabled":
+            patch[f] = bool(v)
+        else:
+            patch[f] = v
+    if not patch and not unset:
+        raise HTTPException(status_code=400, detail="No changes supplied")
+    update_ops: Dict[str, Any] = {}
+    if patch:
+        update_ops["$set"] = {"key": "email_smtp", **patch, "updated_by": admin["id"], "updated_at": iso(now_utc())}
+    if unset:
+        update_ops["$unset"] = unset
+        update_ops.setdefault("$set", {}).update({"key": "email_smtp", "updated_by": admin["id"], "updated_at": iso(now_utc())})
+    await db.system_settings.update_one({"key": "email_smtp"}, update_ops, upsert=True)
+    await log_activity(admin["id"], "email_settings_updated", None, {"changed": list(patch.keys()), "cleared": list(unset.keys())})
+    return await get_email_settings(admin=admin)
+
+
+@api.get("/settings/email-template")
+async def get_email_template(admin: dict = Depends(require_admin)):
+    return await _get_email_template()
+
+
+@api.put("/settings/email-template")
+async def update_email_template(body: EmailTemplateInput, admin: dict = Depends(require_admin)):
+    patch: Dict[str, Any] = {}
+    if body.subject is not None:
+        patch["subject"] = body.subject
+    if body.body is not None:
+        patch["body"] = body.body
+    if body.attachments is not None:
+        patch["attachments"] = [a.model_dump() for a in body.attachments]
+    if not patch:
+        raise HTTPException(status_code=400, detail="No changes supplied")
+    await db.system_settings.update_one(
+        {"key": "email_template"},
+        {"$set": {"key": "email_template", **patch, "updated_by": admin["id"], "updated_at": iso(now_utc())}},
+        upsert=True,
+    )
+    return await _get_email_template()
+
+
+@api.post("/settings/email/test-send")
+async def email_test_send(body: EmailTestSendInput, admin: dict = Depends(require_admin)):
+    if not _is_valid_email(body.to):
+        raise HTTPException(status_code=400, detail="Invalid recipient email")
+    cfg = await _get_email_smtp_config()
+    if not (cfg.get("host") and cfg.get("email") and cfg.get("password")):
+        raise HTTPException(status_code=400, detail="SMTP not fully configured (host/email/password required)")
+    tpl = await _get_email_template()
+    fake_lead = {"customer_name": "Test User", "requirement": "Sample requirement", "phone": "+91XXXXXXXXXX", "email": body.to, "source": "Test"}
+    subject = _render_email_var(body.subject or tpl.get("subject") or "Test email from CRM", fake_lead, body.to)
+    body_text = _render_email_var(body.body or tpl.get("body") or "This is a test email.", fake_lead, body.to)
+    res = await _smtp_send_async(cfg, body.to, subject, body_text, tpl.get("attachments") or [])
+    await _record_email_log(None, body.to, subject, body_text, bool(res.get("ok")), res.get("error"), "test")
+    if not res.get("ok"):
+        raise HTTPException(status_code=502, detail=f"SMTP send failed: {res.get('error')}")
+    return {"ok": True, "to": body.to}
+
+
+@api.post("/leads/{lead_id}/emails")
+async def add_email(lead_id: str, body: LeadEmailInput, user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    new_email = (body.email or "").strip()
+    if not _is_valid_email(new_email):
+        raise HTTPException(status_code=400, detail="Invalid email")
+    existing_primary = (lead.get("email") or "").strip().lower()
+    existing_others = [e.lower() for e in (lead.get("emails") or [])]
+    if new_email.lower() == existing_primary or new_email.lower() in existing_others:
+        raise HTTPException(status_code=409, detail="Email already on this lead")
+    update: Dict[str, Any] = {"$set": {"last_action_at": iso(now_utc())}}
+    if not lead.get("email"):
+        # First email becomes the primary
+        update["$set"]["email"] = new_email
+    else:
+        update["$addToSet"] = {"emails": new_email}
+    await db.leads.update_one({"id": lead_id}, update)
+    await log_activity(user["id"], "email_added", lead_id, {"email": new_email})
+    refreshed = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    # Auto-send the configured template to this newly added address
+    try:
+        await auto_send_email_to_address(refreshed, new_email, trigger="email_added")
+    except Exception as e:
+        logger.warning(f"auto_send on email_added failed: {e}")
+    return await db.leads.find_one({"id": lead_id}, {"_id": 0})
+
+
+@api.delete("/leads/{lead_id}/emails")
+async def remove_email(lead_id: str, email: str = Query(...), user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    target = (email or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="Email required")
+    update: Dict[str, Any] = {"$set": {"last_action_at": iso(now_utc())}}
+    if (lead.get("email") or "").strip().lower() == target.lower():
+        # Promote the next email[] to primary if available
+        next_primary = None
+        for e in lead.get("emails") or []:
+            if (e or "").strip().lower() != target.lower():
+                next_primary = e
+                break
+        update["$set"]["email"] = next_primary
+        if next_primary:
+            update["$pull"] = {"emails": next_primary}
+    else:
+        update["$pull"] = {"emails": target}
+    await db.leads.update_one({"id": lead_id}, update)
+    await log_activity(user["id"], "email_removed", lead_id, {"email": target})
+    return await db.leads.find_one({"id": lead_id}, {"_id": 0})
 
 
 # ------------- Gmail / Justdial integration -------------
