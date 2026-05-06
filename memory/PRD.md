@@ -22,6 +22,11 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 28 (Feb 2026) — Configurable Gmail/Justdial poll interval (default 60s)
+- **Backend** (`server.py`): poll default reduced from 120s (2 min) → **60s** via new `GMAIL_POLL_DEFAULT_SECONDS` env var. Added `_get_gmail_poll_seconds()` (DB override over default) + `_reschedule_gmail_poll()` (live job swap, mirrors `_reschedule_exportersindia_pull`). New `GET /api/settings/gmail-poll` and `PUT /api/settings/gmail-poll` (admin-only, min 10s). `gmail_status` endpoint now returns `poll_interval_seconds` (and computed `poll_interval_minutes` for back-compat).
+- **Frontend** (`Integrations.jsx`): replaced "every X minute(s)" copy with "every Xs". Added `PollIntervalEditor` widget under the description: shows current interval, "Change" button reveals a numeric input + Save/Cancel. Saves via `PUT /api/settings/gmail-poll` and reloads status; min validation enforced client-side too.
+- **Verified end-to-end**: GET returns `interval_seconds=60, default=60, is_override=false`; PUT 45 → status reflects `poll_interval_seconds=45`; reset to 60. Scheduler reschedules immediately without restart.
+
 ### Iteration 27 (Feb 2026) — Justdial dedup bug fix (preserve query string in profile URL)
 - **Root cause**: `_normalize_justdial_link` was stripping the query string from JD `contact_link` URLs. Real Justdial URLs all share the same path (`https://fapp1.justdial.com/CTIMEQM`) and differ ONLY in their `?id=…&fl=…` query — which encodes the unique enquiry token. Previous normalization collapsed every distinct enquiry to a single key, falsely dedup'ing them all to one lead.
 - **Fix** (`server.py`): keep the query string; only normalize host casing, drop fragment, strip trailing slash on path. Verified via curl: 3 ingest scenarios — different `?id=` → new lead, same exact URL → dedup with `dedup_reason='justdial_profile_url'`.

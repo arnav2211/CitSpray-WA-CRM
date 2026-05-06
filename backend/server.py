@@ -5655,7 +5655,8 @@ GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "openid",
 ]
-GMAIL_POLL_MINUTES = max(1, int(os.environ.get("GMAIL_POLL_INTERVAL_MINUTES", "2")))
+GMAIL_POLL_DEFAULT_SECONDS = max(10, int(os.environ.get("GMAIL_POLL_INTERVAL_SECONDS", "60")))
+GMAIL_POLL_MINUTES = max(1, int(os.environ.get("GMAIL_POLL_INTERVAL_MINUTES", "1")))  # legacy fallback
 GMAIL_QUERY = os.environ.get("GMAIL_JUSTDIAL_QUERY", "from:instantemail@justdial.com is:unread newer_than:7d")
 GMAIL_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI)
 GMAIL_SLOTS = ("primary", "secondary")
@@ -5680,6 +5681,69 @@ async def _ensure_gmail_migrated():
         await db.gmail_connections.delete_one({"key": "default"})
 
 
+async def _get_gmail_poll_seconds() -> int:
+    """DB override > env default. Min 10s. Returns the effective Gmail poll
+    interval in seconds — used at boot AND on every settings change."""
+    doc = await db.system_settings.find_one({"key": "gmail_poll"}, {"_id": 0}) or {}
+    val = doc.get("interval_seconds")
+    if val is None:
+        return GMAIL_POLL_DEFAULT_SECONDS
+    try:
+        return max(10, int(val))
+    except Exception:
+        return GMAIL_POLL_DEFAULT_SECONDS
+
+
+async def _reschedule_gmail_poll(new_interval_seconds: int):
+    """Update the gmail_poll scheduler job in place so interval changes apply live."""
+    global scheduler
+    if not scheduler:
+        return
+    try:
+        scheduler.remove_job("gmail_poll")
+    except Exception:
+        pass
+    scheduler.add_job(
+        gmail_poll_task, "interval",
+        seconds=max(10, int(new_interval_seconds or GMAIL_POLL_DEFAULT_SECONDS)),
+        id="gmail_poll", max_instances=1, coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=5),
+    )
+
+
+class GmailPollSettingsInput(BaseModel):
+    interval_seconds: Optional[int] = None
+
+
+@api.get("/settings/gmail-poll")
+async def get_gmail_poll_settings(admin: dict = Depends(require_admin)):
+    secs = await _get_gmail_poll_seconds()
+    doc = await db.system_settings.find_one({"key": "gmail_poll"}, {"_id": 0}) or {}
+    return {
+        "interval_seconds": secs,
+        "default_seconds": GMAIL_POLL_DEFAULT_SECONDS,
+        "min_seconds": 10,
+        "is_override": doc.get("interval_seconds") is not None,
+        "updated_at": doc.get("updated_at"),
+    }
+
+
+@api.put("/settings/gmail-poll")
+async def update_gmail_poll_settings(body: GmailPollSettingsInput, admin: dict = Depends(require_admin)):
+    if body.interval_seconds is None:
+        raise HTTPException(status_code=400, detail="interval_seconds required")
+    secs = max(10, int(body.interval_seconds))
+    await db.system_settings.update_one(
+        {"key": "gmail_poll"},
+        {"$set": {"key": "gmail_poll", "interval_seconds": secs, "updated_by": admin["id"], "updated_at": iso(now_utc())}},
+        upsert=True,
+    )
+    if GMAIL_ENABLED:
+        await _reschedule_gmail_poll(secs)
+    await log_activity(admin["id"], "gmail_poll_interval_updated", None, {"interval_seconds": secs})
+    return {"ok": True, "interval_seconds": secs}
+
+
 @api.get("/integrations/gmail/status")
 async def gmail_status(user: dict = Depends(get_current_user), slot: Optional[str] = None):
     """Returns status for one slot (if `slot` is supplied) or BOTH slots otherwise.
@@ -5688,7 +5752,8 @@ async def gmail_status(user: dict = Depends(get_current_user), slot: Optional[st
     if not GMAIL_ENABLED:
         return {"enabled": False, "reason": "GOOGLE_CLIENT_ID/SECRET/REDIRECT_URI not configured"}
     if slot is None:
-        out = {"enabled": True, "slots": {}, "redirect_uri": GOOGLE_REDIRECT_URI, "poll_interval_minutes": GMAIL_POLL_MINUTES, "query": GMAIL_QUERY}
+        secs = await _get_gmail_poll_seconds()
+        out = {"enabled": True, "slots": {}, "redirect_uri": GOOGLE_REDIRECT_URI, "poll_interval_seconds": secs, "poll_interval_minutes": max(1, secs // 60), "query": GMAIL_QUERY}
         for s in GMAIL_SLOTS:
             cfg = await db.gmail_connections.find_one({"key": s}, {"_id": 0, "access_token": 0, "refresh_token": 0})
             last_poll = await db.gmail_polls.find_one({"key": f"last:{s}"}, {"_id": 0})
@@ -5707,6 +5772,7 @@ async def gmail_status(user: dict = Depends(get_current_user), slot: Optional[st
     if not cfg:
         return {"enabled": True, "connected": False, "slot": s, "redirect_uri": GOOGLE_REDIRECT_URI}
     last_poll = await db.gmail_polls.find_one({"key": f"last:{s}"}, {"_id": 0})
+    secs = await _get_gmail_poll_seconds()
     return {
         "enabled": True,
         "connected": True,
@@ -5717,7 +5783,8 @@ async def gmail_status(user: dict = Depends(get_current_user), slot: Optional[st
         "scopes": cfg.get("scopes"),
         "expires_at": cfg.get("expires_at"),
         "last_poll": last_poll,
-        "poll_interval_minutes": GMAIL_POLL_MINUTES,
+        "poll_interval_seconds": secs,
+        "poll_interval_minutes": max(1, secs // 60),
         "query": GMAIL_QUERY,
         "redirect_uri": GOOGLE_REDIRECT_URI,
     }
@@ -6233,10 +6300,12 @@ async def on_startup():
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(auto_reassign_task, "interval", minutes=1, id="auto_reassign", max_instances=1, coalesce=True)
     if GMAIL_ENABLED:
+        gmail_secs = await _get_gmail_poll_seconds()
         scheduler.add_job(
-            gmail_poll_task, "interval", minutes=GMAIL_POLL_MINUTES,
+            gmail_poll_task, "interval", seconds=gmail_secs,
             id="gmail_poll", max_instances=1, coalesce=True,
         )
+        logger.info(f"Gmail poll scheduled every {gmail_secs}s")
     # ExportersIndia pull — only schedule if admin has enabled it
     try:
         ei_cfg = await _get_exportersindia_pull_cfg()
