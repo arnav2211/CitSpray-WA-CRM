@@ -22,6 +22,24 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 30 (Feb 2026) — Date filter on /reports (Today / Yesterday / Select Month / Custom)
+- **Backend `GET /api/reports/overview`** (`server.py`): added optional `date_from` + `date_to` (YYYY-MM-DD, IST, inclusive). New helper `_parse_ist_range` shared by the leads-list and reports endpoints. Windows ALL counters: total leads, by_status, by_source, conversion_rate, reassigned, per_executive (lead/call/message/followup counts), and the 14-day timeseries (which now ends at `date_to` if supplied). `missed_followups` stays cross-window (it reflects current overdue state). Returns 400 on bad format. `date_from`/`date_to` echoed in response.
+- **Frontend `Reports.jsx`** rewrite:
+  - Added quick-pick chips: **Today** (default), **Yesterday**, **Select Month** (with `<input type="month">` picker), **Custom** (two date inputs).
+  - Custom mode allows any `date_from`/`date_to` IST range; editing either input from a preset auto-switches mode to Custom.
+  - All test IDs: `reports-date-filter`, `reports-preset-today/yesterday/month/custom`, `reports-month-input`, `reports-date-from`, `reports-date-to`.
+- **Verified**: backend smoke — all-time total=613, single day 2026-05-06 → 3 leads, full month 2026-05 → 349 leads, bad date → 400.
+
+### Iteration 29 (Feb 2026) — Date filter on /leads
+- **Backend `GET /api/leads`** (`server.py`): added optional `date_from` + `date_to` query params (YYYY-MM-DD, inclusive). Both interpreted in **IST (Asia/Kolkata)**: `date_from` snaps to 00:00:00 IST start, `date_to` snaps to 23:59:59 IST end, both converted to UTC for the Mongo `created_at` range. 400 on bad format. Backwards-compatible with all existing callers.
+- **Frontend `Leads.jsx`**: added two `<input type="date">` controls (testids `leads-date-from`, `leads-date-to`) inside `leads-date-filter` group, with clear (×) button (`leads-date-clear`) when either is set. State synced to URL params (`date_from`, `date_to`) so date-filtered URLs are bookmarkable. `min`/`max` mutual constraints prevent invalid ranges. Single-date selection = same value in both inputs.
+- **Verified**: backend curl smoke (total=349 with `date_from=2026-05-01`, total=0 with `2026-04-18..2026-04-18` because data is on Apr 19 IST; 400 on `2026/02/01`).
+
+### Iteration 28 (Feb 2026) — Configurable Gmail/Justdial poll interval (default 60s)
+- **Backend** (`server.py`): poll default reduced from 120s (2 min) → **60s** via new `GMAIL_POLL_DEFAULT_SECONDS` env var. Added `_get_gmail_poll_seconds()` (DB override over default) + `_reschedule_gmail_poll()` (live job swap, mirrors `_reschedule_exportersindia_pull`). New `GET /api/settings/gmail-poll` and `PUT /api/settings/gmail-poll` (admin-only, min 10s). `gmail_status` endpoint now returns `poll_interval_seconds` (and computed `poll_interval_minutes` for back-compat).
+- **Frontend** (`Integrations.jsx`): replaced "every X minute(s)" copy with "every Xs". Added `PollIntervalEditor` widget under the description: shows current interval, "Change" button reveals a numeric input + Save/Cancel. Saves via `PUT /api/settings/gmail-poll` and reloads status; min validation enforced client-side too.
+- **Verified end-to-end**: GET returns `interval_seconds=60, default=60, is_override=false`; PUT 45 → status reflects `poll_interval_seconds=45`; reset to 60. Scheduler reschedules immediately without restart.
+
 ### Iteration 27 (Feb 2026) — Justdial dedup bug fix (preserve query string in profile URL)
 - **Root cause**: `_normalize_justdial_link` was stripping the query string from JD `contact_link` URLs. Real Justdial URLs all share the same path (`https://fapp1.justdial.com/CTIMEQM`) and differ ONLY in their `?id=…&fl=…` query — which encodes the unique enquiry token. Previous normalization collapsed every distinct enquiry to a single key, falsely dedup'ing them all to one lead.
 - **Fix** (`server.py`): keep the query string; only normalize host casing, drop fragment, strip trailing slash on path. Verified via curl: 3 ingest scenarios — different `?id=` → new lead, same exact URL → dedup with `dedup_reason='justdial_profile_url'`.

@@ -23,6 +23,8 @@ export default function Leads() {
   const [sourceFilter, setSourceFilter] = useState(params.get("source") || "");
   const [assignedFilter, setAssignedFilter] = useState(params.get("assigned") || "");
   const [outcomeFilter, setOutcomeFilter] = useState(params.get("outcome") || "");
+  const [dateFrom, setDateFrom] = useState(params.get("date_from") || "");
+  const [dateTo, setDateTo] = useState(params.get("date_to") || "");
   const [openId, setOpenId] = useState(params.get("lead") || null);
   const [creating, setCreating] = useState(false);
   const [page, setPage] = useState(parseInt(params.get("page") || "1", 10) || 1);
@@ -38,6 +40,8 @@ export default function Leads() {
           source: sourceFilter || undefined,
           assigned_to: assignedFilter || undefined,
           last_call_outcome: outcomeFilter || undefined,
+          date_from: dateFrom || undefined,
+          date_to: dateTo || undefined,
           paginate: true,
           limit: pageSize,
           offset: (page - 1) * pageSize,
@@ -62,9 +66,9 @@ export default function Leads() {
 
   // Reset to first page whenever a filter changes (so we never end up on an
   // empty page after narrowing the result set).
-  useEffect(() => { setPage(1); }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, q, pageSize]);
+  useEffect(() => { setPage(1); }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, q, pageSize]);
 
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, page, pageSize]);
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, page, pageSize]);
   useEffect(() => {
     const t = setTimeout(() => load(), 300);
     return () => clearTimeout(t);
@@ -79,11 +83,13 @@ export default function Leads() {
     if (sourceFilter) p.source = sourceFilter;
     if (assignedFilter) p.assigned = assignedFilter;
     if (outcomeFilter) p.outcome = outcomeFilter;
+    if (dateFrom) p.date_from = dateFrom;
+    if (dateTo) p.date_to = dateTo;
     if (openId) p.lead = openId;
     if (page > 1) p.page = String(page);
     if (pageSize !== 25) p.size = String(pageSize);
     setParams(p, { replace: true });
-  }, [view, q, statusFilter, sourceFilter, assignedFilter, outcomeFilter, openId, page, pageSize, setParams]);
+  }, [view, q, statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, openId, page, pageSize, setParams]);
 
   const execMap = useMemo(() => Object.fromEntries(execs.map((e) => [e.id, e])), [execs]);
   const isAdmin = user.role === "admin";
@@ -146,6 +152,25 @@ export default function Leads() {
           <option value="busy">Busy / Engaged</option>
           <option value="invalid">Invalid</option>
         </select>
+        {/* Date range — single date = same value in both fields. Inclusive (IST). */}
+        <div className="flex items-center gap-1 col-span-2 md:col-span-2" data-testid="leads-date-filter">
+          <input
+            type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)}
+            max={dateTo || undefined}
+            className="flex-1 border border-gray-300 px-2 py-2 text-sm" title="From date" data-testid="leads-date-from"
+          />
+          <span className="text-gray-400 text-xs">→</span>
+          <input
+            type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)}
+            min={dateFrom || undefined}
+            className="flex-1 border border-gray-300 px-2 py-2 text-sm" title="To date" data-testid="leads-date-to"
+          />
+          {(dateFrom || dateTo) && (
+            <button onClick={() => { setDateFrom(""); setDateTo(""); }} className="border border-gray-300 hover:border-gray-900 px-2 py-2 text-[10px] uppercase tracking-widest font-bold text-gray-500 hover:text-gray-900" title="Clear date filter" data-testid="leads-date-clear">
+              ×
+            </button>
+          )}
+        </div>
       </div>
 
       {view === "table" ? (

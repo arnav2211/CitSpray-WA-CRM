@@ -1524,6 +1524,8 @@ async def list_leads(
     assigned_to: Optional[str] = None,
     last_call_outcome: Optional[str] = None,
     q: Optional[str] = None,
+    date_from: Optional[str] = None,  # YYYY-MM-DD (IST) inclusive
+    date_to: Optional[str] = None,    # YYYY-MM-DD (IST) inclusive
     limit: int = 500,
     offset: int = 0,
     paginate: bool = False,
@@ -1531,7 +1533,9 @@ async def list_leads(
     """List leads with optional filters. Backwards-compatible:
     - Default returns a bare array (existing callers unchanged).
     - Pass `paginate=true&limit=25&offset=0` to receive `{items, total, limit, offset}`
-      so the UI can render page controls."""
+      so the UI can render page controls.
+    - Pass `date_from=YYYY-MM-DD` and/or `date_to=YYYY-MM-DD` (IST, inclusive) to
+      narrow by created_at."""
     query: Dict[str, Any] = {}
     if user["role"] == "executive":
         query["assigned_to"] = user["id"]
@@ -1546,6 +1550,22 @@ async def list_leads(
         if last_call_outcome not in CALL_OUTCOMES:
             raise HTTPException(status_code=400, detail=f"Invalid outcome. Must be one of {CALL_OUTCOMES}")
         query["last_call_outcome"] = last_call_outcome
+    if date_from or date_to:
+        try:
+            from zoneinfo import ZoneInfo
+            ist = ZoneInfo("Asia/Kolkata")
+            range_q: Dict[str, str] = {}
+            if date_from:
+                d_from = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=ist)
+                range_q["$gte"] = iso(d_from.astimezone(timezone.utc))
+            if date_to:
+                # Inclusive end-of-day in IST
+                d_to = datetime.strptime(date_to, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999000, tzinfo=ist)
+                range_q["$lte"] = iso(d_to.astimezone(timezone.utc))
+            if range_q:
+                query["created_at"] = range_q
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date_from / date_to must be YYYY-MM-DD")
     if q:
         import re as _re
         q_safe = _re.escape(q)
@@ -2544,25 +2564,62 @@ async def update_rules(body: RoutingRulesUpdate, admin: dict = Depends(require_a
     return r
 
 # ------------- Reports -------------
+def _parse_ist_range(date_from: Optional[str], date_to: Optional[str]) -> Dict[str, str]:
+    """Build an inclusive ISO range (UTC) from two YYYY-MM-DD IST dates."""
+    if not date_from and not date_to:
+        return {}
+    from zoneinfo import ZoneInfo
+    ist = ZoneInfo("Asia/Kolkata")
+    out: Dict[str, str] = {}
+    if date_from:
+        d = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=ist)
+        out["$gte"] = iso(d.astimezone(timezone.utc))
+    if date_to:
+        d = datetime.strptime(date_to, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999000, tzinfo=ist)
+        out["$lte"] = iso(d.astimezone(timezone.utc))
+    return out
+
+
 @api.get("/reports/overview")
-async def reports_overview(admin: dict = Depends(require_admin)):
-    total = await db.leads.count_documents({})
-    by_status_cursor = db.leads.aggregate([{"$group": {"_id": "$status", "c": {"$sum": 1}}}])
+async def reports_overview(
+    admin: dict = Depends(require_admin),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+):
+    """Optional `date_from`/`date_to` (YYYY-MM-DD, IST, inclusive) narrow lead-creation,
+    call-log, message and followup counters to that window. Omitting both = all-time.
+    Conversion rate, source/status breakdown and the timeseries also respect the window."""
+    try:
+        date_range = _parse_ist_range(date_from, date_to)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date_from / date_to must be YYYY-MM-DD")
+    lead_q: Dict[str, Any] = {}
+    msg_q: Dict[str, Any] = {}
+    call_q: Dict[str, Any] = {}
+    fup_q: Dict[str, Any] = {}
+    if date_range:
+        lead_q["created_at"] = date_range
+        msg_q["at"] = date_range
+        call_q["at"] = date_range
+        fup_q["created_at"] = date_range
+    total = await db.leads.count_documents(lead_q)
+    by_status_cursor = db.leads.aggregate([{"$match": lead_q}, {"$group": {"_id": "$status", "c": {"$sum": 1}}}])
     by_status = {doc["_id"] or "unknown": doc["c"] async for doc in by_status_cursor}
-    by_source_cursor = db.leads.aggregate([{"$group": {"_id": "$source", "c": {"$sum": 1}}}])
+    by_source_cursor = db.leads.aggregate([{"$match": lead_q}, {"$group": {"_id": "$source", "c": {"$sum": 1}}}])
     by_source = {doc["_id"] or "unknown": doc["c"] async for doc in by_source_cursor}
     converted = by_status.get("converted", 0)
     conversion_rate = round((converted / total) * 100, 2) if total else 0
-    # reassigned = count leads with > 1 assignment history entry
-    reassigned = await db.leads.count_documents({"assignment_history.1": {"$exists": True}})
-    # missed = pending followups past due_at
+    # reassigned = count leads (in window) with > 1 assignment history entry
+    reassigned = await db.leads.count_documents({**lead_q, "assignment_history.1": {"$exists": True}})
+    # missed = pending followups past due_at (always cross-window — pending reflects current state)
     now_iso = iso(now_utc())
     missed_followups = await db.followups.count_documents({"status": "pending", "due_at": {"$lt": now_iso}})
     # per executive
     execs = await db.users.find({"role": "executive"}, {"_id": 0, "password_hash": 0}).to_list(500)
     per_exec = []
-    # Pre-aggregate calls by user × outcome
+    # Pre-aggregate calls (windowed) by user × outcome
     call_pipeline = [
+        {"$match": call_q} if call_q else {"$match": {}},
         {"$group": {"_id": {"user": "$by_user_id", "outcome": "$outcome"}, "c": {"$sum": 1}}},
     ]
     call_buckets: Dict[str, Dict[str, int]] = {}
@@ -2572,30 +2629,32 @@ async def reports_overview(admin: dict = Depends(require_admin)):
         if not u:
             continue
         call_buckets.setdefault(u, {})[oc] = d["c"]
-    # Pre-aggregate messages by user (sent count)
+    # Pre-aggregate messages (windowed) by user (sent count)
     msg_pipeline = [
-        {"$match": {"direction": "out", "by_user_id": {"$ne": None}}},
+        {"$match": {**msg_q, "direction": "out", "by_user_id": {"$ne": None}}},
         {"$group": {"_id": "$by_user_id", "c": {"$sum": 1}}},
     ]
     msgs_sent: Dict[str, int] = {}
     async for d in db.messages.aggregate(msg_pipeline):
         msgs_sent[d["_id"]] = d["c"]
     for e in execs:
-        count = await db.leads.count_documents({"assigned_to": e["id"]})
-        conv = await db.leads.count_documents({"assigned_to": e["id"], "status": "converted"})
-        qualified = await db.leads.count_documents({"assigned_to": e["id"], "status": "qualified"})
-        lost = await db.leads.count_documents({"assigned_to": e["id"], "status": "lost"})
-        contacted = await db.leads.count_documents({"assigned_to": e["id"], "status": "contacted"})
-        new_leads = await db.leads.count_documents({"assigned_to": e["id"], "status": "new"})
-        wa_threads = await db.leads.count_documents({"assigned_to": e["id"], "has_whatsapp": True})
-        # Followup completion rate
-        fu_total = await db.followups.count_documents({"executive_id": e["id"]})
-        fu_done = await db.followups.count_documents({"executive_id": e["id"], "status": "done"})
-        fu_pending = await db.followups.count_documents({"executive_id": e["id"], "status": "pending"})
+        base = {**lead_q, "assigned_to": e["id"]}
+        count = await db.leads.count_documents(base)
+        conv = await db.leads.count_documents({**base, "status": "converted"})
+        qualified = await db.leads.count_documents({**base, "status": "qualified"})
+        lost = await db.leads.count_documents({**base, "status": "lost"})
+        contacted = await db.leads.count_documents({**base, "status": "contacted"})
+        new_leads = await db.leads.count_documents({**base, "status": "new"})
+        wa_threads = await db.leads.count_documents({**base, "has_whatsapp": True})
+        # Followup completion rate (windowed)
+        fu_base = {**fup_q, "executive_id": e["id"]}
+        fu_total = await db.followups.count_documents(fu_base)
+        fu_done = await db.followups.count_documents({**fu_base, "status": "done"})
+        fu_pending = await db.followups.count_documents({**fu_base, "status": "pending"})
         fu_completion = round((fu_done / fu_total) * 100, 1) if fu_total else 0
-        # avg response = avg(opened_at - created_at) where both present
+        # avg response = avg(opened_at - created_at) where both present, windowed
         pipeline = [
-            {"$match": {"assigned_to": e["id"], "opened_at": {"$ne": None}}},
+            {"$match": {**lead_q, "assigned_to": e["id"], "opened_at": {"$ne": None}}},
             {"$project": {"delta": {"$subtract": [
                 {"$toDate": "$opened_at"}, {"$toDate": "$created_at"}
             ]}}},
@@ -2633,12 +2692,18 @@ async def reports_overview(admin: dict = Depends(require_admin)):
             "followup_pending": fu_pending,
             "followup_completion_pct": fu_completion,
         })
-    # last 14 days chart
+    # Timeseries — show 14 days ending at date_to (or today). Always windowed
+    # to whichever leads fall within (date_from..date_to) so the chart matches
+    # the rest of the page.
     from collections import Counter
-    leads_all = await db.leads.find({}, {"_id": 0, "created_at": 1, "source": 1}).to_list(10000)
+    leads_all = await db.leads.find(lead_q, {"_id": 0, "created_at": 1, "source": 1}).to_list(20000)
+    if date_to:
+        end = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    else:
+        end = now_utc()
     days: Dict[str, int] = {}
     for i in range(13, -1, -1):
-        d = (now_utc() - timedelta(days=i)).strftime("%Y-%m-%d")
+        d = (end - timedelta(days=i)).strftime("%Y-%m-%d")
         days[d] = 0
     for ld in leads_all:
         ca = (ld.get("created_at") or "")[:10]
@@ -2654,6 +2719,8 @@ async def reports_overview(admin: dict = Depends(require_admin)):
         "missed_followups": missed_followups,
         "per_executive": per_exec,
         "leads_timeseries": chart,
+        "date_from": date_from,
+        "date_to": date_to,
     }
 
 @api.get("/reports/my")
@@ -5662,7 +5729,8 @@ GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "openid",
 ]
-GMAIL_POLL_MINUTES = max(1, int(os.environ.get("GMAIL_POLL_INTERVAL_MINUTES", "2")))
+GMAIL_POLL_DEFAULT_SECONDS = max(10, int(os.environ.get("GMAIL_POLL_INTERVAL_SECONDS", "60")))
+GMAIL_POLL_MINUTES = max(1, int(os.environ.get("GMAIL_POLL_INTERVAL_MINUTES", "1")))  # legacy fallback
 GMAIL_QUERY = os.environ.get("GMAIL_JUSTDIAL_QUERY", "from:instantemail@justdial.com is:unread newer_than:7d")
 GMAIL_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI)
 GMAIL_SLOTS = ("primary", "secondary")
@@ -5687,6 +5755,69 @@ async def _ensure_gmail_migrated():
         await db.gmail_connections.delete_one({"key": "default"})
 
 
+async def _get_gmail_poll_seconds() -> int:
+    """DB override > env default. Min 10s. Returns the effective Gmail poll
+    interval in seconds — used at boot AND on every settings change."""
+    doc = await db.system_settings.find_one({"key": "gmail_poll"}, {"_id": 0}) or {}
+    val = doc.get("interval_seconds")
+    if val is None:
+        return GMAIL_POLL_DEFAULT_SECONDS
+    try:
+        return max(10, int(val))
+    except Exception:
+        return GMAIL_POLL_DEFAULT_SECONDS
+
+
+async def _reschedule_gmail_poll(new_interval_seconds: int):
+    """Update the gmail_poll scheduler job in place so interval changes apply live."""
+    global scheduler
+    if not scheduler:
+        return
+    try:
+        scheduler.remove_job("gmail_poll")
+    except Exception:
+        pass
+    scheduler.add_job(
+        gmail_poll_task, "interval",
+        seconds=max(10, int(new_interval_seconds or GMAIL_POLL_DEFAULT_SECONDS)),
+        id="gmail_poll", max_instances=1, coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=5),
+    )
+
+
+class GmailPollSettingsInput(BaseModel):
+    interval_seconds: Optional[int] = None
+
+
+@api.get("/settings/gmail-poll")
+async def get_gmail_poll_settings(admin: dict = Depends(require_admin)):
+    secs = await _get_gmail_poll_seconds()
+    doc = await db.system_settings.find_one({"key": "gmail_poll"}, {"_id": 0}) or {}
+    return {
+        "interval_seconds": secs,
+        "default_seconds": GMAIL_POLL_DEFAULT_SECONDS,
+        "min_seconds": 10,
+        "is_override": doc.get("interval_seconds") is not None,
+        "updated_at": doc.get("updated_at"),
+    }
+
+
+@api.put("/settings/gmail-poll")
+async def update_gmail_poll_settings(body: GmailPollSettingsInput, admin: dict = Depends(require_admin)):
+    if body.interval_seconds is None:
+        raise HTTPException(status_code=400, detail="interval_seconds required")
+    secs = max(10, int(body.interval_seconds))
+    await db.system_settings.update_one(
+        {"key": "gmail_poll"},
+        {"$set": {"key": "gmail_poll", "interval_seconds": secs, "updated_by": admin["id"], "updated_at": iso(now_utc())}},
+        upsert=True,
+    )
+    if GMAIL_ENABLED:
+        await _reschedule_gmail_poll(secs)
+    await log_activity(admin["id"], "gmail_poll_interval_updated", None, {"interval_seconds": secs})
+    return {"ok": True, "interval_seconds": secs}
+
+
 @api.get("/integrations/gmail/status")
 async def gmail_status(user: dict = Depends(get_current_user), slot: Optional[str] = None):
     """Returns status for one slot (if `slot` is supplied) or BOTH slots otherwise.
@@ -5695,7 +5826,8 @@ async def gmail_status(user: dict = Depends(get_current_user), slot: Optional[st
     if not GMAIL_ENABLED:
         return {"enabled": False, "reason": "GOOGLE_CLIENT_ID/SECRET/REDIRECT_URI not configured"}
     if slot is None:
-        out = {"enabled": True, "slots": {}, "redirect_uri": GOOGLE_REDIRECT_URI, "poll_interval_minutes": GMAIL_POLL_MINUTES, "query": GMAIL_QUERY}
+        secs = await _get_gmail_poll_seconds()
+        out = {"enabled": True, "slots": {}, "redirect_uri": GOOGLE_REDIRECT_URI, "poll_interval_seconds": secs, "poll_interval_minutes": max(1, secs // 60), "query": GMAIL_QUERY}
         for s in GMAIL_SLOTS:
             cfg = await db.gmail_connections.find_one({"key": s}, {"_id": 0, "access_token": 0, "refresh_token": 0})
             last_poll = await db.gmail_polls.find_one({"key": f"last:{s}"}, {"_id": 0})
@@ -5714,6 +5846,7 @@ async def gmail_status(user: dict = Depends(get_current_user), slot: Optional[st
     if not cfg:
         return {"enabled": True, "connected": False, "slot": s, "redirect_uri": GOOGLE_REDIRECT_URI}
     last_poll = await db.gmail_polls.find_one({"key": f"last:{s}"}, {"_id": 0})
+    secs = await _get_gmail_poll_seconds()
     return {
         "enabled": True,
         "connected": True,
@@ -5724,7 +5857,8 @@ async def gmail_status(user: dict = Depends(get_current_user), slot: Optional[st
         "scopes": cfg.get("scopes"),
         "expires_at": cfg.get("expires_at"),
         "last_poll": last_poll,
-        "poll_interval_minutes": GMAIL_POLL_MINUTES,
+        "poll_interval_seconds": secs,
+        "poll_interval_minutes": max(1, secs // 60),
         "query": GMAIL_QUERY,
         "redirect_uri": GOOGLE_REDIRECT_URI,
     }
@@ -6176,10 +6310,12 @@ async def on_startup():
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(auto_reassign_task, "interval", minutes=1, id="auto_reassign", max_instances=1, coalesce=True)
     if GMAIL_ENABLED:
+        gmail_secs = await _get_gmail_poll_seconds()
         scheduler.add_job(
-            gmail_poll_task, "interval", minutes=GMAIL_POLL_MINUTES,
+            gmail_poll_task, "interval", seconds=gmail_secs,
             id="gmail_poll", max_instances=1, coalesce=True,
         )
+        logger.info(f"Gmail poll scheduled every {gmail_secs}s")
     # ExportersIndia pull — only schedule if admin has enabled it
     try:
         ei_cfg = await _get_exportersindia_pull_cfg()

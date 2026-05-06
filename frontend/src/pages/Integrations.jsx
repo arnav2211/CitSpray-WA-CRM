@@ -105,11 +105,12 @@ export default function Integrations() {
             <h2 className="font-chivo font-bold text-xl">Gmail · Justdial Pull</h2>
             <p className="text-sm text-gray-600 mt-1 max-w-3xl">
               Connect up to <b>two</b> Gmail accounts that receive Justdial enquiry notifications.
-              The system polls each inbox every {status?.poll_interval_minutes ?? "?"} minute(s) for unread emails matching{" "}
+              The system polls each inbox every <b>{status?.poll_interval_seconds ?? "?"}</b>s for unread emails matching{" "}
               <span className="kbd">{status?.query || "from:instantemail@justdial.com"}</span>,
-              parses them, de-duplicates by mobile number + gmail-id, creates leads and marks them read.
+              parses them, de-duplicates by profile URL + mobile + gmail-id, creates leads and marks them read.
               Both accounts share the same extraction logic and assignment rules.
             </p>
+            <PollIntervalEditor currentSeconds={status?.poll_interval_seconds} onSaved={load} />
           </div>
         </div>
 
@@ -274,3 +275,57 @@ function SourceTile({ name, status, desc }) {
     </div>
   );
 }
+
+function PollIntervalEditor({ currentSeconds, onSaved }) {
+  const [val, setVal] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setVal(String(currentSeconds ?? 60));
+  }, [currentSeconds]);
+
+  const save = async () => {
+    const n = Number(val);
+    if (!Number.isFinite(n) || n < 10) {
+      toast.error("Interval must be at least 10 seconds");
+      return;
+    }
+    setSaving(true);
+    try {
+      await api.put("/settings/gmail-poll", { interval_seconds: Math.floor(n) });
+      toast.success(`Polling every ${Math.floor(n)}s`);
+      setEditing(false);
+      await onSaved?.();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setSaving(false); }
+  };
+
+  if (!editing) {
+    return (
+      <div className="mt-2 flex items-center gap-2 text-xs">
+        <span className="text-gray-500">Polling interval:</span>
+        <span className="font-mono font-bold text-gray-900">{currentSeconds ?? "—"}s</span>
+        <button onClick={() => setEditing(true)} className="text-[#002FA7] hover:underline text-[10px] uppercase tracking-widest font-bold" data-testid="gmail-poll-edit-btn">
+          Change
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div className="mt-2 flex items-center gap-2 text-xs flex-wrap">
+      <span className="text-gray-500">Polling interval:</span>
+      <input type="number" min={10} value={val} onChange={(e) => setVal(e.target.value)} onKeyDown={(e) => e.key === "Enter" && save()}
+        className="border border-gray-300 px-2 py-1 text-xs w-24 font-mono" data-testid="gmail-poll-input" />
+      <span className="text-gray-500">seconds</span>
+      <button onClick={save} disabled={saving} className="bg-[#002FA7] hover:bg-[#002288] text-white px-3 py-1 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50" data-testid="gmail-poll-save-btn">
+        {saving ? "Saving…" : "Save"}
+      </button>
+      <button onClick={() => setEditing(false)} className="text-gray-400 hover:text-gray-900 text-[10px] uppercase tracking-widest font-bold" data-testid="gmail-poll-cancel-btn">
+        Cancel
+      </button>
+      <span className="text-gray-400 ml-2">min 10s · default 60s</span>
+    </div>
+  );
+}
+
