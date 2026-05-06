@@ -22,6 +22,9 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 24 (Feb 2026) — Manual lead creator owns the lead
+- **`POST /api/leads`** (`server.py` ~L1602): when an executive creates a lead manually, force-assign it to themselves (overrides any `assigned_to` payload value, skips round-robin). Admins are unaffected — they can still pass an explicit assignee or let `_create_lead_internal` route via round-robin / buyleads rules. Verified via curl: exec→self (match), exec sneaking `assigned_to=other`→still self, admin→round-robin still picks an agent.
+
 ### Iteration 23 (Feb 2026) — 7-feature batch (Justdial URL dedup + Delete + sort + replied filter + composer + mobile UX)
 - **Justdial profile-URL dedup** (`server.py`):
   - New helper `_normalize_justdial_link(url)` lowercases scheme+host, strips query/fragment/trailing slash → stable key across `?ref=…` variants.

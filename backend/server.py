@@ -1600,6 +1600,12 @@ async def create_lead(body: LeadCreate, user: dict = Depends(get_current_user)):
                     },
                 )
     data["dedup_hash"] = _lead_dedup_hash(data["customer_name"], iso(now_utc()), data.get("phone", "") or "")
+    # If an executive is creating a lead manually, force-assign it to themselves
+    # (don't run round-robin or honour any payload-supplied assignee). Admins
+    # retain the ability to either pass an explicit assignee or let
+    # _create_lead_internal route via round-robin / buyleads rules.
+    if user["role"] == "executive":
+        data["assigned_to"] = user["id"]
     lead = await _create_lead_internal(data, by_user_id=user["id"])
     return lead
 
