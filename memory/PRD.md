@@ -22,6 +22,12 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 31 (Feb 2026) — Click-to-jump on quoted messages (WhatsApp parity)
+- **`Chat.jsx`** — added `jumpToMessage(id)` helper inside the chat thread that finds the bubble via `[data-testid="bubble-${id}"]`, calls `scrollIntoView({block:"center"})` and adds a transient `ring-4 ring-[#FF8800]` flash for 1.4s. Toast on miss.
+- **WA-thread quoted preview** (`_BubbleImpl`) is now a `<button>` with `cursor:pointer` + hover/active state; click → `onJumpTo(quoted.id || m.reply_to_message_id)`.
+- **Internal Q&A quoted preview** (`InternalChat`) is now a clickable button too — clicks → `onJumpToWa(m.quoted.id)` (the parent's `jumpToMessage`), so clicking the quote in the right panel scrolls the left WA panel to the original message and flashes it. New testid `internal-quoted-{id}`.
+- Prop chain: `Chat → DayGroup → Bubble.onJumpTo`; `Chat → InternalChat.onJumpToWa`. `React.memo` comparator updated to include `onJumpTo`.
+
 ### Iteration 30 (Feb 2026) — Date filter on /reports (Today / Yesterday / Select Month / Custom)
 - **Backend `GET /api/reports/overview`** (`server.py`): added optional `date_from` + `date_to` (YYYY-MM-DD, IST, inclusive). New helper `_parse_ist_range` shared by the leads-list and reports endpoints. Windows ALL counters: total leads, by_status, by_source, conversion_rate, reassigned, per_executive (lead/call/message/followup counts), and the 14-day timeseries (which now ends at `date_to` if supplied). `missed_followups` stays cross-window (it reflects current overdue state). Returns 400 on bad format. `date_from`/`date_to` echoed in response.
 - **Frontend `Reports.jsx`** rewrite:

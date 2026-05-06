@@ -445,6 +445,26 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
     }
   }, [messages.length]);
 
+  // WhatsApp-style jump-to-quoted-message. Scrolls the bubble into view + adds
+  // a temporary highlight ring so the user knows where it landed.
+  const jumpToMessage = useCallback((msgId) => {
+    if (!msgId || !scrollRef.current) return;
+    const el = scrollRef.current.querySelector(`[data-testid="bubble-${msgId}"]`);
+    if (!el) {
+      toast.error("Original message not loaded");
+      return;
+    }
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    // Drop a transient highlight class on the inner bubble div.
+    const inner = el.querySelector("div");
+    if (inner) {
+      inner.classList.add("ring-4", "ring-[#FF8800]", "ring-offset-1");
+      setTimeout(() => {
+        inner.classList.remove("ring-4", "ring-[#FF8800]", "ring-offset-1");
+      }, 1400);
+    }
+  }, []);
+
   // Group messages by IST day key — used to render sticky day separators
   // (#2 WhatsApp-style). Memoized so we don't re-walk the array on each render.
   const messageGroups = useMemo(() => {
@@ -912,6 +932,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                 onResend={resendFn}
                 onReact={reactFn}
                 onAskAdmin={askAdminFn}
+                onJumpTo={jumpToMessage}
               />
             ))}
           </div>
@@ -1182,6 +1203,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
               clearQuote={() => setInternalQuote(null)}
               preselectAgentId={internalPreselectAgent}
               onPreselectConsumed={() => setInternalPreselectAgent(null)}
+              onJumpToWa={jumpToMessage}
             />
             )}
           </aside>
@@ -1279,7 +1301,7 @@ function InfoRow({ label, children }) {
 // through the day's messages — matching WhatsApp's behavior.
 const DayGroup = React.memo(function DayGroup({
   group, allMessages, canMessage, currentUserId,
-  onReply, onResend, onReact, onAskAdmin,
+  onReply, onResend, onReact, onAskAdmin, onJumpTo,
   searchQuery, focusedHitId, searchHitsSet,
 }) {
   const hitsSet = useMemo(
@@ -1313,6 +1335,7 @@ const DayGroup = React.memo(function DayGroup({
           onResend={onResend}
           onReact={onReact}
           onAskAdmin={onAskAdmin}
+          onJumpTo={onJumpTo}
         />
       ))}
     </div>
@@ -1320,7 +1343,7 @@ const DayGroup = React.memo(function DayGroup({
 });
 
 
-function _BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, canMessage = true, currentUserId = null, isHighlighted = false, isFocused = false, searchQuery = "" }) {
+function _BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, onJumpTo, canMessage = true, currentUserId = null, isHighlighted = false, isFocused = false, searchQuery = "" }) {
   const isOut = m.direction === "out";
   const isSystem = m.direction === "system";
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -1380,16 +1403,24 @@ function _BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdm
           <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold mb-1 px-2 pt-1">Template · {m.template_name}</div>
         )}
         {quotedPreview && (
-          <div
-            className={`mb-1.5 border-l-[3px] pl-2 py-1 text-xs bg-black/5 ${media ? "mx-1.5 mt-1.5" : ""}`}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (!onJumpTo) return;
+              const targetId = quoted?.id || m.reply_to_message_id;
+              if (targetId) onJumpTo(targetId);
+            }}
+            className={`block w-full text-left mb-1.5 border-l-[3px] pl-2 py-1 text-xs bg-black/5 hover:bg-black/10 active:bg-black/15 transition-colors cursor-pointer ${media ? "mx-1.5 mt-1.5" : ""}`}
             style={{ borderColor: quotedDirection === "out" ? "#25D366" : "#002FA7" }}
             data-testid={`quoted-preview-${m.id}`}
+            title="Jump to original"
           >
             <div className="text-[9px] uppercase tracking-widest font-bold" style={{ color: quotedDirection === "out" ? "#128C7E" : "#002FA7" }}>
               {quotedDirection === "out" ? "You" : "Customer"}
             </div>
             <div className="text-gray-700 truncate">{quotedPreview}</div>
-          </div>
+          </button>
         )}
         {media}
         {m.msg_type === "location" && renderLocation(m)}
@@ -1472,6 +1503,7 @@ const Bubble = React.memo(_BubbleImpl, (prev, next) => {
   if (prev.onResend !== next.onResend) return false;
   if (prev.onReact !== next.onReact) return false;
   if (prev.onAskAdmin !== next.onAskAdmin) return false;
+  if (prev.onJumpTo !== next.onJumpTo) return false;
   // Reactions live inside `m`; allMessages used only to look up quoted ref by id —
   // skip reference-equality on it and rely on `m` to capture changes.
   return true;
@@ -1751,7 +1783,7 @@ function Field({ label, children }) {
 
 
 // ---------------- Internal Admin ↔ Agent Q&A ----------------
-function InternalChat({ leadId, currentUser, assignedTo, execs, quote, clearQuote, preselectAgentId, onPreselectConsumed }) {
+function InternalChat({ leadId, currentUser, assignedTo, execs, quote, clearQuote, preselectAgentId, onPreselectConsumed, onJumpToWa }) {
   const isAdmin = currentUser?.role === "admin";
   const [threads, setThreads] = useState([]); // admin view
   const [activeAgentId, setActiveAgentId] = useState(preselectAgentId || null); // admin: selected thread
@@ -1887,12 +1919,22 @@ function InternalChat({ leadId, currentUser, assignedTo, execs, quote, clearQuot
             <div key={m.id} className={`flex ${mine ? "justify-end" : "justify-start"}`} data-testid={`internal-msg-${m.id}`}>
               <div className={`max-w-[85%] px-3 py-2 text-sm shadow-sm ${mine ? "bg-[#D6E4FF] border border-[#002FA7]/20" : "bg-white border border-gray-200"}`}>
                 {m.quoted && (
-                  <div className="mb-1 border-l-[3px] pl-2 py-1 text-[11px] bg-black/5" style={{ borderColor: m.quoted.direction === "out" ? "#25D366" : "#002FA7" }}>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (m.quoted?.id && onJumpToWa) onJumpToWa(m.quoted.id);
+                    }}
+                    className="block w-full text-left mb-1 border-l-[3px] pl-2 py-1 text-[11px] bg-black/5 hover:bg-black/10 active:bg-black/15 transition-colors cursor-pointer"
+                    style={{ borderColor: m.quoted.direction === "out" ? "#25D366" : "#002FA7" }}
+                    title="Jump to original WA message"
+                    data-testid={`internal-quoted-${m.id}`}
+                  >
                     <div className="text-[9px] uppercase tracking-widest font-bold" style={{ color: m.quoted.direction === "out" ? "#128C7E" : "#002FA7" }}>
                       {m.quoted.direction === "out" ? "You (WA)" : "Customer"}
                     </div>
                     <div className="text-gray-700 truncate">{m.quoted.body || "(media)"}</div>
-                  </div>
+                  </button>
                 )}
                 <div className="whitespace-pre-wrap break-words">{m.body}</div>
                 <div className="text-[10px] text-gray-500 font-mono mt-1 flex items-center justify-between gap-2">
