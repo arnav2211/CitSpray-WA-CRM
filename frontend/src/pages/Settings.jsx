@@ -919,7 +919,14 @@ function EmailAutoSendPanel() {
         { stored_name: stored, original_filename: file.name, mime_type: file.type || "application/octet-stream" },
       ];
       setTplForm((f) => ({ ...f, attachments: next }));
-      toast.success(`${file.name} attached — remember to Save template`);
+      // Persist immediately so the attachment survives a page refresh / SMTP save reload.
+      // Sends current subject/body together so we don't accidentally clear them.
+      try {
+        await api.put("/settings/email-template", { subject: tplForm.subject, body: tplForm.body, attachments: next });
+        toast.success(`${file.name} attached and saved`);
+      } catch (saveErr) {
+        toast.error(errMsg(saveErr, "Attached locally but auto-save failed — click Save template"));
+      }
     } catch (err) { toast.error(errMsg(err, "Upload failed")); }
     finally {
       setUploadingAtt(false);
@@ -927,8 +934,16 @@ function EmailAutoSendPanel() {
     }
   };
 
-  const removeAtt = (idx) => {
-    setTplForm((f) => ({ ...f, attachments: f.attachments.filter((_, i) => i !== idx) }));
+  const removeAtt = async (idx) => {
+    const next = (tplForm.attachments || []).filter((_, i) => i !== idx);
+    setTplForm((f) => ({ ...f, attachments: next }));
+    // Persist immediately so the removal survives a page refresh.
+    try {
+      await api.put("/settings/email-template", { subject: tplForm.subject, body: tplForm.body, attachments: next });
+      toast.success("Attachment removed");
+    } catch (err) {
+      toast.error(errMsg(err, "Removed locally but auto-save failed — click Save template"));
+    }
   };
 
   const testSend = async () => {
