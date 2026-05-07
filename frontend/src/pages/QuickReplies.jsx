@@ -1,11 +1,12 @@
 import React, { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
-import { Plus, Trash, PencilSimple, X } from "@phosphor-icons/react";
+import { Plus, Trash, PencilSimple, X, ArrowUp, ArrowDown } from "@phosphor-icons/react";
 
 export default function QuickReplies() {
   const [list, setList] = useState([]);
   const [editing, setEditing] = useState(null);
+  const [reordering, setReordering] = useState(false);
 
   const load = async () => {
     try { const { data } = await api.get("/quick-replies"); setList(data); }
@@ -19,6 +20,26 @@ export default function QuickReplies() {
     catch (e) { toast.error(errMsg(e)); }
   };
 
+  // Move qr at index `from` by `delta` (+1 down, -1 up). Optimistic UI: reorder
+  // locally first, then persist via /quick-replies/reorder.
+  const move = async (from, delta) => {
+    const to = from + delta;
+    if (to < 0 || to >= list.length) return;
+    const next = [...list];
+    const [item] = next.splice(from, 1);
+    next.splice(to, 0, item);
+    setList(next);
+    setReordering(true);
+    try {
+      await api.post("/quick-replies/reorder", { ids: next.map((q) => q.id) });
+    } catch (e) {
+      toast.error(errMsg(e, "Reorder failed"));
+      load();
+    } finally {
+      setReordering(false);
+    }
+  };
+
   return (
     <div className="p-4 md:p-8 space-y-4 max-w-4xl">
       <div className="flex items-center justify-between">
@@ -28,6 +49,7 @@ export default function QuickReplies() {
           <p className="text-sm text-gray-600 mt-1 max-w-2xl">
             Internal canned messages executives can insert into the chat composer. These are NOT WhatsApp templates —
             they only work inside the 24-hour customer-care window. Use <span className="kbd">{"{{name}}"}</span> to inject the customer name.
+            Use the ↑/↓ arrows to reorder — the order is what executives see in <span className="kbd">/chat</span>.
           </p>
         </div>
         <button onClick={() => setEditing({})} className="bg-[#002FA7] hover:bg-[#002288] text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1" data-testid="add-qr-btn">
@@ -38,10 +60,38 @@ export default function QuickReplies() {
       <div className="border border-gray-200 bg-white">
         {list.length === 0 ? (
           <div className="p-12 text-center text-xs uppercase tracking-widest text-gray-400">No quick replies yet</div>
-        ) : list.map(qr => (
-          <div key={qr.id} className="px-5 py-4 border-b border-gray-200 flex items-start gap-4 last:border-b-0" data-testid={`qr-row-${qr.id}`}>
+        ) : list.map((qr, i) => (
+          <div key={qr.id} className="px-5 py-4 border-b border-gray-200 flex items-start gap-3 last:border-b-0" data-testid={`qr-row-${qr.id}`}>
+            <div className="flex flex-col gap-1 shrink-0">
+              <button
+                onClick={() => move(i, -1)}
+                disabled={i === 0 || reordering}
+                className="text-gray-500 hover:text-[#002FA7] disabled:opacity-20 disabled:cursor-not-allowed p-0.5"
+                title="Move up"
+                data-testid={`qr-up-${qr.id}`}
+              >
+                <ArrowUp size={14} weight="bold" />
+              </button>
+              <button
+                onClick={() => move(i, +1)}
+                disabled={i === list.length - 1 || reordering}
+                className="text-gray-500 hover:text-[#002FA7] disabled:opacity-20 disabled:cursor-not-allowed p-0.5"
+                title="Move down"
+                data-testid={`qr-down-${qr.id}`}
+              >
+                <ArrowDown size={14} weight="bold" />
+              </button>
+            </div>
             <div className="flex-1 min-w-0">
-              <div className="font-chivo font-bold">{qr.title}</div>
+              <div className="font-chivo font-bold flex items-center gap-2">
+                <span className="text-[10px] uppercase tracking-widest text-gray-400 font-mono">#{i + 1}</span>
+                {qr.title}
+                {qr.media_type && (
+                  <span className="bg-[#25D366] text-white px-1.5 py-0.5 text-[9px] uppercase tracking-widest font-bold">
+                    {qr.media_type}
+                  </span>
+                )}
+              </div>
               <div className="text-sm text-gray-700 mt-1 whitespace-pre-wrap">{qr.text}</div>
             </div>
             <div className="flex gap-2">
