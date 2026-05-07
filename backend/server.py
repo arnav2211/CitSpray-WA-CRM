@@ -5404,38 +5404,105 @@ async def webhook_whatsapp(request: Request):
     return {"ok": True}
 
 # ------------- Auto-reassignment task -------------
+
+async def _auto_reassign_lead(lead_id: str, current_assigned_to: Optional[str], reason: str) -> Optional[str]:
+    """Auto-reassign a lead WITHOUT resetting opened_at.
+
+    Critical differences from assign_lead():
+    1. Does NOT set opened_at=None — so the lead never re-enters the 'unopened'
+       queue after an auto-reassign, breaking the infinite reassignment loop.
+    2. Uses a conditional findOneAndUpdate (optimistic lock) — if two uvicorn
+       workers race on the same lead, only the first write succeeds; the second
+       sees a non-matching assigned_to and writes nothing (no duplicate history).
+    """
+    chosen = await pick_next_executive(exclude_user_id=current_assigned_to)
+    if not chosen:
+        return None
+    chosen_id = chosen["id"]
+    if chosen_id == current_assigned_to:
+        return None  # no eligible alternative
+    entry = {"user_id": chosen_id, "at": iso(now_utc()), "by": None}
+    result = await db.leads.find_one_and_update(
+        {"id": lead_id, "assigned_to": current_assigned_to},   # ← optimistic lock condition
+        {
+            "$set": {"assigned_to": chosen_id, "last_assignment_at": iso(now_utc())},
+            "$push": {"assignment_history": entry},
+        },
+        return_document=False,
+    )
+    if result is None:
+        # Another worker already reassigned this lead; skip logging.
+        return None
+    await log_activity(None, reason, lead_id, {"from": current_assigned_to, "to": chosen_id})
+    return chosen_id
+
+
+_AUTO_REASSIGN_LOCK_KEY = "auto_reassign_lock"
+
+
+async def _acquire_reassign_lock(ttl_seconds: int = 90) -> bool:
+    """Distributed MongoDB lock so only ONE uvicorn worker runs the cron job.
+    Returns True if the lock was acquired, False if another worker holds it."""
+    now = now_utc()
+    expires_at = now + timedelta(seconds=ttl_seconds)
+    try:
+        await db.system_locks.find_one_and_update(
+            {
+                "key": _AUTO_REASSIGN_LOCK_KEY,
+                "$or": [
+                    {"expires_at": {"$lt": now}},          # stale lock — steal it
+                    {"expires_at": {"$exists": False}},    # first run
+                ],
+            },
+            {"$set": {"key": _AUTO_REASSIGN_LOCK_KEY, "acquired_at": now, "expires_at": expires_at}},
+            upsert=True,
+            return_document=False,
+        )
+        return True
+    except Exception:
+        # Duplicate-key / write-conflict → another worker already has the lock
+        return False
+
+
+async def _release_reassign_lock():
+    try:
+        await db.system_locks.delete_one({"key": _AUTO_REASSIGN_LOCK_KEY})
+    except Exception:
+        pass
+
+
 async def auto_reassign_task():
+    # BUG FIX: Distributed lock prevents multiple uvicorn workers from running
+    # this simultaneously, which caused the same lead to be written 2-3× at the
+    # same timestamp (e.g. "Ankita → Ankita" repeated 3 times).
+    if not await _acquire_reassign_lock(ttl_seconds=90):
+        logger.debug("auto_reassign_task: lock held by another worker — skipping")
+        return
     try:
         rules = await get_routing_rules()
+        if not rules.get("round_robin_enabled", True):
+            return
         unopened_mins = int(rules.get("unopened_reassign_minutes") or 15)
         noaction_mins = int(rules.get("no_action_reassign_minutes") or 60)
         unopened_cutoff = iso(now_utc() - timedelta(minutes=unopened_mins))
         noaction_cutoff = iso(now_utc() - timedelta(minutes=noaction_mins))
-        # Auto-reassign ONLY for leads still in 'new' status. The moment an
-        # executive moves a lead off 'new' (to contacted / qualified / quoted /
-        # won / lost / etc.), the cron leaves it alone — that human action is
-        # the explicit signal that the agent is engaged with the lead.
+
+        # BUG FIX: Use _auto_reassign_lead() instead of assign_lead() so that
+        # opened_at is NOT reset to None on every reassignment. The old code
+        # was setting opened_at=None which immediately put the lead back into
+        # the "unopened" query, causing infinite reassignment every 15 minutes.
+
         # Unopened: assigned but not opened within X minutes
         cursor = db.leads.find({
             "assigned_to": {"$ne": None},
             "opened_at": None,
             "status": "new",
             "last_assignment_at": {"$lt": unopened_cutoff},
-        }, {"_id": 0})
-        count = 0
+        }, {"_id": 0}).limit(20)
         async for lead in cursor:
-            prev = lead.get("assigned_to")
-            rules2 = await get_routing_rules()
-            if not rules2.get("round_robin_enabled", True):
-                break
-            chosen = await pick_next_executive(exclude_user_id=prev)
-            if chosen and chosen["id"] != prev:
-                await assign_lead(lead["id"], target_user_id=chosen["id"], by_user_id=None)
-                await log_activity(None, "auto_reassigned_unopened", lead["id"], {"from": prev, "to": chosen["id"]})
-                count += 1
-            if count >= 20:
-                break
-        # No action: opened but no activity (still status='new')
+            await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_unopened")
+
+        # No action: opened but no activity within Y minutes (still status='new')
         cursor2 = db.leads.find({
             "assigned_to": {"$ne": None},
             "status": "new",
@@ -5443,11 +5510,8 @@ async def auto_reassign_task():
             "opened_at": {"$ne": None},
         }, {"_id": 0}).limit(20)
         async for lead in cursor2:
-            prev = lead.get("assigned_to")
-            chosen = await pick_next_executive(exclude_user_id=prev)
-            if chosen and chosen["id"] != prev:
-                await assign_lead(lead["id"], target_user_id=chosen["id"], by_user_id=None)
-                await log_activity(None, "auto_reassigned_noaction", lead["id"], {"from": prev, "to": chosen["id"]})
+            await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_noaction")
+
         # Followups: mark missed
         await db.followups.update_many(
             {"status": "pending", "due_at": {"$lt": iso(now_utc() - timedelta(minutes=30))}},
@@ -5455,6 +5519,8 @@ async def auto_reassign_task():
         )
     except Exception as e:
         logger.exception(f"auto_reassign_task failed: {e}")
+    finally:
+        await _release_reassign_lock()
 
 # ------------- System settings (WhatsApp runtime overrides) -------------
 def _mask_token(t: str) -> str:
