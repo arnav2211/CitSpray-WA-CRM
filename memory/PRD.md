@@ -22,6 +22,19 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 32 (Feb 2026) — QR ordering + Office location preset
+- **Quick Reply ordering** (`server.py` + `QuickReplies.jsx`):
+  - Added `sort_order` field on `quick_replies`. New rows get next-highest order on create.
+  - `GET /api/quick-replies` now returns sorted by `sort_order` ASC (with title fallback for legacy null values).
+  - New `POST /api/quick-replies/reorder` (admin-only) takes `{ids: []}` and persists positional sort_order.
+  - Frontend: ↑/↓ arrow buttons (`qr-up-{id}` / `qr-down-{id}`) on each row, with #N rank prefix and media-type badge. Optimistic local reorder + persist; reload on failure.
+  - `/chat` Quick Reply dropdown automatically respects this order (it consumes whatever the API returns).
+  - **Verified**: reverse-order reorder via curl → list returns in reversed order with `sort_order=1..N`.
+- **Office location preset** (`Chat.jsx → LocationSendModal`): added a blue **Office** card at the top of the Send Location modal with admin-supplied static values (CitSpray, Nagpur, lat 21.109974, lng 79.064088). Two buttons:
+  - **Send office location** (`loc-send-office-btn`) — fires immediately, bypasses the form.
+  - **Pre-fill** (`loc-fill-office-btn`) — populates the form fields so the rep can edit before sending.
+  Custom-location form below remains unchanged.
+
 ### Iteration 31 (Feb 2026) — Click-to-jump on quoted messages (WhatsApp parity)
 - **`Chat.jsx`** — added `jumpToMessage(id)` helper inside the chat thread that finds the bubble via `[data-testid="bubble-${id}"]`, calls `scrollIntoView({block:"center"})` and adds a transient `ring-4 ring-[#FF8800]` flash for 1.4s. Toast on miss.
 - **WA-thread quoted preview** (`_BubbleImpl`) is now a `<button>` with `cursor:pointer` + hover/active state; click → `onJumpTo(quoted.id || m.reply_to_message_id)`.

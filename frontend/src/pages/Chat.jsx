@@ -1224,6 +1224,23 @@ function LocationSendModal({ onClose, onSend, sending }) {
   const [lng, setLng] = useState("");
   const [name, setName] = useState("");
   const [address, setAddress] = useState("");
+  // Office preset — CitSpray, Nagpur. Pre-filled per admin request.
+  const OFFICE = {
+    lat: "21.109974",
+    lng: "79.064088",
+    name: "CitSpray",
+    address: "B wing, Poonam Heights, Pande Layout, Khamla, Nagpur - 440025",
+  };
+  const fillOffice = () => {
+    setLat(OFFICE.lat);
+    setLng(OFFICE.lng);
+    setName(OFFICE.name);
+    setAddress(OFFICE.address);
+  };
+  const sendOfficeNow = () => {
+    // One-click variant — bypass the form so reps can fire-and-forget.
+    onSend({ latitude: OFFICE.lat, longitude: OFFICE.lng, name: OFFICE.name, address: OFFICE.address });
+  };
   const useMyLocation = () => {
     if (!navigator.geolocation) { toast.error("Geolocation unavailable"); return; }
     navigator.geolocation.getCurrentPosition(
@@ -1241,6 +1258,22 @@ function LocationSendModal({ onClose, onSend, sending }) {
     <div className="fixed inset-0 z-40 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
       <form onClick={(e) => e.stopPropagation()} onSubmit={submit} className="w-full max-w-md bg-white border border-gray-900 p-6 space-y-3" data-testid="send-location-modal">
         <h3 className="font-chivo font-black text-xl">Send Location</h3>
+        {/* Office quick-action — one click sends immediately. */}
+        <div className="border border-[#002FA7] bg-[#002FA7]/5 p-3" data-testid="loc-office-card">
+          <div className="text-[10px] uppercase tracking-widest text-[#002FA7] font-bold mb-1">Office</div>
+          <div className="text-sm font-bold">{OFFICE.name}</div>
+          <div className="text-xs text-gray-600">{OFFICE.address}</div>
+          <div className="text-[10px] font-mono text-gray-500 mt-0.5">{OFFICE.lat}, {OFFICE.lng}</div>
+          <div className="flex gap-2 mt-2">
+            <button type="button" onClick={sendOfficeNow} disabled={sending} className="bg-[#25D366] hover:bg-[#1EB755] text-white px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50" data-testid="loc-send-office-btn">
+              {sending ? "Sending…" : "Send office location"}
+            </button>
+            <button type="button" onClick={fillOffice} className="border border-gray-300 hover:border-gray-900 px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold" data-testid="loc-fill-office-btn">
+              Pre-fill
+            </button>
+          </div>
+        </div>
+        <div className="text-[10px] uppercase tracking-widest text-gray-400 font-bold">Or send a custom location</div>
         <div className="grid grid-cols-2 gap-2">
           <input required placeholder="Latitude" value={lat} onChange={(e) => setLat(e.target.value)} className="border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="loc-lat" />
           <input required placeholder="Longitude" value={lng} onChange={(e) => setLng(e.target.value)} className="border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="loc-lng" />

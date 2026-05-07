@@ -3010,13 +3010,21 @@ async def reject_transfer(req_id: str, admin: dict = Depends(require_admin)):
 # Quick Replies
 @api.get("/quick-replies")
 async def list_quick_replies(user: dict = Depends(get_current_user)):
-    return await db.quick_replies.find({}, {"_id": 0}).sort("title", 1).to_list(200)
+    # Sort by admin-defined sort_order asc (NULLS last via fallback to a high
+    # default), then by title for stable ordering of unordered legacy rows.
+    items = await db.quick_replies.find({}, {"_id": 0}).to_list(500)
+    items.sort(key=lambda q: (q.get("sort_order") if isinstance(q.get("sort_order"), (int, float)) else 99999, (q.get("title") or "").lower()))
+    return items
 
 
 @api.post("/quick-replies")
 async def create_quick_reply(body: QuickReplyInput, admin: dict = Depends(require_admin)):
     if body.media_url and body.media_type not in ("image", "video", "document", "audio"):
         raise HTTPException(status_code=400, detail="media_type must be image|video|document|audio when media_url is set")
+    # Append new replies at the end of the order so admin sees them last —
+    # they can drag/sort up later if needed.
+    last = await db.quick_replies.find({}, {"_id": 0, "sort_order": 1}).sort("sort_order", -1).limit(1).to_list(1)
+    next_order = (int(last[0].get("sort_order")) + 1) if (last and isinstance(last[0].get("sort_order"), (int, float))) else 1
     doc = {
         "id": str(uuid.uuid4()),
         "title": body.title.strip(),
@@ -3025,6 +3033,7 @@ async def create_quick_reply(body: QuickReplyInput, admin: dict = Depends(requir
         "media_type": body.media_type or None,
         "media_filename": body.media_filename or None,
         "caption": (body.caption or "").strip() or None,
+        "sort_order": next_order,
         "created_by": admin["id"],
         "created_at": iso(now_utc()),
     }
@@ -3051,6 +3060,23 @@ async def update_quick_reply(qr_id: str, body: QuickReplyInput, admin: dict = De
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Quick reply not found")
     return await db.quick_replies.find_one({"id": qr_id}, {"_id": 0})
+
+
+class QuickReplyReorderInput(BaseModel):
+    ids: List[str]
+
+
+@api.post("/quick-replies/reorder")
+async def reorder_quick_replies(body: QuickReplyReorderInput, admin: dict = Depends(require_admin)):
+    """Persist the canonical display order. The list of ids is taken as the
+    desired order — index becomes the row's sort_order. Any QR not present in
+    the list keeps its previous sort_order (admin can re-drag later)."""
+    for idx, qr_id in enumerate(body.ids):
+        await db.quick_replies.update_one(
+            {"id": qr_id},
+            {"$set": {"sort_order": idx + 1, "updated_at": iso(now_utc())}},
+        )
+    return {"ok": True, "count": len(body.ids)}
 
 
 @api.delete("/quick-replies/{qr_id}")
