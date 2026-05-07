@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
@@ -107,6 +107,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
               <Item to="/templates" icon={ChatCircleDots} testId="nav-templates" onNavigate={handleNavigate}>WA Templates</Item>
               <Item to="/chatflows" icon={ChatTeardropDots} testId="nav-chatflows" onNavigate={handleNavigate}>Chatbot Flows</Item>
               <Item to="/quick-replies" icon={Lightning} testId="nav-quick-replies" onNavigate={handleNavigate}>Quick Replies</Item>
+              <Item to="/payment-settings" icon={QrCode} testId="nav-payment-settings" onNavigate={handleNavigate}>Payment QR</Item>
               <Item to="/settings" icon={Sliders} testId="nav-settings" onNavigate={handleNavigate}>Settings</Item>
               <Item to="/reports" icon={PaperPlaneTilt} testId="nav-reports" onNavigate={handleNavigate}>Reports</Item>
             </>

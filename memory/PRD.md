@@ -22,6 +22,18 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 33 (Feb 2026) — Payment QR (UPI) attachment + admin settings page
+- **Backend (`server.py`)** — new module:
+  - `qrcode==8.2` added to requirements (Python `qrcode[pil]`).
+  - `system_settings.payment_qr` doc — auto-seeded on first read with the two accounts the admin provided (Mangalam Agro · GST and Arnav Mukul Agrawal · No-GST). Each account: `id, label, name, bank, branch, ifsc, account_number, upi_phone, upi_id`.
+  - `GET /api/settings/payment-qr` (any user) — returns `{gst: [...], no_gst: [...]}`.
+  - `PUT /api/settings/payment-qr` (admin-only) — full replacement with UUID assignment for new accounts.
+  - `POST /api/payment-qr/generate` — body `{type: 'gst'|'no_gst', account_id, amount}`. Validates positive whole-rupee amount and account existence, encodes a UPI deep-link `upi://pay?pa=<UPI_ID>&mam=1&am=<amount>&cu=INR`, renders a 600x600 PNG via `qrcode.make`, persists to `/app/backend/uploads/qr_<hex>.png`, returns `{media_url, caption, upi_url, account, amount, type}`.
+  - Caption is hard-coded per spec: emoji header `💳 Payment Request — ₹<amount> (GST/Without GST)`, then BANK DETAILS block with name/bank/branch/account/ifsc/upi_phone/upi_id.
+  - **Verified live**: GET returns seeded accounts, POST generate returns valid PNG + caption + UPI URL with the entered amount substituted, PNG served at `/api/media/qr_*.png` as image/png.
+- **Frontend Chat composer (`Chat.jsx → PaymentQRModal`)**: new `attach-payment-qr` menu item opens a modal with **GST | Without GST** tabs, account picker (only required when admin has > 1 account), whole-rupee amount input, **Generate QR** button (preview shown in-modal with rendered image + caption text), **Send** button → fires `/whatsapp/send-media` with `media_type: image, media_url, caption`. Within-24h gate enforced.
+- **New page `/payment-settings`** (admin-only, `PaymentSettings.jsx`): two tabs (GST / Without GST), each lists accounts as cards. Per-account fields: Label, Name, Bank, Branch, IFSC, Account Number, UPI Phone, UPI ID. Add account / Remove account / Save all. Sticky bottom save bar. Required-field validation client-side. Sidebar link added (`nav-payment-settings`, QrCode icon) for admins.
+
 ### Iteration 32 (Feb 2026) — QR ordering + Office location preset
 - **Quick Reply ordering** (`server.py` + `QuickReplies.jsx`):
   - Added `sort_order` field on `quick_replies`. New rows get next-highest order on create.
