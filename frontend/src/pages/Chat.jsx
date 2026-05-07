@@ -7,7 +7,7 @@ import {
   MagnifyingGlass, PaperPlaneRight, ChatCircleDots, Phone, ArrowsClockwise, Plus, ArrowLeft,
   Funnel, Lightning, ArrowsLeftRight, X, Tag, NotePencil, Info,
   Paperclip, Image as ImageIcon, VideoCamera, FileText, Microphone, MapPin, IdentificationCard, Stop,
-  DownloadSimple, Question, ChatTeardropText, CaretLeft,
+  DownloadSimple, Question, ChatTeardropText, CaretLeft, QrCode,
 } from "@phosphor-icons/react";
 import { fmtIST, fmtISTTime, fmtSmartShort, fmtSmartLong, fmtTime12, fmtDaySeparator, istDayKey } from "@/lib/format";
 import { StatusBadge, SourceBadge } from "@/components/Badges";
@@ -1054,6 +1054,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                   <button onClick={startRecording} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-record"><Microphone size={16} weight="fill" className="text-[#E60000]" /> Record voice note</button>
                   <button onClick={() => { setAttachMode("location"); setShowAttach(false); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-location"><MapPin size={16} className="text-[#0891B2]" /> Location</button>
                   <button onClick={() => { setAttachMode("contact"); setShowAttach(false); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-contact"><IdentificationCard size={16} className="text-[#15803D]" /> Contact</button>
+                  <button onClick={() => { setAttachMode("payment_qr"); setShowAttach(false); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-payment-qr"><QrCode size={16} className="text-[#002FA7]" /> Payment QR</button>
                 </div>
               )}
               <button onClick={() => { setShowQR(v => !v); setShowTpl(false); setShowAttach(false); }} title="Quick replies"
@@ -1215,6 +1216,35 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
       {attachMode === "contact" && (
         <ContactSendModal onClose={() => setAttachMode(null)} onSend={sendContact} sending={sending} lead={conv} />
       )}
+      {attachMode === "payment_qr" && (
+        <PaymentQRModal
+          onClose={() => setAttachMode(null)}
+          sending={sending}
+          within24h={within24h}
+          onSend={async ({ media_url, caption, filename }) => {
+            try {
+              setSending(true);
+              await api.post("/whatsapp/send-media", {
+                lead_id: conv.id,
+                media_type: "image",
+                media_url,
+                caption,
+                filename,
+                ...(replyTo?.id ? { reply_to_message_id: replyTo.id } : {}),
+              });
+              setReplyTo(null);
+              setAttachMode(null);
+              toast.success("Payment QR sent");
+              loadMessages();
+              onChanged?.();
+            } catch (e) {
+              toast.error(errMsg(e, "Send failed"));
+            } finally {
+              setSending(false);
+            }
+          }}
+        />
+      )}
     </>
   );
 }
@@ -1319,6 +1349,151 @@ function ContactSendModal({ onClose, onSend, sending, lead }) {
     </div>
   );
 }
+
+// Generates and previews a UPI Payment QR, then sends it as a WA image with
+// the bank details as caption. Spec: GST | Without GST tabs, dynamic amount,
+// account picker (only shown when admin has added > 1 account in the bucket).
+function PaymentQRModal({ onClose, onSend, sending, within24h }) {
+  const [type, setType] = useState("gst");
+  const [amount, setAmount] = useState("");
+  const [accounts, setAccounts] = useState({ gst: [], no_gst: [] });
+  const [accountId, setAccountId] = useState("");
+  const [preview, setPreview] = useState(null); // {media_url, caption, ...}
+  const [generating, setGenerating] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.get("/settings/payment-qr").then(({ data }) => {
+      if (cancelled) return;
+      setAccounts(data || { gst: [], no_gst: [] });
+    }).catch((e) => toast.error(errMsg(e, "Could not load payment accounts")));
+    return () => { cancelled = true; };
+  }, []);
+
+  // Reset account picker when type changes; default to first account in the bucket.
+  useEffect(() => {
+    const list = (accounts[type] || []);
+    setAccountId(list[0]?.id || "");
+    setPreview(null);
+  }, [type, accounts]);
+
+  const currentAccount = (accounts[type] || []).find((a) => a.id === accountId);
+
+  const generate = async () => {
+    const n = parseInt(amount, 10);
+    if (!Number.isFinite(n) || n <= 0) { toast.error("Enter a positive whole-rupee amount"); return; }
+    if (!accountId) { toast.error("Pick an account first"); return; }
+    setGenerating(true);
+    setPreview(null);
+    try {
+      const { data } = await api.post("/payment-qr/generate", { type, account_id: accountId, amount: n });
+      setPreview(data);
+    } catch (e) { toast.error(errMsg(e, "Could not generate QR")); }
+    finally { setGenerating(false); }
+  };
+
+  const send = () => {
+    if (!preview) { toast.error("Generate the QR first"); return; }
+    if (!within24h) { toast.error("Outside 24-hour window — cannot send media"); return; }
+    onSend({ media_url: preview.media_url, caption: preview.caption, filename: preview.filename });
+  };
+
+  const list = accounts[type] || [];
+  const noAccounts = list.length === 0;
+
+  return (
+    <div className="fixed inset-0 z-40 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <form onClick={(e) => e.stopPropagation()} onSubmit={(e) => { e.preventDefault(); send(); }} className="w-full max-w-md bg-white border border-gray-900 p-6 space-y-3 max-h-[90vh] overflow-y-auto" data-testid="payment-qr-modal">
+        <div className="flex items-center justify-between">
+          <h3 className="font-chivo font-black text-xl">Send Payment QR</h3>
+          <button type="button" onClick={onClose} className="text-gray-400 hover:text-gray-900" data-testid="pqr-close">
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* GST / Without-GST tabs */}
+        <div className="flex border border-gray-300">
+          {[
+            { k: "gst", label: "GST" },
+            { k: "no_gst", label: "Without GST" },
+          ].map((t) => (
+            <button key={t.k} type="button" onClick={() => setType(t.k)}
+              className={`flex-1 px-3 py-2 text-[11px] uppercase tracking-widest font-bold ${type === t.k ? "bg-gray-900 text-white" : "bg-white hover:bg-gray-50"}`}
+              data-testid={`pqr-tab-${t.k}`}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Account picker */}
+        {noAccounts ? (
+          <div className="border border-yellow-300 bg-yellow-50 px-3 py-2 text-xs">
+            No {type === "gst" ? "GST" : "Without GST"} accounts configured. Ask the admin to add one in <span className="kbd">/payment-settings</span>.
+          </div>
+        ) : (
+          <label className="block">
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Account</div>
+            <select value={accountId} onChange={(e) => { setAccountId(e.target.value); setPreview(null); }}
+              className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="pqr-account-select">
+              {list.map((a) => (
+                <option key={a.id} value={a.id}>{a.label || a.name} · {a.upi_id}</option>
+              ))}
+            </select>
+          </label>
+        )}
+
+        {currentAccount && (
+          <div className="border border-gray-200 bg-gray-50 px-3 py-2 text-xs space-y-0.5" data-testid="pqr-account-card">
+            <div><b>{currentAccount.name}</b></div>
+            <div>{currentAccount.bank}{currentAccount.branch ? ` · ${currentAccount.branch}` : ""}</div>
+            <div>A/c: <span className="font-mono">{currentAccount.account_number}</span> · IFSC: <span className="font-mono">{currentAccount.ifsc}</span></div>
+            <div>UPI: <span className="font-mono">{currentAccount.upi_id}</span>{currentAccount.upi_phone ? ` · ${currentAccount.upi_phone}` : ""}</div>
+          </div>
+        )}
+
+        {/* Amount */}
+        <label className="block">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Amount (₹) — whole rupees only</div>
+          <input
+            type="number" min={1} step={1} inputMode="numeric"
+            value={amount}
+            onChange={(e) => { setAmount(e.target.value.replace(/[^0-9]/g, "")); setPreview(null); }}
+            placeholder="1500"
+            className="w-full border border-gray-300 px-3 py-2 text-sm font-mono"
+            data-testid="pqr-amount-input"
+          />
+        </label>
+
+        {/* Generate button + preview */}
+        <div className="flex items-center justify-between gap-2">
+          <button type="button" onClick={generate} disabled={generating || noAccounts || !amount}
+            className="flex-1 bg-[#002FA7] hover:bg-[#002288] text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50"
+            data-testid="pqr-generate-btn">
+            {generating ? "Generating…" : (preview ? "Regenerate" : "Generate QR")}
+          </button>
+        </div>
+
+        {preview && (
+          <div className="border border-gray-200 bg-white p-3 space-y-2" data-testid="pqr-preview">
+            <img src={preview.media_url} alt="Payment QR" className="block mx-auto w-48 h-48 object-contain border border-gray-200" data-testid="pqr-preview-image" />
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Caption</div>
+            <pre className="whitespace-pre-wrap text-xs font-mono bg-gray-50 border border-gray-200 p-2 max-h-40 overflow-y-auto" data-testid="pqr-preview-caption">{preview.caption}</pre>
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2 pt-1">
+          <button type="button" onClick={onClose} className="border border-gray-300 px-3 py-2 text-[10px] uppercase tracking-widest font-bold">Cancel</button>
+          <button type="submit" disabled={sending || !preview || !within24h}
+            className="bg-[#25D366] hover:bg-[#1EB755] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50"
+            data-testid="pqr-send-btn">
+            {sending ? "Sending…" : "Send"}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 
 function InfoRow({ label, children }) {
   return (

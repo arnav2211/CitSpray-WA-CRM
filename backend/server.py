@@ -13,6 +13,7 @@ import logging
 import smtplib
 import ssl
 import asyncio
+import io
 from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal, Any, Dict
@@ -2734,6 +2735,200 @@ async def reports_my(user: dict = Depends(get_current_user)):
         "pending_followups": pending_fu,
         "overdue_followups": overdue_fu,
     }
+
+# ------------- Payment QR (UPI) -------------
+PAYMENT_QR_BASE = {
+    "gst": "upi://pay?pa={pa}&mam=1&am={am}&cu=INR",
+    "no_gst": "upi://pay?pa={pa}&mam=1&am={am}&cu=INR",
+}
+
+# Default seed accounts — written to system_settings.payment_qr on first read
+# only if no doc exists. Admin can edit/add via /api/settings/payment-qr.
+DEFAULT_PAYMENT_QR = {
+    "gst": [
+        {
+            "id": str(uuid.uuid4()),
+            "label": "Mangalam Agro · PNB",
+            "name": "Mangalam Agro",
+            "bank": "Punjab National Bank",
+            "branch": "Khamla, Nagpur",
+            "ifsc": "PUNB0147200",
+            "account_number": "1472002100029992",
+            "upi_phone": "9371177870",
+            "upi_id": "archanaagrawal80-1@okicici",
+        },
+    ],
+    "no_gst": [
+        {
+            "id": str(uuid.uuid4()),
+            "label": "Arnav Mukul Agrawal · PNB",
+            "name": "Arnav Mukul Agrawal",
+            "bank": "Punjab National Bank",
+            "branch": "Khamla, Nagpur",
+            "ifsc": "PUNB0147200",
+            "account_number": "1472000100369074",
+            "upi_phone": "7385171720",
+            "upi_id": "citronellaoilnagpur-2@okaxis",
+        },
+    ],
+}
+
+
+class PaymentQRAccount(BaseModel):
+    id: Optional[str] = None
+    label: str
+    name: str
+    bank: str
+    branch: Optional[str] = ""
+    ifsc: str
+    account_number: str
+    upi_phone: Optional[str] = ""
+    upi_id: str
+
+
+class PaymentQRSettings(BaseModel):
+    gst: List[PaymentQRAccount]
+    no_gst: List[PaymentQRAccount]
+
+
+class PaymentQRGenerate(BaseModel):
+    type: Literal["gst", "no_gst"]
+    account_id: str
+    amount: int  # whole rupees only
+
+
+async def _get_payment_qr_settings() -> Dict[str, Any]:
+    doc = await db.system_settings.find_one({"key": "payment_qr"}, {"_id": 0})
+    if not doc:
+        seed = {"key": "payment_qr", **DEFAULT_PAYMENT_QR, "seeded_at": iso(now_utc())}
+        await db.system_settings.insert_one(seed.copy())
+        doc = seed
+    return {
+        "gst": list(doc.get("gst") or []),
+        "no_gst": list(doc.get("no_gst") or []),
+    }
+
+
+def _build_upi_url(pa: str, amount: int) -> str:
+    """Encode a UPI deep-link with the given amount. Whole rupees only."""
+    from urllib.parse import quote
+    return f"upi://pay?pa={quote(pa, safe='@.-_')}&mam=1&am={int(amount)}&cu=INR"
+
+
+def _render_payment_qr_png(upi_url: str) -> bytes:
+    """Generate a 600x600 white-on-black QR for the given UPI URL."""
+    import qrcode
+    img = qrcode.make(upi_url, box_size=10, border=2)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _format_payment_caption(account: Dict[str, Any], amount: int, qr_type: str) -> str:
+    """Hard-coded caption layout per spec. Includes amount + bank info."""
+    type_label = "GST" if qr_type == "gst" else "Without GST"
+    lines = [
+        f"💳 Payment Request — ₹{amount:,} ({type_label})",
+        "Scan the QR above with any UPI app to pay.",
+        "",
+        "BANK DETAILS",
+        f"Name: {account.get('name', '')}",
+        f"Bank: {account.get('bank', '')}",
+    ]
+    if account.get("branch"):
+        lines.append(f"Branch: {account['branch']}")
+    lines.extend([
+        f"Account Number: {account.get('account_number', '')}",
+        f"IFSC: {account.get('ifsc', '')}",
+    ])
+    if account.get("upi_phone"):
+        lines.append(f"UPI No.: {account['upi_phone']}")
+    lines.append(f"UPI ID: {account.get('upi_id', '')}")
+    return "\n".join(lines)
+
+
+@api.get("/settings/payment-qr")
+async def get_payment_qr_settings(user: dict = Depends(get_current_user)):
+    """Return both GST and Without-GST account lists. Visible to executives so
+    they can pick which account to send; only admins can mutate."""
+    return await _get_payment_qr_settings()
+
+
+@api.put("/settings/payment-qr")
+async def update_payment_qr_settings(body: PaymentQRSettings, admin: dict = Depends(require_admin)):
+    """Replace the entire GST + Without-GST account lists. Each account gets a
+    UUID id assigned if not present."""
+    def normalise(accts: List[PaymentQRAccount]) -> List[Dict[str, Any]]:
+        out = []
+        for a in accts:
+            d = a.model_dump()
+            d["id"] = d.get("id") or str(uuid.uuid4())
+            out.append(d)
+        return out
+    payload = {
+        "key": "payment_qr",
+        "gst": normalise(body.gst),
+        "no_gst": normalise(body.no_gst),
+        "updated_by": admin["id"],
+        "updated_at": iso(now_utc()),
+    }
+    await db.system_settings.update_one({"key": "payment_qr"}, {"$set": payload}, upsert=True)
+    await log_activity(admin["id"], "payment_qr_settings_updated", None, {"gst": len(payload["gst"]), "no_gst": len(payload["no_gst"])})
+    return await _get_payment_qr_settings()
+
+
+@api.post("/payment-qr/generate")
+async def generate_payment_qr(body: PaymentQRGenerate, request: Request, user: dict = Depends(get_current_user)):
+    """Render a fresh PNG QR code for the requested {type, account_id, amount}.
+    Returns the public media URL + the formatted caption + the UPI URL.
+    The caller (frontend chat composer) then fires `/whatsapp/send-media`
+    with image=<media_url> and caption=<caption>."""
+    if body.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be a positive whole rupee value")
+    settings = await _get_payment_qr_settings()
+    bucket = settings.get(body.type) or []
+    account = next((a for a in bucket if a.get("id") == body.account_id), None)
+    if not account:
+        raise HTTPException(status_code=404, detail=f"Account not found in {body.type} list")
+    upi_url = _build_upi_url(account.get("upi_id") or "", body.amount)
+    png_bytes = _render_payment_qr_png(upi_url)
+    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    stored_name = f"qr_{uuid.uuid4().hex}.png"
+    (UPLOAD_ROOT / stored_name).write_bytes(png_bytes)
+    await db.media_files.update_one(
+        {"stored_name": stored_name},
+        {"$set": {
+            "stored_name": stored_name,
+            "original_filename": f"payment_qr_{body.amount}.png",
+            "mime_type": "image/png",
+            "size": len(png_bytes),
+            "kind": "payment_qr",
+            "uploaded_at": iso(now_utc()),
+            "source": "payment_qr_generator",
+            "meta": {"type": body.type, "account_id": body.account_id, "amount": body.amount, "upi_url": upi_url},
+        }},
+        upsert=True,
+    )
+    base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+    if not base:
+        fwd_proto = request.headers.get("x-forwarded-proto")
+        fwd_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        base = f"{fwd_proto or request.url.scheme}://{fwd_host}" if fwd_host else str(request.base_url).rstrip("/")
+    public_url = f"{base}/api/media/{stored_name}"
+    caption = _format_payment_caption(account, body.amount, body.type)
+    return {
+        "ok": True,
+        "media_url": public_url,
+        "media_type": "image",
+        "stored_name": stored_name,
+        "filename": f"payment_qr_{body.amount}.png",
+        "caption": caption,
+        "upi_url": upi_url,
+        "account": account,
+        "amount": body.amount,
+        "type": body.type,
+    }
+
 
 # ------------- Inbox / Conversations / Quick Replies -------------
 class QuickReplyInput(BaseModel):
