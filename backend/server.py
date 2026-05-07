@@ -2822,12 +2822,19 @@ def _build_upi_url(pa: str, amount: int) -> str:
     return f"upi://pay?pa={quote(pa, safe='@.-_')}&mam=1&am={int(amount)}&cu=INR"
 
 
-def _render_payment_qr_png(upi_url: str) -> bytes:
-    """Generate a 600x600 white-on-black QR for the given UPI URL."""
+def _render_payment_qr_jpeg(upi_url: str) -> bytes:
+    """Generate a 600x600 black-on-white QR for the given UPI URL as JPEG.
+    JPEG does not support transparency, so we flatten the QR's RGBA / 1-bit
+    output onto a white background before encoding."""
     import qrcode
+    from PIL import Image
     img = qrcode.make(upi_url, box_size=10, border=2)
+    if img.mode != "RGB":
+        bg = Image.new("RGB", img.size, "white")
+        bg.paste(img.convert("RGB"))
+        img = bg
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    img.save(buf, format="JPEG", quality=92, optimize=True)
     return buf.getvalue()
 
 
@@ -2898,17 +2905,17 @@ async def generate_payment_qr(body: PaymentQRGenerate, request: Request, user: d
     if not account:
         raise HTTPException(status_code=404, detail=f"Account not found in {body.type} list")
     upi_url = _build_upi_url(account.get("upi_id") or "", body.amount)
-    png_bytes = _render_payment_qr_png(upi_url)
+    jpeg_bytes = _render_payment_qr_jpeg(upi_url)
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
-    stored_name = f"qr_{uuid.uuid4().hex}.png"
-    (UPLOAD_ROOT / stored_name).write_bytes(png_bytes)
+    stored_name = f"qr_{uuid.uuid4().hex}.jpg"
+    (UPLOAD_ROOT / stored_name).write_bytes(jpeg_bytes)
     await db.media_files.update_one(
         {"stored_name": stored_name},
         {"$set": {
             "stored_name": stored_name,
-            "original_filename": f"payment_qr_{body.amount}.png",
-            "mime_type": "image/png",
-            "size": len(png_bytes),
+            "original_filename": f"payment_qr_{body.amount}.jpg",
+            "mime_type": "image/jpeg",
+            "size": len(jpeg_bytes),
             "kind": "payment_qr",
             "uploaded_at": iso(now_utc()),
             "source": "payment_qr_generator",
@@ -2928,7 +2935,7 @@ async def generate_payment_qr(body: PaymentQRGenerate, request: Request, user: d
         "media_url": public_url,
         "media_type": "image",
         "stored_name": stored_name,
-        "filename": f"payment_qr_{body.amount}.png",
+        "filename": f"payment_qr_{body.amount}.jpg",
         "caption": caption,
         "upi_url": upi_url,
         "account": account,
