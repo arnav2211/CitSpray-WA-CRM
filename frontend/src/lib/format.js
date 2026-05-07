@@ -20,7 +20,7 @@ export function fmtIST(iso) {
   const d = _parse(iso);
   if (!d) return "—";
   const p = DTF_IST.formatToParts(d).reduce((o, x) => (o[x.type] = x.value, o), {});
-  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute} IST`;
+  return `${p.day}-${p.month}-${p.year} ${p.hour}:${p.minute} IST`;
 }
 
 export function fmtISTTime(iso) {
@@ -133,11 +133,11 @@ export function fmtTime12(iso) {
 }
 
 export const QUERY_TYPE_MAP = {
-  W:   { label: "Direct Enquiry",    short: "Direct",   color: "bg-[#002FA7] text-white" },
-  B:   { label: "Buy-Lead",          short: "Buy",      color: "bg-[#008A00] text-white" },
-  P:   { label: "PNS Call",          short: "PNS",      color: "bg-[#E60000] text-white" },
-  BIZ: { label: "Catalog View",      short: "Catalog",  color: "bg-gray-200 text-gray-900" },
-  WA:  { label: "WhatsApp Enquiry",  short: "WhatsApp", color: "bg-[#FFCC00] text-gray-900" },
+  W: { label: "Direct", short: "Direct", color: "bg-[#002FA7] text-white" },
+  B: { label: "Buylead", short: "Buylead", color: "bg-[#008A00] text-white" },
+  P: { label: "PNS", short: "PNS", color: "bg-[#E60000] text-white" },
+  BIZ: { label: "Catalog", short: "Catalog", color: "bg-gray-200 text-gray-900" },
+  WA: { label: "WhatsApp", short: "WhatsApp", color: "bg-[#FFCC00] text-gray-900" },
 };
 
 export function queryTypeInfo(code) {

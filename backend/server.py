@@ -1908,13 +1908,17 @@ async def log_call(lead_id: str, body: CallLogInput, user: dict = Depends(get_cu
         "at": iso(now_utc()),
     }
     await db.call_logs.insert_one(doc.copy())
+    update_fields: Dict[str, Any] = {
+        "last_call_outcome": body.outcome,
+        "last_call_at": doc["at"],
+        "last_action_at": doc["at"],
+    }
+    # Auto-promote status: if lead is still "new", move to "contacted" on first call log
+    if lead.get("status") == "new":
+        update_fields["status"] = "contacted"
     await db.leads.update_one(
         {"id": lead_id},
-        {"$set": {
-            "last_call_outcome": body.outcome,
-            "last_call_at": doc["at"],
-            "last_action_at": doc["at"],
-        }},
+        {"$set": update_fields},
     )
     await log_activity(user["id"], "call_logged", lead_id, {"outcome": body.outcome, "phone": body.phone})
     return strip_mongo(doc)
@@ -2442,6 +2446,9 @@ async def sync_templates(admin: dict = Depends(require_admin)):
     data = r.json()
     upserted = 0
     for t in data.get("data", []):
+        # Skip Meta's sample hello_world template
+        if (t.get("name") or "").lower() == "hello_world":
+            continue
         body = ""
         try:
             for c in (t.get("components") or []):
@@ -6269,75 +6276,11 @@ async def seed_data():
             "created_at": iso(now_utc()),
         })
         logger.info("Seeded admin user")
-    else:
-        # ensure password matches .env
-        if not verify_password(admin_password, existing.get("password_hash", "")):
-            await db.users.update_one(
-                {"username": admin_username},
-                {"$set": {"password_hash": hash_password(admin_password), "role": "admin", "active": True}},
-            )
-    # test executives
-    for uname, name in [("ravi", "Ravi Kumar"), ("priya", "Priya Sharma")]:
-        if not await db.users.find_one({"username": uname}):
-            await db.users.insert_one({
-                "id": str(uuid.uuid4()),
-                "username": uname,
-                "name": name,
-                "password_hash": hash_password("Exec@123"),
-                "role": "executive",
-                "active": True,
-                "working_hours": [
-                    {"weekday": d, "start": "09:00", "end": "19:00"} for d in range(7)
-                ],
-                "created_at": iso(now_utc()),
-            })
-    # default template
-    if not await db.whatsapp_templates.find_one({"name": "welcome_lead"}):
-        body_w = "Hi {{name}}, thanks for your interest. Our team will connect with you shortly. — LeadOrbit"
-        await db.whatsapp_templates.insert_one({
-            "id": str(uuid.uuid4()),
-            "name": "welcome_lead",
-            "category": "utility",
-            "body": body_w,
-            "params_required": count_template_placeholders(body_w),
-            "created_at": iso(now_utc()),
-        })
-    if not await db.whatsapp_templates.find_one({"name": "followup_reminder"}):
-        body_f = "Hi {{name}}, just checking in regarding your enquiry. Let us know a good time to connect."
-        await db.whatsapp_templates.insert_one({
-            "id": str(uuid.uuid4()),
-            "name": "followup_reminder",
-            "category": "utility",
-            "body": body_f,
-            "params_required": count_template_placeholders(body_f),
-            "created_at": iso(now_utc()),
-        })
-    # Backfill params_required for any existing templates that don't have it (one-shot)
-    cursor = db.whatsapp_templates.find({"params_required": {"$exists": False}}, {"_id": 0, "id": 1, "body": 1})
-    async for t in cursor:
-        await db.whatsapp_templates.update_one(
-            {"id": t["id"]},
-            {"$set": {"params_required": count_template_placeholders(t.get("body") or "")}},
-        )
+  
+
+
     # default routing rules
     await get_routing_rules()
-    # default quick replies
-    if not await db.quick_replies.find_one({}):
-        defaults = [
-            ("Greeting", "Hi {{name}}, thanks for reaching out — how can we help you today?"),
-            ("Will call shortly", "Thanks for your enquiry! Our team will call you in the next 30 minutes."),
-            ("Price request", "Could you please share the quantity and delivery location so we can share an accurate quote?"),
-            ("Send brochure", "Here's our brochure with pricing and specifications. Let me know if any product catches your eye."),
-            ("Follow-up", "Just checking in on our previous conversation — is now a good time to discuss next steps?"),
-        ]
-        for title, text in defaults:
-            await db.quick_replies.insert_one({
-                "id": str(uuid.uuid4()),
-                "title": title,
-                "text": text,
-                "created_by": None,
-                "created_at": iso(now_utc()),
-            })
     # indexes
     await db.users.create_index("username", unique=True)
     await db.leads.create_index("dedup_hash")

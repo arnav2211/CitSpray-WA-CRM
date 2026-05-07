@@ -797,8 +797,9 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
 
   return (
     <>
+    <div className="flex flex-col h-full overflow-hidden">
       {/* Top bar */}
-      <div className="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-3" data-testid="chat-topbar">
+      <div className="shrink-0 bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-3" data-testid="chat-topbar">
         <button onClick={onClose} className="md:hidden p-1 -ml-1" data-testid="back-btn"><ArrowLeft size={18} /></button>
         <div className="w-9 h-9 rounded-full bg-[#25D366] flex items-center justify-center text-white font-bold text-sm">
           {(conv.customer_name || "?").slice(0,1).toUpperCase()}
@@ -859,7 +860,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
         )}
       </div>
 
-      <div className="flex-1 flex min-h-0">
+      <div className="flex-1 flex min-h-0 overflow-hidden">
         {/* Messages column */}
         <div className="flex-1 min-w-0 flex flex-col">
           {/* Per-phone filter banner — when deep-linked from /leads with ?phone=… */}
@@ -1209,6 +1210,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
           </aside>
         )}
       </div>
+    </div>
       {attachMode === "location" && (
         <LocationSendModal onClose={() => setAttachMode(null)} onSend={sendLocation} sending={sending} />
       )}
@@ -1376,7 +1378,7 @@ const DayGroup = React.memo(function DayGroup({
 });
 
 
-function _BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, onJumpTo, canMessage = true, currentUserId = null, isHighlighted = false, isFocused = false, searchQuery = "" }) {
+function BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, canMessage = true, currentUserId = null, isHighlighted = false, isFocused = false, searchQuery = "" }) {
   const isOut = m.direction === "out";
   const isSystem = m.direction === "system";
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -1525,7 +1527,7 @@ function _BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdm
 // Memoize Bubble — re-render only when its specific message reference, search-state,
 // or callback set changes. Cuts ~80% of bubble re-renders during chat polling on
 // large histories (#5 perf).
-const Bubble = React.memo(_BubbleImpl, (prev, next) => {
+const Bubble = React.memo(BubbleImpl, (prev, next) => {
   if (prev.m !== next.m) return false;
   if (prev.isHighlighted !== next.isHighlighted) return false;
   if (prev.isFocused !== next.isFocused) return false;
