@@ -2840,9 +2840,8 @@ def _render_payment_qr_jpeg(upi_url: str) -> bytes:
 
 def _format_payment_caption(account: Dict[str, Any], amount: int, qr_type: str) -> str:
     """Hard-coded caption layout per spec. Includes amount + bank info."""
-    type_label = "GST" if qr_type == "gst" else "Without GST"
     lines = [
-        f"💳 Payment Request — ₹{amount:,} ({type_label})",
+        f"💳 Payment Request — ₹{amount:,}",
         "Scan the QR above with any UPI app to pay.",
         "",
         "BANK DETAILS",
