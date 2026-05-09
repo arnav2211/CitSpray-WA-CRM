@@ -236,6 +236,38 @@ export default function Chat() {
     setParams(p, { replace: true });
   }, [activeId, setParams]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Keep `activeId` in sync when the URL `?lead=` param changes (e.g. user
+  // navigates from Internal Q&A → /chat?lead=X while already on /chat — the
+  // component doesn't remount, so we need to listen for the param change).
+  useEffect(() => {
+    const urlLead = params.get("lead") || null;
+    setActiveId((cur) => (cur === urlLead ? cur : urlLead));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params.get("lead")]);
+
+  // When `activeId` is set but the lead isn't in our paginated `convs` page
+  // (e.g. clicked a global message-search hit, or arrived via deep-link to a
+  // lead that's beyond page 0), fetch it on-demand and merge into `convs`.
+  // Without this, the chat panel would render the empty state.
+  useEffect(() => {
+    if (!activeId) return;
+    if (convs.find((c) => c.id === activeId)) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data } = await api.get(`/inbox/conversations/${activeId}`);
+        if (cancelled || !data || !data.id) return;
+        setConvs((prev) => {
+          if (prev.find((c) => c.id === data.id)) return prev;
+          return [data, ...prev];
+        });
+      } catch (e) {
+        // Silent on 404 / 403; user will just see the empty-state.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activeId, convs]);
+
   const activeConv = useMemo(() => convs.find(c => c.id === activeId), [convs, activeId]);
   const totalUnread = convs.reduce((s, c) => s + (c.unread || 0), 0);
   // Capture the initial deep-link params ONCE so the URL-sync effect below doesn't

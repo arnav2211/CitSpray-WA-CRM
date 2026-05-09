@@ -3183,6 +3183,59 @@ async def search_messages(
     return {"items": items, "total": total, "limit": limit, "offset": offset, "q": qq}
 
 
+@api.get("/inbox/conversations/{lead_id}")
+async def get_one_conversation(lead_id: str, user: dict = Depends(get_current_user)):
+    """Fetch a single conversation row — used by the chat UI when the user
+    deep-links / clicks a search hit and the lead isn't in the current paginated
+    page. RBAC matches the list endpoint."""
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    last = await db.messages.find_one({"lead_id": lead_id}, {"_id": 0}, sort=[("at", -1)])
+    unread = await db.messages.count_documents({"lead_id": lead_id, "direction": "in", "read": {"$ne": True}})
+    last_in_at = None
+    last_out_at = None
+    last_in = await db.messages.find_one({"lead_id": lead_id, "direction": "in"}, {"_id": 0, "at": 1}, sort=[("at", -1)])
+    last_out = await db.messages.find_one({"lead_id": lead_id, "direction": "out"}, {"_id": 0, "at": 1}, sort=[("at", -1)])
+    if last_in:
+        last_in_at = last_in.get("at")
+    if last_out:
+        last_out_at = last_out.get("at")
+    within_24h = False
+    if last_in_at:
+        try:
+            d = datetime.fromisoformat(last_in_at.replace("Z", "+00:00"))
+            within_24h = (now_utc() - d) < timedelta(hours=24)
+        except Exception:
+            pass
+    unreplied = bool(last_in_at and (not last_out_at or last_in_at > last_out_at))
+    iqa = await db.internal_messages.find_one({"lead_id": lead_id}, {"_id": 0, "qa_status": 1}, sort=[("at", -1)])
+    return {
+        **{k: lead.get(k) for k in [
+            "id", "customer_name", "phone", "phones", "email", "requirement",
+            "area", "city", "state", "source", "source_data", "status",
+            "assigned_to", "contact_link", "created_at", "opened_at", "last_action_at",
+            "has_whatsapp", "notes",
+        ]},
+        "last_message": {
+            "body": last.get("body"),
+            "direction": last.get("direction"),
+            "at": last.get("at"),
+            "status": last.get("status"),
+            "msg_type": last.get("msg_type"),
+            "template_name": last.get("template_name"),
+        } if last else None,
+        "unread": unread,
+        "last_in_at": last_in_at,
+        "last_out_at": last_out_at,
+        "within_24h": within_24h,
+        "unreplied": unreplied,
+        "internal_qa_status": (iqa or {}).get("qa_status", "none"),
+    }
+
+
 @api.post("/inbox/leads/{lead_id}/mark-read")
 async def mark_thread_read(lead_id: str, user: dict = Depends(get_current_user)):
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
