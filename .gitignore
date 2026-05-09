@@ -463,6 +463,8 @@ credentials.json
 *.pem
 *.key
 .credentials
+frontend/node_modules/.cache/default-development/44.pack
+frontend/node_modules/.cache/default-development/48.pack
 -e 
 # Environment and credential files
 .env
