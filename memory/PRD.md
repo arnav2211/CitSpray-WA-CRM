@@ -22,6 +22,24 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 36 (Feb 2026) — WhatsApp-style Search-by-Messages + chat-list pagination/infinite scroll
+- **Backend (`server.py`)**:
+  - `GET /api/inbox/conversations` — added `limit` (default 50, max 200) + `offset` for infinite scroll. Sort + slice at lead level (`skip().limit()`); per-lead message aggregation respects only the page slice.
+  - **NEW** `GET /api/inbox/search-messages?q=…` — global cross-conversation message search. RBAC: executives see only their assigned leads. Returns `{items: [{message_id, lead_id, lead_name, lead_phone, direction, msg_type, body, snippet, at, has_media}], total, limit, offset, q}`. Snippet built around match (40 chars before / 80 after). Searches `body` AND `caption` with case-insensitive regex on the indexed `lead_id` set.
+  - **Verified live**: `q=hello` returned 110 total matches across leads in <250ms.
+- **Frontend `Chat.jsx`**:
+  - **WhatsApp-style search-mode toggle** below the search input: **Chats | Messages** tabs (testids `search-mode-chats`/`search-mode-messages`). Placeholder updates per mode.
+  - **Messages mode** renders a debounced (250ms) results list of `MessageHitRow` components — lead name + IST date + 2-line snippet with the match `<mark>` highlighted. Click → opens that lead and auto-scrolls + flashes the original bubble.
+  - `pendingJumpMessageId` state passed to `ChatThread`; new effect retries the jump up to 6 times (120ms each) while messages render; toasts on miss.
+  - **Infinite scroll** on the chats list: `listScrollRef` + `onScroll` triggers `fetchConvs()` next page when within 200px of bottom. Filter changes reset `page=0` and refetch. Live polling now refreshes ONLY page 0 (`refreshFirstPage`) — keeps further pages stable while scrolling.
+  - "Loading…" / "End of list" footer states (testids `conv-list-loading`/`conv-list-end`).
+
+### Iteration 35 (Feb 2026) — Email attachments now auto-save on upload/remove
+- `Settings.jsx → onAttach` PUTs `/api/settings/email-template` immediately after upload (sends current subject/body + new attachments[]). `removeAtt` is async too. Solves silent attachment loss when admin uploaded a file but didn't click Save.
+
+### Iteration 34 (Feb 2026) — Payment QR now sent as JPEG (WhatsApp-compatible)
+- `_render_payment_qr_jpeg` flattens the QR onto white BG (no transparency), encodes at quality 92. Stored as `qr_<hex>.jpg` with `mime_type=image/jpeg`. WA Cloud API accepts cleanly.
+
 ### Iteration 33 (Feb 2026) — Payment QR (UPI) attachment + admin settings page
 - **Backend (`server.py`)** — new module:
   - `qrcode==8.2` added to requirements (Python `qrcode[pil]`).

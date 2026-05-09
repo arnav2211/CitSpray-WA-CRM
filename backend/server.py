@@ -2968,11 +2968,22 @@ async def list_conversations(
     status: Optional[str] = None,
     assigned_to: Optional[str] = None,
     include_all: bool = False,
+    limit: int = 50,
+    offset: int = 0,
 ):
     """Returns a list of leads optimized for the chat inbox: each row carries last_msg preview,
     unread count, last_user_message_at and within_24h flag.
     Default filters to WhatsApp-active leads (`has_whatsapp=true` OR has at least one message).
-    Pass `include_all=true` to bypass the WA filter (admin debugging)."""
+    Pass `include_all=true` to bypass the WA filter (admin debugging).
+    Pagination: `limit` (default 50) + `offset` for infinite-scroll. Each batch is sorted
+    by last_action_at DESC so newest activity bubbles to the top — pagination is stable
+    within a single client session as long as the underlying messages don't reshuffle.
+    Filters (only_unread/unreplied/replied/has_whatsapp) are applied AFTER paging the
+    leads collection — so the returned page may contain fewer than `limit` rows when
+    filters drop ineligible leads. Frontend should keep paging until the response is
+    empty or noticeably short."""
+    limit = max(1, min(int(limit or 50), 200))
+    offset = max(0, int(offset or 0))
     query: Dict[str, Any] = {}
     if user["role"] == "executive":
         query["assigned_to"] = user["id"]
@@ -2998,7 +3009,7 @@ async def list_conversations(
         query["$or"] = ors
     leads = await db.leads.find(query, {
         "_id": 0, "raw_email_html": 0, "raw_email_text": 0,
-    }).sort("last_action_at", -1).to_list(500)
+    }).sort("last_action_at", -1).skip(offset).limit(limit).to_list(limit)
     if not leads:
         return []
     lead_ids = [ld["id"] for ld in leads]
@@ -3098,6 +3109,72 @@ async def list_conversations(
             "internal_qa_status": iqa_map.get(ld["id"], "none"),
         })
     return out
+
+
+@api.get("/inbox/search-messages")
+async def search_messages(
+    q: str,
+    user: dict = Depends(get_current_user),
+    limit: int = 50,
+    offset: int = 0,
+):
+    """Global cross-conversation message search (WhatsApp 'Search by messages').
+    Returns flat hits: each row carries the matching message body + a leading
+    snippet around the matched substring + the lead identity, so the frontend
+    can render a results list and click-to-jump to that exact bubble."""
+    qq = (q or "").strip()
+    if not qq:
+        return {"items": [], "total": 0, "limit": limit, "offset": offset}
+    limit = max(1, min(int(limit or 50), 200))
+    offset = max(0, int(offset or 0))
+    import re as _re
+    rx = _re.compile(_re.escape(qq), _re.IGNORECASE)
+    # Restrict to leads visible to this user (executives see only their assignments)
+    lead_q: Dict[str, Any] = {}
+    if user["role"] == "executive":
+        lead_q["assigned_to"] = user["id"]
+    visible_leads = await db.leads.find(lead_q, {"_id": 0, "id": 1, "customer_name": 1, "phone": 1, "assigned_to": 1}).to_list(20000)
+    if not visible_leads:
+        return {"items": [], "total": 0, "limit": limit, "offset": offset}
+    lead_index: Dict[str, Dict[str, Any]] = {ld["id"]: ld for ld in visible_leads}
+    # Search messages.body OR caption for case-insensitive substring match
+    msg_query: Dict[str, Any] = {
+        "lead_id": {"$in": list(lead_index.keys())},
+        "$or": [
+            {"body": {"$regex": _re.escape(qq), "$options": "i"}},
+            {"caption": {"$regex": _re.escape(qq), "$options": "i"}},
+        ],
+    }
+    total = await db.messages.count_documents(msg_query)
+    cursor = db.messages.find(msg_query, {
+        "_id": 0, "id": 1, "lead_id": 1, "direction": 1, "body": 1, "caption": 1,
+        "msg_type": 1, "at": 1, "media_url": 1,
+    }).sort("at", -1).skip(offset).limit(limit)
+    items = []
+    async for m in cursor:
+        ld = lead_index.get(m.get("lead_id")) or {}
+        text = (m.get("body") or "") or (m.get("caption") or "")
+        # Build a 120-char snippet centered on the match
+        snippet = text
+        match = rx.search(text)
+        if match and len(text) > 120:
+            start = max(0, match.start() - 40)
+            end = min(len(text), match.end() + 80)
+            snippet = ("…" if start > 0 else "") + text[start:end] + ("…" if end < len(text) else "")
+        items.append({
+            "message_id": m.get("id"),
+            "lead_id": m.get("lead_id"),
+            "lead_name": ld.get("customer_name"),
+            "lead_phone": ld.get("phone"),
+            "lead_assigned_to": ld.get("assigned_to"),
+            "direction": m.get("direction"),
+            "msg_type": m.get("msg_type"),
+            "body": text,
+            "snippet": snippet,
+            "at": m.get("at"),
+            "has_media": bool(m.get("media_url")),
+        })
+    return {"items": items, "total": total, "limit": limit, "offset": offset, "q": qq}
 
 
 @api.post("/inbox/leads/{lead_id}/mark-read")

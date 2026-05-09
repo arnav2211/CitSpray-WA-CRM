@@ -77,7 +77,37 @@ export default function Chat() {
     return () => window.removeEventListener("popstate", onPop);
   }, [isMobilePage, activeId]);
 
-  const fetchConvs = useCallback(async () => {
+  const PAGE_SIZE = 50;
+  const [page, setPage] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  // Global cross-conversation message search (WhatsApp "Search by messages")
+  const [searchMode, setSearchMode] = useState("chats"); // 'chats' | 'messages'
+  const [msgResults, setMsgResults] = useState({ items: [], total: 0, loading: false });
+  // When user clicks a message-search hit we set this so ChatThread knows to
+  // scroll to + flash that exact bubble after the conversation loads.
+  const [pendingJumpMessageId, setPendingJumpMessageId] = useState(null);
+  const listScrollRef = useRef(null);
+
+  // Infinite scroll handler — fires when the user scrolls within 200px of the
+  // bottom of the chat-list panel. Throttled by `loadingMore` flag so we don't
+  // double-fire on rapid scroll events.
+  const onListScroll = useCallback(() => {
+    const el = listScrollRef.current;
+    if (!el) return;
+    if (searchMode !== "chats") return;
+    if (loadingMore || !hasMore) return;
+    const remaining = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (remaining < 200) {
+      fetchConvs();
+    }
+  }, [searchMode, loadingMore, hasMore, fetchConvs]);
+
+  const fetchConvs = useCallback(async (opts = {}) => {
+    const { reset = false } = opts;
+    const nextOffset = reset ? 0 : page * PAGE_SIZE;
+    if (!reset && (loadingMore || !hasMore)) return;
+    if (!reset) setLoadingMore(true);
     try {
       const { data } = await api.get("/inbox/conversations", {
         params: {
@@ -87,31 +117,103 @@ export default function Chat() {
           only_replied: filterReplied || undefined,
           status: filterStatus || undefined,
           assigned_to: filterAssignee || undefined,
+          limit: PAGE_SIZE,
+          offset: nextOffset,
         },
       });
-      // Sort by last_message timestamp DESC (full ISO datetime → lexicographic
-      // comparison is correct because ISO-8601 sorts chronologically). Falls
-      // back to last_in_at, last_out_at, then last_action_at.
-      const sorted = [...data].sort((a, b) => {
-        const ta = a.last_message?.at || a.last_in_at || a.last_out_at || a.last_action_at || "";
-        const tb = b.last_message?.at || b.last_in_at || b.last_out_at || b.last_action_at || "";
-        return tb.localeCompare(ta);
+      const incoming = Array.isArray(data) ? data : [];
+      // Merge & dedup on id; keep latest copy from this fetch (for live unread updates).
+      setConvs((prev) => {
+        const base = reset ? [] : prev;
+        const map = new Map(base.map((c) => [c.id, c]));
+        for (const c of incoming) map.set(c.id, c);
+        const merged = Array.from(map.values());
+        merged.sort((a, b) => {
+          const ta = a.last_message?.at || a.last_in_at || a.last_out_at || a.last_action_at || "";
+          const tb = b.last_message?.at || b.last_in_at || b.last_out_at || b.last_action_at || "";
+          return tb.localeCompare(ta);
+        });
+        return merged;
       });
-      setConvs(sorted);
+      // hasMore inference: server returns up to PAGE_SIZE per call; a short page
+      // means we've exhausted leads. Filter-driven drops can return fewer rows
+      // even with more leads available — we keep paging until empty.
+      setHasMore(incoming.length >= 1);
+      setPage((p) => (reset ? 1 : p + 1));
     } catch (e) {
-      // silent; toast on hard fail
       const msg = errMsg(e, "");
       if (msg && !msg.toLowerCase().includes("network")) toast.error(msg);
+    } finally {
+      setLoadingMore(false);
     }
+  }, [search, filterUnread, filterUnreplied, filterReplied, filterStatus, filterAssignee, page, loadingMore, hasMore]);
+
+  // Refresh-only fetch — re-pulls page 0 for live unread updates without
+  // disrupting any further pages the user has scrolled into.
+  const refreshFirstPage = useCallback(async () => {
+    try {
+      const { data } = await api.get("/inbox/conversations", {
+        params: {
+          q: search || undefined,
+          only_unread: filterUnread || undefined,
+          only_unreplied: filterUnreplied || undefined,
+          only_replied: filterReplied || undefined,
+          status: filterStatus || undefined,
+          assigned_to: filterAssignee || undefined,
+          limit: PAGE_SIZE,
+          offset: 0,
+        },
+      });
+      const incoming = Array.isArray(data) ? data : [];
+      setConvs((prev) => {
+        const map = new Map(prev.map((c) => [c.id, c]));
+        for (const c of incoming) map.set(c.id, c);
+        const merged = Array.from(map.values());
+        merged.sort((a, b) => {
+          const ta = a.last_message?.at || a.last_in_at || a.last_out_at || a.last_action_at || "";
+          const tb = b.last_message?.at || b.last_in_at || b.last_out_at || b.last_action_at || "";
+          return tb.localeCompare(ta);
+        });
+        return merged;
+      });
+    } catch (_) { /* silent */ }
   }, [search, filterUnread, filterUnreplied, filterReplied, filterStatus, filterAssignee]);
 
-  // Initial + filter changes
-  useEffect(() => { fetchConvs(); }, [fetchConvs]);
-  // Poll
+  // Run global message search (debounced 250ms via the effect re-trigger)
+  const runMessageSearch = useCallback(async (term) => {
+    const q = (term || "").trim();
+    if (!q) { setMsgResults({ items: [], total: 0, loading: false }); return; }
+    setMsgResults((r) => ({ ...r, loading: true }));
+    try {
+      const { data } = await api.get("/inbox/search-messages", { params: { q, limit: 50 } });
+      setMsgResults({ items: data.items || [], total: data.total || 0, loading: false });
+    } catch (e) {
+      setMsgResults({ items: [], total: 0, loading: false });
+      toast.error(errMsg(e));
+    }
+  }, []);
+
+  // Initial + filter-changes → reset to page 0 and refetch
   useEffect(() => {
-    const id = setInterval(fetchConvs, POLL_MS);
+    setHasMore(true);
+    setPage(0);
+    fetchConvs({ reset: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search, filterUnread, filterUnreplied, filterReplied, filterStatus, filterAssignee]);
+
+  // Live polling — refresh ONLY page 0 (keeps further pages stable while user scrolls)
+  useEffect(() => {
+    const id = setInterval(refreshFirstPage, POLL_MS);
     return () => clearInterval(id);
-  }, [fetchConvs]);
+  }, [refreshFirstPage]);
+
+  // Debounced message search trigger — re-runs 250ms after the user stops typing
+  // when in 'messages' search mode.
+  useEffect(() => {
+    if (searchMode !== "messages") return;
+    const t = setTimeout(() => runMessageSearch(search), 250);
+    return () => clearTimeout(t);
+  }, [searchMode, search, runMessageSearch]);
 
   // Load execs for admin filter
   useEffect(() => {
@@ -171,10 +273,29 @@ export default function Chat() {
           <div className="relative">
             <MagnifyingGlass className="absolute left-2 top-2.5 text-gray-400" size={14} />
             <input value={search} onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search by name, phone…"
+              placeholder={searchMode === "chats" ? "Search chats by name or phone…" : "Search inside messages…"}
               className="w-full border border-gray-300 pl-7 pr-3 py-2 text-sm outline-none focus:border-[#25D366] focus:ring-2 focus:ring-[#25D366]"
               data-testid="conv-search-input" />
           </div>
+          {/* WhatsApp-style mode toggle: Chats vs Messages */}
+          <div className="flex border border-gray-300 text-[10px] uppercase tracking-widest font-bold" data-testid="conv-search-mode">
+            <button
+              onClick={() => setSearchMode("chats")}
+              className={`flex-1 px-3 py-1.5 ${searchMode === "chats" ? "bg-gray-900 text-white" : "bg-white hover:bg-gray-50"}`}
+              data-testid="search-mode-chats"
+            >
+              Chats
+            </button>
+            <button
+              onClick={() => setSearchMode("messages")}
+              className={`flex-1 px-3 py-1.5 ${searchMode === "messages" ? "bg-gray-900 text-white" : "bg-white hover:bg-gray-50"}`}
+              data-testid="search-mode-messages"
+            >
+              Messages
+            </button>
+          </div>
+          {/* Filters only relevant in chats mode */}
+          {searchMode === "chats" && (
           <div className="flex items-center gap-2 flex-wrap">
             <FilterChip active={filterUnread} onClick={() => setFilterUnread(v => !v)} testId="filter-unread">Unread</FilterChip>
             <FilterChip active={filterUnreplied} onClick={() => setFilterUnreplied(v => !v)} testId="filter-unreplied">Not replied</FilterChip>
@@ -190,16 +311,62 @@ export default function Chat() {
               </select>
             )}
           </div>
+          )}
         </div>
-        <div className="flex-1 overflow-y-auto">
-          {convs.length === 0 ? (
-            <div className="p-8 text-center text-xs uppercase tracking-widest text-gray-400">
-              <ChatCircleDots size={48} className="mx-auto mb-3 text-gray-300" weight="light" />
-              No conversations match these filters
-            </div>
-          ) : convs.map((c) => (
-            <ConvRow key={c.id} c={c} active={c.id === activeId} onClick={() => setActiveId(c.id)} execs={execs} />
-          ))}
+        <div className="flex-1 overflow-y-auto" ref={(el) => { listScrollRef.current = el; }} onScroll={onListScroll} data-testid="conv-list-scroll">
+          {searchMode === "messages" ? (
+            // ---------- Global message-search results ----------
+            (search.trim() === "") ? (
+              <div className="p-8 text-center text-xs uppercase tracking-widest text-gray-400">
+                <MagnifyingGlass size={48} className="mx-auto mb-3 text-gray-300" weight="light" />
+                Type to search messages across all chats
+              </div>
+            ) : msgResults.loading ? (
+              <div className="p-8 text-center text-xs uppercase tracking-widest text-gray-400" data-testid="msg-search-loading">Searching…</div>
+            ) : msgResults.items.length === 0 ? (
+              <div className="p-8 text-center text-xs uppercase tracking-widest text-gray-400" data-testid="msg-search-empty">No messages match "{search}"</div>
+            ) : (
+              <>
+                <div className="px-4 py-2 text-[10px] uppercase tracking-widest text-gray-500 font-bold border-b border-gray-100" data-testid="msg-search-count">
+                  {msgResults.total} message{msgResults.total === 1 ? "" : "s"} match
+                </div>
+                {msgResults.items.map((hit) => (
+                  <MessageHitRow
+                    key={hit.message_id || `${hit.lead_id}-${hit.at}`}
+                    hit={hit}
+                    query={search.trim()}
+                    onClick={() => {
+                      // Navigate to the lead and ask the thread to scroll to this message id.
+                      setPendingJumpMessageId(hit.message_id);
+                      setActiveId(hit.lead_id);
+                    }}
+                  />
+                ))}
+              </>
+            )
+          ) : (
+            // ---------- Chats list (paginated) ----------
+            <>
+              {convs.length === 0 ? (
+                <div className="p-8 text-center text-xs uppercase tracking-widest text-gray-400">
+                  <ChatCircleDots size={48} className="mx-auto mb-3 text-gray-300" weight="light" />
+                  No conversations match these filters
+                </div>
+              ) : convs.map((c) => (
+                <ConvRow key={c.id} c={c} active={c.id === activeId} onClick={() => setActiveId(c.id)} execs={execs} />
+              ))}
+              {hasMore && convs.length > 0 && (
+                <div className="p-3 text-center text-[10px] uppercase tracking-widest text-gray-400 font-bold" data-testid="conv-list-loading">
+                  {loadingMore ? "Loading…" : "Scroll for more"}
+                </div>
+              )}
+              {!hasMore && convs.length > 0 && (
+                <div className="p-3 text-center text-[10px] uppercase tracking-widest text-gray-300 font-bold" data-testid="conv-list-end">
+                  End of list
+                </div>
+              )}
+            </>
+          )}
         </div>
       </aside>
 
@@ -211,10 +378,12 @@ export default function Chat() {
             user={user}
             execs={execs}
             onClose={() => setActiveId(null)}
-            onChanged={fetchConvs}
+            onChanged={refreshFirstPage}
             initialTab={initialDeeplink.tab}
             initialAgentId={initialDeeplink.agent}
             initialPhone={initialDeeplink.phone}
+            jumpToMessageId={pendingJumpMessageId}
+            onJumpConsumed={() => setPendingJumpMessageId(null)}
           />
         ) : (
           <EmptyState />
@@ -226,7 +395,7 @@ export default function Chat() {
           execs={execs}
           isAdmin={isAdmin}
           onClose={() => setShowNewChat(false)}
-          onCreated={(lead) => { setShowNewChat(false); fetchConvs(); setActiveId(lead.id); }}
+          onCreated={(lead) => { setShowNewChat(false); fetchConvs({ reset: true }); setActiveId(lead.id); }}
         />
       )}
     </div>
@@ -324,8 +493,49 @@ function EmptyState() {
   );
 }
 
+// ---------------- Global message-search result row ----------------
+function MessageHitRow({ hit, query, onClick }) {
+  // Highlight the matched substring(s) inside the snippet (case-insensitive).
+  const renderSnippet = () => {
+    const text = hit.snippet || hit.body || "";
+    if (!query) return text;
+    const lc = text.toLowerCase();
+    const q = query.toLowerCase();
+    const out = [];
+    let i = 0;
+    while (i < text.length) {
+      const idx = lc.indexOf(q, i);
+      if (idx === -1) { out.push(text.slice(i)); break; }
+      if (idx > i) out.push(text.slice(i, idx));
+      out.push(<mark key={idx} className="bg-[#FFF59D] px-0.5">{text.slice(idx, idx + q.length)}</mark>);
+      i = idx + q.length;
+    }
+    return out;
+  };
+  const at = hit.at ? new Date(hit.at).toLocaleDateString("en-IN", { day: "2-digit", month: "short" }) : "";
+  return (
+    <button
+      onClick={onClick}
+      className="w-full text-left px-3 py-3 hover:bg-gray-50 border-b border-gray-100 transition-colors"
+      data-testid={`msg-hit-${hit.message_id}`}
+    >
+      <div className="flex items-center justify-between mb-0.5">
+        <div className="text-sm font-bold text-gray-900 truncate">{hit.lead_name || hit.lead_phone || "Lead"}</div>
+        <div className="text-[9px] uppercase tracking-widest text-gray-400 font-bold shrink-0 ml-2">{at}</div>
+      </div>
+      <div className="text-xs text-gray-700 line-clamp-2">
+        <span className="text-[9px] uppercase tracking-widest text-gray-500 font-bold mr-1">
+          {hit.direction === "out" ? "You" : "Customer"}:
+        </span>
+        {renderSnippet()}
+      </div>
+    </button>
+  );
+}
+
+
 // ---------------- Chat thread ----------------
-function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initialAgentId, initialPhone }) {
+function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initialAgentId, initialPhone, jumpToMessageId, onJumpConsumed }) {
   const isAdmin = user.role === "admin";
   const canMessage = isAdmin || conv.assigned_to === user.id;
   const [messages, setMessages] = useState([]);
@@ -464,6 +674,29 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
       }, 1400);
     }
   }, []);
+
+  // Auto-jump when the parent passes `jumpToMessageId` (from a global message
+  // search hit). We wait until messages are loaded, then attempt the jump.
+  // The messages list may need a moment to render — retry briefly.
+  useEffect(() => {
+    if (!jumpToMessageId || !messages.length) return;
+    let attempts = 0;
+    const tryJump = () => {
+      const el = scrollRef.current?.querySelector(`[data-testid="bubble-${jumpToMessageId}"]`);
+      if (el) {
+        jumpToMessage(jumpToMessageId);
+        onJumpConsumed?.();
+      } else if (attempts < 6) {
+        attempts += 1;
+        setTimeout(tryJump, 120);
+      } else {
+        toast.error("Message not in loaded window — scroll up to find it");
+        onJumpConsumed?.();
+      }
+    };
+    setTimeout(tryJump, 80);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jumpToMessageId, messages.length]);
 
   // Group messages by IST day key — used to render sticky day separators
   // (#2 WhatsApp-style). Memoized so we don't re-walk the array on each render.
