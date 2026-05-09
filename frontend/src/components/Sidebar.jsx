@@ -62,7 +62,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
       {/* Sidebar — fixed overlay on mobile, in-flow on md+ */}
       <aside
         className={`
-          fixed md:relative top-0 left-0 z-50 md:z-auto h-full md:h-auto
+          fixed md:relative top-0 left-0 z-50 md:z-auto h-full
           w-72 md:w-60 shrink-0 bg-gray-50 border-r border-gray-200 flex flex-col
           transform transition-transform duration-200 ease-out
           ${mobileOpen ? "translate-x-0" : "-translate-x-full"} md:translate-x-0
