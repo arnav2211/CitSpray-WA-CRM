@@ -89,20 +89,6 @@ export default function Chat() {
   const [pendingJumpMessageId, setPendingJumpMessageId] = useState(null);
   const listScrollRef = useRef(null);
 
-  // Infinite scroll handler — fires when the user scrolls within 200px of the
-  // bottom of the chat-list panel. Throttled by `loadingMore` flag so we don't
-  // double-fire on rapid scroll events.
-  const onListScroll = useCallback(() => {
-    const el = listScrollRef.current;
-    if (!el) return;
-    if (searchMode !== "chats") return;
-    if (loadingMore || !hasMore) return;
-    const remaining = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (remaining < 200) {
-      fetchConvs();
-    }
-  }, [searchMode, loadingMore, hasMore, fetchConvs]);
-
   const fetchConvs = useCallback(async (opts = {}) => {
     const { reset = false } = opts;
     const nextOffset = reset ? 0 : page * PAGE_SIZE;
@@ -192,6 +178,21 @@ export default function Chat() {
       toast.error(errMsg(e));
     }
   }, []);
+
+  // Infinite scroll handler — fires when the user scrolls within 200px of the
+  // bottom of the chat-list panel. Throttled by `loadingMore` flag so we don't
+  // double-fire on rapid scroll events. Declared AFTER fetchConvs to avoid
+  // temporal-dead-zone (useCallback lowers to const).
+  const onListScroll = useCallback(() => {
+    const el = listScrollRef.current;
+    if (!el) return;
+    if (searchMode !== "chats") return;
+    if (loadingMore || !hasMore) return;
+    const remaining = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (remaining < 200) {
+      fetchConvs();
+    }
+  }, [searchMode, loadingMore, hasMore, fetchConvs]);
 
   // Initial + filter-changes → reset to page 0 and refetch
   useEffect(() => {
