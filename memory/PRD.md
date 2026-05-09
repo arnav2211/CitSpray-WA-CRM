@@ -22,6 +22,12 @@ FastAPI + MongoDB (motor) + React 19 + JWT + APScheduler. Swiss / High-Contrast 
 - Gmail OAuth flow (server-side, no PKCE) with background poller.
 
 ## What's Been Implemented
+### Iteration 39 (Feb 2026) — /leads sort: reassigned leads bubble up; new leads stay on top
+- **Backend `assign_lead`**: now records `last_reassigned_at = now()` whenever the call is a *reassignment* (lead already had a previous owner / non-empty `assignment_history`), not on first assignment. Emits `lead_reassigned` activity action.
+- **Backend `GET /api/leads`**: replaced `.sort('created_at', -1)` cursor with a Mongo aggregation computing `_sort_at = max(created_at, last_reassigned_at) ?? created_at` and sorting DESC (created_at tiebreaker). Brand-new leads with no reassignment fall back cleanly.
+- **Result**: fresh leads always above older reassigned ones (their `created_at > any earlier last_reassigned_at`); a reassigned lead bubbles above older un-reassigned ones via its `last_reassigned_at`.
+- **Verified live** with 4-step curl: create L1 → create L2 → reassign L1 → create L3 → list returns `[L3, L1, L2]` exactly per spec.
+
 ### Iteration 36 (Feb 2026) — WhatsApp-style Search-by-Messages + chat-list pagination/infinite scroll
 - **Backend (`server.py`)**:
   - `GET /api/inbox/conversations` — added `limit` (default 50, max 200) + `offset` for infinite scroll. Sort + slice at lead level (`skip().limit()`); per-lead message aggregation respects only the page slice.

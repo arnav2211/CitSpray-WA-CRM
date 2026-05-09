@@ -1247,14 +1247,19 @@ async def assign_lead(lead_id: str, target_user_id: Optional[str] = None, by_use
             return None
         chosen_id = chosen["id"]
     entry = {"user_id": chosen_id, "at": iso(now_utc()), "by": by_user_id}
+    # Detect whether this is a *reassignment* (lead already has a prior owner)
+    # vs a first assignment. Reassignments get `last_reassigned_at` so the
+    # /leads list can bubble them up alongside brand-new leads.
+    prev = await db.leads.find_one({"id": lead_id}, {"_id": 0, "assigned_to": 1, "assignment_history": 1})
+    is_reassignment = bool(prev and (prev.get("assigned_to") or (prev.get("assignment_history") or [])))
+    set_ops: Dict[str, Any] = {"assigned_to": chosen_id, "last_assignment_at": iso(now_utc()), "opened_at": None}
+    if is_reassignment:
+        set_ops["last_reassigned_at"] = iso(now_utc())
     await db.leads.update_one(
         {"id": lead_id},
-        {
-            "$set": {"assigned_to": chosen_id, "last_assignment_at": iso(now_utc()), "opened_at": None},
-            "$push": {"assignment_history": entry},
-        },
+        {"$set": set_ops, "$push": {"assignment_history": entry}},
     )
-    await log_activity(by_user_id, "lead_assigned", lead_id, {"assigned_to": chosen_id})
+    await log_activity(by_user_id, "lead_reassigned" if is_reassignment else "lead_assigned", lead_id, {"assigned_to": chosen_id})
     return chosen_id
 
 async def auto_send_whatsapp_on_create(lead: dict):
@@ -1589,9 +1594,28 @@ async def list_leads(
         query["$or"] = ors
     safe_limit = max(1, min(int(limit), 500))
     safe_offset = max(0, int(offset))
-    cursor = db.leads.find(query, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})\
-        .sort("created_at", -1).skip(safe_offset).limit(safe_limit)
-    items = await cursor.to_list(safe_limit)
+    # Sort by MAX(created_at, last_reassigned_at) DESC so:
+    #   - Brand-new leads (no reassignment yet) sort by their created_at — newest top.
+    #   - Reassigned leads bubble up via their last_reassigned_at — but only above
+    #     leads created BEFORE the reassignment. New leads created AFTER any
+    #     reassignment automatically stay on top (their created_at > all earlier
+    #     last_reassigned_at).
+    pipeline: List[Dict[str, Any]] = [
+        {"$match": query},
+        {"$addFields": {
+            "_sort_at": {
+                "$ifNull": [
+                    {"$max": ["$created_at", "$last_reassigned_at"]},
+                    "$created_at",
+                ],
+            },
+        }},
+        {"$sort": {"_sort_at": -1, "created_at": -1}},
+        {"$skip": safe_offset},
+        {"$limit": safe_limit},
+        {"$project": {"_id": 0, "raw_email_html": 0, "raw_email_text": 0, "_sort_at": 0}},
+    ]
+    items = await db.leads.aggregate(pipeline).to_list(safe_limit)
     if paginate:
         total = await db.leads.count_documents(query)
         return {"items": items, "total": total, "limit": safe_limit, "offset": safe_offset}
