@@ -5529,6 +5529,18 @@ async def webhook_whatsapp(request: Request):
                         }},
                     )
                     created_msgs += 1
+
+                    # ---- Auto-Reply Sequence Trigger ----
+                    if not lead.get("auto_reply_sequence_triggered"):
+                        # Atomic lock so only the very first reply triggers it across concurrent webhooks
+                        updated_lead = await db.leads.find_one_and_update(
+                            {"id": lead["id"], "auto_reply_sequence_triggered": {"$ne": True}},
+                            {"$set": {"auto_reply_sequence_triggered": True}},
+                            return_document=True
+                        )
+                        if updated_lead:
+                            asyncio.create_task(_trigger_auto_sequence(lead["id"], from_phone or lead.get("phone")))
+
                     # ---- Flow engine dispatch (interactive replies) ----
                     if msg_type == "interactive":
                         try:
@@ -5757,6 +5769,90 @@ async def update_whatsapp_settings(body: WhatsAppSettingsInput, admin: dict = De
     safe = {k: (_mask_token(v) if k in ("access_token", "app_secret") and isinstance(v, str) else v) for k, v in effective.items()}
     return {"ok": True, "effective": safe}
 
+
+# ------------- WhatsApp Auto-Sequence -------------
+class AutoSequenceInput(BaseModel):
+    is_active: bool
+    quick_reply_ids: List[str]
+
+
+@api.get("/settings/auto-sequence")
+async def get_auto_sequence(admin: dict = Depends(require_admin)):
+    doc = await db.system_settings.find_one({"key": "auto_reply_sequence"}, {"_id": 0})
+    if not doc:
+        return {"is_active": False, "quick_reply_ids": []}
+    return {"is_active": doc.get("is_active", False), "quick_reply_ids": doc.get("quick_reply_ids", [])}
+
+
+@api.put("/settings/auto-sequence")
+async def update_auto_sequence(body: AutoSequenceInput, admin: dict = Depends(require_admin)):
+    await db.system_settings.update_one(
+        {"key": "auto_reply_sequence"},
+        {"$set": {
+            "key": "auto_reply_sequence",
+            "is_active": body.is_active,
+            "quick_reply_ids": body.quick_reply_ids,
+            "updated_by": admin["id"],
+            "updated_at": iso(now_utc())
+        }},
+        upsert=True
+    )
+    return {"ok": True}
+
+
+async def _trigger_auto_sequence(lead_id: str, target_phone: str):
+    try:
+        # Give Meta/Webhook a brief moment to finish updating before firing out
+        await asyncio.sleep(1)
+        doc = await db.system_settings.find_one({"key": "auto_reply_sequence"}, {"_id": 0})
+        if not doc or not doc.get("is_active") or not doc.get("quick_reply_ids"):
+            return
+        
+        for qr_id in doc["quick_reply_ids"]:
+            qr = await db.quick_replies.find_one({"id": qr_id})
+            if not qr:
+                continue
+            
+            api_result = {}
+            if qr.get("media_url"):
+                api_result = await wa_send_media(
+                    to_phone=target_phone,
+                    media_type=qr.get("media_type") or "document",
+                    url=qr["media_url"],
+                    caption=qr.get("caption") or qr.get("text"),
+                    filename=qr.get("media_filename")
+                )
+            else:
+                api_result = await wa_send_text(
+                    to_phone=target_phone,
+                    body=qr.get("text") or ""
+                )
+                
+            msg = {
+                "id": str(uuid.uuid4()),
+                "lead_id": lead_id,
+                "direction": "out",
+                "body": qr.get("text") or "",
+                "to_phone": target_phone,
+                "status": api_result.get("status", "failed"),
+                "wamid": api_result.get("wamid"),
+                "error": api_result.get("error"),
+                "error_code": api_result.get("code"),
+                "at": iso(now_utc()),
+                "by_user_id": None, # automated
+            }
+            if qr.get("media_url"):
+                msg["media_type"] = qr.get("media_type")
+                msg["media_url"] = qr["media_url"]
+                msg["filename"] = qr.get("media_filename")
+                msg["caption"] = qr.get("caption")
+            
+            await db.messages.insert_one(msg)
+            # Short wait before sending next to guarantee order on client device
+            await asyncio.sleep(1.5)
+            
+    except Exception as e:
+        logger.exception(f"Auto-sequence failed for lead {lead_id}: {e}")
 
 # ------------- Email Auto-Send (SMTP) -------------
 EMAIL_DEFAULT_HOST = "smtp.hostinger.com"
