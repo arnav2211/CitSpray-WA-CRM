@@ -1129,6 +1129,8 @@ function WhatsAppAutoSequencePanel() {
   const [quickReplies, setQuickReplies] = useState([]);
   const [templates, setTemplates] = useState([]);
   const [saving, setSaving] = useState(false);
+  const [selectedAdd, setSelectedAdd] = useState("");
+  const [customText, setCustomText] = useState("");
 
   const load = async () => {
     try {
@@ -1161,10 +1163,17 @@ function WhatsAppAutoSequencePanel() {
     }
   };
 
-  const addQr = (e) => {
-    if (!e.target.value) return;
-    save({ quick_reply_ids: [...cfg.quick_reply_ids, e.target.value] });
-    e.target.value = "";
+  const addQr = (value) => {
+    if (!value) return;
+    save({ quick_reply_ids: [...cfg.quick_reply_ids, value] });
+    setSelectedAdd("");
+  };
+
+  const addCustom = () => {
+    const text = customText.trim();
+    if (!text) return;
+    save({ quick_reply_ids: [...cfg.quick_reply_ids, `__custom__:${text}`] });
+    setCustomText("");
   };
 
   const removeQr = (index) => {
@@ -1201,13 +1210,20 @@ function WhatsAppAutoSequencePanel() {
         ) : (
           <div className="space-y-2 mb-4">
             {cfg.quick_reply_ids.map((id, i) => {
-              const qr = quickReplies.find(q => q.id === id);
-              const tpl = !qr ? templates.find(t => t.id === id || t.name === id) : null;
+              const isCustom = id.startsWith("__custom__:");
+              const customMsg = isCustom ? id.slice("__custom__:".length) : null;
+              const qr = !isCustom ? quickReplies.find(q => q.id === id) : null;
+              const tpl = !isCustom && !qr ? templates.find(t => t.id === id || t.name === id) : null;
               return (
                 <div key={`${id}-${i}`} className="flex items-center justify-between border border-gray-200 p-2 bg-gray-50 text-sm">
-                  <div>
+                  <div className="flex-1 min-w-0 mr-3">
                     <span className="font-bold mr-2">{i + 1}.</span>
-                    {qr ? (
+                    {isCustom ? (
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className="text-[9px] bg-purple-100 text-purple-800 px-1.5 py-0.5 rounded font-bold uppercase tracking-wider">Custom</span>
+                        <span className="text-gray-700 truncate">{customMsg}</span>
+                      </span>
+                    ) : qr ? (
                       <span className="inline-flex items-center gap-1.5">
                         <span className="text-[9px] bg-blue-100 text-blue-800 px-1.5 py-0.5 rounded font-bold uppercase tracking-wider">Quick Reply</span>
                         <strong>{qr.title}</strong>
@@ -1221,7 +1237,7 @@ function WhatsAppAutoSequencePanel() {
                       <span className="text-[#E60000] font-bold">Unknown/Deleted Item</span>
                     )}
                   </div>
-                  <button onClick={() => removeQr(i)} disabled={saving} className="text-[#E60000] hover:bg-[#E60000] hover:text-white px-2 py-1 text-[10px] uppercase tracking-widest font-bold border border-[#E60000]">
+                  <button onClick={() => removeQr(i)} disabled={saving} className="text-[#E60000] hover:bg-[#E60000] hover:text-white px-2 py-1 text-[10px] uppercase tracking-widest font-bold border border-[#E60000] shrink-0">
                     Remove
                   </button>
                 </div>
@@ -1230,9 +1246,15 @@ function WhatsAppAutoSequencePanel() {
           </div>
         )}
 
-        <div className="flex gap-2 items-center">
-          <select onChange={addQr} disabled={saving} className="border border-gray-300 px-3 py-2 text-sm flex-1" defaultValue="">
-            <option value="" disabled>-- Add Quick Reply or Template to sequence --</option>
+        <div className="space-y-2">
+          <div className="text-[10px] uppercase tracking-widest text-gray-400 font-bold mb-1">Add from saved messages</div>
+          <select
+            value={selectedAdd}
+            onChange={(e) => { addQr(e.target.value); }}
+            disabled={saving}
+            className="border border-gray-300 px-3 py-2 text-sm w-full"
+          >
+            <option value="">-- Select a Quick Reply or WA Template --</option>
             {quickReplies.length > 0 && (
               <optgroup label="Quick Replies">
                 {quickReplies.map((qr) => (
@@ -1248,6 +1270,26 @@ function WhatsAppAutoSequencePanel() {
               </optgroup>
             )}
           </select>
+
+          <div className="text-[10px] uppercase tracking-widest text-gray-400 font-bold mb-1 mt-3">Or add a custom message</div>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={customText}
+              onChange={(e) => setCustomText(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addCustom(); } }}
+              placeholder="Type a one-off message (e.g. Thanks for reaching out! 🙏)"
+              disabled={saving}
+              className="flex-1 border border-gray-300 px-3 py-2 text-sm outline-none focus:border-[#002FA7]"
+            />
+            <button
+              onClick={addCustom}
+              disabled={saving || !customText.trim()}
+              className="bg-[#002FA7] hover:bg-[#002288] text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 disabled:opacity-50"
+            >
+              <Plus size={12} weight="bold" /> Add
+            </button>
+          </div>
         </div>
       </div>
     </div>
