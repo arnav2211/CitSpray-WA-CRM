@@ -11,6 +11,7 @@ import {
 } from "@phosphor-icons/react";
 import { fmtIST, fmtISTTime, fmtSmartShort, fmtSmartLong, fmtTime12, fmtDaySeparator, istDayKey } from "@/lib/format";
 import { StatusBadge, SourceBadge } from "@/components/Badges";
+import OMSDataSection from "@/components/OMSDataSection";
 
 const POLL_MS = 4000;
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
@@ -1420,6 +1421,8 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                 </InfoRow>
               )}
               {conv.created_at && <InfoRow label="Created"><span className="text-xs text-gray-700">{fmtIST(conv.created_at)}</span></InfoRow>}
+
+              <OMSDataSection leadId={conv.id} />
 
               {/* Notes section */}
               <div className="pt-3 border-t border-gray-200">

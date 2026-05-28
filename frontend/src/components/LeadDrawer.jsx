@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { StatusBadge, SourceBadge, QueryTypeBadge } from "@/components/Badges";
 import { X, Phone, EnvelopeSimple, MapPin, ArrowSquareOut, PaperPlaneRight, Clock, CalendarBlank, NotePencil, Plus, Trash, Info, PhoneCall, WhatsappLogo, Star, PencilSimple, Check, Lightning, MagnifyingGlass } from "@phosphor-icons/react";
 import { fmtIST, fmtISTTime, fmtTime12, fmtSmartLong, fmtDaySeparator, istDayKey, queryTypeInfo } from "@/lib/format";
+import OMSDataSection from "@/components/OMSDataSection";
 
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
 
@@ -501,6 +502,8 @@ export default function LeadDrawer({ leadId, onClose }) {
               savingCall={savingCall}
               onSubmit={submitCall}
             />
+
+            <OMSDataSection leadId={leadId} />
 
             <section>
               <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2">Notes</div>

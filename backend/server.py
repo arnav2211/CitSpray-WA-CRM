@@ -38,6 +38,11 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
+# ------------- OMS Integration Setup -------------
+OMS_DB_NAME = os.environ.get("OMS_DB_NAME", "test_database")
+OMS_BASE_URL = os.environ.get("OMS_BASE_URL", "https://oms.mangalamagro.in").rstrip("/")
+oms_db = client[OMS_DB_NAME]
+
 JWT_ALGORITHM = "HS256"
 JWT_SECRET = os.environ.get("JWT_SECRET", "devsecret")
 
@@ -2004,6 +2009,51 @@ async def set_active_wa_phone(lead_id: str, body: ActiveWaPhoneInput, user: dict
     await db.leads.update_one({"id": lead_id}, {"$set": {"active_wa_phone": matched, "last_action_at": iso(now_utc())}})
     await log_activity(user["id"], "active_wa_phone_set", lead_id, {"phone": matched})
     return await db.leads.find_one({"id": lead_id}, {"_id": 0})
+
+
+@api.get("/leads/{lead_id}/oms-data")
+async def get_lead_oms_data(lead_id: str, user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+    # Collect and normalize all phone numbers (primary + alternate list)
+    raw_phones = [lead.get("phone")] + (lead.get("phones") or [])
+    suffixes = []
+    for p in raw_phones:
+        if not p:
+            continue
+        digits = re.sub(r"\D+", "", p)
+        if len(digits) >= 10:
+            suffixes.append(digits[-10:])
+        elif digits:
+            suffixes.append(digits)
+
+    if not suffixes:
+        return {"customer": None, "orders": [], "pis": [], "oms_base_url": OMS_BASE_URL}
+
+    # Search OMS Customers by suffix-match (robust cross-number matching)
+    or_conditions = [{"phone_numbers": {"$regex": f"{suffix}$"}} for suffix in suffixes]
+    matched_customers = await oms_db.customers.find({"$or": or_conditions}, {"_id": 0}).to_list(20)
+
+    if not matched_customers:
+        return {"customer": None, "orders": [], "pis": [], "oms_base_url": OMS_BASE_URL}
+
+    customer_ids = [c["id"] for c in matched_customers]
+
+    # Fetch matched orders and PIs from OMS
+    orders = await oms_db.orders.find({"customer_id": {"$in": customer_ids}}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    pis = await oms_db.proforma_invoices.find({"customer_id": {"$in": customer_ids}}, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+    return {
+        "customer": matched_customers[0],
+        "customers": matched_customers,
+        "orders": orders,
+        "pis": pis,
+        "oms_base_url": OMS_BASE_URL
+    }
 
 @api.post("/whatsapp/send")
 async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_current_user)):
@@ -5529,6 +5579,18 @@ async def webhook_whatsapp(request: Request):
                         }},
                     )
                     created_msgs += 1
+
+                    # ---- Auto-Reply Sequence Trigger ----
+                    if not lead.get("auto_reply_sequence_triggered"):
+                        # Atomic lock so only the very first reply triggers it across concurrent webhooks
+                        updated_lead = await db.leads.find_one_and_update(
+                            {"id": lead["id"], "auto_reply_sequence_triggered": {"$ne": True}},
+                            {"$set": {"auto_reply_sequence_triggered": True}},
+                            return_document=True
+                        )
+                        if updated_lead:
+                            asyncio.create_task(_trigger_auto_sequence(lead["id"], from_phone or lead.get("phone")))
+
                     # ---- Flow engine dispatch (interactive replies) ----
                     if msg_type == "interactive":
                         try:
@@ -5757,6 +5819,90 @@ async def update_whatsapp_settings(body: WhatsAppSettingsInput, admin: dict = De
     safe = {k: (_mask_token(v) if k in ("access_token", "app_secret") and isinstance(v, str) else v) for k, v in effective.items()}
     return {"ok": True, "effective": safe}
 
+
+# ------------- WhatsApp Auto-Sequence -------------
+class AutoSequenceInput(BaseModel):
+    is_active: bool
+    quick_reply_ids: List[str]
+
+
+@api.get("/settings/auto-sequence")
+async def get_auto_sequence(admin: dict = Depends(require_admin)):
+    doc = await db.system_settings.find_one({"key": "auto_reply_sequence"}, {"_id": 0})
+    if not doc:
+        return {"is_active": False, "quick_reply_ids": []}
+    return {"is_active": doc.get("is_active", False), "quick_reply_ids": doc.get("quick_reply_ids", [])}
+
+
+@api.put("/settings/auto-sequence")
+async def update_auto_sequence(body: AutoSequenceInput, admin: dict = Depends(require_admin)):
+    await db.system_settings.update_one(
+        {"key": "auto_reply_sequence"},
+        {"$set": {
+            "key": "auto_reply_sequence",
+            "is_active": body.is_active,
+            "quick_reply_ids": body.quick_reply_ids,
+            "updated_by": admin["id"],
+            "updated_at": iso(now_utc())
+        }},
+        upsert=True
+    )
+    return {"ok": True}
+
+
+async def _trigger_auto_sequence(lead_id: str, target_phone: str):
+    try:
+        # Give Meta/Webhook a brief moment to finish updating before firing out
+        await asyncio.sleep(1)
+        doc = await db.system_settings.find_one({"key": "auto_reply_sequence"}, {"_id": 0})
+        if not doc or not doc.get("is_active") or not doc.get("quick_reply_ids"):
+            return
+        
+        for qr_id in doc["quick_reply_ids"]:
+            qr = await db.quick_replies.find_one({"id": qr_id})
+            if not qr:
+                continue
+            
+            api_result = {}
+            if qr.get("media_url"):
+                api_result = await wa_send_media(
+                    to_phone=target_phone,
+                    media_type=qr.get("media_type") or "document",
+                    url=qr["media_url"],
+                    caption=qr.get("caption") or qr.get("text"),
+                    filename=qr.get("media_filename")
+                )
+            else:
+                api_result = await wa_send_text(
+                    to_phone=target_phone,
+                    body=qr.get("text") or ""
+                )
+                
+            msg = {
+                "id": str(uuid.uuid4()),
+                "lead_id": lead_id,
+                "direction": "out",
+                "body": qr.get("text") or "",
+                "to_phone": target_phone,
+                "status": api_result.get("status", "failed"),
+                "wamid": api_result.get("wamid"),
+                "error": api_result.get("error"),
+                "error_code": api_result.get("code"),
+                "at": iso(now_utc()),
+                "by_user_id": None, # automated
+            }
+            if qr.get("media_url"):
+                msg["media_type"] = qr.get("media_type")
+                msg["media_url"] = qr["media_url"]
+                msg["filename"] = qr.get("media_filename")
+                msg["caption"] = qr.get("caption")
+            
+            await db.messages.insert_one(msg)
+            # Short wait before sending next to guarantee order on client device
+            await asyncio.sleep(1.5)
+            
+    except Exception as e:
+        logger.exception(f"Auto-sequence failed for lead {lead_id}: {e}")
 
 # ------------- Email Auto-Send (SMTP) -------------
 EMAIL_DEFAULT_HOST = "smtp.hostinger.com"

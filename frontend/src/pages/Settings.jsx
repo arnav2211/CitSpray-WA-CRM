@@ -109,6 +109,8 @@ export default function Settings() {
 
       <EmailAutoSendPanel />
 
+      <WhatsAppAutoSequencePanel />
+
       <form onSubmit={submit} className="border border-gray-200 bg-white" data-testid="whatsapp-settings-form">
         <div className="px-5 py-4 border-b border-gray-200 flex items-center justify-between">
           <div>
@@ -912,8 +914,8 @@ function EmailAutoSendPanel() {
       fd.append("file", file);
       fd.append("kind", "document");
       const { data } = await api.post("/chatflows/upload-media", fd);
-      // Extract stored_name from absolute URL: /api/media/<stored_name>
-      const stored = (data.url || "").split("/api/media/").pop();
+      // Use stored_name directly from the API response — don't parse the URL.
+      const stored = data.stored_name;
       const next = [
         ...(tplForm.attachments || []),
         { stored_name: stored, original_filename: file.name, mime_type: file.type || "application/octet-stream" },
@@ -1116,6 +1118,110 @@ function EmailAutoSendPanel() {
         <button onClick={testSend} disabled={sendingTest || !smtpForm.email} className="border border-gray-900 hover:bg-gray-900 hover:text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 disabled:opacity-50" data-testid="email-test-send-btn">
           <PaperPlaneTilt size={12} weight="bold" /> Send test
         </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- WhatsApp Auto-Sequence ----------------
+function WhatsAppAutoSequencePanel() {
+  const [cfg, setCfg] = useState(null);
+  const [quickReplies, setQuickReplies] = useState([]);
+  const [saving, setSaving] = useState(false);
+
+  const load = async () => {
+    try {
+      const [{ data: seq }, { data: qrs }] = await Promise.all([
+        api.get("/settings/auto-sequence"),
+        api.get("/quick-replies")
+      ]);
+      setCfg(seq);
+      setQuickReplies(qrs || []);
+    } catch (e) {
+      toast.error(errMsg(e));
+    }
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const save = async (patch) => {
+    const next = { ...cfg, ...patch };
+    setSaving(true);
+    try {
+      await api.put("/settings/auto-sequence", next);
+      toast.success("Auto-sequence settings saved");
+      setCfg(next);
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const addQr = (e) => {
+    if (!e.target.value) return;
+    save({ quick_reply_ids: [...cfg.quick_reply_ids, e.target.value] });
+    e.target.value = "";
+  };
+
+  const removeQr = (index) => {
+    const next = [...cfg.quick_reply_ids];
+    next.splice(index, 1);
+    save({ quick_reply_ids: next });
+  };
+
+  if (!cfg) return null;
+
+  return (
+    <div className="border border-gray-200 bg-white" data-testid="auto-sequence-panel">
+      <div className="px-5 py-4 border-b border-gray-200 flex items-start justify-between gap-3">
+        <div>
+          <h2 className="font-chivo font-bold text-lg flex items-center gap-2">
+            <PaperPlaneTilt size={18} weight="bold" /> WhatsApp Auto-Reply Sequence
+          </h2>
+          <p className="text-xs text-gray-500 mt-1 max-w-2xl">
+            Automatically send a sequence of Quick Replies when a customer replies for the very first time.
+            This triggers ONLY ONCE per customer conversation (lead) and opens the 24-hour messaging window.
+          </p>
+        </div>
+        <label className="inline-flex items-center gap-2 cursor-pointer">
+          <input type="checkbox" checked={cfg.is_active} onChange={(e) => save({ is_active: e.target.checked })} className="w-4 h-4 accent-[#25D366]" />
+          <span className="text-[10px] uppercase tracking-widest font-bold">{cfg.is_active ? "Enabled" : "Disabled"}</span>
+        </label>
+      </div>
+
+      <div className="p-5">
+        <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2">Message Sequence</div>
+        
+        {cfg.quick_reply_ids.length === 0 ? (
+          <div className="text-sm text-gray-500 italic mb-4">No messages in sequence. Add one below.</div>
+        ) : (
+          <div className="space-y-2 mb-4">
+            {cfg.quick_reply_ids.map((id, i) => {
+              const qr = quickReplies.find(q => q.id === id);
+              return (
+                <div key={`${id}-${i}`} className="flex items-center justify-between border border-gray-200 p-2 bg-gray-50 text-sm">
+                  <div>
+                    <span className="font-bold mr-2">{i + 1}.</span>
+                    {qr ? qr.title : <span className="text-[#E60000]">Unknown/Deleted Reply</span>}
+                  </div>
+                  <button onClick={() => removeQr(i)} disabled={saving} className="text-[#E60000] hover:bg-[#E60000] hover:text-white px-2 py-1 text-[10px] uppercase tracking-widest font-bold border border-[#E60000]">
+                    Remove
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        <div className="flex gap-2 items-center">
+          <select onChange={addQr} disabled={saving} className="border border-gray-300 px-3 py-2 text-sm flex-1" defaultValue="">
+            <option value="" disabled>-- Add Quick Reply to sequence --</option>
+            {quickReplies.map((qr) => (
+              <option key={qr.id} value={qr.id}>{qr.title}</option>
+            ))}
+          </select>
+        </div>
       </div>
     </div>
   );
