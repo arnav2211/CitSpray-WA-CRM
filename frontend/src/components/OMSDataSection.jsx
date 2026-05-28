@@ -161,6 +161,38 @@ export default function OMSDataSection({ leadId }) {
     }
   };
 
+  const handleShareTaxInvoice = async (order) => {
+    const relativeUrl = order.tax_invoice_url;
+    if (!relativeUrl) {
+      toast.error("No tax invoice available for this order!");
+      return;
+    }
+
+    setSharingId(`tax-invoice-${order.id}`);
+    try {
+      const separator = relativeUrl.startsWith("/") ? "" : "/";
+      const publicUrl = `${oms_base_url}${separator}${relativeUrl}`;
+      const filename = `${order.order_number}_Tax_Invoice.pdf`;
+
+      const caption = `📄 *Tax Invoice - CitSpray Aroma Sciences*\n\n` +
+        `Dear Customer, please find attached the Tax Invoice for your order *${order.order_number}*.`;
+
+      await api.post("/whatsapp/send-media", {
+        lead_id: leadId,
+        media_type: "document",
+        media_url: publicUrl,
+        caption: caption,
+        filename: filename
+      });
+      
+      toast.success(`Shared tax invoice for ${order.order_number}!`);
+    } catch (e) {
+      toast.error(errMsg(e, "Failed to share tax invoice"));
+    } finally {
+      setSharingId(null);
+    }
+  };
+
   const handleSharePiDetails = async (pi) => {
     setSharingId(`pi-details-${pi.id}`);
     try {
@@ -280,12 +312,12 @@ export default function OMSDataSection({ leadId }) {
                     )}
 
                     {/* Sharing Actions Row */}
-                    <div className="flex items-center gap-1.5 pt-1">
+                    <div className="flex flex-wrap items-center gap-1.5 pt-1">
                       {/* Share details */}
                       <button
                         onClick={() => handleShareOrderDetails(o)}
                         disabled={sharingId !== null}
-                        className="flex-1 bg-[#25D366] hover:bg-[#1fa851] disabled:opacity-50 text-white text-[9px] uppercase tracking-widest font-bold py-1 px-1.5 flex items-center justify-center gap-1 rounded transition-transform active:scale-95"
+                        className="flex-1 min-w-[70px] bg-[#25D366] hover:bg-[#1fa851] disabled:opacity-50 text-white text-[9px] uppercase tracking-widest font-bold py-1 px-1.5 flex items-center justify-center gap-1 rounded transition-transform active:scale-95"
                         title="Share details via WhatsApp"
                       >
                         <WhatsappLogo size={10} weight="fill" /> Details
@@ -296,7 +328,7 @@ export default function OMSDataSection({ leadId }) {
                         <button
                           onClick={() => handleSharePackedImages(o)}
                           disabled={sharingId !== null}
-                          className="flex-1 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-white text-[9px] uppercase tracking-widest font-bold py-1 px-1.5 flex items-center justify-center gap-1 rounded transition-transform active:scale-95"
+                          className="flex-1 min-w-[70px] bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-white text-[9px] uppercase tracking-widest font-bold py-1 px-1.5 flex items-center justify-center gap-1 rounded transition-transform active:scale-95"
                           title="Share Packed Images via WhatsApp"
                         >
                           <ImageIcon size={10} weight="fill" /> Packed
@@ -308,11 +340,30 @@ export default function OMSDataSection({ leadId }) {
                         <button
                           onClick={() => handleShareDispatchSlip(o)}
                           disabled={sharingId !== null}
-                          className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-[9px] uppercase tracking-widest font-bold py-1 px-1.5 flex items-center justify-center gap-1 rounded transition-transform active:scale-95"
+                          className="flex-1 min-w-[70px] bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-[9px] uppercase tracking-widest font-bold py-1 px-1.5 flex items-center justify-center gap-1 rounded transition-transform active:scale-95"
                           title="Share Dispatch Slip via WhatsApp"
                         >
                           <Truck size={10} weight="fill" /> Slip
                         </button>
+                      )}
+
+                      {/* Tax Invoice Option */}
+                      {o.tax_invoice_url ? (
+                        <button
+                          onClick={() => handleShareTaxInvoice(o)}
+                          disabled={sharingId !== null}
+                          className="flex-1 min-w-[70px] bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-[9px] uppercase tracking-widest font-bold py-1 px-1.5 flex items-center justify-center gap-1 rounded transition-transform active:scale-95"
+                          title="Share Tax Invoice via WhatsApp"
+                        >
+                          <Receipt size={10} weight="fill" /> Invoice
+                        </button>
+                      ) : (
+                        <span 
+                          className="flex-1 min-w-[100px] text-center text-gray-400 bg-gray-50 border border-gray-200 py-1 px-1.5 text-[8px] uppercase tracking-wider font-bold rounded"
+                          title="Tax Invoice is not required for this order"
+                        >
+                          Invoice: Not required
+                        </span>
                       )}
                     </div>
                   </div>
