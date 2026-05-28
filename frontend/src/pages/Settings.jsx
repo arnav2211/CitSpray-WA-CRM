@@ -1127,16 +1127,19 @@ function EmailAutoSendPanel() {
 function WhatsAppAutoSequencePanel() {
   const [cfg, setCfg] = useState(null);
   const [quickReplies, setQuickReplies] = useState([]);
+  const [templates, setTemplates] = useState([]);
   const [saving, setSaving] = useState(false);
 
   const load = async () => {
     try {
-      const [{ data: seq }, { data: qrs }] = await Promise.all([
+      const [{ data: seq }, { data: qrs }, { data: tpls }] = await Promise.all([
         api.get("/settings/auto-sequence"),
-        api.get("/quick-replies")
+        api.get("/quick-replies"),
+        api.get("/whatsapp/templates")
       ]);
       setCfg(seq);
       setQuickReplies(qrs || []);
+      setTemplates(tpls || []);
     } catch (e) {
       toast.error(errMsg(e));
     }
@@ -1180,7 +1183,7 @@ function WhatsAppAutoSequencePanel() {
             <PaperPlaneTilt size={18} weight="bold" /> WhatsApp Auto-Reply Sequence
           </h2>
           <p className="text-xs text-gray-500 mt-1 max-w-2xl">
-            Automatically send a sequence of Quick Replies when a customer replies for the very first time.
+            Automatically send a sequence of Quick Replies or WhatsApp Templates when a customer replies for the very first time.
             This triggers ONLY ONCE per customer conversation (lead) and opens the 24-hour messaging window.
           </p>
         </div>
@@ -1199,11 +1202,24 @@ function WhatsAppAutoSequencePanel() {
           <div className="space-y-2 mb-4">
             {cfg.quick_reply_ids.map((id, i) => {
               const qr = quickReplies.find(q => q.id === id);
+              const tpl = !qr ? templates.find(t => t.id === id || t.name === id) : null;
               return (
                 <div key={`${id}-${i}`} className="flex items-center justify-between border border-gray-200 p-2 bg-gray-50 text-sm">
                   <div>
                     <span className="font-bold mr-2">{i + 1}.</span>
-                    {qr ? qr.title : <span className="text-[#E60000]">Unknown/Deleted Reply</span>}
+                    {qr ? (
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className="text-[9px] bg-blue-100 text-blue-800 px-1.5 py-0.5 rounded font-bold uppercase tracking-wider">Quick Reply</span>
+                        <strong>{qr.title}</strong>
+                      </span>
+                    ) : tpl ? (
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className="text-[9px] bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded font-bold uppercase tracking-wider">WA Template</span>
+                        <strong>{tpl.name}</strong>
+                      </span>
+                    ) : (
+                      <span className="text-[#E60000] font-bold">Unknown/Deleted Item</span>
+                    )}
                   </div>
                   <button onClick={() => removeQr(i)} disabled={saving} className="text-[#E60000] hover:bg-[#E60000] hover:text-white px-2 py-1 text-[10px] uppercase tracking-widest font-bold border border-[#E60000]">
                     Remove
@@ -1216,10 +1232,21 @@ function WhatsAppAutoSequencePanel() {
 
         <div className="flex gap-2 items-center">
           <select onChange={addQr} disabled={saving} className="border border-gray-300 px-3 py-2 text-sm flex-1" defaultValue="">
-            <option value="" disabled>-- Add Quick Reply to sequence --</option>
-            {quickReplies.map((qr) => (
-              <option key={qr.id} value={qr.id}>{qr.title}</option>
-            ))}
+            <option value="" disabled>-- Add Quick Reply or Template to sequence --</option>
+            {quickReplies.length > 0 && (
+              <optgroup label="Quick Replies">
+                {quickReplies.map((qr) => (
+                  <option key={qr.id} value={qr.id}>{qr.title}</option>
+                ))}
+              </optgroup>
+            )}
+            {templates.length > 0 && (
+              <optgroup label="WhatsApp Templates">
+                {templates.map((tpl) => (
+                  <option key={tpl.id} value={tpl.id}>{tpl.name}</option>
+                ))}
+              </optgroup>
+            )}
           </select>
         </div>
       </div>

@@ -5860,29 +5860,65 @@ async def _trigger_auto_sequence(lead_id: str, target_phone: str):
         
         for qr_id in doc["quick_reply_ids"]:
             qr = await db.quick_replies.find_one({"id": qr_id})
-            if not qr:
-                continue
-            
             api_result = {}
-            if qr.get("media_url"):
-                api_result = await wa_send_media(
-                    to_phone=target_phone,
-                    media_type=qr.get("media_type") or "document",
-                    url=qr["media_url"],
-                    caption=qr.get("caption") or qr.get("text"),
-                    filename=qr.get("media_filename")
-                )
+            body_val = ""
+            extra = {}
+            
+            if qr:
+                # 1. Send as Quick Reply (freeform)
+                if qr.get("media_url"):
+                    api_result = await wa_send_media(
+                        to_phone=target_phone,
+                        media_type=qr.get("media_type") or "document",
+                        url=qr["media_url"],
+                        caption=qr.get("caption") or qr.get("text"),
+                        filename=qr.get("media_filename")
+                    )
+                else:
+                    api_result = await wa_send_text(
+                        to_phone=target_phone,
+                        body=qr.get("text") or ""
+                    )
+                body_val = qr.get("text") or ""
+                if qr.get("media_url"):
+                    extra["media_type"] = qr.get("media_type")
+                    extra["media_url"] = qr["media_url"]
+                    extra["filename"] = qr.get("media_filename")
+                    extra["caption"] = qr.get("caption")
             else:
-                api_result = await wa_send_text(
+                # 2. Search in WhatsApp Templates
+                tpl = await db.whatsapp_templates.find_one({"$or": [{"id": qr_id}, {"name": qr_id}]})
+                if not tpl:
+                    continue
+                
+                cfg = await get_wa_config()
+                params_required = int(tpl.get("params_required") or 0)
+                params_to_send = None
+                if params_required > 0:
+                    lead = await db.leads.find_one({"id": lead_id})
+                    cust_name = lead.get("customer_name", "Customer") if lead else "Customer"
+                    params_to_send = [cust_name] + [""] * (params_required - 1)
+                
+                api_result = await wa_send_template(
                     to_phone=target_phone,
-                    body=qr.get("text") or ""
+                    template_name=tpl["name"],
+                    lang_code=tpl.get("language") or cfg["default_template_lang"],
+                    body_params=params_to_send
                 )
+                
+                body_val = tpl.get("body") or f"[Template: {tpl['name']}]"
+                if params_to_send and tpl.get("body"):
+                    try:
+                        body_val = tpl["body"].replace("{{1}}", params_to_send[0])
+                    except Exception:
+                        pass
+                extra = {"template_name": tpl["name"]}
                 
             msg = {
                 "id": str(uuid.uuid4()),
                 "lead_id": lead_id,
                 "direction": "out",
-                "body": qr.get("text") or "",
+                "body": body_val,
                 "to_phone": target_phone,
                 "status": api_result.get("status", "failed"),
                 "wamid": api_result.get("wamid"),
@@ -5890,13 +5926,8 @@ async def _trigger_auto_sequence(lead_id: str, target_phone: str):
                 "error_code": api_result.get("code"),
                 "at": iso(now_utc()),
                 "by_user_id": None, # automated
+                **extra
             }
-            if qr.get("media_url"):
-                msg["media_type"] = qr.get("media_type")
-                msg["media_url"] = qr["media_url"]
-                msg["filename"] = qr.get("media_filename")
-                msg["caption"] = qr.get("caption")
-            
             await db.messages.insert_one(msg)
             # Short wait before sending next to guarantee order on client device
             await asyncio.sleep(1.5)
