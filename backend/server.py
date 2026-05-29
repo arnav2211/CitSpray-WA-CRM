@@ -6983,6 +6983,164 @@ async def on_shutdown():
         scheduler.shutdown(wait=False)
     client.close()
 
+# ─── Admin Alert / Urgent Notification System ────────────────────────────
+
+@api.post("/admin/alerts")
+async def create_admin_alert(body: dict, user=Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admin can send alerts")
+    title = body.get("title", "").strip()
+    message = body.get("message", "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required")
+
+    recipients = body.get("recipients", [])  # list of CRM user IDs
+    recipient_roles = body.get("recipient_roles", [])  # list of roles
+    order_id = body.get("order_id", "")
+    customer_name = body.get("customer_name", "")
+
+    # Build CRM target user IDs
+    target_user_ids = set(recipients)
+    if recipient_roles:
+        role_users = await db.users.find({"role": {"$in": recipient_roles}, "active": {"$ne": False}}, {"_id": 0, "id": 1}).to_list(500)
+        for u in role_users:
+            target_user_ids.add(u["id"])
+
+    if not target_user_ids:
+        raise HTTPException(status_code=400, detail="No recipients selected")
+
+    alert_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    alert_doc = {
+        "id": alert_id,
+        "title": title,
+        "message": message,
+        "sent_by": user["name"],
+        "sent_by_id": user["id"],
+        "order_id": order_id,
+        "customer_name": customer_name,
+        "recipient_ids": list(target_user_ids),
+        "recipient_roles": recipient_roles,
+        "acknowledgements": {},
+        "created_at": now,
+    }
+    await db.admin_alerts.insert_one(alert_doc)
+
+    # ─── Bidirectional Sync: Forward Alert to OMS ───
+    try:
+        # Find usernames of the CRM target recipients
+        crm_target_users = await db.users.find({"id": {"$in": list(target_user_ids)}}, {"_id": 0, "username": 1}).to_list(500)
+        crm_usernames = [u["username"] for u in crm_target_users if u.get("username")]
+
+        # Map recipient roles from CRM to OMS
+        oms_recipient_roles = []
+        for r in recipient_roles:
+            if r == "admin":
+                oms_recipient_roles.append("admin")
+            elif r == "executive":
+                oms_recipient_roles.append("telecaller")
+
+        # Find matching users in OMS
+        oms_clauses = []
+        if crm_usernames:
+            oms_clauses.append({"username": {"$in": crm_usernames}})
+        if oms_recipient_roles:
+            oms_clauses.append({"role": {"$in": oms_recipient_roles}})
+
+        oms_target_ids = set()
+        if oms_clauses:
+            oms_users = await oms_db.users.find({"$or": oms_clauses, "active": {"$ne": False}}, {"_id": 0, "id": 1}).to_list(500)
+            for ou in oms_users:
+                oms_target_ids.add(ou["id"])
+
+        if oms_target_ids:
+            oms_alert_doc = alert_doc.copy()
+            oms_alert_doc["recipient_ids"] = list(oms_target_ids)
+            oms_alert_doc["recipient_roles"] = oms_recipient_roles
+            await oms_db.admin_alerts.insert_one(oms_alert_doc)
+    except Exception as e:
+        logger.error(f"Alert sync to OMS failed: {e}")
+
+    return {"id": alert_id, "message": f"Alert sent to {len(target_user_ids)} user(s)"}
+
+@api.get("/admin/alerts/pending")
+async def get_pending_alerts(user=Depends(get_current_user)):
+    uid = user["id"]
+    alerts = await db.admin_alerts.find(
+        {"recipient_ids": uid, f"acknowledgements.{uid}": {"$exists": False}, "cancelled": {"$ne": True}},
+        {"_id": 0}
+    ).sort("created_at", -1).to_list(50)
+    return alerts
+
+@api.put("/admin/alerts/{alert_id}/acknowledge")
+async def acknowledge_alert(alert_id: str, user=Depends(get_current_user)):
+    now = datetime.now(timezone.utc).isoformat()
+    result = await db.admin_alerts.update_one(
+        {"id": alert_id, "recipient_ids": user["id"]},
+        {"$set": {f"acknowledgements.{user['id']}": {"name": user["name"], "at": now}}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Alert not found")
+
+    # ─── Bidirectional Sync: Acknowledge Alert in OMS ───
+    try:
+        oms_user = await oms_db.users.find_one({"username": user["username"]})
+        if oms_user:
+            await oms_db.admin_alerts.update_one(
+                {"id": alert_id, "recipient_ids": oms_user["id"]},
+                {"$set": {f"acknowledgements.{oms_user['id']}": {"name": oms_user["name"], "at": now}}}
+            )
+    except Exception as e:
+        logger.error(f"Acknowledgement sync to OMS failed: {e}")
+
+    return {"message": "Acknowledged"}
+
+@api.put("/admin/alerts/{alert_id}/cancel")
+async def cancel_alert(alert_id: str, user=Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admin can cancel alerts")
+    now = datetime.now(timezone.utc).isoformat()
+    result = await db.admin_alerts.update_one(
+        {"id": alert_id},
+        {"$set": {"cancelled": True, "cancelled_at": now, "cancelled_by": user["name"]}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Alert not found")
+
+    # ─── Bidirectional Sync: Cancel Alert in OMS ───
+    try:
+        await oms_db.admin_alerts.update_one(
+            {"id": alert_id},
+            {"$set": {"cancelled": True, "cancelled_at": now, "cancelled_by": user["name"]}}
+        )
+    except Exception as e:
+        logger.error(f"Cancellation sync to OMS failed: {e}")
+
+    return {"message": "Alert cancelled"}
+
+@api.get("/admin/alerts/history")
+async def get_alert_history(user=Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    alerts = await db.admin_alerts.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    
+    # Enrich with user names for display
+    all_user_ids = set()
+    for a in alerts:
+        all_user_ids.update(a.get("recipient_ids", []))
+    users_map = {}
+    if all_user_ids:
+        users_list = await db.users.find({"id": {"$in": list(all_user_ids)}}, {"_id": 0, "id": 1, "name": 1, "role": 1}).to_list(500)
+        users_map = {u["id"]: u for u in users_list}
+    for a in alerts:
+        a["recipients_info"] = [users_map.get(uid, {"id": uid, "name": "Unknown"}) for uid in a.get("recipient_ids", [])]
+        total = len(a.get("recipient_ids", []))
+        acked = len(a.get("acknowledgements", {}))
+        a["ack_count"] = acked
+        a["total_count"] = total
+        a["fully_acknowledged"] = acked >= total
+    return alerts
+
 # Root ping for api
 @api.get("/")
 async def root():

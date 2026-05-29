@@ -22,6 +22,7 @@ import ChatFlows from "@/pages/ChatFlows";
 import InternalQA from "@/pages/InternalQA";
 import TransferRequests from "@/pages/TransferRequests";
 import PaymentSettings from "@/pages/PaymentSettings";
+import AdminAlerts from "@/pages/AdminAlerts";
 
 export default function App() {
   return (
@@ -49,6 +50,7 @@ export default function App() {
               <Route path="/settings" element={<AdminOnly><Settings /></AdminOnly>} />
               <Route path="/payment-settings" element={<AdminOnly><PaymentSettings /></AdminOnly>} />
               <Route path="/reports" element={<AdminOnly><Reports /></AdminOnly>} />
+              <Route path="/alerts" element={<AdminOnly><AdminAlerts /></AdminOnly>} />
             </Route>
             <Route path="*" element={<Navigate to="/dashboard" replace />} />
           </Routes>

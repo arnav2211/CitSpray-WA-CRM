@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
@@ -102,6 +102,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
             <>
               <div className="px-5 pt-4 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Admin</div>
               <Item to="/users" icon={Users} testId="nav-users" onNavigate={handleNavigate}>Executives</Item>
+              <Item to="/alerts" icon={Megaphone} testId="nav-alerts" onNavigate={handleNavigate}>Admin Alerts</Item>
               <Item to="/routing" icon={Gear} testId="nav-routing" onNavigate={handleNavigate}>Routing Rules</Item>
               <Item to="/integrations" icon={Plug} testId="nav-integrations" onNavigate={handleNavigate}>Integrations</Item>
               <Item to="/templates" icon={ChatCircleDots} testId="nav-templates" onNavigate={handleNavigate}>WA Templates</Item>

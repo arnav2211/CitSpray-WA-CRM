@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import Sidebar from "@/components/Sidebar";
 import FollowupAlerts from "@/components/FollowupAlerts";
+import { AlertListener } from "@/components/AlertListener";
 import { Outlet, useLocation } from "react-router-dom";
 import { List } from "@phosphor-icons/react";
 
@@ -49,6 +50,7 @@ export default function AppShell() {
         </div>
       </main>
       <FollowupAlerts />
+      <AlertListener />
     </div>
   );
 }
@@ -65,5 +67,6 @@ function pageTitle(path) {
   if (path.startsWith("/integrations")) return "Integrations";
   if (path.startsWith("/settings")) return "Settings";
   if (path.startsWith("/reports")) return "Reports";
+  if (path.startsWith("/alerts")) return "Admin Alerts";
   return "Dashboard";
 }
