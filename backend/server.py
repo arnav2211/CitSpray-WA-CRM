@@ -6985,6 +6985,41 @@ async def on_shutdown():
 
 # ─── Admin Alert / Urgent Notification System ────────────────────────────
 
+@api.get("/admin/alerts/other-users")
+async def get_oms_users(user=Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    try:
+        oms_users = await oms_db.users.find({"active": {"$ne": False}}, {"_id": 0, "id": 1, "name": 1, "username": 1, "role": 1}).to_list(1000)
+        return oms_users
+    except Exception as e:
+        logger.error(f"Failed to fetch OMS users: {e}")
+        return []
+
+@api.get("/admin/alerts/mappings")
+async def get_user_mappings(user=Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    mappings = await oms_db.user_mappings.find({}, {"_id": 0}).to_list(1000)
+    return mappings
+
+@api.post("/admin/alerts/mappings")
+async def save_user_mappings(body: dict, user=Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    mappings = body.get("mappings", [])
+    await oms_db.user_mappings.delete_many({})
+    if mappings:
+        valid_mappings = []
+        for m in mappings:
+            oms_id = m.get("oms_user_id")
+            crm_id = m.get("crm_user_id")
+            if oms_id and crm_id:
+                valid_mappings.append({"oms_user_id": oms_id, "crm_user_id": crm_id})
+        if valid_mappings:
+            await oms_db.user_mappings.insert_many(valid_mappings)
+    return {"status": "success", "message": "Mappings saved successfully"}
+
 @api.post("/admin/alerts")
 async def create_admin_alert(body: dict, user=Depends(get_current_user)):
     if user["role"] != "admin":
@@ -7001,12 +7036,14 @@ async def create_admin_alert(body: dict, user=Depends(get_current_user)):
 
     # Build CRM target user IDs
     target_user_ids = set(recipients)
-    if recipient_roles:
-        role_users = await db.users.find({"role": {"$in": recipient_roles}, "active": {"$ne": False}}, {"_id": 0, "id": 1}).to_list(500)
+    # Filter out special "oms_everyone" broadcast role from CRM lookup
+    crm_recipient_roles = [r for r in recipient_roles if r != "oms_everyone"]
+    if crm_recipient_roles:
+        role_users = await db.users.find({"role": {"$in": crm_recipient_roles}, "active": {"$ne": False}}, {"_id": 0, "id": 1}).to_list(500)
         for u in role_users:
             target_user_ids.add(u["id"])
 
-    if not target_user_ids:
+    if not target_user_ids and "oms_everyone" not in recipient_roles:
         raise HTTPException(status_code=400, detail="No recipients selected")
 
     alert_id = str(uuid.uuid4())
@@ -7024,13 +7061,40 @@ async def create_admin_alert(body: dict, user=Depends(get_current_user)):
         "acknowledgements": {},
         "created_at": now,
     }
-    await db.admin_alerts.insert_one(alert_doc)
+    # Only insert into CRM alerts database if there are actual CRM targets
+    if target_user_ids:
+        await db.admin_alerts.insert_one(alert_doc)
+    else:
+        # If CRM targets are empty (e.g. only OMS broadcast), save empty recipient list or still write it
+        # Let's save alert_doc to crm db as well for admin history purposes
+        await db.admin_alerts.insert_one(alert_doc)
 
     # ─── Bidirectional Sync: Forward Alert to OMS ───
     try:
-        # Find usernames of the CRM target recipients
-        crm_target_users = await db.users.find({"id": {"$in": list(target_user_ids)}}, {"_id": 0, "username": 1}).to_list(500)
-        crm_usernames = [u["username"] for u in crm_target_users if u.get("username")]
+        # Find detail info of the CRM target recipients
+        crm_target_users = await db.users.find({"id": {"$in": list(target_user_ids)}}, {"_id": 0, "id": 1, "username": 1}).to_list(500)
+
+        # Get the mappings from the shared user_mappings collection in OMS DB
+        mappings = await oms_db.user_mappings.find({}).to_list(1000)
+        crm_to_oms = {m["crm_user_id"]: m["oms_user_id"] for m in mappings if m.get("oms_user_id") and m.get("crm_user_id")}
+
+        oms_target_ids = set()
+        mapped_crm_ids = set()
+
+        for u in crm_target_users:
+            crm_uid = u["id"]
+            if crm_uid in crm_to_oms:
+                oms_target_ids.add(crm_to_oms[crm_uid])
+                mapped_crm_ids.add(crm_uid)
+
+        # Fallback to username mapping for unmapped users
+        unmapped_users = [u for u in crm_target_users if u["id"] not in mapped_crm_ids]
+        if unmapped_users:
+            unmapped_usernames = [u["username"] for u in unmapped_users if u.get("username")]
+            if unmapped_usernames:
+                oms_users_fallback = await oms_db.users.find({"username": {"$in": unmapped_usernames}, "active": {"$ne": False}}, {"_id": 0, "id": 1}).to_list(500)
+                for ou in oms_users_fallback:
+                    oms_target_ids.add(ou["id"])
 
         # Map recipient roles from CRM to OMS
         oms_recipient_roles = []
@@ -7040,18 +7104,18 @@ async def create_admin_alert(body: dict, user=Depends(get_current_user)):
             elif r == "executive":
                 oms_recipient_roles.append("telecaller")
 
-        # Find matching users in OMS
-        oms_clauses = []
-        if crm_usernames:
-            oms_clauses.append({"username": {"$in": crm_usernames}})
         if oms_recipient_roles:
-            oms_clauses.append({"role": {"$in": oms_recipient_roles}})
-
-        oms_target_ids = set()
-        if oms_clauses:
-            oms_users = await oms_db.users.find({"$or": oms_clauses, "active": {"$ne": False}}, {"_id": 0, "id": 1}).to_list(500)
-            for ou in oms_users:
+            oms_users_by_role = await oms_db.users.find({"role": {"$in": oms_recipient_roles}, "active": {"$ne": False}}, {"_id": 0, "id": 1}).to_list(500)
+            for ou in oms_users_by_role:
                 oms_target_ids.add(ou["id"])
+
+        # SPECIAL: Handle Everyone in OMS broadcast
+        if "oms_everyone" in recipient_roles:
+            oms_all_active_users = await oms_db.users.find({"active": {"$ne": False}}, {"_id": 0, "id": 1}).to_list(1000)
+            for ou in oms_all_active_users:
+                oms_target_ids.add(ou["id"])
+            if "oms_everyone" not in oms_recipient_roles:
+                oms_recipient_roles.append("oms_everyone")
 
         if oms_target_ids:
             oms_alert_doc = alert_doc.copy()
@@ -7061,7 +7125,7 @@ async def create_admin_alert(body: dict, user=Depends(get_current_user)):
     except Exception as e:
         logger.error(f"Alert sync to OMS failed: {e}")
 
-    return {"id": alert_id, "message": f"Alert sent to {len(target_user_ids)} user(s)"}
+    return {"id": alert_id, "message": "Alert processed successfully"}
 
 @api.get("/admin/alerts/pending")
 async def get_pending_alerts(user=Depends(get_current_user)):
@@ -7084,7 +7148,16 @@ async def acknowledge_alert(alert_id: str, user=Depends(get_current_user)):
 
     # ─── Bidirectional Sync: Acknowledge Alert in OMS ───
     try:
-        oms_user = await oms_db.users.find_one({"username": user["username"]})
+        # Check mapping first
+        mapping = await oms_db.user_mappings.find_one({"crm_user_id": user["id"]})
+        oms_user = None
+        if mapping and mapping.get("oms_user_id"):
+            oms_user = await oms_db.users.find_one({"id": mapping["oms_user_id"]})
+
+        if not oms_user:
+            # Fallback to username
+            oms_user = await oms_db.users.find_one({"username": user["username"]})
+
         if oms_user:
             await oms_db.admin_alerts.update_one(
                 {"id": alert_id, "recipient_ids": oms_user["id"]},
