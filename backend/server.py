@@ -3766,6 +3766,29 @@ async def _pull_exportersindia_once(force_date_from: Optional[str] = None) -> Di
     return {"ok": True, "date_from": date_from, **result}
 
 
+async def _acquire_ei_lock() -> bool:
+    now = datetime.now(timezone.utc)
+    # Gunicorn worker lock: Only let one worker run the pull task in this interval
+    res = await db.system_settings.find_one_and_update(
+        {
+            "key": "exportersindia_pull",
+            "$or": [
+                {"lock_acquired_at": None},
+                {"lock_acquired_at": {"$lt": now - timedelta(minutes=4)}}
+            ]
+        },
+        {"$set": {"lock_acquired_at": now}},
+        return_document=True
+    )
+    return bool(res)
+
+async def _release_ei_lock():
+    await db.system_settings.update_one(
+        {"key": "exportersindia_pull"},
+        {"$set": {"lock_acquired_at": None}}
+    )
+
+
 async def exportersindia_pull_task():
     """APScheduler tick. Reads current config (so admins can enable/change interval at
     runtime without restart); reschedules itself when interval changes."""
@@ -3775,13 +3798,22 @@ async def exportersindia_pull_task():
             return
         if not cfg["api_key"] or not cfg["email"]:
             return
-        res = await _pull_exportersindia_once()
-        if not res.get("ok"):
-            logger.warning(f"EI pull failed: {res.get('error')}")
-        else:
-            logger.info(f"EI pull ok date_from={res.get('date_from')} created={len(res.get('created') or [])}")
+        
+        if not await _acquire_ei_lock():
+            logger.info("ExportersIndia pull task: Lock already held by another worker - skipping")
+            return
+            
+        try:
+            res = await _pull_exportersindia_once()
+            if not res.get("ok"):
+                logger.warning(f"EI pull failed: {res.get('error')}")
+            else:
+                logger.info(f"EI pull ok date_from={res.get('date_from')} created={len(res.get('created') or [])}")
+        finally:
+            await _release_ei_lock()
     except Exception as e:
         logger.exception(f"EI pull task crashed: {e}")
+
 
 
 async def _reschedule_exportersindia_pull(new_interval_seconds: int):
