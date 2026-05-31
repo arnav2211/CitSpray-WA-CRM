@@ -4,7 +4,7 @@ import { useAuth } from "@/context/AuthContext";
 import { Link, useSearchParams, useNavigate } from "react-router-dom";
 import { StatusBadge, SourceBadge, EnquiryTypeBadge } from "@/components/Badges";
 import { toast } from "sonner";
-import { Kanban, Table, Plus, MagnifyingGlass, FileX, WhatsappLogo } from "@phosphor-icons/react";
+import { Kanban, Table, Plus, MagnifyingGlass, FileX, WhatsappLogo, UploadSimple } from "@phosphor-icons/react";
 import LeadDrawer from "@/components/LeadDrawer";
 import { fmtIST } from "@/lib/format";
 
@@ -27,6 +27,7 @@ export default function Leads() {
   const [dateTo, setDateTo] = useState(params.get("date_to") || "");
   const [openId, setOpenId] = useState(params.get("lead") || null);
   const [creating, setCreating] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [page, setPage] = useState(parseInt(params.get("page") || "1", 10) || 1);
   const [pageSize, setPageSize] = useState(parseInt(params.get("size") || "25", 10) || 25);
   const [total, setTotal] = useState(0);
@@ -111,6 +112,10 @@ export default function Leads() {
             className={`border px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 ${view === "kanban" ? "bg-gray-900 text-white border-gray-900" : "border-gray-300 hover:bg-gray-100"}`}
             onClick={() => setView("kanban")} data-testid="view-kanban-btn"
           ><Kanban size={12} weight="bold" /> Kanban</button>
+          <button
+            className="border border-gray-300 hover:bg-gray-100 text-gray-700 px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1"
+            onClick={() => setUploading(true)} data-testid="upload-leads-btn"
+          ><UploadSimple size={12} weight="bold" /> Upload Excel</button>
           <button
             className="bg-[#002FA7] hover:bg-[#002288] text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1"
             onClick={() => setCreating(true)} data-testid="new-lead-btn"
@@ -327,6 +332,7 @@ export default function Leads() {
 
       {openId && <LeadDrawer leadId={openId} onClose={() => { setOpenId(null); load(); }} />}
       {creating && <NewLeadModal execs={execs} onClose={() => setCreating(false)} onCreated={(id) => { setCreating(false); load(); if (id) setOpenId(id); }} isAdmin={isAdmin} />}
+      {uploading && <UploadLeadsModal execs={execs} onClose={() => setUploading(false)} onUploaded={() => { setUploading(false); load(); }} isAdmin={isAdmin} />}
     </div>
   );
 }
@@ -477,6 +483,231 @@ function NewLeadModal({ onClose, onCreated, execs, isAdmin }) {
           </button>
         </div>
       </form>
+    </div>
+  );
+}
+
+function UploadLeadsModal({ onClose, onUploaded, execs, isAdmin }) {
+  const [file, setFile] = useState(null);
+  const [assignedTo, setAssignedTo] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [dragActive, setDragActive] = useState(false);
+
+  const handleDrag = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.type === "dragenter" || e.type === "dragover") {
+      setDragActive(true);
+    } else if (e.type === "dragleave") {
+      setDragActive(false);
+    }
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragActive(false);
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      const f = e.dataTransfer.files[0];
+      if (f.name.endsWith(".xlsx") || f.name.endsWith(".xls") || f.name.endsWith(".csv")) {
+        setFile(f);
+      } else {
+        toast.error("Please upload an Excel (.xlsx, .xls) or CSV (.csv) file");
+      }
+    }
+  };
+
+  const handleFileChange = (e) => {
+    if (e.target.files && e.target.files[0]) {
+      setFile(e.target.files[0]);
+    }
+  };
+
+  const downloadTemplate = async () => {
+    try {
+      const response = await api.get("/leads/upload-template", {
+        responseType: "blob"
+      });
+      const blob = new Blob([response.data], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      });
+      const link = document.createElement("a");
+      link.href = window.URL.createObjectURL(blob);
+      link.download = "leads_upload_template.xlsx";
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      toast.success("Template download started");
+    } catch (e) {
+      toast.error("Failed to download template: " + errMsg(e));
+    }
+  };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!file) return;
+    setLoading(true);
+    setResult(null);
+
+    const formData = new FormData();
+    formData.append("file", file);
+    if (assignedTo) {
+      formData.append("assigned_to", assignedTo);
+    }
+
+    try {
+      const { data } = await api.post("/leads/upload", formData, {
+        headers: {
+          "Content-Type": "multipart/form-data"
+        }
+      });
+      setResult(data);
+      if (data.summary.imported > 0) {
+        toast.success(`Successfully imported ${data.summary.imported} leads!`);
+        onUploaded();
+      } else if (data.summary.duplicates > 0) {
+        toast.success(`Processed ${data.summary.duplicates} repeat enquiries.`);
+        onUploaded();
+      } else {
+        toast.error("No new leads were imported.");
+      }
+    } catch (err) {
+      toast.error("Failed to upload leads: " + errMsg(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" onClick={onClose} data-testid="upload-leads-modal">
+      <div onClick={(e) => e.stopPropagation()} className="w-full max-w-2xl bg-white border border-gray-900 p-6 max-h-[90vh] overflow-y-auto">
+        <div className="flex justify-between items-start">
+          <div>
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Import</div>
+            <h2 className="font-chivo font-black text-2xl mt-1 mb-2">Upload Leads via Excel</h2>
+          </div>
+          <button 
+            onClick={downloadTemplate}
+            type="button"
+            className="text-[10px] uppercase tracking-widest font-bold text-[#002FA7] hover:underline flex items-center gap-1 border border-[#002FA7]/30 px-2.5 py-1.5 rounded bg-[#002FA7]/5 hover:bg-[#002FA7]/10"
+          >
+            Download Template
+          </button>
+        </div>
+
+        {!result ? (
+          <form onSubmit={submit} className="space-y-4 mt-4">
+            {isAdmin && (
+              <Field label="Assign Imported Leads To" full>
+                <select 
+                  value={assignedTo} 
+                  onChange={(e) => setAssignedTo(e.target.value)} 
+                  className="w-full border border-gray-300 px-2 py-2 text-sm"
+                  data-testid="upload-assign-select"
+                >
+                  <option value="">Auto (round-robin)</option>
+                  {execs.map((x) => (
+                    <option key={x.id} value={x.id}>
+                      {x.role === "admin" ? `${x.name} (admin)` : x.name}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            )}
+
+            <div 
+              onDragEnter={handleDrag}
+              onDragOver={handleDrag}
+              onDragLeave={handleDrag}
+              onDrop={handleDrop}
+              className={`border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-all ${
+                dragActive ? "border-[#002FA7] bg-[#002FA7]/5 scale-[0.99]" : "border-gray-300 hover:border-gray-900 bg-gray-50"
+              }`}
+              onClick={() => document.getElementById("excel-file-input").click()}
+            >
+              <input 
+                id="excel-file-input"
+                type="file"
+                accept=".xlsx,.xls,.csv"
+                onChange={handleFileChange}
+                className="hidden"
+              />
+              <UploadSimple size={36} className="mx-auto text-gray-400 mb-2" />
+              {file ? (
+                <div>
+                  <p className="text-sm font-bold text-gray-900">{file.name}</p>
+                  <p className="text-xs text-gray-500 mt-1">{(file.size / 1024).toFixed(1)} KB · Click or drag to replace</p>
+                </div>
+              ) : (
+                <div>
+                  <p className="text-sm text-gray-700 font-medium">Drag & drop your Excel or CSV file here</p>
+                  <p className="text-xs text-gray-500 mt-1">or click to browse from your computer</p>
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2">
+              <button 
+                type="button" 
+                onClick={onClose} 
+                className="border border-gray-300 px-4 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-100"
+              >
+                Cancel
+              </button>
+              <button 
+                disabled={loading || !file} 
+                type="submit"
+                className="bg-[#002FA7] hover:bg-[#002288] text-white px-5 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50 flex items-center gap-1.5"
+              >
+                {loading ? "Processing..." : "Import Leads"}
+              </button>
+            </div>
+          </form>
+        ) : (
+          <div className="space-y-4 mt-6">
+            <div className="border border-gray-200 p-4 bg-gray-50 grid grid-cols-4 gap-2 text-center">
+              <div className="border-r border-gray-200">
+                <div className="text-xs text-gray-500 uppercase tracking-wider font-semibold">Total Rows</div>
+                <div className="text-2xl font-black mt-1 text-gray-900">{result.summary.total}</div>
+              </div>
+              <div className="border-r border-gray-200">
+                <div className="text-xs text-[#002FA7] uppercase tracking-wider font-semibold">Imported</div>
+                <div className="text-2xl font-black mt-1 text-[#002FA7]">{result.summary.imported}</div>
+              </div>
+              <div className="border-r border-gray-200">
+                <div className="text-xs text-amber-600 uppercase tracking-wider font-semibold">Duplicates</div>
+                <div className="text-2xl font-black mt-1 text-amber-600">{result.summary.duplicates}</div>
+              </div>
+              <div>
+                <div className="text-xs text-rose-600 uppercase tracking-wider font-semibold">Errors</div>
+                <div className="text-2xl font-black mt-1 text-rose-600">{result.summary.errors}</div>
+              </div>
+            </div>
+
+            {result.errors && result.errors.length > 0 && (
+              <div className="space-y-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-rose-600">Error Logs</h3>
+                <div className="max-h-48 overflow-y-auto border border-rose-200 bg-rose-50/50 p-3 rounded font-mono text-xs text-rose-700 space-y-1.5">
+                  {result.errors.map((err, i) => (
+                    <div key={i}>• {err}</div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="flex justify-end pt-2">
+              <button 
+                type="button" 
+                onClick={onClose} 
+                className="bg-gray-900 hover:bg-black text-white px-5 py-2 text-[10px] uppercase tracking-widest font-bold"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

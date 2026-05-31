@@ -22,6 +22,7 @@ import bcrypt
 import jwt
 import httpx
 from bs4 import BeautifulSoup
+import pandas as pd
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Query, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -1625,6 +1626,176 @@ async def list_leads(
         total = await db.leads.count_documents(query)
         return {"items": items, "total": total, "limit": safe_limit, "offset": safe_offset}
     return items
+
+@api.get("/leads/upload-template")
+async def download_upload_template(user: dict = Depends(get_current_user)):
+    """Generate and return a sample Excel template for bulk lead uploading."""
+    columns = [
+        "Customer Name", "Phone", "Email", "Requirement", 
+        "Area", "City", "State", "Country", "Source", "Enquiry Type"
+    ]
+    df = pd.DataFrame(columns=columns)
+    df.loc[0] = [
+        "John Doe", "8790934618", "john.doe@example.com", "Requires citrus spray sample pack",
+        "Industrial Area", "Hyderabad", "Telangana", "India", "Excel Upload", "Samples"
+    ]
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Leads Template")
+    output.seek(0)
+    excel_bytes = output.getvalue()
+    return Response(
+        content=excel_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": "attachment; filename=leads_upload_template.xlsx",
+            "Access-Control-Expose-Headers": "Content-Disposition"
+        }
+    )
+
+@api.post("/leads/upload")
+async def upload_leads(
+    file: UploadFile = File(...),
+    assigned_to: Optional[str] = Form(None),
+    user: dict = Depends(get_current_user)
+):
+    """Bulk upload leads from an Excel or CSV file."""
+    target_assignee = assigned_to
+    if user["role"] == "executive":
+        target_assignee = user["id"]
+        
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        
+    try:
+        filename = file.filename.lower()
+        if filename.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(contents))
+        else:
+            df = pd.read_excel(io.BytesIO(contents))
+    except Exception as e:
+        logger.error(f"Failed to parse spreadsheet: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid file format: {str(e)}")
+        
+    columns_mapping = {}
+    for col in df.columns:
+        col_lower = str(col).strip().lower()
+        if col_lower in ("customer name", "customer_name", "name", "full name", "customer"):
+            columns_mapping[col] = "customer_name"
+        elif col_lower in ("phone", "mobile", "phone number", "mobile number", "contact", "phone_number"):
+            columns_mapping[col] = "phone"
+        elif col_lower in ("email", "email address", "email_address", "email id", "email_id"):
+            columns_mapping[col] = "email"
+        elif col_lower in ("requirement", "requirements", "query", "message", "notes", "description"):
+            columns_mapping[col] = "requirement"
+        elif col_lower in ("area", "locality", "region"):
+            columns_mapping[col] = "area"
+        elif col_lower in ("city", "town"):
+            columns_mapping[col] = "city"
+        elif col_lower in ("state", "province"):
+            columns_mapping[col] = "state"
+        elif col_lower in ("country",):
+            columns_mapping[col] = "country"
+        elif col_lower in ("source",):
+            columns_mapping[col] = "source"
+        elif col_lower in ("enquiry type", "enquiry_type", "type"):
+            columns_mapping[col] = "enquiry_type"
+            
+    df = df.rename(columns=columns_mapping)
+    
+    if "customer_name" not in df.columns:
+        raise HTTPException(
+            status_code=400, 
+            detail="Spreadsheet must contain a 'Customer Name' (or Name, Full Name) column"
+        )
+        
+    imported_count = 0
+    duplicate_count = 0
+    error_count = 0
+    errors = []
+    
+    for index, row in df.iterrows():
+        row_num = index + 2
+        
+        cust_name = row.get("customer_name")
+        if pd.isna(cust_name) or not str(cust_name).strip():
+            errors.append(f"Row {row_num}: Customer Name is missing")
+            error_count += 1
+            continue
+            
+        cust_name = str(cust_name).strip()
+        
+        phone_val = row.get("phone")
+        phone_str = None
+        if not pd.isna(phone_val) and str(phone_val).strip():
+            if isinstance(phone_val, float):
+                if phone_val.is_integer():
+                    phone_str = str(int(phone_val))
+                else:
+                    phone_str = str(phone_val)
+            else:
+                phone_str = str(phone_val).strip()
+                
+        canonical_phone = None
+        if phone_str:
+            canonical_phone = normalize_phone_display(phone_str)
+            
+        existing = None
+        if canonical_phone:
+            existing = await _find_lead_by_phone(canonical_phone)
+            
+        email = str(row.get("email")).strip() if not pd.isna(row.get("email")) else None
+        requirement = str(row.get("requirement")).strip() if not pd.isna(row.get("requirement")) else None
+        area = str(row.get("area")).strip() if not pd.isna(row.get("area")) else None
+        city = str(row.get("city")).strip() if not pd.isna(row.get("city")) else None
+        state = str(row.get("state")).strip() if not pd.isna(row.get("state")) else None
+        country = str(row.get("country")).strip() if not pd.isna(row.get("country")) else None
+        source = str(row.get("source")).strip() if not pd.isna(row.get("source")) else "Excel Upload"
+        enquiry_type = str(row.get("enquiry_type")).strip() if not pd.isna(row.get("enquiry_type")) else None
+        
+        lead_payload = {
+            "customer_name": cust_name,
+            "phone": canonical_phone,
+            "email": email,
+            "requirement": requirement,
+            "area": area,
+            "city": city,
+            "state": state,
+            "country": country,
+            "source": source,
+            "enquiry_type": enquiry_type,
+            "assigned_to": target_assignee
+        }
+        
+        if existing:
+            try:
+                await _handle_repeat_enquiry(existing, {**lead_payload, "source": source})
+                duplicate_count += 1
+            except Exception as ex_dup:
+                logger.warning(f"Failed to handle repeat enquiry for duplicate lead: {ex_dup}")
+                errors.append(f"Row {row_num}: Error handling duplicate ({str(ex_dup)})")
+                error_count += 1
+        else:
+            lead_payload["dedup_hash"] = _lead_dedup_hash(cust_name, iso(now_utc()), canonical_phone or "")
+            try:
+                await _create_lead_internal(lead_payload, by_user_id=user["id"])
+                imported_count += 1
+            except Exception as ex_create:
+                logger.error(f"Failed to create lead in upload: {ex_create}")
+                errors.append(f"Row {row_num}: Failed to create lead ({str(ex_create)})")
+                error_count += 1
+                
+    return {
+        "success": True,
+        "summary": {
+            "total": len(df),
+            "imported": imported_count,
+            "duplicates": duplicate_count,
+            "errors": error_count
+        },
+        "errors": errors
+    }
 
 @api.post("/leads")
 async def create_lead(body: LeadCreate, user: dict = Depends(get_current_user)):
