@@ -57,19 +57,21 @@ export default function LeadDrawer({ leadId, onClose }) {
   const [callPhone, setCallPhone] = useState("");
   const [callSummary, setCallSummary] = useState("");
   const [savingCall, setSavingCall] = useState(false);
+  const [followups, setFollowups] = useState([]);
 
   const loadAll = async () => {
     try {
       // Messages are reloaded by the dedicated effect keyed on (leadId, phoneFilter)
-      // so we only fetch lead+activity+calls here. This eliminates the race
+      // so we only fetch lead+activity+calls+followups here. This eliminates the race
       // condition where loadAll() and the phone-filter effect would both write
       // setMessages() out of order.
-      const [{ data: L }, { data: A }, { data: C }] = await Promise.all([
+      const [{ data: L }, { data: A }, { data: C }, { data: F }] = await Promise.all([
         api.get(`/leads/${leadId}`),
         api.get(`/leads/${leadId}/activity`),
         api.get(`/leads/${leadId}/calls`),
+        api.get("/followups", { params: { lead_id: leadId } }),
       ]);
-      setLead(L); setActivity(A); setCalls(C);
+      setLead(L); setActivity(A); setCalls(C); setFollowups(F || []);
       if (!callPhone) setCallPhone(L.phone || "");
     } catch (e) { toast.error(errMsg(e)); onClose?.(); }
   };
@@ -528,13 +530,51 @@ export default function LeadDrawer({ leadId, onClose }) {
 
             <section>
               <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2 flex items-center gap-1"><CalendarBlank size={12} /> Schedule Follow-up</div>
-              <div className="flex flex-wrap gap-2">
+              <div className="flex flex-wrap gap-2 mb-3">
                 <input type="datetime-local" value={fuDate} onChange={(e) => setFuDate(e.target.value)} className="border border-gray-300 px-2 py-2 text-sm" data-testid="followup-date-input" />
                 <input value={fuNote} onChange={(e) => setFuNote(e.target.value)} placeholder="Note (optional)"
                   className="flex-1 border border-gray-300 px-3 py-2 text-sm" data-testid="followup-note-input" />
                 <button onClick={scheduleFollowup} className="border border-gray-900 px-3 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-900 hover:text-white" data-testid="followup-submit-btn">
                   Schedule
                 </button>
+              </div>
+
+              {/* List of followups */}
+              <div className="space-y-2 max-h-60 overflow-y-auto">
+                {followups.length === 0 && <div className="text-xs text-gray-400 uppercase tracking-widest">No follow-ups scheduled</div>}
+                {followups.map(f => {
+                  const isOverdue = f.status === "pending" && new Date(f.due_at) < new Date();
+                  return (
+                    <div key={f.id} className="border border-gray-200 bg-white p-3 flex items-center justify-between gap-2" data-testid={`followup-row-${f.id}`}>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className={`text-[10px] uppercase tracking-widest font-bold ${f.status === "done" ? "text-[#008A00]" : f.status === "missed" ? "text-gray-500" : isOverdue ? "text-[#E60000]" : "text-[#002FA7]"}`}>
+                            {f.status} {isOverdue && "(overdue)"}
+                          </span>
+                          <span className="text-xs font-mono text-gray-500">{fmtIST(f.due_at)}</span>
+                        </div>
+                        {f.note && <div className="text-sm mt-1 break-words">{f.note}</div>}
+                      </div>
+                      {f.status === "pending" && (
+                        <button
+                          onClick={async () => {
+                            try {
+                              await api.patch(`/followups/${f.id}`, { status: "done" });
+                              toast.success("Follow-up marked as completed");
+                              loadAll();
+                            } catch (e) {
+                              toast.error(errMsg(e));
+                            }
+                          }}
+                          className="text-[10px] uppercase tracking-widest font-bold text-[#008A00] hover:underline flex items-center gap-1 shrink-0"
+                          data-testid={`complete-followup-btn-${f.id}`}
+                        >
+                          <Check size={12} /> Mark Done
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </section>
           </div>

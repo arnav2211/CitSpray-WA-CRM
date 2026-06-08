@@ -7,7 +7,7 @@ import {
   MagnifyingGlass, PaperPlaneRight, ChatCircleDots, Phone, ArrowsClockwise, Plus, ArrowLeft,
   Funnel, Lightning, ArrowsLeftRight, X, Tag, NotePencil, Info,
   Paperclip, Image as ImageIcon, VideoCamera, FileText, Microphone, MapPin, IdentificationCard, Stop,
-  DownloadSimple, Question, ChatTeardropText, CaretLeft, QrCode,
+  DownloadSimple, Question, ChatTeardropText, CaretLeft, QrCode, PhoneCall, CalendarBlank, Check, Clock,
 } from "@phosphor-icons/react";
 import { fmtIST, fmtISTTime, fmtSmartShort, fmtSmartLong, fmtTime12, fmtDaySeparator, istDayKey } from "@/lib/format";
 import { StatusBadge, SourceBadge } from "@/components/Badges";
@@ -15,6 +15,22 @@ import OMSDataSection from "@/components/OMSDataSection";
 
 const POLL_MS = 4000;
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
+
+const CALL_OUTCOMES = [
+  { v: "connected", label: "Connected (Call Answered)" },
+  { v: "busy", label: "Busy" },
+  { v: "no_answer", label: "No Answer" },
+  { v: "rejected", label: "Rejected (Call Declined)" },
+  { v: "switched_off", label: "Switched Off / Out of Coverage" },
+];
+
+const OUTCOME_COLOR = {
+  connected: "text-[#008A00]",
+  busy: "text-[#E67E00]",
+  no_answer: "text-[#B85F00]",
+  rejected: "text-[#E60000]",
+  switched_off: "text-gray-500",
+};
 
 // ---------------- Helpers ----------------
 function tickFor(status) {
@@ -599,6 +615,89 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   const fileInputRef = useRef(null);
   const fileKindRef = useRef("image");
   const inputRef = useRef(null);
+
+  const [calls, setCalls] = useState([]);
+  const [followups, setFollowups] = useState([]);
+
+  // Call form
+  const [callOutcome, setCallOutcome] = useState("");
+  const [callPhone, setCallPhone] = useState("");
+  const [callSummary, setCallSummary] = useState("");
+  const [savingCall, setSavingCall] = useState(false);
+
+  // Followup form
+  const [fuDate, setFuDate] = useState("");
+  const [fuNote, setFuNote] = useState("");
+  const [savingFu, setSavingFu] = useState(false);
+
+  const loadCallsAndFollowups = useCallback(async () => {
+    if (!conv?.id) return;
+    try {
+      const [{ data: C }, { data: F }] = await Promise.all([
+        api.get(`/leads/${conv.id}/calls`),
+        api.get("/followups", { params: { lead_id: conv.id } }),
+      ]);
+      setCalls(C || []);
+      setFollowups(F || []);
+    } catch (e) {
+      console.error("Failed to load calls/followups", e);
+    }
+  }, [conv?.id]);
+
+  useEffect(() => {
+    loadCallsAndFollowups();
+    const allPhones = [conv.phone, ...(conv.phones || [])].filter(Boolean);
+    if (conv.phone && (!callPhone || !allPhones.includes(callPhone))) {
+      setCallPhone(conv.phone);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conv.id, conv.phone, conv.phones, loadCallsAndFollowups]);
+
+  useEffect(() => {
+    if (!conv?.id) return;
+    const id = setInterval(loadCallsAndFollowups, POLL_MS);
+    return () => clearInterval(id);
+  }, [conv?.id, loadCallsAndFollowups]);
+
+  const submitCall = async () => {
+    if (!callOutcome) { toast.error("Pick a call outcome"); return; }
+    if (!callPhone) { toast.error("Pick a phone number"); return; }
+    if (callOutcome === "connected" && !callSummary.trim()) { toast.error("Summary required for connected calls"); return; }
+    setSavingCall(true);
+    try {
+      await api.post(`/leads/${conv.id}/calls`, {
+        phone: callPhone,
+        outcome: callOutcome,
+        summary: callOutcome === "connected" ? callSummary.trim() : null,
+      });
+      setCallOutcome(""); setCallSummary("");
+      toast.success("Call logged");
+      loadCallsAndFollowups();
+      onChanged?.();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setSavingCall(false); }
+  };
+
+  const scheduleFollowup = async () => {
+    if (!fuDate) { toast.error("Pick a date/time"); return; }
+    setSavingFu(true);
+    try {
+      const dueIso = new Date(fuDate).toISOString();
+      await api.post("/followups", { lead_id: conv.id, due_at: dueIso, note: fuNote });
+      setFuDate(""); setFuNote("");
+      toast.success("Follow-up scheduled");
+      loadCallsAndFollowups();
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setSavingFu(false); }
+  };
+
+  const completeFollowup = async (fuId) => {
+    try {
+      await api.patch(`/followups/${fuId}`, { status: "done" });
+      toast.success("Follow-up marked as completed");
+      loadCallsAndFollowups();
+    } catch (e) { toast.error(errMsg(e)); }
+  };
 
   // Mobile detection — touch + small viewport. Re-evaluated on mount.
   const isMobile = useMemo(() => {
@@ -1423,6 +1522,135 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
               {conv.created_at && <InfoRow label="Created"><span className="text-xs text-gray-700">{fmtIST(conv.created_at)}</span></InfoRow>}
 
               <OMSDataSection leadId={conv.id} />
+
+              {/* Call Activity Section */}
+              <div className="pt-3 border-t border-gray-200">
+                <div className="flex items-center gap-2 text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2">
+                  <PhoneCall size={12} /> Call Activity ({calls.length})
+                </div>
+                {canMessage && (
+                  <div className="border border-gray-200 bg-gray-50 p-2 space-y-2 mb-2 text-xs">
+                    <div className="grid grid-cols-2 gap-1">
+                      <select
+                        value={callPhone}
+                        onChange={(e) => setCallPhone(e.target.value)}
+                        className="border border-gray-300 p-1 text-xs bg-white w-full outline-none"
+                        data-testid="chat-call-phone-select"
+                      >
+                        {[conv.phone, ...(conv.phones || [])].filter(Boolean).map((p, i) => (
+                          <option key={p} value={p}>{p}{i === 0 ? " (Primary)" : ""}</option>
+                        ))}
+                      </select>
+                      <select
+                        value={callOutcome}
+                        onChange={(e) => setCallOutcome(e.target.value)}
+                        className="border border-gray-300 p-1 text-xs bg-white w-full outline-none"
+                        data-testid="chat-call-outcome-select"
+                      >
+                        <option value="">— Outcome —</option>
+                        {CALL_OUTCOMES.map(o => <option key={o.v} value={o.v}>{o.label}</option>)}
+                      </select>
+                    </div>
+                    {callOutcome === "connected" && (
+                      <textarea
+                        value={callSummary}
+                        onChange={(e) => setCallSummary(e.target.value)}
+                        placeholder="Conversation summary (required)…"
+                        rows={2}
+                        className="w-full border border-gray-300 p-1.5 text-xs bg-white outline-none focus:border-[#002FA7]"
+                        data-testid="chat-call-summary-input"
+                      />
+                    )}
+                    <button
+                      onClick={submitCall}
+                      disabled={!callOutcome || savingCall}
+                      className="w-full bg-[#002FA7] hover:bg-[#002288] text-white py-1.5 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50 flex items-center justify-center gap-1"
+                      data-testid="chat-log-call-btn"
+                    >
+                      <PhoneCall size={12} weight="bold" /> Log Call
+                    </button>
+                  </div>
+                )}
+                <div className="space-y-2 max-h-40 overflow-y-auto">
+                  {calls.length === 0 && <div className="text-xs text-gray-400 italic">No calls logged yet</div>}
+                  {calls.map(c => {
+                    const o = CALL_OUTCOMES.find(x => x.v === c.outcome);
+                    return (
+                      <div key={c.id} className="bg-gray-50 border border-gray-200 p-2 text-xs" data-testid={`chat-call-row-${c.id}`}>
+                        <div className="flex items-center justify-between gap-1 flex-wrap">
+                          <span className={`text-[10px] uppercase tracking-widest font-bold ${OUTCOME_COLOR[c.outcome] || "text-gray-500"}`}>
+                            {o?.label || c.outcome}
+                          </span>
+                          <span className="text-[10px] text-gray-500 font-mono">{fmtIST(c.at)}</span>
+                        </div>
+                        <div className="text-[10px] text-gray-400 font-mono mt-0.5">{c.phone} · logged by {c.by_user_name}</div>
+                        {c.summary && <div className="text-gray-700 mt-1 whitespace-pre-wrap leading-normal">{c.summary}</div>}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Follow-ups Section */}
+              <div className="pt-3 border-t border-gray-200">
+                <div className="flex items-center gap-2 text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2">
+                  <CalendarBlank size={12} /> Follow-ups ({followups.length})
+                </div>
+                {canMessage && (
+                  <div className="border border-gray-200 bg-gray-50 p-2 space-y-2 mb-2 text-xs">
+                    <input
+                      type="datetime-local"
+                      value={fuDate}
+                      onChange={(e) => setFuDate(e.target.value)}
+                      className="border border-gray-300 p-1 text-xs bg-white w-full outline-none"
+                      data-testid="chat-followup-date-input"
+                    />
+                    <input
+                      value={fuNote}
+                      onChange={(e) => setFuNote(e.target.value)}
+                      placeholder="Note (optional)…"
+                      className="w-full border border-gray-300 p-1.5 text-xs bg-white outline-none focus:border-[#002FA7]"
+                      data-testid="chat-followup-note-input"
+                    />
+                    <button
+                      onClick={scheduleFollowup}
+                      disabled={!fuDate || savingFu}
+                      className="w-full bg-[#002FA7] hover:bg-[#002288] text-white py-1.5 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50 flex items-center justify-center gap-1"
+                      data-testid="chat-schedule-followup-btn"
+                    >
+                      <CalendarBlank size={12} weight="bold" /> Schedule
+                    </button>
+                  </div>
+                )}
+                <div className="space-y-2 max-h-40 overflow-y-auto">
+                  {followups.length === 0 && <div className="text-xs text-gray-400 italic">No follow-ups scheduled</div>}
+                  {followups.map(f => {
+                    const isOverdue = f.status === "pending" && new Date(f.due_at) < new Date();
+                    return (
+                      <div key={f.id} className="bg-gray-50 border border-gray-200 p-2 text-xs flex items-center justify-between gap-2" data-testid={`chat-followup-row-${f.id}`}>
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className={`text-[10px] uppercase tracking-widest font-bold ${f.status === "done" ? "text-[#008A00]" : f.status === "missed" ? "text-gray-500" : isOverdue ? "text-[#E60000]" : "text-[#002FA7]"}`}>
+                              {f.status} {isOverdue && "(overdue)"}
+                            </span>
+                            <span className="text-[10px] text-gray-500 font-mono">{fmtIST(f.due_at)}</span>
+                          </div>
+                          {f.note && <div className="text-gray-700 mt-1 break-words">{f.note}</div>}
+                        </div>
+                        {f.status === "pending" && (
+                          <button
+                            onClick={() => completeFollowup(f.id)}
+                            className="text-[10px] uppercase tracking-widest font-bold text-[#008A00] hover:underline flex items-center gap-0.5 shrink-0"
+                            data-testid={`chat-complete-followup-btn-${f.id}`}
+                          >
+                            <Check size={12} /> Done
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
 
               {/* Notes section */}
               <div className="pt-3 border-t border-gray-200">

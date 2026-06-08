@@ -310,6 +310,21 @@ class TestFollowups:
         assert ru.json()["status"] == "done"
         assert ru.json().get("completed_at")
 
+    def test_list_followups_by_lead_id(self, admin):
+        payload = {"SENDER_NAME": "TEST_FU_Filter", "MOBILE": "7777777777",
+                   "UNIQUE_QUERY_ID": f"TEST_FUF_{time.time_ns()}", "QUERY_TIME": "2026-01-01 10:00:00"}
+        cr = requests.post(f"{API}/webhooks/indiamart", json=payload, timeout=20)
+        lead_id = cr.json()["created"][0]
+        rc = requests.post(f"{API}/followups", headers=admin["h"],
+                           json={"lead_id": lead_id, "due_at": "2026-12-01T12:00:00+00:00", "note": "Filter test"}, timeout=20)
+        assert rc.status_code == 200
+        r_list = requests.get(f"{API}/followups", headers=admin["h"], params={"lead_id": lead_id, "scope": "all"}, timeout=20)
+        assert r_list.status_code == 200
+        items = r_list.json()
+        assert len(items) >= 1
+        assert items[0]["lead_id"] == lead_id
+        assert items[0]["note"] == "Filter test"
+
 
 # ------------- Routing rules -------------
 class TestRoutingRules:

@@ -2732,8 +2732,11 @@ async def list_followups(
     user: dict = Depends(get_current_user),
     scope: str = "mine",
     status: Optional[str] = None,
+    lead_id: Optional[str] = None,
 ):
     query: Dict[str, Any] = {}
+    if lead_id:
+        query["lead_id"] = lead_id
     if user["role"] == "executive" or scope == "mine":
         query["executive_id"] = user["id"]
     if status:
@@ -6106,7 +6109,7 @@ async def _trigger_auto_sequence(lead_id: str, target_phone: str):
                         extra["media_type"] = qr.get("media_type")
                         extra["media_url"] = qr["media_url"]
                         extra["filename"] = qr.get("media_filename")
-                        extra["caption"] = qr.get("caption")
+                        extra["caption"] = qr.get("caption") or qr.get("text")
                 else:
                     # 2. Search in WhatsApp Templates
                     tpl = await db.whatsapp_templates.find_one({"$or": [{"id": qr_id}, {"name": qr_id}]})
