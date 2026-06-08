@@ -196,31 +196,14 @@ export default function OMSDataSection({ leadId }) {
   const handleSharePiDetails = async (pi) => {
     setSharingId(`pi-details-${pi.id}`);
     try {
-      const itemsText = pi.items
-        .map(it => `• ${it.product_name} (${it.qty} ${it.unit || "pcs"})`)
-        .join("\n");
-
-      const text = `📄 *Proforma Invoice - CitSpray Aroma Sciences* 📄\n\n` +
-        `Dear Customer,\n\n` +
-        `Please find the details for Proforma Invoice *${pi.pi_number}*:\n\n` +
-        `*Items:*\n` +
-        `${itemsText}\n\n` +
-        `• *Grand Total:* ₹${pi.grand_total}\n` +
-        `• *Status:* ${pi.status.toUpperCase()}\n\n` +
-        `*Bank Details for Payment:*\n` +
-        `🏛️ *Punjab National Bank*\n` +
-        `• *Account Name:* Mangalam Agro\n` +
-        `• *A/c No:* 1472002100029992\n` +
-        `• *IFSC Code:* PUNB0147200\n` +
-        `• *UPI VPA:* archanaagrawal80-1@okicici\n\n` +
-        `Kindly share the payment screenshot once done so we can initiate packing.\n\n` +
-        `Thank you!\n` +
-        `*Mangalam Agro*`;
-
-      await api.post("/whatsapp/send", { lead_id: leadId, body: text });
-      toast.success(`Shared PI ${pi.pi_number} details via WhatsApp!`);
+      await api.post("/whatsapp/send-pi-pdf", {
+        lead_id: leadId,
+        pi_id: pi.id,
+        pi_number: pi.pi_number
+      });
+      toast.success(`Shared PI ${pi.pi_number} PDF via WhatsApp!`);
     } catch (e) {
-      toast.error(errMsg(e, "Failed to share PI details"));
+      toast.error(errMsg(e, "Failed to share PI PDF"));
     } finally {
       setSharingId(null);
     }
@@ -411,9 +394,9 @@ export default function OMSDataSection({ leadId }) {
                       onClick={() => handleSharePiDetails(p)}
                       disabled={sharingId !== null}
                       className="flex-1 bg-[#25D366] hover:bg-[#1fa851] disabled:opacity-50 text-white text-[9px] uppercase tracking-widest font-bold py-1 px-1.5 flex items-center justify-center gap-1 rounded transition-transform active:scale-95"
-                      title="Share PI Details via WhatsApp"
+                      title="Share PI PDF via WhatsApp"
                     >
-                      <WhatsappLogo size={10} weight="fill" /> Share details &amp; Bank Info
+                      <WhatsappLogo size={10} weight="fill" /> Share PI PDF
                     </button>
                     
                     <a

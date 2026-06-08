@@ -274,6 +274,10 @@ async def wa_send_template(to_phone: str, template_name: str, lang_code: Optiona
     return {"status": "sent", "wamid": wamid, "raw": data}
 
 app = FastAPI(title="LeadOrbit CRM API")
+UPLOAD_DIR = ROOT_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+app.mount("/api/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+
 api = APIRouter(prefix="/api")
 
 # ------------- Helpers -------------
@@ -2358,6 +2362,12 @@ class WASendMedia(WAComposerBase):
     filename: Optional[str] = None  # document only
 
 
+class WASendPiPdf(BaseModel):
+    lead_id: str
+    pi_id: str
+    pi_number: str
+
+
 class WASendLocation(WAComposerBase):
     latitude: float
     longitude: float
@@ -2486,6 +2496,100 @@ async def whatsapp_send_media(body: WASendMedia, user: dict = Depends(get_curren
                        {"status": msg["status"], "wamid": msg["wamid"], "media_type": body.media_type})
     if msg["status"] == "failed":
         raise HTTPException(status_code=400, detail=msg.get("error") or "WhatsApp media send failed")
+    return strip_mongo(msg)
+
+
+@api.post("/whatsapp/send-pi-pdf")
+async def whatsapp_send_pi_pdf(body: WASendPiPdf, user: dict = Depends(get_current_user)):
+    ctx = await _assert_chat_permitted(user, body.lead_id)
+    target_phone = ctx["target_phone"]
+    
+    # Resolve OMS JWT secret
+    oms_jwt_secret = os.environ.get("OMS_JWT_SECRET", "9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c")
+    
+    # Find active user in OMS database
+    oms_user = await oms_db.users.find_one({"active": True})
+    if not oms_user:
+        oms_user = await oms_db.users.find_one({})
+    if not oms_user:
+        raise HTTPException(status_code=400, detail="No active user found in OMS to authenticate PDF request")
+        
+    # Generate token for OMS PDF endpoint
+    token_payload = {
+        "user_id": oms_user["id"],
+        "exp": datetime.now(timezone.utc) + timedelta(hours=1)
+    }
+    token = jwt.encode(token_payload, oms_jwt_secret, algorithm="HS256")
+    
+    pdf_fetched = False
+    pdf_content = None
+    
+    # Try fetching internally from localhost:8000
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http_client:
+            url = f"http://127.0.0.1:8000/api/proforma-invoices/{body.pi_id}/pdf"
+            r = await http_client.get(url, params={"token": token})
+            if r.status_code == 200:
+                pdf_content = r.content
+                pdf_fetched = True
+                logger.info(f"Fetched PI PDF internally from localhost:8000 for PI {body.pi_number}")
+    except Exception as e:
+        logger.warning(f"Failed to fetch PI PDF internally from localhost:8000: {e}")
+        
+    # Fallback to public/configured OMS_BASE_URL
+    if not pdf_fetched:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as http_client:
+                url = f"{OMS_BASE_URL}/api/proforma-invoices/{body.pi_id}/pdf"
+                r = await http_client.get(url, params={"token": token})
+                if r.status_code == 200:
+                    pdf_content = r.content
+                    pdf_fetched = True
+                    logger.info(f"Fetched PI PDF from OMS_BASE_URL {OMS_BASE_URL} for PI {body.pi_number}")
+                else:
+                    logger.error(f"Failed to fetch PI PDF from OMS_BASE_URL: status={r.status_code}, body={r.text[:200]}")
+        except Exception as e:
+            logger.error(f"Failed to fetch PI PDF from OMS_BASE_URL: {e}")
+            
+    if not pdf_fetched or not pdf_content:
+        raise HTTPException(status_code=500, detail="Failed to fetch Proforma Invoice PDF from OMS server")
+        
+    # Save PDF locally
+    filename = f"{uuid.uuid4()}_{body.pi_number}.pdf"
+    filepath = UPLOAD_DIR / filename
+    
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, lambda: filepath.write_bytes(pdf_content))
+    
+    # Construct CRM public URL
+    crm_base_url = os.environ.get("FRONTEND_BASE_URL", "https://crm.mangalamagro.in").rstrip("/")
+    public_url = f"{crm_base_url}/api/uploads/{filename}"
+    
+    # Send via WhatsApp
+    caption = f"📄 *Proforma Invoice - CitSpray Aroma Sciences*\n\nDear Customer, please find attached Proforma Invoice *{body.pi_number}*."
+    filename_param = f"{body.pi_number}.pdf"
+    
+    reply_ctx = await _resolve_reply_context(body.lead_id, None)
+    
+    api_result = await wa_send_media(
+        to_phone=target_phone,
+        media_type="document",
+        url=public_url,
+        caption=caption,
+        filename=filename_param,
+        reply_to_wamid=reply_ctx["wamid"]
+    )
+    
+    preview = f"[document: {filename_param}] {caption}".rstrip()
+    extra = {"media_type": "document", "media_url": public_url, "caption": caption, "filename": filename_param}
+    
+    msg = await _record_sent_message(body.lead_id, user["id"], target_phone, preview, api_result, extra, reply_ctx)
+    await log_activity(user["id"], "whatsapp_sent", body.lead_id,
+                       {"status": msg["status"], "wamid": msg["wamid"], "media_type": "document"})
+                       
+    if msg["status"] == "failed":
+        raise HTTPException(status_code=400, detail=msg.get("error") or "WhatsApp document send failed")
+        
     return strip_mongo(msg)
 
 
