@@ -4,7 +4,7 @@ import { useAuth } from "@/context/AuthContext";
 import { Link, useSearchParams, useNavigate } from "react-router-dom";
 import { StatusBadge, SourceBadge, EnquiryTypeBadge } from "@/components/Badges";
 import { toast } from "sonner";
-import { Kanban, Table, Plus, MagnifyingGlass, FileX, WhatsappLogo, UploadSimple } from "@phosphor-icons/react";
+import { Kanban, Table, Plus, MagnifyingGlass, FileX, WhatsappLogo, UploadSimple, Star } from "@phosphor-icons/react";
 import LeadDrawer from "@/components/LeadDrawer";
 import { fmtIST } from "@/lib/format";
 
@@ -25,6 +25,7 @@ export default function Leads() {
   const [outcomeFilter, setOutcomeFilter] = useState(params.get("outcome") || "");
   const [dateFrom, setDateFrom] = useState(params.get("date_from") || "");
   const [dateTo, setDateTo] = useState(params.get("date_to") || "");
+  const [starredFilter, setStarredFilter] = useState(params.get("starred") === "true");
   const [openId, setOpenId] = useState(params.get("lead") || null);
   const [creating, setCreating] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -43,6 +44,7 @@ export default function Leads() {
           last_call_outcome: outcomeFilter || undefined,
           date_from: dateFrom || undefined,
           date_to: dateTo || undefined,
+          starred: starredFilter ? true : undefined,
           paginate: true,
           limit: pageSize,
           offset: (page - 1) * pageSize,
@@ -52,6 +54,21 @@ export default function Leads() {
       setLeads(data?.items || []);
       setTotal(typeof data?.total === "number" ? data.total : (data?.items || []).length);
     } catch (e) { toast.error(errMsg(e)); }
+  };
+
+  const toggleStar = async (leadId, currentStarred) => {
+    try {
+      setLeads((prev) =>
+        prev.map((ld) => (ld.id === leadId ? { ...ld, starred: !currentStarred } : ld))
+      );
+      await api.patch(`/leads/${leadId}`, { starred: !currentStarred });
+      toast.success(currentStarred ? "Lead unstarred" : "Lead starred");
+    } catch (e) {
+      toast.error(errMsg(e));
+      setLeads((prev) =>
+        prev.map((ld) => (ld.id === leadId ? { ...ld, starred: currentStarred } : ld))
+      );
+    }
   };
 
   useEffect(() => {
@@ -67,9 +84,9 @@ export default function Leads() {
 
   // Reset to first page whenever a filter changes (so we never end up on an
   // empty page after narrowing the result set).
-  useEffect(() => { setPage(1); }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, q, pageSize]);
+  useEffect(() => { setPage(1); }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, q, pageSize, starredFilter]);
 
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, page, pageSize]);
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, page, pageSize, starredFilter]);
   useEffect(() => {
     const t = setTimeout(() => load(), 300);
     return () => clearTimeout(t);
@@ -86,11 +103,12 @@ export default function Leads() {
     if (outcomeFilter) p.outcome = outcomeFilter;
     if (dateFrom) p.date_from = dateFrom;
     if (dateTo) p.date_to = dateTo;
+    if (starredFilter) p.starred = "true";
     if (openId) p.lead = openId;
     if (page > 1) p.page = String(page);
     if (pageSize !== 25) p.size = String(pageSize);
     setParams(p, { replace: true });
-  }, [view, q, statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, openId, page, pageSize, setParams]);
+  }, [view, q, statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, starredFilter, openId, page, pageSize, setParams]);
 
   const execMap = useMemo(() => Object.fromEntries(execs.map((e) => [e.id, e])), [execs]);
   const isAdmin = user.role === "admin";
@@ -157,6 +175,10 @@ export default function Leads() {
           <option value="busy">Busy / Engaged</option>
           <option value="invalid">Invalid</option>
         </select>
+        <select value={starredFilter ? "true" : ""} onChange={(e) => setStarredFilter(e.target.value === "true")} className="border border-gray-300 px-2 py-2 text-sm" data-testid="leads-starred-filter">
+          <option value="">All leads</option>
+          <option value="true">Starred leads only</option>
+        </select>
         {/* Date range — single date = same value in both fields. Inclusive (IST). */}
         <div className="flex items-center gap-1 col-span-2 md:col-span-2" data-testid="leads-date-filter">
           <input
@@ -202,7 +224,22 @@ export default function Leads() {
                   data-testid={`lead-card-${l.id}`}>
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0 flex-1">
-                      <div className={`truncate ${unread ? "font-bold" : "font-semibold"}`}>{l.customer_name}</div>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className={`truncate ${unread ? "font-bold" : "font-semibold"}`}>{l.customer_name}</span>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleStar(l.id, l.starred);
+                          }}
+                          className={`inline-flex items-center justify-center p-1 rounded-full hover:bg-gray-100 transition-colors ${
+                            l.starred ? "text-[#E6B012]" : "text-gray-300 hover:text-gray-400"
+                          }`}
+                          title={l.starred ? "Unstar lead" : "Star lead"}
+                          data-testid={`lead-star-btn-mobile-${l.id}`}
+                        >
+                          <Star size={14} weight={l.starred ? "fill" : "regular"} />
+                        </button>
+                      </div>
                       {l.phone && (
                         <div className="text-xs text-gray-500 font-mono mt-0.5 flex items-center gap-1.5">
                           <span>{l.phone}</span>
@@ -265,7 +302,22 @@ export default function Leads() {
                     data-testid={`lead-row-${l.id}`}
                   >
                     <td className="px-4 py-3">
-                      <div className={`${unread ? "font-bold" : ""}`}>{l.customer_name}</div>
+                      <div className="flex items-center gap-1.5">
+                        <span className={`${unread ? "font-bold" : ""}`}>{l.customer_name}</span>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleStar(l.id, l.starred);
+                          }}
+                          className={`inline-flex items-center justify-center p-1 rounded-full hover:bg-gray-100 transition-colors ${
+                            l.starred ? "text-[#E6B012]" : "text-gray-300 hover:text-gray-400"
+                          }`}
+                          title={l.starred ? "Unstar lead" : "Star lead"}
+                          data-testid={`lead-star-btn-${l.id}`}
+                        >
+                          <Star size={16} weight={l.starred ? "fill" : "regular"} />
+                        </button>
+                      </div>
                       {l.phone && (
                         <div className="text-xs text-gray-500 font-mono flex items-center gap-1.5">
                           <span>{l.phone}</span>
@@ -327,7 +379,7 @@ export default function Leads() {
         />
         </>
       ) : (
-        <Kanban_ leads={leads} onOpen={setOpenId} execMap={execMap} />
+        <Kanban_ leads={leads} onOpen={setOpenId} execMap={execMap} onToggleStar={toggleStar} />
       )}
 
       {openId && <LeadDrawer leadId={openId} onClose={() => { setOpenId(null); load(); }} />}
@@ -337,7 +389,7 @@ export default function Leads() {
   );
 }
 
-function Kanban_({ leads, onOpen, execMap }) {
+function Kanban_({ leads, onOpen, execMap, onToggleStar }) {
   return (
     <div className="grid grid-cols-1 md:grid-cols-5 gap-0 border border-gray-200 bg-white">
       {STATUSES.map((s, i) => {
@@ -350,12 +402,30 @@ function Kanban_({ leads, onOpen, execMap }) {
             </div>
             <div className="p-2 space-y-2">
               {items.map((l) => (
-                <button key={l.id} onClick={() => onOpen(l.id)}
-                  className="w-full text-left border border-gray-200 bg-white p-3 hover:border-gray-900 transition-colors"
+                <div key={l.id} onClick={() => onOpen(l.id)}
+                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(l.id); } }}
+                  role="button"
+                  tabIndex={0}
+                  className="w-full text-left border border-gray-200 bg-white p-3 hover:border-gray-900 transition-colors cursor-pointer"
                   data-testid={`kanban-card-${l.id}`}
                 >
-                  <div className="flex items-center justify-between">
-                    <div className="font-semibold text-sm truncate">{l.customer_name}</div>
+                  <div className="flex items-center justify-between gap-1.5">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className="font-semibold text-sm truncate">{l.customer_name}</span>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onToggleStar(l.id, l.starred);
+                        }}
+                        className={`inline-flex items-center justify-center p-1 rounded-full hover:bg-gray-100 transition-colors flex-shrink-0 ${
+                          l.starred ? "text-[#E6B012]" : "text-gray-300 hover:text-gray-400"
+                        }`}
+                        title={l.starred ? "Unstar lead" : "Star lead"}
+                        data-testid={`lead-star-btn-kanban-${l.id}`}
+                      >
+                        <Star size={14} weight={l.starred ? "fill" : "regular"} />
+                      </button>
+                    </div>
                     <SourceBadge source={l.source} />
                   </div>
                   <div className="text-xs text-gray-500 mt-1 truncate">{l.requirement || "—"}</div>
@@ -365,7 +435,7 @@ function Kanban_({ leads, onOpen, execMap }) {
                       {execMap[l.assigned_to]?.name || "Unassigned"}
                     </div>
                   </div>
-                </button>
+                </div>
               ))}
             </div>
           </div>

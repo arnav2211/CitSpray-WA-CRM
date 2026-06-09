@@ -161,6 +161,10 @@ export default function LeadDrawer({ leadId, onClose }) {
     } catch (e) { toast.error(errMsg(e)); }
   };
 
+  const toggleStar = async () => {
+    await update({ starred: !lead.starred });
+  };
+
   const saveName = async () => {
     const aliases = aliasDraft
       .split(",")
@@ -313,6 +317,16 @@ export default function LeadDrawer({ leadId, onClose }) {
               <SourceBadge source={lead.source} />
               <QueryTypeBadge code={lead.source_data?.QUERY_TYPE} />
               <StatusBadge status={lead.status} />
+              <button
+                onClick={toggleStar}
+                className={`inline-flex items-center justify-center p-1 rounded-full hover:bg-gray-100 transition-colors ${
+                  lead.starred ? "text-[#E6B012]" : "text-gray-300 hover:text-gray-400"
+                }`}
+                title={lead.starred ? "Unstar lead" : "Star lead"}
+                data-testid="lead-star-btn-drawer"
+              >
+                <Star size={16} weight={lead.starred ? "fill" : "regular"} />
+              </button>
               {!lead.opened_at && <span className="text-[10px] uppercase tracking-widest font-bold text-[#E60000]">Unopened</span>}
             </div>
             {/* Name + alias edit */}

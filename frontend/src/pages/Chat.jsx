@@ -7,7 +7,7 @@ import {
   MagnifyingGlass, PaperPlaneRight, ChatCircleDots, Phone, ArrowsClockwise, Plus, ArrowLeft,
   Funnel, Lightning, ArrowsLeftRight, X, Tag, NotePencil, Info,
   Paperclip, Image as ImageIcon, VideoCamera, FileText, Microphone, MapPin, IdentificationCard, Stop,
-  DownloadSimple, Question, ChatTeardropText, CaretLeft, QrCode, PhoneCall, CalendarBlank, Check, Clock,
+  DownloadSimple, Question, ChatTeardropText, CaretLeft, QrCode, PhoneCall, CalendarBlank, Check, Clock, Star,
 } from "@phosphor-icons/react";
 import { fmtIST, fmtISTTime, fmtSmartShort, fmtSmartLong, fmtTime12, fmtDaySeparator, istDayKey } from "@/lib/format";
 import { StatusBadge, SourceBadge } from "@/components/Badges";
@@ -63,6 +63,7 @@ export default function Chat() {
   const [filterUnread, setFilterUnread] = useState(false);
   const [filterUnreplied, setFilterUnreplied] = useState(false);
   const [filterReplied, setFilterReplied] = useState(false);
+  const [filterStarred, setFilterStarred] = useState(false);
   const [filterStatus, setFilterStatus] = useState("");
   const [filterAssignee, setFilterAssignee] = useState("");
   const [execs, setExecs] = useState([]);
@@ -101,10 +102,29 @@ export default function Chat() {
   // Global cross-conversation message search (WhatsApp "Search by messages")
   const [searchMode, setSearchMode] = useState("chats"); // 'chats' | 'messages'
   const [msgResults, setMsgResults] = useState({ items: [], total: 0, loading: false });
-  // When user clicks a message-search hit we set this so ChatThread knows to
+  // Keep track of the active lead's conversation object (resolved from convs list)
+  const activeConv = useMemo(() => convs.find((c) => c.id === activeId) || null, [convs, activeId]);
+
+  // Jump-to-message states: when user clicks a search result, we set
+  // pendingJumpMessageId, which is read by ChatThread once activeId resolves,
   // scroll to + flash that exact bubble after the conversation loads.
   const [pendingJumpMessageId, setPendingJumpMessageId] = useState(null);
   const listScrollRef = useRef(null);
+
+  const handleToggleStar = async (leadId, currentStarred) => {
+    try {
+      setConvs((prev) =>
+        prev.map((c) => (c.id === leadId ? { ...c, starred: !currentStarred } : c))
+      );
+      await api.patch(`/leads/${leadId}`, { starred: !currentStarred });
+      toast.success(currentStarred ? "Lead unstarred" : "Lead starred");
+    } catch (e) {
+      toast.error(errMsg(e));
+      setConvs((prev) =>
+        prev.map((c) => (c.id === leadId ? { ...c, starred: currentStarred } : c))
+      );
+    }
+  };
 
   const fetchConvs = useCallback(async (opts = {}) => {
     const { reset = false } = opts;
@@ -120,6 +140,7 @@ export default function Chat() {
           only_replied: filterReplied || undefined,
           status: filterStatus || undefined,
           assigned_to: filterAssignee || undefined,
+          starred: filterStarred ? true : undefined,
           limit: PAGE_SIZE,
           offset: nextOffset,
         },
@@ -149,7 +170,7 @@ export default function Chat() {
     } finally {
       setLoadingMore(false);
     }
-  }, [search, filterUnread, filterUnreplied, filterReplied, filterStatus, filterAssignee, page, loadingMore, hasMore]);
+  }, [search, filterUnread, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred, page, loadingMore, hasMore]);
 
   // Refresh-only fetch — re-pulls page 0 for live unread updates without
   // disrupting any further pages the user has scrolled into.
@@ -163,6 +184,7 @@ export default function Chat() {
           only_replied: filterReplied || undefined,
           status: filterStatus || undefined,
           assigned_to: filterAssignee || undefined,
+          starred: filterStarred ? true : undefined,
           limit: PAGE_SIZE,
           offset: 0,
         },
@@ -180,7 +202,7 @@ export default function Chat() {
         return merged;
       });
     } catch (_) { /* silent */ }
-  }, [search, filterUnread, filterUnreplied, filterReplied, filterStatus, filterAssignee]);
+  }, [search, filterUnread, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred]);
 
   // Run global message search (debounced 250ms via the effect re-trigger)
   const runMessageSearch = useCallback(async (term) => {
@@ -217,7 +239,7 @@ export default function Chat() {
     setPage(0);
     fetchConvs({ reset: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search, filterUnread, filterUnreplied, filterReplied, filterStatus, filterAssignee]);
+  }, [search, filterUnread, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred]);
 
   // Live polling — refresh ONLY page 0 (keeps further pages stable while user scrolls)
   useEffect(() => {
@@ -350,6 +372,7 @@ export default function Chat() {
             <FilterChip active={filterUnread} onClick={() => setFilterUnread(v => !v)} testId="filter-unread">Unread</FilterChip>
             <FilterChip active={filterUnreplied} onClick={() => setFilterUnreplied(v => !v)} testId="filter-unreplied">Not replied</FilterChip>
             <FilterChip active={filterReplied} onClick={() => setFilterReplied(v => !v)} testId="filter-replied">Replied</FilterChip>
+            <FilterChip active={filterStarred} onClick={() => setFilterStarred(v => !v)} testId="filter-starred">Starred</FilterChip>
             <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)} className="border border-gray-300 px-2 py-1 text-xs" data-testid="filter-status">
               <option value="">All status</option>
               {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
@@ -403,7 +426,7 @@ export default function Chat() {
                   No conversations match these filters
                 </div>
               ) : convs.map((c) => (
-                <ConvRow key={c.id} c={c} active={c.id === activeId} onClick={() => setActiveId(c.id)} execs={execs} />
+                <ConvRow key={c.id} c={c} active={c.id === activeId} onClick={() => setActiveId(c.id)} execs={execs} onToggleStar={handleToggleStar} />
               ))}
               {hasMore && convs.length > 0 && (
                 <div className="p-3 text-center text-[10px] uppercase tracking-widest text-gray-400 font-bold" data-testid="conv-list-loading">
@@ -434,6 +457,7 @@ export default function Chat() {
             initialPhone={initialDeeplink.phone}
             jumpToMessageId={pendingJumpMessageId}
             onJumpConsumed={() => setPendingJumpMessageId(null)}
+            onToggleStar={handleToggleStar}
           />
         ) : (
           <EmptyState />
@@ -453,13 +477,17 @@ export default function Chat() {
 }
 
 // ---------------- Sidebar row ----------------
-function ConvRow({ c, active, onClick, execs }) {
+function ConvRow({ c, active, onClick, execs, onToggleStar }) {
   const last = c.last_message || {};
   const exec = execs.find(e => e.id === c.assigned_to);
   const hasUnread = (c.unread || 0) > 0;
   return (
-    <button onClick={onClick} data-testid={`conv-row-${c.id}`}
-      className={`w-full text-left px-3 py-3 flex gap-3 border-b border-gray-100 transition-colors ${
+    <div onClick={onClick}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onClick(); } }}
+      role="button"
+      tabIndex={0}
+      data-testid={`conv-row-${c.id}`}
+      className={`w-full text-left px-3 py-3 flex gap-3 border-b border-gray-100 transition-colors cursor-pointer ${
         active
           ? "bg-[#F0F2F5]"
           : hasUnread
@@ -471,8 +499,23 @@ function ConvRow({ c, active, onClick, execs }) {
         {(c.customer_name || "?").slice(0, 1).toUpperCase()}
       </div>
       <div className="flex-1 min-w-0">
-        <div className="flex items-center justify-between">
-          <div className={`text-sm truncate ${hasUnread ? "font-bold text-gray-900" : "font-semibold"}`}>{c.customer_name || c.phone}</div>
+        <div className="flex items-center justify-between gap-1.5">
+          <div className="flex items-center gap-1 min-w-0">
+            <span className={`text-sm truncate ${hasUnread ? "font-bold text-gray-900" : "font-semibold"}`}>{c.customer_name || c.phone}</span>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleStar(c.id, c.starred);
+              }}
+              className={`inline-flex items-center justify-center p-1 rounded-full hover:bg-gray-200 transition-colors flex-shrink-0 ${
+                c.starred ? "text-[#E6B012]" : "text-gray-300 hover:text-gray-400"
+              }`}
+              title={c.starred ? "Unstar lead" : "Star lead"}
+              data-testid={`lead-star-btn-chat-${c.id}`}
+            >
+              <Star size={14} weight={c.starred ? "fill" : "regular"} />
+            </button>
+          </div>
           <div className={`text-[10px] shrink-0 ml-2 ${hasUnread ? "text-[#25D366] font-bold" : "text-gray-500"}`} title={last.at ? fmtIST(last.at) : ""}>
             {last.at ? fmtSmartShort(last.at) : ""}
           </div>
@@ -517,7 +560,7 @@ function ConvRow({ c, active, onClick, execs }) {
           )}
         </div>
       </div>
-    </button>
+    </div>
   );
 }
 
@@ -585,7 +628,7 @@ function MessageHitRow({ hit, query, onClick }) {
 
 
 // ---------------- Chat thread ----------------
-function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initialAgentId, initialPhone, jumpToMessageId, onJumpConsumed }) {
+function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initialAgentId, initialPhone, jumpToMessageId, onJumpConsumed, onToggleStar }) {
   const isAdmin = user.role === "admin";
   const canMessage = isAdmin || conv.assigned_to === user.id;
   const [messages, setMessages] = useState([]);
@@ -1173,6 +1216,16 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <div className="font-semibold truncate">{conv.customer_name}</div>
+            <button
+              onClick={() => onToggleStar(conv.id, conv.starred)}
+              className={`inline-flex items-center justify-center p-1 rounded-full hover:bg-gray-100 transition-colors ${
+                conv.starred ? "text-[#E6B012]" : "text-gray-300 hover:text-gray-400"
+              }`}
+              title={conv.starred ? "Unstar lead" : "Star lead"}
+              data-testid={`lead-star-btn-thread-${conv.id}`}
+            >
+              <Star size={16} weight={conv.starred ? "fill" : "regular"} />
+            </button>
             {/* Inline status dropdown — disabled for non-owners */}
             <select
               value={conv.status || "new"}
@@ -1511,6 +1564,21 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
               {conv.email && <InfoRow label="Email"><span className="font-mono text-xs break-all">{conv.email}</span></InfoRow>}
               <InfoRow label="Source"><SourceBadge source={conv.source} /></InfoRow>
               <InfoRow label="Status"><StatusBadge status={conv.status} /></InfoRow>
+              <InfoRow label="Starred">
+                <button
+                  onClick={() => onToggleStar(conv.id, conv.starred)}
+                  className={`inline-flex items-center justify-center p-1 rounded-full hover:bg-gray-100 transition-colors ${
+                    conv.starred ? "text-[#E6B012]" : "text-gray-300 hover:text-gray-400"
+                  }`}
+                  title={conv.starred ? "Unstar lead" : "Star lead"}
+                  data-testid={`lead-star-btn-details-${conv.id}`}
+                >
+                  <Star size={16} weight={conv.starred ? "fill" : "regular"} />
+                  <span className="text-xs font-semibold ml-1.5 text-gray-700">
+                    {conv.starred ? "Starred" : "Not starred"}
+                  </span>
+                </button>
+              </InfoRow>
               <InfoRow label="Requirement">
                 <div className="text-xs text-gray-700 whitespace-pre-wrap">{conv.requirement || "—"}</div>
               </InfoRow>

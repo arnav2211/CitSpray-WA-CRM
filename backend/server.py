@@ -384,6 +384,7 @@ class LeadUpdate(BaseModel):
     status: Optional[Literal["new", "contacted", "qualified", "converted", "lost"]] = None
     assigned_to: Optional[str] = None
     active_wa_phone: Optional[str] = None
+    starred: Optional[bool] = None
 
 
 CALL_OUTCOMES = ("connected", "no_response", "rejected", "not_reachable", "busy", "invalid")
@@ -1545,6 +1546,7 @@ async def list_leads(
     limit: int = 500,
     offset: int = 0,
     paginate: bool = False,
+    starred: Optional[bool] = None,
 ):
     """List leads with optional filters. Backwards-compatible:
     - Default returns a bare array (existing callers unchanged).
@@ -1560,6 +1562,8 @@ async def list_leads(
             query["assigned_to"] = assigned_to
     if status:
         query["status"] = status
+    if starred:
+        query["starred"] = True
     if source:
         query["source"] = source
     if last_call_outcome:
@@ -1871,7 +1875,7 @@ async def update_lead(lead_id: str, body: LeadUpdate, user: dict = Depends(get_c
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     updates: Dict[str, Any] = {}
-    for f in ["customer_name", "phone", "phones", "aliases", "email", "requirement", "area", "city", "state", "status", "active_wa_phone"]:
+    for f in ["customer_name", "phone", "phones", "aliases", "email", "requirement", "area", "city", "state", "status", "active_wa_phone", "starred"]:
         v = getattr(body, f)
         if v is not None:
             updates[f] = v
@@ -3328,6 +3332,7 @@ async def list_conversations(
     include_all: bool = False,
     limit: int = 50,
     offset: int = 0,
+    starred: Optional[bool] = None,
 ):
     """Returns a list of leads optimized for the chat inbox: each row carries last_msg preview,
     unread count, last_user_message_at and within_24h flag.
@@ -3349,6 +3354,8 @@ async def list_conversations(
         query["assigned_to"] = assigned_to
     if status:
         query["status"] = status
+    if starred:
+        query["starred"] = True
     if q:
         import re as _re
         q_safe = _re.escape(q)
@@ -3449,7 +3456,7 @@ async def list_conversations(
                 "id", "customer_name", "phone", "phones", "email", "requirement",
                 "area", "city", "state", "source", "source_data", "status",
                 "assigned_to", "contact_link", "created_at", "opened_at", "last_action_at",
-                "has_whatsapp", "notes",
+                "has_whatsapp", "notes", "starred",
             ]},
             "last_message": {
                 "body": last.get("body"),
@@ -3569,7 +3576,7 @@ async def get_one_conversation(lead_id: str, user: dict = Depends(get_current_us
             "id", "customer_name", "phone", "phones", "email", "requirement",
             "area", "city", "state", "source", "source_data", "status",
             "assigned_to", "contact_link", "created_at", "opened_at", "last_action_at",
-            "has_whatsapp", "notes",
+            "has_whatsapp", "notes", "starred",
         ]},
         "last_message": {
             "body": last.get("body"),
