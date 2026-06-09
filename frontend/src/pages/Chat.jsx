@@ -307,7 +307,6 @@ export default function Chat() {
     return () => { cancelled = true; };
   }, [activeId, convs]);
 
-  const activeConv = useMemo(() => convs.find(c => c.id === activeId), [convs, activeId]);
   const totalUnread = convs.reduce((s, c) => s + (c.unread || 0), 0);
   // Capture the initial deep-link params ONCE so the URL-sync effect below doesn't
   // strip them before ChatThread mounts (convs are loaded async).
