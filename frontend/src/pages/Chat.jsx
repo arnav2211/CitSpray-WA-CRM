@@ -653,6 +653,23 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   const [showAttach, setShowAttach] = useState(false);
   const [attachMode, setAttachMode] = useState(null);  // 'location' | 'contact' | null
   const [recording, setRecording] = useState(null);  // {recorder, chunks, startedAt} or null
+  const [targetLang, setTargetLang] = useState("hi");
+  const [translatingInput, setTranslatingInput] = useState(false);
+
+  const handleTranslateInput = async () => {
+    if (!draft.trim()) return;
+    setTranslatingInput(true);
+    try {
+      const { data } = await api.post("/translate", { text: draft, target_lang: targetLang });
+      setDraft(data.translated_text);
+      toast.success("Message translated!");
+    } catch (err) {
+      toast.error("Translation failed");
+    } finally {
+      setTranslatingInput(false);
+    }
+  };
+
   const scrollRef = useRef(null);
   const fileInputRef = useRef(null);
   const fileKindRef = useRef("image");
@@ -1484,6 +1501,37 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                 className={`px-3 py-2 text-[10px] uppercase tracking-widest font-bold ${showTpl ? "bg-gray-900 text-white" : "border border-gray-300 hover:bg-gray-200"}`} data-testid="tpl-toggle">
                 Tpl
               </button>
+              <div className="flex items-center gap-1 border border-gray-300 px-1.5 py-1 bg-white shrink-0" data-testid="composer-translator">
+                <select
+                  value={targetLang}
+                  onChange={(e) => setTargetLang(e.target.value)}
+                  className="bg-transparent text-[11px] font-bold uppercase tracking-wider outline-none cursor-pointer border-0 py-0.5"
+                  title="Target language for translation"
+                  data-testid="composer-translate-lang-select"
+                >
+                  <option value="hi">Hindi</option>
+                  <option value="mr">Marathi</option>
+                  <option value="gu">Gujarati</option>
+                  <option value="ta">Tamil</option>
+                  <option value="te">Telugu</option>
+                  <option value="kn">Kannada</option>
+                  <option value="ml">Malayalam</option>
+                  <option value="bn">Bengali</option>
+                  <option value="pa">Punjabi</option>
+                  <option value="en">English</option>
+                  <option value="es">Spanish</option>
+                  <option value="ar">Arabic</option>
+                </select>
+                <button
+                  onClick={handleTranslateInput}
+                  disabled={!draft.trim() || translatingInput}
+                  className="text-[10px] hover:bg-gray-100 px-1.5 py-0.5 font-bold uppercase tracking-wider text-[#002FA7] disabled:opacity-40"
+                  title="Translate composer text"
+                  data-testid="composer-translate-btn"
+                >
+                  {translatingInput ? "..." : "Translate"}
+                </button>
+              </div>
               {recording ? (
                 <div className="flex-1 flex items-center gap-2 bg-[#FFE9E9] border border-[#E60000] px-3 py-2 text-sm" data-testid="recording-bar">
                   <span className="w-2 h-2 rounded-full bg-[#E60000] animate-pulse" />
@@ -2121,6 +2169,27 @@ function BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmi
   const isOut = m.direction === "out";
   const isSystem = m.direction === "system";
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [translatedText, setTranslatedText] = useState(null);
+  const [translating, setTranslating] = useState(false);
+
+  const handleTranslate = async () => {
+    if (translatedText) {
+      setTranslatedText(null);
+      return;
+    }
+    const textToTranslate = m.body || m.caption || "";
+    if (!textToTranslate.trim()) return;
+    setTranslating(true);
+    try {
+      const { data } = await api.post("/translate", { text: textToTranslate, target_lang: "en" });
+      setTranslatedText(data.translated_text);
+    } catch (err) {
+      toast.error("Translation failed");
+    } finally {
+      setTranslating(false);
+    }
+  };
+
   if (isSystem) {
     return (
       <div className="flex justify-center my-2">
@@ -2165,6 +2234,9 @@ function BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmi
           <button onClick={() => onReply(m)} className="text-gray-500 hover:text-[#25D366] text-[10px] uppercase tracking-widest font-bold px-1" title="Reply" data-testid={`reply-btn-${m.id}`}>
             ↩
           </button>
+          <button onClick={handleTranslate} className="text-gray-500 hover:text-[#002FA7] text-sm px-1" title={translatedText ? "Show Original" : "Translate to English"} data-testid={`translate-btn-${m.id}`}>
+            🌐
+          </button>
           {onAskAdmin && (
             <button onClick={() => onAskAdmin(m)} className="text-gray-500 hover:text-[#002FA7] text-[10px] uppercase tracking-widest font-bold px-1" title="Ask admin about this message" data-testid={`ask-admin-btn-${m.id}`}>
               <Question size={13} weight="bold" />
@@ -2201,6 +2273,15 @@ function BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmi
         {m.msg_type === "contacts" && renderContacts(m)}
         {captionText && (
           <div className={`whitespace-pre-wrap break-words ${media ? "px-2 pt-1.5" : ""}`}>{captionText}</div>
+        )}
+        {translatedText && (
+          <div className="mt-1.5 pt-1.5 border-t border-gray-200 text-xs text-gray-700 italic" data-testid={`translation-${m.id}`}>
+            <span className="font-bold not-italic text-[10px] uppercase tracking-widest text-[#002FA7] mr-1 block">Translated to English:</span>
+            {translatedText}
+          </div>
+        )}
+        {translating && (
+          <div className="mt-1.5 pt-1.5 border-t border-gray-200 text-[10px] uppercase tracking-widest text-gray-400 font-bold animate-pulse" data-testid={`translating-${m.id}`}>Translating...</div>
         )}
         <div className={`flex items-center justify-end gap-1 mt-1 ${media ? "px-2 pb-1" : ""}`}>
           {isOut && m.status === "failed" && onResend && (

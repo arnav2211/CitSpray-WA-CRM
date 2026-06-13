@@ -7533,6 +7533,44 @@ async def get_alert_history(user=Depends(get_current_user)):
         a["fully_acknowledged"] = acked >= total
     return alerts
 
+class TranslateRequest(BaseModel):
+    text: str
+    target_lang: str = "en"
+
+@api.post("/translate")
+async def translate_text(body: TranslateRequest, user: dict = Depends(get_current_user)):
+    text = body.text.strip()
+    target_lang = body.target_lang.strip()
+    if not text:
+        return {"translated_text": "", "source_lang": ""}
+    
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {
+        "client": "gtx",
+        "sl": "auto",
+        "tl": target_lang,
+        "dt": "t",
+        "q": text
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params=params)
+            if resp.status_code == 200:
+                data = resp.json()
+                translated_segments = []
+                if data and isinstance(data, list) and len(data) > 0 and data[0]:
+                    for segment in data[0]:
+                        if segment and len(segment) > 0:
+                            translated_segments.append(segment[0])
+                translated_text = "".join(translated_segments)
+                source_lang = data[2] if len(data) > 2 else "auto"
+                return {"translated_text": translated_text, "source_lang": source_lang}
+            else:
+                raise HTTPException(status_code=500, detail=f"Google Translate API error: status {resp.status_code}")
+    except Exception as e:
+        logger.error(f"Translation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
+
 # Root ping for api
 @api.get("/")
 async def root():
