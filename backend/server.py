@@ -111,13 +111,13 @@ def phone_match_pattern(query: str) -> Optional[str]:
     """Return a regex pattern that matches stored phone fields against any of the
     common variations (with/without +, +91, 0, spaces, dashes). Indian 10-digit
     inputs are matched against the stored canonical 10-digit form. Anything else
-    is matched on a digits-only suffix of length >= 7."""
+    is matched on a digits-only substring."""
     digits = re.sub(r"\D+", "", query or "")
     if not digits:
         return None
     if len(digits) >= 10:
-        digits = digits[-10:]
-    return re.escape(digits) + "$"
+        return re.escape(digits[-10:]) + "$"
+    return re.escape(digits)
 
 
 _TPL_PLACEHOLDER_RX = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
@@ -3356,6 +3356,8 @@ async def list_conversations(
         query["status"] = status
     if starred:
         query["starred"] = True
+    if not include_all:
+        query["has_whatsapp"] = True
     if q:
         import re as _re
         q_safe = _re.escape(q)
