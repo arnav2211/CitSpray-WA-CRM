@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
 import { useSearchParams } from "react-router-dom";
-import { ArrowSquareOut, Plug, ArrowsClockwise, X, EnvelopeSimple, CheckCircle, Warning } from "@phosphor-icons/react";
+import { ArrowSquareOut, Plug, ArrowsClockwise, X, EnvelopeSimple, CheckCircle, Warning, Eye, EyeSlash } from "@phosphor-icons/react";
 import { fmtIST } from "@/lib/format";
 
 const SLOT_LABELS = { primary: "Primary", secondary: "Secondary" };
@@ -133,6 +133,7 @@ export default function Integrations() {
                 onConnect={() => connect(slot)}
                 onDisconnect={() => disconnect(slot)}
                 onSyncNow={() => syncNow(slot)}
+                onSaved={load}
               />
             ))}
           </div>
@@ -152,16 +153,66 @@ export default function Integrations() {
   );
 }
 
-function SlotPanel({ slot, status, info, busy, onConnect, onDisconnect, onSyncNow }) {
+function SlotPanel({ slot, status, info, busy, onConnect, onDisconnect, onSyncNow, onSaved }) {
   const label = SLOT_LABELS[slot];
   const connected = !!info.connected;
+  const [method, setMethod] = useState("oauth");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [host, setHost] = useState("imap.gmail.com");
+  const [port, setPort] = useState("993");
+  const [showPassword, setShowPassword] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
+  useEffect(() => {
+    if (status) {
+      setMethod(status.oauth_enabled ? "oauth" : "imap");
+    }
+  }, [status]);
+
+  const handleConnectImap = async (e) => {
+    e.preventDefault();
+    if (!email || !password) {
+      toast.error("Email and password are required");
+      return;
+    }
+    setConnecting(true);
+    try {
+      await api.post("/integrations/gmail/connect-imap", {
+        slot,
+        email,
+        password,
+        host: host || "imap.gmail.com",
+        port: parseInt(port) || 993,
+      });
+      toast.success(`${label} Gmail connected via IMAP successfully`);
+      setEmail("");
+      setPassword("");
+      await onSaved?.();
+    } catch (err) {
+      toast.error(errMsg(err));
+    } finally {
+      setConnecting(false);
+    }
+  };
+
   return (
     <div className="p-5 space-y-3" data-testid={`gmail-slot-${slot}`}>
       <div className="flex items-center justify-between">
         <div>
           <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Gmail · {label}</div>
           <div className="mt-0.5 text-sm font-semibold break-all" data-testid={`gmail-slot-email-${slot}`}>
-            {connected ? (info.email || "—") : <span className="text-gray-400 italic">Not connected</span>}
+            {connected ? (
+              <span>
+                {info.email || "—"}{" "}
+                <span className="text-[9px] bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded font-mono uppercase font-bold ml-1 border border-gray-200">
+                  {info.connection_type === "imap" ? "IMAP" : "OAuth"}
+                </span>
+              </span>
+            ) : (
+              <span className="text-gray-400 italic">Not connected</span>
+            )}
           </div>
         </div>
         {connected ? (
@@ -172,27 +223,155 @@ function SlotPanel({ slot, status, info, busy, onConnect, onDisconnect, onSyncNo
       </div>
 
       {!connected && (
-        <>
-          <div className="border border-gray-200 bg-gray-50 p-3 text-xs text-gray-700 leading-relaxed">
-            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Redirect URI</div>
-            <div className="font-mono bg-white border border-gray-300 p-2 break-all" data-testid={`redirect-uri-display-${slot}`}>
-              {status.redirect_uri}
-            </div>
-            <div className="mt-2">Ensure this URI is present under <b>Authorized redirect URIs</b> in your Google Cloud OAuth client, then click Connect.</div>
+        <div className="space-y-3 pt-1">
+          <div className="flex border-b border-gray-200">
+            <button
+              type="button"
+              onClick={() => setMethod("oauth")}
+              className={`pb-2 text-[10px] uppercase tracking-widest font-bold border-b-2 px-3 transition-colors ${
+                method === "oauth"
+                  ? "border-[#002FA7] text-[#002FA7]"
+                  : "border-transparent text-gray-400 hover:text-gray-600"
+              }`}
+            >
+              Google OAuth 2.0
+            </button>
+            <button
+              type="button"
+              onClick={() => setMethod("imap")}
+              className={`pb-2 text-[10px] uppercase tracking-widest font-bold border-b-2 px-3 transition-colors ${
+                method === "imap"
+                  ? "border-[#002FA7] text-[#002FA7]"
+                  : "border-transparent text-gray-400 hover:text-gray-600"
+              }`}
+            >
+              IMAP (App Password)
+            </button>
           </div>
-          <button onClick={onConnect} disabled={busy}
-            className="bg-[#002FA7] hover:bg-[#002288] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-2 disabled:opacity-50"
-            data-testid={`connect-gmail-btn-${slot}`}>
-            <Plug size={14} weight="bold" /> {busy ? "Redirecting…" : `Connect ${label} Gmail`}
-          </button>
-        </>
+
+          {method === "oauth" && (
+            <div className="space-y-3">
+              <div className="border border-gray-200 bg-gray-50 p-3 text-xs text-gray-700 leading-relaxed">
+                <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Redirect URI</div>
+                <div className="font-mono bg-white border border-gray-300 p-2 break-all" data-testid={`redirect-uri-display-${slot}`}>
+                  {status.redirect_uri || "N/A (OAuth not configured)"}
+                </div>
+                {status.oauth_enabled ? (
+                  <div className="mt-2">Ensure this URI is present under <b>Authorized redirect URIs</b> in your Google Cloud OAuth client, then click Connect.</div>
+                ) : (
+                  <div className="mt-2 text-[#E60000] font-semibold">⚠️ Google OAuth client is not configured in server environment variables. Please use IMAP instead.</div>
+                )}
+              </div>
+              <button onClick={onConnect} disabled={busy || !status.oauth_enabled}
+                className="bg-[#002FA7] hover:bg-[#002288] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-2 disabled:opacity-50 transition-colors"
+                data-testid={`connect-gmail-btn-${slot}`}>
+                <Plug size={14} weight="bold" /> {busy ? "Redirecting…" : `Connect ${label} Gmail`}
+              </button>
+            </div>
+          )}
+
+          {method === "imap" && (
+            <form onSubmit={handleConnectImap} className="space-y-3 border border-gray-200 p-3.5 bg-gray-50">
+              <div>
+                <label className="block text-[9px] uppercase tracking-wider text-gray-500 font-bold mb-1">Email Address</label>
+                <input
+                  type="email"
+                  required
+                  placeholder="e.g. user@gmail.com"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  className="w-full border border-gray-300 px-3 py-1.5 text-xs focus:outline-none focus:border-[#002FA7] font-medium text-black bg-white"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[9px] uppercase tracking-wider text-gray-500 font-bold mb-1">App Password</label>
+                <div className="relative">
+                  <input
+                    type={showPassword ? "text" : "password"}
+                    required
+                    placeholder="16-character google app password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    className="w-full border border-gray-300 pl-3 pr-9 py-1.5 text-xs focus:outline-none focus:border-[#002FA7] font-mono text-black bg-white"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-2.5 top-2.5 text-gray-400 hover:text-gray-600 transition-colors"
+                  >
+                    {showPassword ? <EyeSlash size={14} weight="bold" /> : <Eye size={14} weight="bold" />}
+                  </button>
+                </div>
+                <p className="text-[10px] text-gray-500 mt-1 leading-normal">
+                  💡 <b>Google App Password</b> is required if 2-Factor Auth is enabled. Generate one in{" "}
+                  <a
+                    href="https://myaccount.google.com/apppasswords"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-[#002FA7] hover:underline"
+                  >
+                    Google Account → Security → App passwords
+                  </a>.
+                </p>
+              </div>
+
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={() => setShowAdvanced(!showAdvanced)}
+                  className="text-[9px] text-gray-400 hover:text-gray-600 uppercase tracking-widest font-bold flex items-center gap-1.5"
+                >
+                  {showAdvanced ? "Hide" : "Show"} Advanced Settings
+                </button>
+                {showAdvanced && (
+                  <div className="grid grid-cols-2 gap-2 mt-2 pt-2 border-t border-gray-200">
+                    <div>
+                      <label className="block text-[9px] uppercase tracking-wider text-gray-500 font-bold mb-0.5">IMAP Host</label>
+                      <input
+                        type="text"
+                        placeholder="imap.gmail.com"
+                        value={host}
+                        onChange={(e) => setHost(e.target.value)}
+                        className="w-full border border-gray-300 px-2.5 py-1 text-xs focus:outline-none focus:border-[#002FA7] font-mono text-black bg-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[9px] uppercase tracking-wider text-gray-500 font-bold mb-0.5">IMAP Port</label>
+                      <input
+                        type="number"
+                        placeholder="993"
+                        value={port}
+                        onChange={(e) => setPort(e.target.value)}
+                        className="w-full border border-gray-300 px-2.5 py-1 text-xs focus:outline-none focus:border-[#002FA7] font-mono text-black bg-white"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <button
+                type="submit"
+                disabled={connecting}
+                className="w-full bg-[#002FA7] hover:bg-[#002288] text-white py-2 text-[10px] uppercase tracking-widest font-bold flex items-center justify-center gap-2 disabled:opacity-50 transition-colors mt-2"
+              >
+                <Plug size={14} weight="bold" /> {connecting ? "Connecting & Verifying..." : `Connect ${label} via IMAP`}
+              </button>
+            </form>
+          )}
+        </div>
       )}
 
       {connected && (
         <>
           <div className="grid grid-cols-2 gap-0 border border-gray-200">
             <Cell k="Connected at" v={fmtIST(info.connected_at)} />
-            <Cell k="Token expires" v={info.expires_at ? fmtIST(info.expires_at) : "—"} />
+            <Cell k="Auth Method" v={info.connection_type === "imap" ? "IMAP (App Password)" : "Google OAuth 2.0"} />
+            {info.connection_type === "imap" ? (
+              <Cell k="IMAP Server" v={`${info.imap_host || "imap.gmail.com"}:${info.imap_port || 993}`} />
+            ) : (
+              <Cell k="Token expires" v={info.expires_at ? fmtIST(info.expires_at) : "—"} />
+            )}
           </div>
           {info.last_poll ? (
             <div className="border border-gray-200 bg-gray-50 p-3 grid grid-cols-2 md:grid-cols-4 gap-3 text-sm" data-testid={`last-poll-stats-${slot}`}>
@@ -212,12 +391,12 @@ function SlotPanel({ slot, status, info, busy, onConnect, onDisconnect, onSyncNo
           )}
           <div className="flex flex-wrap items-center gap-2">
             <button onClick={onSyncNow} disabled={busy}
-              className="border border-gray-900 px-3 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-900 hover:text-white flex items-center gap-2 disabled:opacity-50"
+              className="border border-gray-900 px-3 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-900 hover:text-white flex items-center gap-2 disabled:opacity-50 transition-colors"
               data-testid={`gmail-sync-now-btn-${slot}`}>
               <ArrowsClockwise size={14} weight="bold" /> {busy ? "Syncing…" : "Sync now"}
             </button>
             <button onClick={onDisconnect} disabled={busy}
-              className="border border-[#E60000] text-[#E60000] hover:bg-[#E60000] hover:text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-2 disabled:opacity-50"
+              className="border border-[#E60000] text-[#E60000] hover:bg-[#E60000] hover:text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-2 disabled:opacity-50 transition-colors"
               data-testid={`gmail-disconnect-btn-${slot}`}>
               <Plug size={14} weight="bold" /> Disconnect
             </button>

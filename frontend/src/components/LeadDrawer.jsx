@@ -31,6 +31,7 @@ const OUTCOME_COLOR = {
 export default function LeadDrawer({ leadId, onClose }) {
   const { user } = useAuth();
   const nav = useNavigate();
+  const [activeLeadId, setActiveLeadId] = useState(leadId);
   const [lead, setLead] = useState(null);
   const [messages, setMessages] = useState([]);
   const [activity, setActivity] = useState([]);
@@ -58,23 +59,30 @@ export default function LeadDrawer({ leadId, onClose }) {
   const [callSummary, setCallSummary] = useState("");
   const [savingCall, setSavingCall] = useState(false);
   const [followups, setFollowups] = useState([]);
+  const [showEnquiries, setShowEnquiries] = useState(false);
 
-  const loadAll = async () => {
+  const loadAll = async (targetId) => {
+    const currentId = targetId || activeLeadId;
+    if (!currentId) return;
     try {
-      // Messages are reloaded by the dedicated effect keyed on (leadId, phoneFilter)
+      // Messages are reloaded by the dedicated effect keyed on (activeLeadId, phoneFilter)
       // so we only fetch lead+activity+calls+followups here. This eliminates the race
       // condition where loadAll() and the phone-filter effect would both write
       // setMessages() out of order.
       const [{ data: L }, { data: A }, { data: C }, { data: F }] = await Promise.all([
-        api.get(`/leads/${leadId}`),
-        api.get(`/leads/${leadId}/activity`),
-        api.get(`/leads/${leadId}/calls`),
-        api.get("/followups", { params: { lead_id: leadId } }),
+        api.get(`/leads/${currentId}`),
+        api.get(`/leads/${currentId}/activity`),
+        api.get(`/leads/${currentId}/calls`),
+        api.get("/followups", { params: { lead_id: currentId } }),
       ]);
       setLead(L); setActivity(A); setCalls(C); setFollowups(F || []);
       if (!callPhone) setCallPhone(L.phone || "");
     } catch (e) { toast.error(errMsg(e)); onClose?.(); }
   };
+
+  useEffect(() => {
+    setActiveLeadId(leadId);
+  }, [leadId]);
 
   useEffect(() => {
     (async () => {
@@ -90,9 +98,11 @@ export default function LeadDrawer({ leadId, onClose }) {
         setQuickReplies(Q || []);
       } catch { /* empty */ }
     })();
-    loadAll();
+    if (activeLeadId) {
+      loadAll(activeLeadId);
+    }
     // eslint-disable-next-line
-  }, [leadId]);
+  }, [activeLeadId]);
 
   // ONE source of truth for the per-number chat view.
   // - Initialize phoneFilter from the lead's primary/active number on first load.
@@ -108,24 +118,24 @@ export default function LeadDrawer({ leadId, onClose }) {
   // Reset phoneFilter when switching to a different lead.
   useEffect(() => {
     setPhoneFilter("");
-  }, [leadId]);
+  }, [activeLeadId]);
 
-  // (Re)load messages whenever the (lead, phoneFilter) pair changes. Only this
+  // (Re)load messages whenever the (activeLeadId, phoneFilter) pair changes. Only this
   // effect writes to setMessages — no race with loadAll().
   useEffect(() => {
-    if (!leadId) return;
+    if (!activeLeadId) return;
     let cancelled = false;
     (async () => {
       try {
         const params = phoneFilter ? { phone: phoneFilter } : {};
-        const { data: M } = await api.get(`/leads/${leadId}/messages`, { params });
+        const { data: M } = await api.get(`/leads/${activeLeadId}/messages`, { params });
         if (!cancelled) setMessages(M);
       } catch (e) {
         if (!cancelled) toast.error(errMsg(e));
       }
     })();
     return () => { cancelled = true; };
-  }, [leadId, phoneFilter]);
+  }, [activeLeadId, phoneFilter]);
 
   // Pick a number from the WA-panel tab strip:
   //   - update phoneFilter (drives history reload + which number outbound goes to)
@@ -134,9 +144,21 @@ export default function LeadDrawer({ leadId, onClose }) {
   const selectPhone = (p) => {
     if (!p || p === phoneFilter) return;
     setPhoneFilter(p);
-    api.put(`/leads/${leadId}/active-wa-phone`, { phone: p })
+    api.put(`/leads/${activeLeadId}/active-wa-phone`, { phone: p })
       .then(() => loadAll())
       .catch((e) => toast.error(errMsg(e, "Couldn't update active WhatsApp number")));
+  };
+
+  const handleChanged = (targetId) => {
+    if (targetId && targetId !== activeLeadId) {
+      setActiveLeadId(targetId);
+      if (window.location.pathname.includes(`/leads/${leadId}`)) {
+        nav(`/leads/${targetId}`, { replace: true });
+      }
+      loadAll(targetId);
+    } else {
+      loadAll();
+    }
   };
 
   if (!lead) {
@@ -155,7 +177,7 @@ export default function LeadDrawer({ leadId, onClose }) {
 
   const update = async (patch) => {
     try {
-      const { data } = await api.patch(`/leads/${leadId}`, patch);
+      const { data } = await api.patch(`/leads/${activeLeadId}`, patch);
       setLead(data);
       toast.success("Updated");
     } catch (e) { toast.error(errMsg(e)); }
@@ -185,7 +207,7 @@ export default function LeadDrawer({ leadId, onClose }) {
     if (callOutcome === "connected" && !callSummary.trim()) { toast.error("Summary required for connected calls"); return; }
     setSavingCall(true);
     try {
-      await api.post(`/leads/${leadId}/calls`, {
+      await api.post(`/leads/${activeLeadId}/calls`, {
         phone: callPhone,
         outcome: callOutcome,
         summary: callOutcome === "connected" ? callSummary.trim() : null,
@@ -200,7 +222,7 @@ export default function LeadDrawer({ leadId, onClose }) {
   const addNote = async () => {
     if (!noteText.trim()) return;
     try {
-      await api.post(`/leads/${leadId}/notes`, { body: noteText });
+      await api.post(`/leads/${activeLeadId}/notes`, { body: noteText });
       setNoteText("");
       loadAll();
       toast.success("Note added");
@@ -210,7 +232,7 @@ export default function LeadDrawer({ leadId, onClose }) {
   const sendWA = async () => {
     if (!waText.trim()) return;
     try {
-      await api.post(`/whatsapp/send`, { lead_id: leadId, body: waText });
+      await api.post(`/whatsapp/send`, { lead_id: activeLeadId, body: waText });
       setWaText("");
       loadAll();
       toast.success("WhatsApp sent");
@@ -227,7 +249,7 @@ export default function LeadDrawer({ leadId, onClose }) {
       const placeholderCount = (t.body || "").match(/\{\{[^}]+\}\}/g)?.length || 0;
       const params = placeholderCount > 0 ? Array(placeholderCount).fill(lead.customer_name || "there") : [];
       await api.post("/whatsapp/send", {
-        lead_id: leadId,
+        lead_id: activeLeadId,
         template_name: t.name,
         template_language: t.language || "en_US",
         template_params: params,
@@ -266,7 +288,7 @@ export default function LeadDrawer({ leadId, onClose }) {
 
   const reassign = async (userId) => {
     try {
-      await api.post(`/leads/${leadId}/reassign`, { assigned_to: userId });
+      await api.post(`/leads/${activeLeadId}/reassign`, { assigned_to: userId });
       loadAll();
       toast.success("Reassigned");
     } catch (e) { toast.error(errMsg(e)); }
@@ -288,7 +310,7 @@ export default function LeadDrawer({ leadId, onClose }) {
     );
     if (!ok2) return;
     try {
-      await api.delete(`/leads/${leadId}`);
+      await api.delete(`/leads/${activeLeadId}`);
       toast.success(`Lead "${customerName}" deleted`);
       onClose?.();
     } catch (e) {
@@ -300,7 +322,7 @@ export default function LeadDrawer({ leadId, onClose }) {
     if (!fuDate) { toast.error("Pick a date/time"); return; }
     try {
       const dueIso = new Date(fuDate).toISOString();
-      await api.post("/followups", { lead_id: leadId, due_at: dueIso, note: fuNote });
+      await api.post("/followups", { lead_id: activeLeadId, due_at: dueIso, note: fuNote });
       setFuDate(""); setFuNote("");
       toast.success("Follow-up scheduled");
       loadAll();
@@ -390,8 +412,8 @@ export default function LeadDrawer({ leadId, onClose }) {
                 <Clock size={12} /> {fmtIST(lead.created_at)}
               </span>
             </div>
-            <PhonesRow lead={lead} canEdit={canEdit} onChanged={loadAll} />
-            <EmailsRow lead={lead} canEdit={canEdit} onChanged={loadAll} />
+            <PhonesRow lead={lead} canEdit={canEdit} onChanged={handleChanged} />
+            <EmailsRow lead={lead} canEdit={canEdit} onChanged={handleChanged} />
           </div>
           <div className="flex items-start gap-1 shrink-0">
             <button onClick={() => setShowActivity(true)} className="border border-gray-300 hover:bg-gray-100 p-2" title="Lead activity & history" data-testid="open-activity-btn">
@@ -519,7 +541,49 @@ export default function LeadDrawer({ leadId, onClose }) {
               onSubmit={submitCall}
             />
 
-            <OMSDataSection leadId={leadId} />
+            {/* Inquiries section */}
+            {lead.enquiries && lead.enquiries.length > 0 && (
+              <section data-testid="enquiries-section">
+                <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2 flex items-center justify-between">
+                  <span>Inquiries ({lead.enquiries.length})</span>
+                  {lead.enquiries.length > 1 && (
+                    <button
+                      onClick={() => setShowEnquiries(!showEnquiries)}
+                      className="text-[#002FA7] text-[10px] uppercase tracking-widest font-bold hover:underline"
+                    >
+                      {showEnquiries ? "Hide All" : "View All"}
+                    </button>
+                  )}
+                </div>
+                
+                <div className="space-y-2">
+                  {(showEnquiries ? lead.enquiries : [lead.enquiries[lead.enquiries.length - 1]]).slice().reverse().map((enq, idx) => (
+                    <div key={enq.id || idx} className="border border-gray-200 p-3 bg-white space-y-1">
+                      <div className="flex justify-between items-center flex-wrap text-xs text-gray-500">
+                        <span className="font-bold text-[#002FA7] uppercase tracking-widest text-[10px]">{enq.source || "Unknown"}</span>
+                        <span className="font-mono">{fmtIST(enq.created_at)}</span>
+                      </div>
+                      {enq.requirement && (
+                        <div className="text-sm font-semibold text-gray-800">{enq.requirement}</div>
+                      )}
+                      {enq.customer_name && enq.customer_name !== lead.customer_name && (
+                        <div className="text-xs text-gray-500">Name: {enq.customer_name}</div>
+                      )}
+                      {(enq.area || enq.city) && (
+                        <div className="text-xs text-gray-500">Location: {[enq.area, enq.city].filter(Boolean).join(", ")}</div>
+                      )}
+                      {enq.contact_link && (
+                        <a href={enq.contact_link} target="_blank" rel="noreferrer" className="text-xs text-blue-600 hover:underline flex items-center gap-0.5 mt-1">
+                          View details link <ArrowSquareOut size={10} />
+                        </a>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            <OMSDataSection leadId={activeLeadId} />
 
             <section>
               <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2">Notes</div>
@@ -603,7 +667,7 @@ export default function LeadDrawer({ leadId, onClose }) {
                 <WhatsappLogo size={12} /> WhatsApp Thread
               </div>
               <button
-                onClick={() => nav(`/chat?lead=${leadId}`)}
+                onClick={() => nav(`/chat?lead=${activeLeadId}`)}
                 className="text-[10px] uppercase tracking-widest font-bold text-white/80 hover:text-white border border-white/20 hover:border-white/60 px-2 py-1 flex items-center gap-1"
                 data-testid="open-full-chat-btn"
               >
@@ -971,11 +1035,18 @@ function PhonesRow({ lead, canEdit, onChanged }) {
     if (!trimmed) return;
     setBusy(true);
     try {
-      await api.post(`/leads/${lead.id}/phones`, { phone: trimmed });
-      toast.success("Phone added");
-      setVal("");
-      setAdding(false);
-      onChanged?.();
+      const resp = await api.post(`/leads/${lead.id}/phones`, { phone: trimmed });
+      if (resp.data && resp.data.merged) {
+        toast.success("Duplicate phone detected! Leads merged successfully.");
+        setVal("");
+        setAdding(false);
+        onChanged?.(resp.data.redirect_lead_id);
+      } else {
+        toast.success("Phone added");
+        setVal("");
+        setAdding(false);
+        onChanged?.();
+      }
     } catch (e) { toast.error(errMsg(e)); }
     finally { setBusy(false); }
   };

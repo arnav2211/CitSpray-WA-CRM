@@ -1367,6 +1367,80 @@ async def _handle_repeat_enquiry(existing: dict, new_data: dict) -> None:
     lead_id = existing["id"]
     current_uid = existing.get("assigned_to")
     new_source = (new_data.get("source") or "").strip() or existing.get("source") or "Manual"
+    new_enquiry = {
+        "id": str(uuid.uuid4()),
+        "customer_name": new_data.get("customer_name", "Unknown"),
+        "phone": new_data.get("phone"),
+        "phones": new_data.get("phones") or [],
+        "email": new_data.get("email"),
+        "emails": new_data.get("emails") or [],
+        "requirement": new_data.get("requirement"),
+        "area": new_data.get("area"),
+        "city": new_data.get("city"),
+        "state": new_data.get("state"),
+        "country": new_data.get("country"),
+        "source": new_source,
+        "contact_link": new_data.get("contact_link"),
+        "justdial_profile_url": new_data.get("justdial_profile_url"),
+        "source_data": new_data.get("source_data", {}),
+        "created_at": new_data.get("_created_at_override") or iso(now_utc()),
+    }
+
+    enquiries = _ensure_lead_enquiries(existing)
+    enquiries.append(new_enquiry)
+    try:
+        enquiries.sort(key=lambda x: x.get("created_at") or "")
+    except Exception:
+        pass
+
+    update_ops: Dict[str, Any] = {
+        "$set": {
+            "last_action_at": iso(now_utc()),
+            "last_enquiry_source": new_source,
+            "last_enquiry_at": iso(now_utc()),
+            "enquiries": enquiries,
+            "status": "new",
+            "opened_at": None,
+        }
+    }
+
+    # Merge phones
+    existing_phones = list(existing.get("phones") or [])
+    primary_phone = existing.get("phone")
+    new_phones = []
+    if new_data.get("phone"):
+        new_phones.append(normalize_phone_display(new_data["phone"]))
+    if new_data.get("phones"):
+        new_phones.extend([normalize_phone_display(p) for p in new_data["phones"] if p])
+    added_phone = False
+    for p in new_phones:
+        if p and p != primary_phone and p not in existing_phones:
+            existing_phones.append(p)
+            added_phone = True
+    if added_phone:
+        update_ops["$set"]["phones"] = existing_phones
+
+    # Merge emails
+    existing_emails = list(existing.get("emails") or [])
+    primary_email = existing.get("email")
+    new_emails = []
+    if new_data.get("email"):
+        new_emails.append(new_data["email"])
+    if new_data.get("emails"):
+        new_emails.extend(new_data["emails"])
+    added_email = False
+    for e in new_emails:
+        if e and e != primary_email and e not in existing_emails:
+            existing_emails.append(e)
+            added_email = True
+    if added_email:
+        update_ops["$set"]["emails"] = existing_emails
+
+    # Backfill missing top-level details if available
+    for field in ["requirement", "area", "city", "state", "country"]:
+        if not existing.get(field) and new_data.get(field):
+            update_ops["$set"][field] = new_data[field]
+
     # Determine if the current assignee is still eligible
     keep_owner = False
     if current_uid:
@@ -1374,7 +1448,6 @@ async def _handle_repeat_enquiry(existing: dict, new_data: dict) -> None:
         if u and not await _is_user_on_leave(current_uid):
             keep_owner = True
 
-    update_ops: Dict[str, Any] = {"$set": {"last_action_at": iso(now_utc()), "last_enquiry_source": new_source, "last_enquiry_at": iso(now_utc())}}
     if keep_owner:
         # Retain existing assignment — no change needed; just touch timestamps.
         await db.leads.update_one({"id": lead_id}, update_ops)
@@ -1403,7 +1476,6 @@ async def _handle_repeat_enquiry(existing: dict, new_data: dict) -> None:
     if target_uid:
         update_ops["$set"]["assigned_to"] = target_uid
         update_ops["$set"]["last_assignment_at"] = iso(now_utc())
-        update_ops["$set"]["opened_at"] = None
         update_ops["$push"] = {"assignment_history": {"user_id": target_uid, "at": iso(now_utc()), "by": None, "reason": "repeat_enquiry_sticky_fallback"}}
         await db.leads.update_one({"id": lead_id}, update_ops)
         await log_activity(None, "repeat_enquiry_reassigned", lead_id, {
@@ -1467,6 +1539,26 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         existing = await db.leads.find_one({"dedup_hash": dhash}, {"_id": 0})
         if existing:
             return existing
+    # Build initial enquiry
+    initial_enquiry = {
+        "id": str(uuid.uuid4()),
+        "customer_name": data.get("customer_name", "Unknown"),
+        "phone": data.get("phone"),
+        "phones": data.get("phones") or [],
+        "email": data.get("email"),
+        "emails": data.get("emails") or [],
+        "requirement": data.get("requirement"),
+        "area": data.get("area"),
+        "city": data.get("city"),
+        "state": data.get("state"),
+        "country": data.get("country"),
+        "source": data.get("source", "Manual"),
+        "contact_link": data.get("contact_link"),
+        "justdial_profile_url": data.get("justdial_profile_url"),
+        "source_data": data.get("source_data", {}),
+        "created_at": data.get("_created_at_override") or iso(now_utc()),
+    }
+
     lead = {
         "id": str(uuid.uuid4()),
         "customer_name": data.get("customer_name", "Unknown"),
@@ -1496,6 +1588,7 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         "has_whatsapp": bool(data.get("has_whatsapp")),
         "last_action_at": iso(now_utc()),
         "created_at": data.get("_created_at_override") or iso(now_utc()),
+        "enquiries": [initial_enquiry],
     }
     await db.leads.insert_one(lead.copy())
     # auto-assign if no explicit assignee
@@ -1967,21 +2060,15 @@ async def add_phone(lead_id: str, body: PhoneInput, user: dict = Depends(get_cur
                 "existing_lead_id": lead_id,
             },
         )
-    # Cross-lead dedup: stop the user from adding a phone that already lives on another lead
+    # Cross-lead dedup: if a phone already lives on another lead, merge this lead into it
     other = await _find_lead_by_phone(new_phone, exclude_id=lead_id)
     if other:
-        owner = await db.users.find_one({"id": other.get("assigned_to")}, {"_id": 0, "name": 1, "username": 1}) or {}
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "duplicate_phone",
-                "message": f"Phone {new_phone} is already on another lead ({other.get('customer_name')}).",
-                "existing_lead_id": other["id"],
-                "owned_by_id": other.get("assigned_to"),
-                "owned_by_name": owner.get("name"),
-                "owned_by_username": owner.get("username"),
-            },
-        )
+        merged_lead = await _merge_leads(source_lead=lead, dest_lead=other, by_user_id=user["id"])
+        return {
+            "merged": True,
+            "redirect_lead_id": other["id"],
+            "lead": merged_lead
+        }
     update: Dict[str, Any] = {"last_action_at": iso(now_utc())}
     is_first_phone = not lead.get("phone")
     if is_first_phone:
@@ -4265,14 +4352,134 @@ def _normalize_justdial_link(url: Optional[str]) -> Optional[str]:
         return url.strip() or None
 
 
+def _ensure_lead_enquiries(lead: dict) -> list:
+    enquiries = lead.get("enquiries")
+    if enquiries and isinstance(enquiries, list):
+        return enquiries
+    
+    # Construct the initial enquiry from the lead's main fields
+    initial_enquiry = {
+        "id": lead.get("initial_enquiry_id") or str(uuid.uuid4()),
+        "customer_name": lead.get("customer_name", "Unknown"),
+        "phone": lead.get("phone"),
+        "phones": lead.get("phones") or [],
+        "email": lead.get("email"),
+        "emails": lead.get("emails") or [],
+        "requirement": lead.get("requirement"),
+        "area": lead.get("area"),
+        "city": lead.get("city"),
+        "state": lead.get("state"),
+        "country": lead.get("country"),
+        "source": lead.get("source", "Manual"),
+        "contact_link": lead.get("contact_link"),
+        "justdial_profile_url": lead.get("justdial_profile_url"),
+        "source_data": lead.get("source_data", {}),
+        "created_at": lead.get("created_at") or iso(now_utc()),
+    }
+    return [initial_enquiry]
+
+
+async def _merge_leads(source_lead: dict, dest_lead: dict, by_user_id: Optional[str] = None) -> dict:
+    """Merge source_lead into dest_lead.
+    - Combines enquiries from both leads.
+    - Combines notes from both leads.
+    - Combines emails and alternate phone numbers.
+    - Re-keys associated messages/chats to target the dest_lead.
+    - Re-keys associated activities to target the dest_lead.
+    - Deletes source_lead from the database.
+    - Resets dest_lead's status to 'new' and opened_at to None so it resurfaces.
+    """
+    dest_id = dest_lead["id"]
+    source_id = source_lead["id"]
+
+    # 1. Compile enquiries
+    dest_enquiries = _ensure_lead_enquiries(dest_lead)
+    source_enquiries = _ensure_lead_enquiries(source_lead)
+    merged_enquiries = dest_enquiries + source_enquiries
+    # Sort merged_enquiries by created_at chronologically
+    try:
+        merged_enquiries.sort(key=lambda x: x.get("created_at") or "")
+    except Exception:
+        pass
+
+    # 2. Compile notes
+    dest_notes = list(dest_lead.get("notes") or [])
+    source_notes = list(source_lead.get("notes") or [])
+    # Add a note explaining the merge
+    merge_note = {
+        "id": str(uuid.uuid4()),
+        "body": f"[System] Merged duplicate lead '{source_lead.get('customer_name')}' (ID: {source_id}) into this lead.",
+        "by": by_user_id or "system",
+        "by_name": "System",
+        "at": iso(now_utc()),
+    }
+    merged_notes = dest_notes + source_notes + [merge_note]
+
+    # 3. Combine alternate phones and emails
+    dest_phones = list(dest_lead.get("phones") or [])
+    all_source_phones = [source_lead.get("phone"), *(source_lead.get("phones") or [])]
+    for p in all_source_phones:
+        p_norm = normalize_phone_display(p) if p else None
+        if p_norm and p_norm != dest_lead.get("phone") and p_norm not in dest_phones:
+            dest_phones.append(p_norm)
+
+    dest_emails = list(dest_lead.get("emails") or [])
+    all_source_emails = [source_lead.get("email"), *(source_lead.get("emails") or [])]
+    for e in all_source_emails:
+        if e and e != dest_lead.get("email") and e not in dest_emails:
+            dest_emails.append(e)
+
+    # 4. Update dest_lead fields in database
+    update_fields = {
+        "enquiries": merged_enquiries,
+        "notes": merged_notes,
+        "phones": dest_phones,
+        "emails": dest_emails,
+        "status": "new",
+        "opened_at": None,
+        "last_action_at": iso(now_utc()),
+    }
+    
+    # If the destination lead didn't have a requirement/area/etc. but the source lead did, copy them
+    for field in ["requirement", "area", "city", "state", "country"]:
+        if not dest_lead.get(field) and source_lead.get(field):
+            update_fields[field] = source_lead[field]
+
+    await db.leads.update_one({"id": dest_id}, {"$set": update_fields})
+
+    # 5. Re-key messages (WhatsApp chats) to the destination lead ID
+    await db.messages.update_many({"lead_id": source_id}, {"$set": {"lead_id": dest_id}})
+
+    # 6. Re-key activities to the destination lead ID
+    await db.activities.update_many({"lead_id": source_id}, {"$set": {"lead_id": dest_id}})
+    
+    # Also log a specific activity for the merge
+    await log_activity(by_user_id, "lead_merged", dest_id, {
+        "merged_lead_id": source_id,
+        "merged_customer_name": source_lead.get("customer_name"),
+    })
+
+    # 7. Delete the source lead
+    await db.leads.delete_one({"id": source_id})
+
+    # Retrieve and return the updated destination lead
+    refreshed = await db.leads.find_one({"id": dest_id}, {"_id": 0})
+    return refreshed
+
+
 async def _find_lead_by_justdial_link(url: Optional[str]) -> Optional[dict]:
     norm = _normalize_justdial_link(url)
     if not norm:
         return None
     return await db.leads.find_one(
-        {"justdial_profile_url": norm},
+        {"$or": [
+            {"justdial_profile_url": norm},
+            {"enquiries.justdial_profile_url": norm},
+            {"enquiries.contact_link": norm},
+        ]},
         {"_id": 0, "id": 1, "customer_name": 1, "assigned_to": 1, "source": 1, "phone": 1},
     )
+
 
 
 @api.post("/ingest/justdial")
@@ -6776,7 +6983,8 @@ async def update_gmail_poll_settings(body: GmailPollSettingsInput, admin: dict =
         {"$set": {"key": "gmail_poll", "interval_seconds": secs, "updated_by": admin["id"], "updated_at": iso(now_utc())}},
         upsert=True,
     )
-    if GMAIL_ENABLED:
+    has_gmail_conns = await db.gmail_connections.count_documents({}) > 0
+    if GMAIL_ENABLED or has_gmail_conns:
         await _reschedule_gmail_poll(secs)
     await log_activity(admin["id"], "gmail_poll_interval_updated", None, {"interval_seconds": secs})
     return {"ok": True, "interval_seconds": secs}
@@ -6787,17 +6995,28 @@ async def gmail_status(user: dict = Depends(get_current_user), slot: Optional[st
     """Returns status for one slot (if `slot` is supplied) or BOTH slots otherwise.
     Back-compat: legacy key='default' docs are migrated to 'primary' on first read."""
     await _ensure_gmail_migrated()
-    if not GMAIL_ENABLED:
-        return {"enabled": False, "reason": "GOOGLE_CLIENT_ID/SECRET/REDIRECT_URI not configured"}
+    secs = await _get_gmail_poll_seconds()
+    oauth_enabled = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI)
+    
     if slot is None:
-        secs = await _get_gmail_poll_seconds()
-        out = {"enabled": True, "slots": {}, "redirect_uri": GOOGLE_REDIRECT_URI, "poll_interval_seconds": secs, "poll_interval_minutes": max(1, secs // 60), "query": GMAIL_QUERY}
+        out = {
+            "enabled": True,
+            "oauth_enabled": oauth_enabled,
+            "slots": {},
+            "redirect_uri": GOOGLE_REDIRECT_URI if oauth_enabled else "",
+            "poll_interval_seconds": secs,
+            "poll_interval_minutes": max(1, secs // 60),
+            "query": GMAIL_QUERY
+        }
         for s in GMAIL_SLOTS:
-            cfg = await db.gmail_connections.find_one({"key": s}, {"_id": 0, "access_token": 0, "refresh_token": 0})
+            cfg = await db.gmail_connections.find_one({"key": s}, {"_id": 0, "access_token": 0, "refresh_token": 0, "imap_password": 0})
             last_poll = await db.gmail_polls.find_one({"key": f"last:{s}"}, {"_id": 0})
             out["slots"][s] = {
                 "connected": bool(cfg),
                 "email": (cfg or {}).get("email"),
+                "connection_type": (cfg or {}).get("connection_type") or "oauth",
+                "imap_host": (cfg or {}).get("imap_host"),
+                "imap_port": (cfg or {}).get("imap_port"),
                 "connected_at": (cfg or {}).get("connected_at"),
                 "connected_by_user_id": (cfg or {}).get("connected_by"),
                 "scopes": (cfg or {}).get("scopes"),
@@ -6805,17 +7024,28 @@ async def gmail_status(user: dict = Depends(get_current_user), slot: Optional[st
                 "last_poll": last_poll,
             }
         return out
+        
     s = _normalize_gmail_slot(slot)
-    cfg = await db.gmail_connections.find_one({"key": s}, {"_id": 0, "access_token": 0, "refresh_token": 0})
+    cfg = await db.gmail_connections.find_one({"key": s}, {"_id": 0, "access_token": 0, "refresh_token": 0, "imap_password": 0})
     if not cfg:
-        return {"enabled": True, "connected": False, "slot": s, "redirect_uri": GOOGLE_REDIRECT_URI}
+        return {
+            "enabled": True,
+            "oauth_enabled": oauth_enabled,
+            "connected": False,
+            "slot": s,
+            "redirect_uri": GOOGLE_REDIRECT_URI if oauth_enabled else ""
+        }
+        
     last_poll = await db.gmail_polls.find_one({"key": f"last:{s}"}, {"_id": 0})
-    secs = await _get_gmail_poll_seconds()
     return {
         "enabled": True,
+        "oauth_enabled": oauth_enabled,
         "connected": True,
         "slot": s,
         "email": cfg.get("email"),
+        "connection_type": cfg.get("connection_type") or "oauth",
+        "imap_host": cfg.get("imap_host"),
+        "imap_port": cfg.get("imap_port"),
         "connected_at": cfg.get("connected_at"),
         "connected_by_user_id": cfg.get("connected_by"),
         "scopes": cfg.get("scopes"),
@@ -6824,7 +7054,7 @@ async def gmail_status(user: dict = Depends(get_current_user), slot: Optional[st
         "poll_interval_seconds": secs,
         "poll_interval_minutes": max(1, secs // 60),
         "query": GMAIL_QUERY,
-        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "redirect_uri": GOOGLE_REDIRECT_URI if oauth_enabled else "",
     }
 
 @api.get("/integrations/gmail/auth/init")
@@ -6936,7 +7166,301 @@ async def gmail_disconnect(admin: dict = Depends(require_admin), slot: Optional[
         except Exception:
             pass
     await db.gmail_connections.delete_one({"key": s})
+    await db.gmail_polls.delete_one({"key": f"last:{s}"})
     return {"ok": True, "slot": s}
+
+
+class ImapConnectInput(BaseModel):
+    slot: str
+    email: str
+    password: str
+    host: Optional[str] = "imap.gmail.com"
+    port: Optional[int] = 993
+
+
+@api.post("/integrations/gmail/connect-imap")
+async def gmail_connect_imap(body: ImapConnectInput, admin: dict = Depends(require_admin)):
+    import imaplib
+    s = _normalize_gmail_slot(body.slot)
+    host = (body.host or "imap.gmail.com").strip()
+    port = body.port or 993
+    email_addr = body.email.strip()
+    password = body.password.strip()
+    
+    if not email_addr or not password:
+        raise HTTPException(status_code=400, detail="Email and password are required")
+        
+    try:
+        def _check_imap():
+            mail = imaplib.IMAP4_SSL(host, port, timeout=15)
+            mail.login(email_addr, password)
+            mail.select("INBOX")
+            mail.logout()
+        await asyncio.get_event_loop().run_in_executor(None, _check_imap)
+    except Exception as e:
+        logger.warning(f"IMAP login verification failed for {email_addr} on {host}: {e}")
+        raise HTTPException(status_code=400, detail=f"IMAP login failed: {str(e)}")
+        
+    other_slot = "secondary" if s == "primary" else "primary"
+    other_cfg = await db.gmail_connections.find_one({"key": other_slot}, {"_id": 0, "email": 1})
+    if other_cfg and (other_cfg.get("email") or "").lower() == email_addr.lower():
+        raise HTTPException(status_code=400, detail="This email is already connected to the other slot")
+        
+    doc = {
+        "key": s,
+        "slot": s,
+        "email": email_addr,
+        "connection_type": "imap",
+        "imap_host": host,
+        "imap_port": port,
+        "imap_password": password,
+        "connected_by": admin["id"],
+        "connected_at": iso(now_utc()),
+    }
+    await db.gmail_connections.update_one({"key": s}, {"$set": doc}, upsert=True)
+    await db.gmail_polls.delete_one({"key": f"last:{s}"})
+    
+    # Enable scheduler job
+    secs = await _get_gmail_poll_seconds()
+    await _reschedule_gmail_poll(secs)
+    
+    return {"ok": True, "slot": s, "email": email_addr}
+
+
+async def _imap_poll_one_slot(slot: str, cfg: dict, summary: dict) -> dict:
+    import imaplib
+    import email
+    from email.header import decode_header
+    import hashlib
+    
+    host = cfg.get("imap_host") or "imap.gmail.com"
+    port = cfg.get("imap_port") or 993
+    email_addr = cfg.get("email")
+    password = cfg.get("imap_password")
+    
+    try:
+        def _do_imap_poll():
+            res_messages = []
+            mail = imaplib.IMAP4_SSL(host, port, timeout=30)
+            try:
+                mail.login(email_addr, password)
+                mail.select("INBOX")
+                status, data = mail.search(None, 'UNSEEN', 'FROM', 'instantemail@justdial.com')
+                if status == 'OK':
+                    mail_ids = data[0].split()
+                    for m_id in mail_ids[:20]:
+                        status, msg_data = mail.fetch(m_id, '(RFC822)')
+                        if status == 'OK' and msg_data:
+                            raw_email = msg_data[0][1]
+                            res_messages.append((m_id, raw_email))
+            finally:
+                try:
+                    mail.logout()
+                except:
+                    pass
+            return res_messages
+
+        fetched_messages = await asyncio.get_event_loop().run_in_executor(None, _do_imap_poll)
+    except Exception as e:
+        logger.exception(f"IMAP poll connection/fetch failed for slot={slot}: {e}")
+        summary["fatal"] = f"IMAP connection failed: {str(e)[:150]}"
+        summary["errors"] += 1
+        return summary
+        
+    summary["fetched"] = len(fetched_messages)
+    m_ids_to_mark_seen = []
+    
+    for m_id, raw_email in fetched_messages:
+        try:
+            msg = email.message_from_bytes(raw_email)
+            msg_id_header = msg.get("Message-ID") or msg.get("Message-Id") or ""
+            gmail_id = msg_id_header.strip().strip("<>") or f"imap-{slot}-{m_id.decode()}"
+            
+            already = await db.email_logs.find_one({"gmail_id": gmail_id}, {"_id": 0, "id": 1})
+            if already:
+                summary["skipped_dupe"] += 1
+                m_ids_to_mark_seen.append(m_id)
+                continue
+                
+            subject = ""
+            subject_header = msg.get("Subject") or ""
+            try:
+                decoded = decode_header(subject_header)
+                for part, encoding in decoded:
+                    if isinstance(part, bytes):
+                        subject += part.decode(encoding or "utf-8", errors="replace")
+                    else:
+                        subject += part
+            except Exception:
+                subject = subject_header
+                
+            from_h = msg.get("From") or ""
+            from_email = parseaddr(from_h)[1] or "instantemail@justdial.com"
+            
+            bodies = {"text": "", "html": ""}
+            if msg.is_multipart():
+                for part in msg.walk():
+                    content_type = part.get_content_type()
+                    content_disposition = str(part.get("Content-Disposition"))
+                    if "attachment" in content_disposition:
+                        continue
+                    payload = part.get_payload(decode=True)
+                    if not payload:
+                        continue
+                    try:
+                        charset = part.get_content_charset() or "utf-8"
+                        text_content = payload.decode(charset, errors="replace")
+                    except Exception:
+                        text_content = payload.decode("utf-8", errors="replace")
+                    
+                    if content_type == "text/plain":
+                        bodies["text"] = text_content
+                    elif content_type == "text/html":
+                        bodies["html"] = text_content
+            else:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    try:
+                        charset = msg.get_content_charset() or "utf-8"
+                        text_content = payload.decode(charset, errors="replace")
+                    except Exception:
+                        text_content = payload.decode("utf-8", errors="replace")
+                    content_type = msg.get_content_type()
+                    if content_type == "text/plain":
+                        bodies["text"] = text_content
+                    elif content_type == "text/html":
+                        bodies["html"] = text_content
+                        
+            parsed = parse_justdial_email(bodies.get("text", ""), bodies.get("html", ""))
+            if not parsed.get("customer_name") and not parsed.get("requirement"):
+                summary["errors"] += 1
+                await db.email_logs.insert_one({
+                    "id": str(uuid.uuid4()),
+                    "from": from_email,
+                    "subject": subject,
+                    "raw_html": bodies.get("html"),
+                    "raw_text": bodies.get("text"),
+                    "received_at": iso(now_utc()),
+                    "processed": True,
+                    "error": "unparseable",
+                    "gmail_id": gmail_id,
+                    "gmail_slot": slot,
+                    "gmail_account_email": email_addr,
+                })
+            else:
+                name = parsed.get("customer_name") or "Justdial Lead"
+                ts = parsed.get("timestamp") or iso(now_utc())
+                content_hash = hashlib.sha256(((bodies.get("text") or "") + (bodies.get("html") or "")).encode("utf-8")).hexdigest()
+                dhash = _lead_dedup_hash(name, ts, content_hash[:16])
+                
+                contact_link = parsed.get("contact_link")
+                profile_url = _normalize_justdial_link(contact_link)
+                if profile_url:
+                    existing_by_url = await _find_lead_by_justdial_link(profile_url)
+                    if existing_by_url:
+                        await db.email_logs.insert_one({
+                            "id": str(uuid.uuid4()),
+                            "from": from_email,
+                            "subject": subject,
+                            "raw_html": bodies.get("html"),
+                            "raw_text": bodies.get("text"),
+                            "received_at": iso(now_utc()),
+                            "processed": True,
+                            "lead_id": existing_by_url["id"],
+                            "duplicate": True,
+                            "dedup_reason": "justdial_profile_url",
+                            "gmail_id": gmail_id,
+                            "gmail_slot": slot,
+                            "gmail_account_email": email_addr,
+                        })
+                        await log_activity(None, "justdial_duplicate_profile_url", existing_by_url["id"], {"url": profile_url, "gmail_id": gmail_id})
+                        summary["skipped_dupe"] += 1
+                        m_ids_to_mark_seen.append(m_id)
+                        continue
+                        
+                created_override = None
+                if parsed.get("timestamp"):
+                    try:
+                        from zoneinfo import ZoneInfo
+                        dt = datetime.strptime(parsed["timestamp"].strip(), "%Y-%m-%d %H:%M:%S")
+                        created_override = iso(dt.replace(tzinfo=ZoneInfo("Asia/Kolkata")))
+                    except Exception:
+                        try:
+                            from datetime import timedelta, timezone as pytimezone
+                            tz_kolkata = pytimezone(timedelta(hours=5, minutes=30))
+                            created_override = iso(dt.replace(tzinfo=tz_kolkata))
+                        except Exception:
+                            created_override = None
+                            
+                if not created_override:
+                    date_header = msg.get("Date")
+                    if date_header:
+                        try:
+                            from email.utils import parsedate_to_datetime
+                            dt = parsedate_to_datetime(date_header)
+                            created_override = iso(dt.astimezone(pytimezone.utc))
+                        except Exception:
+                            pass
+                            
+                data = {
+                    "customer_name": name,
+                    "requirement": parsed.get("requirement"),
+                    "area": parsed.get("area"),
+                    "city": parsed.get("city"),
+                    "state": parsed.get("state"),
+                    "phone": parsed.get("phone"),
+                    "source": "Justdial",
+                    "contact_link": contact_link,
+                    "justdial_profile_url": profile_url,
+                    "source_data": {"timestamp": ts, "subject": subject, "from": from_email, "gmail_id": gmail_id, "gmail_slot": slot, "gmail_account_email": email_addr},
+                    "raw_email_html": bodies.get("html"),
+                    "raw_email_text": bodies.get("text"),
+                    "dedup_hash": dhash,
+                    "_created_at_override": created_override,
+                }
+                lead = await _create_lead_internal(data, by_user_id=None)
+                await db.email_logs.insert_one({
+                    "id": str(uuid.uuid4()),
+                    "from": from_email,
+                    "subject": subject,
+                    "raw_html": bodies.get("html"),
+                    "raw_text": bodies.get("text"),
+                    "received_at": iso(now_utc()),
+                    "processed": True,
+                    "lead_id": lead["id"],
+                    "gmail_id": gmail_id,
+                    "gmail_slot": slot,
+                    "gmail_account_email": email_addr,
+                })
+                summary["ingested"] += 1
+                
+            m_ids_to_mark_seen.append(m_id)
+            
+        except Exception as e:
+            summary["errors"] += 1
+            logger.exception(f"IMAP message processing failed for {m_id} (slot={slot}): {e}")
+            
+    if m_ids_to_mark_seen:
+        try:
+            def _do_imap_mark_seen():
+                mail = imaplib.IMAP4_SSL(host, port, timeout=30)
+                try:
+                    mail.login(email_addr, password)
+                    mail.select("INBOX")
+                    for m_id in m_ids_to_mark_seen:
+                        mail.store(m_id, '+FLAGS', '\\Seen')
+                finally:
+                    try:
+                        mail.logout()
+                    except:
+                        pass
+            await asyncio.get_event_loop().run_in_executor(None, _do_imap_mark_seen)
+        except Exception as e:
+            logger.warning(f"Failed to mark IMAP messages seen: {e}")
+            
+    await db.gmail_polls.replace_one({"key": f"last:{slot}"}, {**summary, "key": f"last:{slot}"}, upsert=True)
+    return summary
+
 
 async def _get_gmail_service(slot: str = "primary"):
     from google.oauth2.credentials import Credentials
@@ -7019,13 +7543,24 @@ def _header(message: dict, name: str) -> str:
     return ""
 
 async def _gmail_poll_one_slot(slot: str) -> dict:
-    """Poll a single Gmail slot for Justdial enquiries. Returns a per-slot summary dict."""
+    """Poll a single Gmail/IMAP slot for Justdial enquiries. Returns a per-slot summary dict."""
     summary = {"slot": slot, "ran_at": iso(now_utc()), "fetched": 0, "ingested": 0, "skipped_dupe": 0, "errors": 0}
-    service, cfg = await _get_gmail_service(slot)
+    cfg = await db.gmail_connections.find_one({"key": slot}, {"_id": 0})
+    if not cfg:
+        summary["error"] = "not_connected"
+        return summary
+    summary["email"] = cfg.get("email")
+    if cfg.get("connection_type") == "imap":
+        return await _imap_poll_one_slot(slot, cfg, summary)
+        
+    if not GMAIL_ENABLED:
+        summary["error"] = "google_oauth_not_configured_on_server"
+        return summary
+        
+    service, _ = await _get_gmail_service(slot)
     if not service:
         summary["error"] = "not_connected"
         return summary
-    summary["email"] = (cfg or {}).get("email")
     try:
         resp = service.users().messages().list(userId="me", q=GMAIL_QUERY, maxResults=20).execute()
         ids = [m["id"] for m in (resp.get("messages") or [])]
@@ -7162,25 +7697,34 @@ async def _gmail_poll_one_slot(slot: str) -> dict:
         summary["fatal"] = str(e)[:200]
         logger.exception(f"Gmail poll task failed for slot={slot}: {e}")
     # Persist per-slot last poll AND keep a combined "last" for back-compat
-    await db.gmail_polls.update_one({"key": f"last:{slot}"}, {"$set": {**summary, "key": f"last:{slot}"}}, upsert=True)
+    await db.gmail_polls.replace_one({"key": f"last:{slot}"}, {**summary, "key": f"last:{slot}"}, upsert=True)
     return summary
 
 
 async def gmail_poll_task():
-    """Poll ALL connected Gmail slots for Justdial enquiries and ingest them.
+    """Poll ALL connected Gmail/IMAP slots for Justdial enquiries and ingest them.
     Uses shared parse / dedup / assignment pipeline so every inbox is processed identically."""
-    if not GMAIL_ENABLED:
-        return
     await _ensure_gmail_migrated()
+    has_conns = await db.gmail_connections.count_documents({}) > 0
+    if not GMAIL_ENABLED and not has_conns:
+        return
     combined = {"key": "last", "ran_at": iso(now_utc()), "fetched": 0, "ingested": 0, "skipped_dupe": 0, "errors": 0, "slots": {}}
+    has_active_slots = False
     for slot in GMAIL_SLOTS:
+        cfg = await db.gmail_connections.find_one({"key": slot}, {"_id": 0})
+        if not cfg:
+            continue
+        if cfg.get("connection_type") != "imap" and not GMAIL_ENABLED:
+            continue
+        has_active_slots = True
         slot_summary = await _gmail_poll_one_slot(slot)
         combined["slots"][slot] = slot_summary
         combined["fetched"] += int(slot_summary.get("fetched") or 0)
         combined["ingested"] += int(slot_summary.get("ingested") or 0)
         combined["skipped_dupe"] += int(slot_summary.get("skipped_dupe") or 0)
         combined["errors"] += int(slot_summary.get("errors") or 0)
-    await db.gmail_polls.update_one({"key": "last"}, {"$set": combined}, upsert=True)
+    if has_active_slots:
+        await db.gmail_polls.replace_one({"key": "last"}, {**combined, "key": "last"}, upsert=True)
 
 @api.post("/integrations/gmail/sync-now")
 async def gmail_sync_now(admin: dict = Depends(require_admin), slot: Optional[str] = None):
@@ -7273,13 +7817,14 @@ async def on_startup():
     await seed_data()
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(auto_reassign_task, "interval", minutes=1, id="auto_reassign", max_instances=1, coalesce=True)
-    if GMAIL_ENABLED:
+    has_gmail_conns = await db.gmail_connections.count_documents({}) > 0
+    if GMAIL_ENABLED or has_gmail_conns:
         gmail_secs = await _get_gmail_poll_seconds()
         scheduler.add_job(
             gmail_poll_task, "interval", seconds=gmail_secs,
             id="gmail_poll", max_instances=1, coalesce=True,
         )
-        logger.info(f"Gmail poll scheduled every {gmail_secs}s")
+        logger.info(f"Gmail/IMAP poll scheduled every {gmail_secs}s")
     # ExportersIndia pull — only schedule if admin has enabled it
     try:
         ei_cfg = await _get_exportersindia_pull_cfg()

@@ -1474,100 +1474,107 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
           )}
 
           {/* Input */}
-          {canMessage ? (
-            <div className="bg-[#F0F2F5] border-t border-gray-200 p-3 flex items-end gap-2 relative" data-testid="chat-composer">
-              <input ref={fileInputRef} type="file" onChange={onFilePicked} className="hidden" data-testid="hidden-file-input" />
-              <button onClick={() => { setShowAttach(v => !v); setShowQR(false); setShowTpl(false); }} title="Attach"
-                className={`p-2 ${showAttach ? "bg-gray-900 text-white" : "hover:bg-gray-200 text-gray-700"}`} disabled={!within24h} data-testid="attach-toggle">
-                <Paperclip size={18} weight="bold" />
-              </button>
-              {showAttach && (
-                <div className="absolute bottom-16 left-3 bg-white border border-gray-200 shadow-md z-10 w-52" data-testid="attach-menu">
-                  <button onClick={() => pickFile("image")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-image"><ImageIcon size={16} className="text-[#C2410C]" /> Photo</button>
-                  <button onClick={() => pickFile("video")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-video"><VideoCamera size={16} className="text-[#BE185D]" /> Video</button>
-                  <button onClick={() => pickFile("document")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-document"><FileText size={16} className="text-[#475569]" /> Document</button>
-                  <button onClick={() => pickFile("audio")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-audio-file"><Microphone size={16} className="text-[#7C3AED]" /> Audio file</button>
-                  <button onClick={startRecording} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-record"><Microphone size={16} weight="fill" className="text-[#E60000]" /> Record voice note</button>
-                  <button onClick={() => { setAttachMode("location"); setShowAttach(false); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-location"><MapPin size={16} className="text-[#0891B2]" /> Location</button>
-                  <button onClick={() => { setAttachMode("contact"); setShowAttach(false); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-contact"><IdentificationCard size={16} className="text-[#15803D]" /> Contact</button>
-                  <button onClick={() => { setAttachMode("payment_qr"); setShowAttach(false); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-payment-qr"><QrCode size={16} className="text-[#002FA7]" /> Payment QR</button>
-                </div>
-              )}
-              <button onClick={() => { setShowQR(v => !v); setShowTpl(false); setShowAttach(false); }} title="Quick replies"
-                className={`p-2 ${showQR ? "bg-gray-900 text-white" : "hover:bg-gray-200 text-gray-700"}`} data-testid="qr-toggle">
-                <Lightning size={18} weight="bold" />
-              </button>
-              <button onClick={() => { setShowTpl(v => !v); setShowQR(false); setShowAttach(false); }} title="Templates"
-                className={`px-3 py-2 text-[10px] uppercase tracking-widest font-bold ${showTpl ? "bg-gray-900 text-white" : "border border-gray-300 hover:bg-gray-200"}`} data-testid="tpl-toggle">
-                Tpl
-              </button>
-              <div className="flex items-center gap-1 border border-gray-300 px-1.5 py-1 bg-white shrink-0" data-testid="composer-translator">
-                <select
-                  value={targetLang}
-                  onChange={(e) => setTargetLang(e.target.value)}
-                  className="bg-transparent text-[11px] font-bold uppercase tracking-wider outline-none cursor-pointer border-0 py-0.5"
-                  title="Target language for translation"
-                  data-testid="composer-translate-lang-select"
-                >
-                  <option value="hi">Hindi</option>
-                  <option value="mr">Marathi</option>
-                  <option value="gu">Gujarati</option>
-                  <option value="ta">Tamil</option>
-                  <option value="te">Telugu</option>
-                  <option value="kn">Kannada</option>
-                  <option value="ml">Malayalam</option>
-                  <option value="bn">Bengali</option>
-                  <option value="pa">Punjabi</option>
-                  <option value="en">English</option>
-                  <option value="es">Spanish</option>
-                  <option value="ar">Arabic</option>
-                </select>
-                <button
-                  onClick={handleTranslateInput}
-                  disabled={!draft.trim() || translatingInput}
-                  className="text-[10px] hover:bg-gray-100 px-1.5 py-0.5 font-bold uppercase tracking-wider text-[#002FA7] disabled:opacity-40"
-                  title="Translate composer text"
-                  data-testid="composer-translate-btn"
-                >
-                  {translatingInput ? "..." : "Translate"}
-                </button>
-              </div>
-              {recording ? (
-                <div className="flex-1 flex items-center gap-2 bg-[#FFE9E9] border border-[#E60000] px-3 py-2 text-sm" data-testid="recording-bar">
-                  <span className="w-2 h-2 rounded-full bg-[#E60000] animate-pulse" />
-                  <span className="text-[#E60000] font-bold">Recording…</span>
-                  <button onClick={stopRecording} className="ml-auto bg-[#E60000] text-white px-3 py-1 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1" data-testid="recording-stop">
-                    <Stop size={12} weight="fill" /> Stop &amp; send
+            <div className="bg-[#F0F2F5] border-t border-gray-200 p-3 flex flex-col gap-2 relative" data-testid="chat-composer">
+              {/* Utility/Toolbar Row */}
+              <div className="flex items-center justify-between sm:justify-start gap-2 flex-wrap">
+                <div className="flex items-center gap-1.5">
+                  <input ref={fileInputRef} type="file" onChange={onFilePicked} className="hidden" data-testid="hidden-file-input" />
+                  <button onClick={() => { setShowAttach(v => !v); setShowQR(false); setShowTpl(false); }} title="Attach"
+                    className={`p-2 rounded hover:bg-gray-200 text-gray-700 ${showAttach ? "bg-gray-900 text-white" : ""}`} disabled={!within24h} data-testid="attach-toggle">
+                    <Paperclip size={18} weight="bold" />
+                  </button>
+                  {showAttach && (
+                    <div className="absolute bottom-full mb-2 left-3 bg-white border border-gray-200 shadow-md z-10 w-52 rounded-md py-1" data-testid="attach-menu">
+                      <button onClick={() => pickFile("image")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-image"><ImageIcon size={16} className="text-[#C2410C]" /> Photo</button>
+                      <button onClick={() => pickFile("video")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-video"><VideoCamera size={16} className="text-[#BE185D]" /> Video</button>
+                      <button onClick={() => pickFile("document")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-document"><FileText size={16} className="text-[#475569]" /> Document</button>
+                      <button onClick={() => pickFile("audio")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-audio-file"><Microphone size={16} className="text-[#7C3AED]" /> Audio file</button>
+                      <button onClick={startRecording} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-record"><Microphone size={16} weight="fill" className="text-[#E60000]" /> Record voice note</button>
+                      <button onClick={() => { setAttachMode("location"); setShowAttach(false); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-location"><MapPin size={16} className="text-[#0891B2]" /> Location</button>
+                      <button onClick={() => { setAttachMode("contact"); setShowAttach(false); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-contact"><IdentificationCard size={16} className="text-[#15803D]" /> Contact</button>
+                      <button onClick={() => { setAttachMode("payment_qr"); setShowAttach(false); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-payment-qr"><QrCode size={16} className="text-[#002FA7]" /> Payment QR</button>
+                    </div>
+                  )}
+                  <button onClick={() => { setShowQR(v => !v); setShowTpl(false); setShowAttach(false); }} title="Quick replies"
+                    className={`p-2 rounded hover:bg-gray-200 text-gray-700 ${showQR ? "bg-gray-900 text-white" : ""}`} data-testid="qr-toggle">
+                    <Lightning size={18} weight="bold" />
+                  </button>
+                  <button onClick={() => { setShowTpl(v => !v); setShowQR(false); setShowAttach(false); }} title="Templates"
+                    className={`px-3 py-2 text-[10px] uppercase tracking-widest font-bold rounded ${showTpl ? "bg-gray-900 text-white" : "border border-gray-300 hover:bg-gray-200"}`} data-testid="tpl-toggle">
+                    Tpl
                   </button>
                 </div>
-              ) : (
-                <textarea
-                  ref={inputRef}
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  disabled={!within24h}
-                  onKeyDown={(e) => {
-                    // Desktop: Enter sends, Shift+Enter newline.
-                    // Mobile: Enter ALWAYS inserts a newline; only the Send button submits.
-                    if (e.key === "Enter" && !e.shiftKey && !isMobile) {
-                      e.preventDefault();
-                      send();
-                    }
-                  }}
-                  placeholder={within24h ? "Type a message…" : "Outside 24-hour window — use a template (Tpl ↑)"}
-                  rows={1}
-                  style={{ maxHeight: 144 }}
-                  className="flex-1 resize-none border border-gray-300 px-3 py-2 text-sm leading-6 outline-none focus:border-[#25D366] disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
-                  data-testid="chat-input"
-                  data-mobile={isMobile ? "1" : "0"}
-                />
-              )}
-              {!recording && (
-                <button onClick={send} disabled={!draft.trim() || sending || !within24h}
-                  className="bg-[#25D366] hover:bg-[#1da851] text-white p-2 disabled:opacity-50 disabled:cursor-not-allowed" data-testid="chat-send-btn">
-                  <PaperPlaneRight size={18} weight="fill" />
-                </button>
-              )}
+                
+                <div className="flex items-center gap-1 border border-gray-300 px-1.5 py-1 bg-white rounded shadow-sm shrink-0" data-testid="composer-translator">
+                  <select
+                    value={targetLang}
+                    onChange={(e) => setTargetLang(e.target.value)}
+                    className="bg-transparent text-[11px] font-bold uppercase tracking-wider outline-none cursor-pointer border-0 py-0.5"
+                    title="Target language for translation"
+                    data-testid="composer-translate-lang-select"
+                  >
+                    <option value="hi">Hindi</option>
+                    <option value="mr">Marathi</option>
+                    <option value="gu">Gujarati</option>
+                    <option value="ta">Tamil</option>
+                    <option value="te">Telugu</option>
+                    <option value="kn">Kannada</option>
+                    <option value="ml">Malayalam</option>
+                    <option value="bn">Bengali</option>
+                    <option value="pa">Punjabi</option>
+                    <option value="en">English</option>
+                    <option value="es">Spanish</option>
+                    <option value="ar">Arabic</option>
+                  </select>
+                  <button
+                    onClick={handleTranslateInput}
+                    disabled={!draft.trim() || translatingInput}
+                    className="text-[10px] hover:bg-gray-100 px-1.5 py-0.5 font-bold uppercase tracking-wider text-[#002FA7] disabled:opacity-40 rounded"
+                    title="Translate composer text"
+                    data-testid="composer-translate-btn"
+                  >
+                    {translatingInput ? "..." : "Translate"}
+                  </button>
+                </div>
+              </div>
+
+              {/* Message Input & Send Row */}
+              <div className="flex items-end gap-2 w-full">
+                {recording ? (
+                  <div className="flex-1 flex items-center gap-2 bg-[#FFE9E9] border border-[#E60000] px-3 py-2 text-sm rounded-md" data-testid="recording-bar">
+                    <span className="w-2 h-2 rounded-full bg-[#E60000] animate-pulse" />
+                    <span className="text-[#E60000] font-bold">Recording…</span>
+                    <button onClick={stopRecording} className="ml-auto bg-[#E60000] text-white px-3 py-1 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 rounded" data-testid="recording-stop">
+                      <Stop size={12} weight="fill" /> Stop &amp; send
+                    </button>
+                  </div>
+                ) : (
+                  <textarea
+                    ref={inputRef}
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    disabled={!within24h}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey && !isMobile) {
+                        e.preventDefault();
+                        send();
+                      }
+                    }}
+                    placeholder={within24h ? "Type a message…" : "Outside 24-hour window — use a template (Tpl ↑)"}
+                    rows={1}
+                    style={{ maxHeight: 144 }}
+                    className="flex-1 resize-none border border-gray-300 rounded px-3 py-2 text-sm leading-6 outline-none focus:border-[#25D366] disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
+                    data-testid="chat-input"
+                    data-mobile={isMobile ? "1" : "0"}
+                  />
+                )}
+                {!recording && (
+                  <button onClick={send} disabled={!draft.trim() || sending || !within24h}
+                    className="bg-[#25D366] hover:bg-[#1da851] text-white p-2 rounded disabled:opacity-50 disabled:cursor-not-allowed" data-testid="chat-send-btn">
+                    <PaperPlaneRight size={18} weight="fill" />
+                  </button>
+                )}
+              </div>
             </div>
           ) : (
             <div className="bg-[#FFE9E9] border-t border-[#E60000] p-3 text-center text-sm text-[#E60000]">
