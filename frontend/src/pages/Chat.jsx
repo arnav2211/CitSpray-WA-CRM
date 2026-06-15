@@ -1474,6 +1474,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
           )}
 
           {/* Input */}
+          {canMessage ? (
             <div className="bg-[#F0F2F5] border-t border-gray-200 p-3 flex flex-col gap-2 relative" data-testid="chat-composer">
               {/* Utility/Toolbar Row */}
               <div className="flex items-center justify-between sm:justify-start gap-2 flex-wrap">
