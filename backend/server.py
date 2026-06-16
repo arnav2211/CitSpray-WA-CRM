@@ -4715,6 +4715,7 @@ async def _handle_exportersindia_payload(payload: Any, identifier: Optional[str]
 
     created_ids: List[str] = []
     skipped_empty = 0
+    skipped_existing = 0
     for e in entries:
         if not isinstance(e, dict):
             continue
@@ -4750,6 +4751,24 @@ async def _handle_exportersindia_payload(payload: Any, identifier: Optional[str]
         enq_date = e.get("enq_date") or e.get("ENQ_DATE") or iso(now_utc())
         dhash = _lead_dedup_hash(name, enq_date, str(inq_id) if inq_id else (phone or ""))
 
+        # Do not pull the lead if it's already in the database
+        existing = None
+        if dhash:
+            existing = await db.leads.find_one({"dedup_hash": dhash}, {"_id": 0, "id": 1})
+        if not existing and phone:
+            norm_phone = normalize_phone_display(phone)
+            if norm_phone:
+                existing = await _find_lead_by_phone(norm_phone)
+        if not existing and email and email.strip():
+            existing = await db.leads.find_one({"email": email.strip()}, {"_id": 0, "id": 1})
+            if not existing:
+                existing = await db.leads.find_one({"emails": email.strip()}, {"_id": 0, "id": 1})
+
+        if existing:
+            logger.info(f"ExportersIndia Ingest: Lead already exists (ID={existing['id']}) - skipping.")
+            skipped_existing += 1
+            continue
+
         data = {
             "customer_name": name,
             "phone": phone,
@@ -4769,9 +4788,22 @@ async def _handle_exportersindia_payload(payload: Any, identifier: Optional[str]
         created_ids.append(lead["id"])
     await db.webhook_payloads.update_one(
         {"id": raw["id"]},
-        {"$set": {"processed": True, "lead_ids": created_ids, "entry_count": len(entries), "skipped_empty": skipped_empty}},
+        {"$set": {
+            "processed": True, 
+            "lead_ids": created_ids, 
+            "entry_count": len(entries), 
+            "skipped_empty": skipped_empty,
+            "skipped_existing": skipped_existing
+        }},
     )
-    return {"status": "SUCCESS", "ok": True, "created": created_ids, "received": len(entries), "skipped_empty": skipped_empty}
+    return {
+        "status": "SUCCESS", 
+        "ok": True, 
+        "created": created_ids, 
+        "received": len(entries), 
+        "skipped_empty": skipped_empty,
+        "skipped_existing": skipped_existing
+    }
 
 
 @api.post("/webhooks/exportersindia")
