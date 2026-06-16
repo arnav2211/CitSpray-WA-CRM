@@ -1590,7 +1590,21 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         "created_at": data.get("_created_at_override") or iso(now_utc()),
         "enquiries": [initial_enquiry],
     }
-    await db.leads.insert_one(lead.copy())
+    from pymongo.errors import DuplicateKeyError
+    try:
+        await db.leads.insert_one(lead.copy())
+    except DuplicateKeyError:
+        jd_url = data.get("justdial_profile_url")
+        if jd_url:
+            existing_summary = await _find_lead_by_justdial_link(jd_url)
+            if existing_summary:
+                existing = await db.leads.find_one({"id": existing_summary["id"]}, {"_id": 0})
+                if existing:
+                    await _handle_repeat_enquiry(existing, data)
+                    refreshed = await db.leads.find_one({"id": existing["id"]}, {"_id": 0})
+                    return refreshed or existing
+        raise
+
     # auto-assign if no explicit assignee
     if not lead["assigned_to"]:
         try:
@@ -7766,7 +7780,15 @@ async def seed_data():
     # indexes
     await db.users.create_index("username", unique=True)
     await db.leads.create_index("dedup_hash")
-    await db.leads.create_index("justdial_profile_url")
+    try:
+        await db.leads.drop_index("justdial_profile_url_1")
+    except Exception:
+        pass
+    await db.leads.create_index(
+        "justdial_profile_url",
+        unique=True,
+        partialFilterExpression={"justdial_profile_url": {"$type": "string"}}
+    )
     await db.leads.create_index("assigned_to")
     await db.leads.create_index("status")
     await db.leads.create_index("created_at")
