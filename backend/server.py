@@ -7781,14 +7781,13 @@ async def seed_data():
     await db.users.create_index("username", unique=True)
     await db.leads.create_index("dedup_hash")
     try:
-        await db.leads.drop_index("justdial_profile_url_1")
-    except Exception:
-        pass
-    await db.leads.create_index(
-        "justdial_profile_url",
-        unique=True,
-        partialFilterExpression={"justdial_profile_url": {"$type": "string"}}
-    )
+        await db.leads.create_index(
+            "justdial_profile_url",
+            unique=True,
+            partialFilterExpression={"justdial_profile_url": {"$type": "string"}}
+        )
+    except Exception as e:
+        logger.warning(f"Could not create unique partial index on justdial_profile_url: {e}")
     await db.leads.create_index("assigned_to")
     await db.leads.create_index("status")
     await db.leads.create_index("created_at")
@@ -7836,12 +7835,18 @@ scheduler: Optional[AsyncIOScheduler] = None
 @app.on_event("startup")
 async def on_startup():
     global scheduler
+    logger.info("DEBUG STARTUP: starting seed_data...")
     await seed_data()
+    logger.info("DEBUG STARTUP: seed_data complete. Initializing scheduler...")
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(auto_reassign_task, "interval", minutes=1, id="auto_reassign", max_instances=1, coalesce=True)
+    logger.info("DEBUG STARTUP: counting gmail_connections...")
     has_gmail_conns = await db.gmail_connections.count_documents({}) > 0
+    logger.info(f"DEBUG STARTUP: gmail connections count done (has_gmail_conns={has_gmail_conns}). GMAIL_ENABLED={GMAIL_ENABLED}")
     if GMAIL_ENABLED or has_gmail_conns:
+        logger.info("DEBUG STARTUP: getting gmail poll seconds...")
         gmail_secs = await _get_gmail_poll_seconds()
+        logger.info(f"DEBUG STARTUP: gmail poll seconds={gmail_secs}. Scheduling gmail_poll...")
         scheduler.add_job(
             gmail_poll_task, "interval", seconds=gmail_secs,
             id="gmail_poll", max_instances=1, coalesce=True,
@@ -7849,7 +7854,9 @@ async def on_startup():
         logger.info(f"Gmail/IMAP poll scheduled every {gmail_secs}s")
     # ExportersIndia pull — only schedule if admin has enabled it
     try:
+        logger.info("DEBUG STARTUP: getting exportersindia pull cfg...")
         ei_cfg = await _get_exportersindia_pull_cfg()
+        logger.info(f"DEBUG STARTUP: exportersindia pull cfg={ei_cfg}")
         if ei_cfg.get("enabled") and ei_cfg.get("api_key") and ei_cfg.get("email"):
             scheduler.add_job(
                 exportersindia_pull_task, "interval",
@@ -7859,6 +7866,7 @@ async def on_startup():
             logger.info(f"ExportersIndia pull enabled every {ei_cfg['interval_seconds']}s")
     except Exception as e:
         logger.warning(f"Could not schedule ExportersIndia pull: {e}")
+    logger.info("DEBUG STARTUP: starting scheduler...")
     scheduler.start()
     logger.info(f"Startup complete; scheduler running (gmail_enabled={GMAIL_ENABLED})")
 
