@@ -18,16 +18,34 @@ function Stat({ label, value, accent, testId }) {
   );
 }
 
+function formatDuration(sec) {
+  if (!sec) return "0s";
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return `${h}h ${remM}m ${s}s`;
+}
+
 export default function Dashboard() {
   const { user } = useAuth();
   const [data, setData] = useState(null);
   const [my, setMy] = useState(null);
   const [recent, setRecent] = useState([]);
+  
+  // Daily calling reports state
+  const [dailyCalls, setDailyCalls] = useState(null);
+  const [dailyDate, setDailyDate] = useState(() => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" }));
+  const [selectedExecId, setSelectedExecId] = useState("");
+
+  const isAdmin = user.role === "admin";
 
   useEffect(() => {
     (async () => {
       try {
-        if (user.role === "admin") {
+        if (isAdmin) {
           const { data: d } = await api.get("/reports/overview");
           setData(d);
         } else {
@@ -38,9 +56,24 @@ export default function Dashboard() {
         setRecent(leads);
       } catch (e) { toast.error(errMsg(e)); }
     })();
-  }, [user.role]);
+  }, [user.role, isAdmin]);
 
-  const isAdmin = user.role === "admin";
+  useEffect(() => {
+    if (user.role === "data_entry") return;
+    (async () => {
+      try {
+        const params = { date: dailyDate };
+        if (isAdmin && selectedExecId) {
+          params.user_id = selectedExecId;
+        }
+        const { data: res } = await api.get("/reports/daily-calls", { params });
+        setDailyCalls(res);
+      } catch (e) {
+        toast.error("Failed to load daily calls: " + errMsg(e));
+      }
+    })();
+  }, [dailyDate, selectedExecId, isAdmin, user.role]);
+
   const byStatusData = data ? Object.entries(data.by_status || {}).map(([k, v]) => ({ name: k, value: v })) : [];
   const bySourceData = data ? Object.entries(data.by_source || {}).map(([k, v]) => ({ name: k, value: v })) : [];
 
@@ -67,6 +100,87 @@ export default function Dashboard() {
             <Stat label="Conversion Rate" value={`${data.conversion_rate}%`} accent="text-[#008A00]" testId="stat-conversion" />
             <Stat label="Reassigned" value={data.reassigned_leads} accent="text-[#002FA7]" testId="stat-reassigned" />
             <Stat label="Missed Follow-ups" value={data.missed_followups} accent="text-[#E60000]" testId="stat-missed" />
+          </div>
+
+          {/* Daily Call Activity Widget */}
+          <div className="border border-gray-200 bg-white p-5 space-y-4">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 pb-3 border-b border-gray-100">
+              <div>
+                <h2 className="font-chivo font-black text-xl text-gray-900">Daily Call Activity</h2>
+                <p className="text-xs text-gray-500">Track dialing metrics, talked calls, and total duration</p>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <select
+                  value={selectedExecId}
+                  onChange={(e) => setSelectedExecId(e.target.value)}
+                  className="border border-gray-300 px-3 py-1.5 text-xs font-semibold focus:outline-none focus:border-gray-900 bg-white"
+                >
+                  <option value="">All Executives</option>
+                  {data.per_executive.map(e => (
+                    <option key={e.id} value={e.id}>{e.name}</option>
+                  ))}
+                </select>
+                <input
+                  type="date"
+                  value={dailyDate}
+                  onChange={(e) => setDailyDate(e.target.value)}
+                  className="border border-gray-300 px-3 py-1.5 text-xs font-mono focus:outline-none focus:border-gray-900"
+                />
+              </div>
+            </div>
+
+            {dailyCalls ? (
+              <>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div className="bg-gray-50 p-4 border border-gray-150">
+                    <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold">Call Attempts</div>
+                    <div className="font-chivo font-black text-2xl mt-1 text-gray-900">{dailyCalls.total_calls}</div>
+                  </div>
+                  <div className="bg-gray-50 p-4 border border-gray-150">
+                    <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold">Connected/Talked Calls</div>
+                    <div className="font-chivo font-black text-2xl mt-1 text-[#008A00]">{dailyCalls.talked_calls}</div>
+                  </div>
+                  <div className="bg-gray-50 p-4 border border-gray-150">
+                    <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold">Total Talk Time</div>
+                    <div className="font-chivo font-black text-2xl mt-1 text-[#002FA7]">
+                      {formatDuration(dailyCalls.total_talk_time_seconds)}
+                    </div>
+                  </div>
+                </div>
+
+                {!selectedExecId && dailyCalls.per_executive && dailyCalls.per_executive.length > 0 && (
+                  <div className="mt-4 pt-3 border-t border-gray-100">
+                    <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2">Executive Breakdown</div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="bg-gray-50 text-[9px] uppercase tracking-widest text-gray-500 font-bold border-b border-gray-200">
+                            <th className="text-left px-3 py-2">Executive Name</th>
+                            <th className="text-right px-3 py-2">Attempts</th>
+                            <th className="text-right px-3 py-2">Connected</th>
+                            <th className="text-right px-3 py-2">Talk Time</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-gray-150">
+                          {dailyCalls.per_executive.map(e => (
+                            <tr key={e.user_id} className="hover:bg-gray-50">
+                              <td className="px-3 py-2 font-semibold text-gray-800">{e.user_name}</td>
+                              <td className="px-3 py-2 text-right font-mono">{e.total_calls}</td>
+                              <td className="px-3 py-2 text-right font-mono text-[#008A00]">{e.talked_calls}</td>
+                              <td className="px-3 py-2 text-right font-mono text-[#002FA7]">
+                                {formatDuration(e.total_talk_time_seconds)}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="text-center py-6 text-xs text-gray-400 uppercase tracking-widest">Loading metrics…</div>
+            )}
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -164,6 +278,45 @@ export default function Dashboard() {
             <Stat label="New" value={my.new_leads} accent="text-[#002FA7]" testId="stat-my-new" />
             <Stat label="Converted" value={my.converted} accent="text-[#008A00]" testId="stat-my-converted" />
             <Stat label="Overdue" value={my.overdue_followups} accent="text-[#E60000]" testId="stat-my-overdue" />
+          </div>
+
+          {/* Daily Call Activity Widget */}
+          <div className="border border-gray-200 bg-white p-5 space-y-4">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 pb-3 border-b border-gray-100">
+              <div>
+                <h2 className="font-chivo font-black text-xl text-gray-900">Daily Call Activity</h2>
+                <p className="text-xs text-gray-500">Track dialing metrics, talked calls, and total duration</p>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="date"
+                  value={dailyDate}
+                  onChange={(e) => setDailyDate(e.target.value)}
+                  className="border border-gray-300 px-3 py-1.5 text-xs font-mono focus:outline-none focus:border-gray-900"
+                />
+              </div>
+            </div>
+
+            {dailyCalls ? (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="bg-gray-50 p-4 border border-gray-150">
+                  <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold">Call Attempts</div>
+                  <div className="font-chivo font-black text-2xl mt-1 text-gray-900">{dailyCalls.total_calls}</div>
+                </div>
+                <div className="bg-gray-50 p-4 border border-gray-150">
+                  <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold">Connected/Talked Calls</div>
+                  <div className="font-chivo font-black text-2xl mt-1 text-[#008A00]">{dailyCalls.talked_calls}</div>
+                </div>
+                <div className="bg-gray-50 p-4 border border-gray-150">
+                  <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold">Total Talk Time</div>
+                  <div className="font-chivo font-black text-2xl mt-1 text-[#002FA7]">
+                    {formatDuration(dailyCalls.total_talk_time_seconds)}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="text-center py-6 text-xs text-gray-400 uppercase tracking-widest">Loading metrics…</div>
+            )}
           </div>
 
           <div className="grid md:grid-cols-2 gap-4">

@@ -23,7 +23,7 @@ import jwt
 import httpx
 from bs4 import BeautifulSoup
 import pandas as pd
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Query, UploadFile, File, Form
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Query, UploadFile, File, Form, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
@@ -335,7 +335,7 @@ class UserCreate(BaseModel):
     username: str
     password: str
     name: str
-    role: Literal["admin", "executive"] = "executive"
+    role: Literal["admin", "executive", "data_entry"] = "executive"
     active: bool = True
     working_hours: List[Dict[str, Any]] = []
     receiver_numbers: List[str] = []
@@ -343,7 +343,7 @@ class UserCreate(BaseModel):
 class UserUpdate(BaseModel):
     name: Optional[str] = None
     password: Optional[str] = None
-    role: Optional[Literal["admin", "executive"]] = None
+    role: Optional[Literal["admin", "executive", "data_entry"]] = None
     active: Optional[bool] = None
     working_hours: Optional[List[Dict[str, Any]]] = None
     receiver_numbers: Optional[List[str]] = None
@@ -365,6 +365,7 @@ class LeadCreate(BaseModel):
     source: str = "Manual"
     enquiry_type: Optional[str] = None
     contact_link: Optional[str] = None
+    gst_no: Optional[str] = None
     source_data: Dict[str, Any] = {}
     assigned_to: Optional[str] = None  # user id
 
@@ -385,6 +386,7 @@ class LeadUpdate(BaseModel):
     assigned_to: Optional[str] = None
     active_wa_phone: Optional[str] = None
     starred: Optional[bool] = None
+    gst_no: Optional[str] = None
 
 
 CALL_OUTCOMES = ("connected", "no_response", "rejected", "not_reachable", "busy", "invalid")
@@ -394,6 +396,19 @@ class CallLogInput(BaseModel):
     phone: str
     outcome: Literal["connected", "no_response", "rejected", "not_reachable", "busy", "invalid"]
     summary: Optional[str] = None  # required only for outcome=connected
+
+
+class SyncedCallRecord(BaseModel):
+    phone: str
+    call_type: str
+    timestamp: str
+    duration_seconds: int
+    note: Optional[str] = None
+    direction: Optional[str] = None
+
+
+class CallSyncBatchInput(BaseModel):
+    logs: List[SyncedCallRecord]
 
 
 class ActiveWaPhoneInput(BaseModel):
@@ -604,6 +619,21 @@ async def delete_user(user_id: str, admin: dict = Depends(require_admin)):
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
     await db.users.delete_one({"id": user_id})
     return {"ok": True}
+
+@api.get("/admin/data-entry-stats")
+async def get_data_entry_stats(admin: dict = Depends(require_admin)):
+    data_entry_users = await db.users.find({"role": "data_entry"}, {"_id": 0, "password_hash": 0}).to_list(100)
+    stats = []
+    for u in data_entry_users:
+        count = await db.leads.count_documents({"created_by": u["id"]})
+        stats.append({
+            "id": u["id"],
+            "username": u["username"],
+            "name": u["name"],
+            "active": u.get("active", True),
+            "leads_uploaded": count
+        })
+    return stats
 
 # ------------- Receiver numbers (PNS / call routing) -------------
 def _normalize_receiver_list(items: List[str]) -> List[str]:
@@ -1115,8 +1145,10 @@ def _exec_in_working_hours(exec_user: dict, at: datetime) -> bool:
     wh = exec_user.get("working_hours") or []
     if not wh:
         return True  # no hours set -> always available
-    weekday = at.weekday()
-    hhmm = at.strftime("%H:%M")
+    from zoneinfo import ZoneInfo
+    at_ist = at.astimezone(ZoneInfo("Asia/Kolkata"))
+    weekday = at_ist.weekday()
+    hhmm = at_ist.strftime("%H:%M")
     for slot in wh:
         try:
             if int(slot.get("weekday", -1)) == weekday:
@@ -1556,6 +1588,7 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         "contact_link": data.get("contact_link"),
         "justdial_profile_url": data.get("justdial_profile_url"),
         "source_data": data.get("source_data", {}),
+        "gst_no": data.get("gst_no"),
         "created_at": data.get("_created_at_override") or iso(now_utc()),
     }
 
@@ -1576,12 +1609,14 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         "source": data.get("source", "Manual"),
         "contact_link": data.get("contact_link"),
         "justdial_profile_url": data.get("justdial_profile_url"),
+        "gst_no": data.get("gst_no"),
         "source_data": data.get("source_data", {}),
         "raw_email_html": data.get("raw_email_html"),
         "raw_email_text": data.get("raw_email_text"),
         "dedup_hash": dhash,
         "status": "new",
         "assigned_to": data.get("assigned_to"),
+        "created_by": by_user_id,
         "assignment_history": [],
         "notes": [],
         "opened_at": None,
@@ -1662,7 +1697,9 @@ async def list_leads(
     - Pass `date_from=YYYY-MM-DD` and/or `date_to=YYYY-MM-DD` (IST, inclusive) to
       narrow by created_at."""
     query: Dict[str, Any] = {}
-    if user["role"] == "executive":
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Access denied")
+    elif user["role"] == "executive":
         query["assigned_to"] = user["id"]
     else:
         if assigned_to:
@@ -1747,12 +1784,12 @@ async def download_upload_template(user: dict = Depends(get_current_user)):
     """Generate and return a sample Excel template for bulk lead uploading."""
     columns = [
         "Customer Name", "Phone", "Email", "Requirement", 
-        "Area", "City", "State", "Country", "Source", "Enquiry Type"
+        "Area", "City", "State", "Country", "Source", "Enquiry Type", "GST No."
     ]
     df = pd.DataFrame(columns=columns)
     df.loc[0] = [
         "John Doe", "8790934618", "john.doe@example.com", "Requires citrus spray sample pack",
-        "Industrial Area", "Hyderabad", "Telangana", "India", "Excel Upload", "Samples"
+        "Industrial Area", "Hyderabad", "Telangana", "India", "Excel Upload", "Samples", "36AAAAA1111A1Z1"
     ]
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -1768,16 +1805,170 @@ async def download_upload_template(user: dict = Depends(get_current_user)):
         }
     )
 
+async def _process_upload_task(
+    upload_id: str,
+    rows: list,
+    target_assignee: Optional[str],
+    source: Optional[str],
+    override_date_str: Optional[str],
+    user_id: str
+):
+    imported_count = 0
+    duplicate_count = 0
+    error_count = 0
+    errors = []
+    processed_count = 0
+    
+    override_date = None
+    if override_date_str:
+        override_date = datetime.fromisoformat(override_date_str)
+        
+    for index, row in enumerate(rows):
+        row_num = index + 2
+        
+        cust_name = row.get("customer_name")
+        if not cust_name or (isinstance(cust_name, float) and pd.isna(cust_name)) or not str(cust_name).strip():
+            err_msg = f"Row {row_num}: Customer Name is missing"
+            errors.append(err_msg)
+            error_count += 1
+            processed_count += 1
+            await db.upload_status.update_one(
+                {"id": upload_id},
+                {"$set": {"processed": processed_count, "errors_count": error_count}, "$push": {"errors": err_msg}}
+            )
+            continue
+            
+        cust_name = str(cust_name).strip()
+        
+        phone_val = row.get("phone")
+        phone_str = None
+        if phone_val and not (isinstance(phone_val, float) and pd.isna(phone_val)) and str(phone_val).strip():
+            if isinstance(phone_val, float):
+                if phone_val.is_integer():
+                    phone_str = str(int(phone_val))
+                else:
+                    phone_str = str(phone_val)
+            else:
+                phone_str = str(phone_val).strip()
+                
+        canonical_phone = None
+        if phone_str:
+            canonical_phone = normalize_phone_display(phone_str)
+            
+        existing = None
+        if canonical_phone:
+            existing = await _find_lead_by_phone(canonical_phone)
+            
+        email = str(row.get("email")).strip() if (row.get("email") and not (isinstance(row.get("email"), float) and pd.isna(row.get("email")))) else None
+        requirement = str(row.get("requirement")).strip() if (row.get("requirement") and not (isinstance(row.get("requirement"), float) and pd.isna(row.get("requirement")))) else None
+        area = str(row.get("area")).strip() if (row.get("area") and not (isinstance(row.get("area"), float) and pd.isna(row.get("area")))) else None
+        city = str(row.get("city")).strip() if (row.get("city") and not (isinstance(row.get("city"), float) and pd.isna(row.get("city")))) else None
+        state = str(row.get("state")).strip() if (row.get("state") and not (isinstance(row.get("state"), float) and pd.isna(row.get("state")))) else None
+        country = str(row.get("country")).strip() if (row.get("country") and not (isinstance(row.get("country"), float) and pd.isna(row.get("country")))) else None
+        
+        row_source = str(row.get("source")).strip() if (row.get("source") and not (isinstance(row.get("source"), float) and pd.isna(row.get("source")))) else None
+        if not row_source:
+            row_source = source if source else "Excel Upload"
+            
+        enquiry_type = str(row.get("enquiry_type")).strip() if (row.get("enquiry_type") and not (isinstance(row.get("enquiry_type"), float) and pd.isna(row.get("enquiry_type")))) else None
+        gst_no = str(row.get("gst_no")).strip() if (row.get("gst_no") and not (isinstance(row.get("gst_no"), float) and pd.isna(row.get("gst_no")))) else None
+        
+        lead_payload = {
+            "customer_name": cust_name,
+            "phone": canonical_phone,
+            "email": email,
+            "requirement": requirement,
+            "area": area,
+            "city": city,
+            "state": state,
+            "country": country,
+            "source": row_source,
+            "enquiry_type": enquiry_type,
+            "gst_no": gst_no,
+            "assigned_to": target_assignee
+        }
+        if override_date:
+            lead_payload["_created_at_override"] = iso(override_date + timedelta(seconds=index))
+            
+        if existing:
+            try:
+                await _handle_repeat_enquiry(existing, {**lead_payload, "source": row_source})
+                duplicate_count += 1
+            except Exception as ex_dup:
+                logger.warning(f"Failed to handle repeat enquiry for duplicate lead: {ex_dup}")
+                err_msg = f"Row {row_num}: Error handling duplicate ({str(ex_dup)})"
+                errors.append(err_msg)
+                error_count += 1
+        else:
+            lead_payload["dedup_hash"] = _lead_dedup_hash(cust_name, iso(now_utc()), canonical_phone or "")
+            try:
+                await _create_lead_internal(lead_payload, by_user_id=user_id)
+                imported_count += 1
+            except Exception as ex_create:
+                logger.error(f"Failed to create lead in upload: {ex_create}")
+                err_msg = f"Row {row_num}: Failed to create lead ({str(ex_create)})"
+                errors.append(err_msg)
+                error_count += 1
+                
+        processed_count += 1
+        await db.upload_status.update_one(
+            {"id": upload_id},
+            {
+                "$set": {
+                    "processed": processed_count,
+                    "imported": imported_count,
+                    "duplicates": duplicate_count,
+                    "errors_count": error_count,
+                    "errors": errors
+                }
+            }
+        )
+        
+    await db.upload_status.update_one(
+        {"id": upload_id},
+        {
+            "$set": {
+                "status": "completed",
+                "summary": {
+                    "total": len(rows),
+                    "imported": imported_count,
+                    "duplicates": duplicate_count,
+                    "errors": error_count
+                }
+            }
+        }
+    )
+
 @api.post("/leads/upload")
 async def upload_leads(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     assigned_to: Optional[str] = Form(None),
+    source: Optional[str] = Form(None),
+    month: Optional[int] = Form(None),
+    year: Optional[int] = Form(None),
     user: dict = Depends(get_current_user)
 ):
     """Bulk upload leads from an Excel or CSV file."""
     target_assignee = assigned_to
     if user["role"] == "executive":
         target_assignee = user["id"]
+    elif user["role"] == "data_entry":
+        target_assignee = None
+        
+    override_date = None
+    if month is not None and year is not None:
+        try:
+            m = int(month)
+            y = int(year)
+            if 1 <= m <= 12 and 1900 <= y <= 2100:
+                import calendar
+                dt = now_utc()
+                max_days = calendar.monthrange(y, m)[1]
+                day = min(dt.day, max_days)
+                override_date = dt.replace(year=y, month=m, day=day)
+        except Exception as ex_date:
+            logger.warning(f"Failed to parse custom upload date: {ex_date}")
         
     contents = await file.read()
     if not contents:
@@ -1816,6 +2007,8 @@ async def upload_leads(
             columns_mapping[col] = "source"
         elif col_lower in ("enquiry type", "enquiry_type", "type"):
             columns_mapping[col] = "enquiry_type"
+        elif col_lower in ("gst no", "gst number", "gstin", "gst"):
+            columns_mapping[col] = "gst_no"
             
     df = df.rename(columns=columns_mapping)
     
@@ -1825,92 +2018,52 @@ async def upload_leads(
             detail="Spreadsheet must contain a 'Customer Name' (or Name, Full Name) column"
         )
         
-    imported_count = 0
-    duplicate_count = 0
-    error_count = 0
-    errors = []
-    
+    rows_list = []
     for index, row in df.iterrows():
-        row_num = index + 2
-        
-        cust_name = row.get("customer_name")
-        if pd.isna(cust_name) or not str(cust_name).strip():
-            errors.append(f"Row {row_num}: Customer Name is missing")
-            error_count += 1
-            continue
-            
-        cust_name = str(cust_name).strip()
-        
-        phone_val = row.get("phone")
-        phone_str = None
-        if not pd.isna(phone_val) and str(phone_val).strip():
-            if isinstance(phone_val, float):
-                if phone_val.is_integer():
-                    phone_str = str(int(phone_val))
-                else:
-                    phone_str = str(phone_val)
+        row_dict = {}
+        for col in df.columns:
+            val = row[col]
+            if pd.isna(val):
+                row_dict[col] = None
             else:
-                phone_str = str(phone_val).strip()
-                
-        canonical_phone = None
-        if phone_str:
-            canonical_phone = normalize_phone_display(phone_str)
-            
-        existing = None
-        if canonical_phone:
-            existing = await _find_lead_by_phone(canonical_phone)
-            
-        email = str(row.get("email")).strip() if not pd.isna(row.get("email")) else None
-        requirement = str(row.get("requirement")).strip() if not pd.isna(row.get("requirement")) else None
-        area = str(row.get("area")).strip() if not pd.isna(row.get("area")) else None
-        city = str(row.get("city")).strip() if not pd.isna(row.get("city")) else None
-        state = str(row.get("state")).strip() if not pd.isna(row.get("state")) else None
-        country = str(row.get("country")).strip() if not pd.isna(row.get("country")) else None
-        source = str(row.get("source")).strip() if not pd.isna(row.get("source")) else "Excel Upload"
-        enquiry_type = str(row.get("enquiry_type")).strip() if not pd.isna(row.get("enquiry_type")) else None
+                row_dict[col] = val
+        rows_list.append(row_dict)
         
-        lead_payload = {
-            "customer_name": cust_name,
-            "phone": canonical_phone,
-            "email": email,
-            "requirement": requirement,
-            "area": area,
-            "city": city,
-            "state": state,
-            "country": country,
-            "source": source,
-            "enquiry_type": enquiry_type,
-            "assigned_to": target_assignee
-        }
-        
-        if existing:
-            try:
-                await _handle_repeat_enquiry(existing, {**lead_payload, "source": source})
-                duplicate_count += 1
-            except Exception as ex_dup:
-                logger.warning(f"Failed to handle repeat enquiry for duplicate lead: {ex_dup}")
-                errors.append(f"Row {row_num}: Error handling duplicate ({str(ex_dup)})")
-                error_count += 1
-        else:
-            lead_payload["dedup_hash"] = _lead_dedup_hash(cust_name, iso(now_utc()), canonical_phone or "")
-            try:
-                await _create_lead_internal(lead_payload, by_user_id=user["id"])
-                imported_count += 1
-            except Exception as ex_create:
-                logger.error(f"Failed to create lead in upload: {ex_create}")
-                errors.append(f"Row {row_num}: Failed to create lead ({str(ex_create)})")
-                error_count += 1
-                
+    upload_id = str(uuid.uuid4())
+    initial_status = {
+        "id": upload_id,
+        "total": len(rows_list),
+        "processed": 0,
+        "imported": 0,
+        "duplicates": 0,
+        "errors_count": 0,
+        "errors": [],
+        "status": "processing",
+        "created_at": iso(now_utc()),
+    }
+    await db.upload_status.insert_one(initial_status)
+    
+    background_tasks.add_task(
+        _process_upload_task,
+        upload_id,
+        rows_list,
+        target_assignee,
+        source,
+        iso(override_date) if override_date else None,
+        user["id"]
+    )
+    
     return {
         "success": True,
-        "summary": {
-            "total": len(df),
-            "imported": imported_count,
-            "duplicates": duplicate_count,
-            "errors": error_count
-        },
-        "errors": errors
+        "upload_id": upload_id
     }
+
+@api.get("/leads/upload/status/{upload_id}")
+async def get_upload_status(upload_id: str, user: dict = Depends(get_current_user)):
+    status = await db.upload_status.find_one({"id": upload_id}, {"_id": 0})
+    if not status:
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    return status
 
 @api.post("/leads")
 async def create_lead(body: LeadCreate, user: dict = Depends(get_current_user)):
@@ -1955,6 +2108,8 @@ async def create_lead(body: LeadCreate, user: dict = Depends(get_current_user)):
     # _create_lead_internal route via round-robin / buyleads rules.
     if user["role"] == "executive":
         data["assigned_to"] = user["id"]
+    elif user["role"] == "data_entry":
+        data["assigned_to"] = None
     lead = await _create_lead_internal(data, by_user_id=user["id"])
     return lead
 
@@ -1963,6 +2118,8 @@ async def get_lead(lead_id: str, user: dict = Depends(get_current_user)):
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     # mark opened (only assignee)
@@ -1979,10 +2136,12 @@ async def update_lead(lead_id: str, body: LeadUpdate, user: dict = Depends(get_c
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     updates: Dict[str, Any] = {}
-    for f in ["customer_name", "phone", "phones", "aliases", "email", "requirement", "area", "city", "state", "status", "active_wa_phone", "starred"]:
+    for f in ["customer_name", "phone", "phones", "aliases", "email", "requirement", "area", "city", "state", "status", "active_wa_phone", "starred", "gst_no", "enquiry_type"]:
         v = getattr(body, f)
         if v is not None:
             updates[f] = v
@@ -2216,6 +2375,7 @@ async def log_call(lead_id: str, body: CallLogInput, user: dict = Depends(get_cu
         "by_user_id": user["id"],
         "by_user_name": user["name"],
         "at": iso(now_utc()),
+        "direction": "outgoing",
     }
     await db.call_logs.insert_one(doc.copy())
     update_fields: Dict[str, Any] = {
@@ -2231,6 +2391,28 @@ async def log_call(lead_id: str, body: CallLogInput, user: dict = Depends(get_cu
         {"$set": update_fields},
     )
     await log_activity(user["id"], "call_logged", lead_id, {"outcome": body.outcome, "phone": body.phone})
+
+    # Intelligent Reassignment Logic
+    current_assignee = lead.get("assigned_to")
+    if body.outcome == "connected" and current_assignee and current_assignee != user["id"]:
+        has_connected = await db.call_logs.find_one({
+            "lead_id": lead_id,
+            "by_user_id": current_assignee,
+            "outcome": "connected"
+        })
+        if not has_connected:
+            await assign_lead(lead_id, target_user_id=user["id"], by_user_id=user["id"])
+            await log_activity(
+                user["id"],
+                "lead_auto_reassigned_connected_call",
+                lead_id,
+                {
+                    "previous_assignee": current_assignee,
+                    "new_assignee": user["id"],
+                    "reason": "Successful call connection by another executive while current assignee had no successful contact"
+                }
+            )
+
     return strip_mongo(doc)
 
 
@@ -2242,6 +2424,161 @@ async def list_lead_calls(lead_id: str, user: dict = Depends(get_current_user)):
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     return await db.call_logs.find({"lead_id": lead_id}, {"_id": 0}).sort("at", -1).to_list(500)
+
+
+@api.post("/calls/sync-batch")
+async def sync_call_batch(body: CallSyncBatchInput, user: dict = Depends(get_current_user)):
+    # Only allow executives or admin
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    synced_count = 0
+    matched_count = 0
+    reassigned_count = 0
+    
+    for record in body.logs:
+        norm = normalize_phone_display(record.phone)
+        if not norm:
+            continue
+        
+        # Determine outcome (support direct outcome mappings from dialer UI)
+        if record.call_type in ("connected", "busy", "rejected", "no_response", "invalid", "not_reachable"):
+            outcome = record.call_type
+        else:
+            outcome = "connected"
+            if record.duration_seconds == 0:
+                if record.call_type in ("rejected", "rejected_type"):
+                    outcome = "rejected"
+                elif record.call_type in ("busy", "busy_type"):
+                    outcome = "busy"
+                else:
+                    outcome = "no_response"
+            
+        lead = await _find_lead_by_phone(norm)
+        if not lead:
+            lead_id = str(uuid.uuid4())
+            lead_doc = {
+                "id": lead_id,
+                "phone": norm,
+                "customer_name": f"New Call Lead {norm}",
+                "status": "new",
+                "source": "Auto-Created",
+                "assigned_to": user["id"],
+                "created_at": record.timestamp,
+                "requirement": "Auto-created via calling app sync",
+                "last_action_at": record.timestamp,
+            }
+            await db.leads.insert_one(lead_doc)
+            await log_activity(user["id"], "lead_created", lead_id, {"source": "Auto-Created", "phone": norm})
+            lead = lead_doc
+
+        # Duplicate check (same phone, same user, same timestamp)
+        existing = await db.call_logs.find_one({
+            "phone": norm,
+            "by_user_id": user["id"],
+            "at": record.timestamp
+        })
+        if existing:
+            # If the sync payload contains a user note/outcome (e.g. from PostCallActivity),
+            # we should update the existing call log with the note and outcome!
+            if record.note and record.note.strip():
+                note_str = record.note.strip()
+                update_fields = {
+                    "outcome": outcome,
+                    "summary": note_str,
+                }
+                await db.call_logs.update_one({"id": existing["id"]}, {"$set": update_fields})
+                
+                if lead:
+                    lead_update = {
+                        "last_call_outcome": outcome,
+                        "last_call_at": record.timestamp,
+                        "last_action_at": record.timestamp,
+                    }
+                    if lead.get("status") == "new":
+                        lead_update["status"] = "contacted"
+                    await db.leads.update_one({"id": lead["id"]}, {"$set": lead_update})
+            continue
+
+        note_str = record.note.strip() if record.note else ""
+        summary_val = note_str if note_str else f"Synced via Android App ({record.direction or 'outgoing'} Call, Outcome: {outcome}, Duration: {record.duration_seconds}s)"
+        
+        doc = {
+            "id": str(uuid.uuid4()),
+            "phone": norm,
+            "outcome": outcome,
+            "summary": summary_val,
+            "by_user_id": user["id"],
+            "by_user_name": user["name"],
+            "at": record.timestamp,
+            "duration_seconds": record.duration_seconds,
+            "synced_from_app": True,
+            "direction": record.direction or "outgoing",
+        }
+        
+        if lead:
+            lead_id = lead["id"]
+            doc["lead_id"] = lead_id
+            matched_count += 1
+            
+            # Save the call log
+            await db.call_logs.insert_one(doc.copy())
+            
+            # Update lead fields
+            update_fields: Dict[str, Any] = {
+                "last_call_outcome": outcome,
+                "last_call_at": doc["at"],
+                "last_action_at": doc["at"],
+            }
+            if lead.get("status") == "new":
+                update_fields["status"] = "contacted"
+            await db.leads.update_one({"id": lead_id}, {"$set": update_fields})
+            
+            # Log standard activity
+            await log_activity(user["id"], "call_logged", lead_id, {
+                "outcome": outcome, 
+                "phone": norm,
+                "duration_seconds": record.duration_seconds,
+                "synced_from_app": True
+            })
+            
+            # Intelligent Reassignment check
+            current_assignee = lead.get("assigned_to")
+            if outcome == "connected" and current_assignee and current_assignee != user["id"]:
+                # Check if current assignee has ever successfully connected
+                has_connected = await db.call_logs.find_one({
+                    "lead_id": lead_id,
+                    "by_user_id": current_assignee,
+                    "outcome": "connected"
+                })
+                if not has_connected:
+                    # Reassign lead to the caller using standard assign_lead
+                    await assign_lead(lead_id, target_user_id=user["id"], by_user_id=user["id"])
+                    reassigned_count += 1
+                    # Log activity detailing intelligent reassignment
+                    await log_activity(
+                        user["id"],
+                        "lead_auto_reassigned_connected_call",
+                        lead_id,
+                        {
+                            "previous_assignee": current_assignee,
+                            "new_assignee": user["id"],
+                            "reason": "Successful call connection by another executive while current assignee had no successful contact"
+                        }
+                    )
+        else:
+            # No matching lead found: save to general audit logs / orphan call logs
+            doc["lead_id"] = None
+            await db.call_logs.insert_one(doc.copy())
+            
+        synced_count += 1
+        
+    return {
+        "success": True,
+        "synced": synced_count,
+        "matched": matched_count,
+        "reassigned": reassigned_count
+    }
 
 
 @api.get("/calls")
@@ -2944,12 +3281,17 @@ async def list_followups(
     lead_id: Optional[str] = None,
 ):
     query: Dict[str, Any] = {}
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Access denied")
     if lead_id:
         query["lead_id"] = lead_id
     if user["role"] == "executive" or scope == "mine":
         query["executive_id"] = user["id"]
     if status:
         query["status"] = status
+    # Exclude followups that are snoozed until a future time
+    now_iso = datetime.now(timezone.utc).isoformat()
+    query["snoozed_until"] = {"$not": {"$gt": now_iso}}
     fu = await db.followups.find(query, {"_id": 0}).sort("due_at", 1).to_list(500)
     # Enrich each follow-up with the parent lead's customer_name + phone (so the
     # alarm UI doesn't need a second roundtrip).
@@ -2998,6 +3340,12 @@ async def update_followup(fu_id: str, body: FollowupUpdate, user: dict = Depends
         updates["status"] = body.status
         if body.status == "done":
             updates["completed_at"] = iso(now_utc())
+            clear_event = {
+                "type": "followup",
+                "action": "clear",
+                "fu_id": fu_id
+            }
+            await manager.broadcast_to_user(fu["executive_id"], clear_event)
     if body.note is not None:
         updates["note"] = body.note
     if body.due_at is not None:
@@ -3066,7 +3414,8 @@ async def reports_overview(
     by_source_cursor = db.leads.aggregate([{"$match": lead_q}, {"$group": {"_id": "$source", "c": {"$sum": 1}}}])
     by_source = {doc["_id"] or "unknown": doc["c"] async for doc in by_source_cursor}
     converted = by_status.get("converted", 0)
-    conversion_rate = round((converted / total) * 100, 2) if total else 0
+    total_non_new = await db.leads.count_documents({**lead_q, "status": {"$ne": "new"}})
+    conversion_rate = round((converted / total_non_new) * 100, 2) if total_non_new else 0
     # reassigned = count leads (in window) with > 1 assignment history entry
     reassigned = await db.leads.count_documents({**lead_q, "assignment_history.1": {"$exists": True}})
     # missed = pending followups past due_at (always cross-window — pending reflects current state)
@@ -3087,6 +3436,16 @@ async def reports_overview(
         if not u:
             continue
         call_buckets.setdefault(u, {})[oc] = d["c"]
+    # Pre-aggregate calls duration (windowed) by user
+    call_duration_pipeline = [
+        {"$match": call_q} if call_q else {"$match": {}},
+        {"$group": {"_id": "$by_user_id", "total_duration": {"$sum": "$duration_seconds"}}}
+    ]
+    call_durations: Dict[str, int] = {}
+    async for d in db.call_logs.aggregate(call_duration_pipeline):
+        u = d.get("_id")
+        if u:
+            call_durations[u] = d.get("total_duration", 0)
     # Pre-aggregate messages (windowed) by user (sent count)
     msg_pipeline = [
         {"$match": {**msg_q, "direction": "out", "by_user_id": {"$ne": None}}},
@@ -3134,9 +3493,10 @@ async def reports_overview(
             "qualified": qualified,
             "converted": conv,
             "lost": lost,
-            "conversion_rate": round((conv / count) * 100, 1) if count else 0,
+            "conversion_rate": round((conv / (count - new_leads)) * 100, 1) if (count - new_leads) else 0,
             "avg_response_seconds": int(avg_ms / 1000) if avg_ms else 0,
             "calls_total": total_calls,
+            "calls_talk_time_seconds": call_durations.get(e["id"], 0),
             "calls_connected": calls.get("connected", 0),
             "calls_no_response": calls.get("no_response", 0),
             "calls_not_reachable": calls.get("not_reachable", 0),
@@ -3154,11 +3514,14 @@ async def reports_overview(
     # to whichever leads fall within (date_from..date_to) so the chart matches
     # the rest of the page.
     from collections import Counter
-    leads_all = await db.leads.find(lead_q, {"_id": 0, "created_at": 1, "source": 1}).to_list(20000)
     if date_to:
         end = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     else:
         end = now_utc()
+    ts_q = lead_q.copy()
+    if "created_at" not in ts_q:
+        ts_q["created_at"] = {"$gte": iso(end - timedelta(days=14))}
+    leads_all = await db.leads.find(ts_q, {"_id": 0, "created_at": 1, "source": 1}).to_list(20000)
     days: Dict[str, int] = {}
     for i in range(13, -1, -1):
         d = (end - timedelta(days=i)).strftime("%Y-%m-%d")
@@ -3181,8 +3544,260 @@ async def reports_overview(
         "date_to": date_to,
     }
 
+@api.get("/reports/executive-detail/{exec_id}")
+async def executive_detail_report(
+    exec_id: str,
+    admin: dict = Depends(require_admin),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+):
+    """Detailed executive activity report for a date range.
+    Returns:
+    - call_log: chronological list of calls with customer name, phone, outcome,
+      summary, time, and gap (seconds) since the previous call.
+    - leads_assigned: total leads assigned to this exec in the window.
+    - leads_worked: how many of those leads the exec actually touched (called,
+      messaged, or changed status on) in the window.
+    """
+    target = await db.users.find_one({"id": exec_id}, {"_id": 0, "password_hash": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Executive not found")
+    try:
+        date_range = _parse_ist_range(date_from, date_to)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date_from / date_to must be YYYY-MM-DD")
+
+    # --- Call log ---
+    call_q: Dict[str, Any] = {"by_user_id": exec_id}
+    if date_range:
+        call_q["at"] = date_range
+    raw_calls = await db.call_logs.find(call_q, {"_id": 0}).sort("at", 1).to_list(2000)
+
+    # Resolve lead names in one batch
+    lead_ids = list({c["lead_id"] for c in raw_calls if c.get("lead_id")})
+    lead_name_map: Dict[str, dict] = {}
+    if lead_ids:
+        async for ld in db.leads.find({"id": {"$in": lead_ids}}, {"_id": 0, "id": 1, "customer_name": 1, "phone": 1}):
+            lead_name_map[ld["id"]] = ld
+
+    call_log = []
+    prev_at = None
+    for c in raw_calls:
+        gap_seconds = None
+        if prev_at and c.get("at"):
+            try:
+                cur_dt = datetime.fromisoformat(c["at"].replace("Z", "+00:00"))
+                prv_dt = datetime.fromisoformat(prev_at.replace("Z", "+00:00"))
+                gap_seconds = int((cur_dt - prv_dt).total_seconds())
+            except Exception:
+                pass
+        ld_info = lead_name_map.get(c.get("lead_id"), {})
+        call_log.append({
+            "id": c.get("id"),
+            "lead_id": c.get("lead_id"),
+            "customer_name": ld_info.get("customer_name", "Unknown"),
+            "customer_phone": c.get("phone") or ld_info.get("phone"),
+            "outcome": c.get("outcome"),
+            "summary": c.get("summary"),
+            "at": c.get("at"),
+            "duration_seconds": c.get("duration_seconds") or 0,
+            "gap_seconds": gap_seconds,
+        })
+        prev_at = c.get("at")
+
+    # --- Leads assigned in window ---
+    lead_q: Dict[str, Any] = {"assigned_to": exec_id}
+    if date_range:
+        lead_q["created_at"] = date_range
+    leads_assigned = await db.leads.count_documents(lead_q)
+
+    # --- Leads worked (touched): leads where exec made a call, sent a message,
+    #     or changed status within the window ---
+    worked_ids: set = set()
+    # From calls
+    for c in raw_calls:
+        if c.get("lead_id"):
+            worked_ids.add(c["lead_id"])
+    # From outbound messages
+    msg_q: Dict[str, Any] = {"by_user_id": exec_id, "direction": "out"}
+    if date_range:
+        msg_q["at"] = date_range
+    msg_lead_ids = await db.messages.distinct("lead_id", msg_q)
+    worked_ids.update(msg_lead_ids)
+    # From activity logs (status changes etc.)
+    act_q: Dict[str, Any] = {"user_id": exec_id}
+    if date_range:
+        act_q["at"] = date_range
+    act_lead_ids = await db.activity_logs.distinct("lead_id", act_q)
+    worked_ids.update(act_lead_ids)
+    # Only count leads that are actually assigned to this exec
+    if worked_ids:
+        leads_worked = await db.leads.count_documents({
+            "assigned_to": exec_id,
+            "id": {"$in": list(worked_ids)}
+        })
+    else:
+        leads_worked = 0
+
+    total_talk_time_seconds = sum(c.get("duration_seconds") or 0 for c in raw_calls)
+
+    return {
+        "executive": {
+            "id": target["id"],
+            "name": target.get("name"),
+            "username": target.get("username"),
+        },
+        "call_log": call_log,
+        "total_calls": len(call_log),
+        "total_talk_time_seconds": total_talk_time_seconds,
+        "leads_assigned": leads_assigned,
+        "leads_worked": leads_worked,
+        "date_from": date_from,
+        "date_to": date_to,
+    }
+
+@api.get("/reports/daily-calls")
+async def reports_daily_calls(
+    date: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Access denied")
+        
+    # Default to today in IST
+    if not date_from and not date_to:
+        if not date:
+            from zoneinfo import ZoneInfo
+            ist = ZoneInfo("Asia/Kolkata")
+            date = datetime.now(ist).strftime("%Y-%m-%d")
+        date_from = date
+        date_to = date
+        
+    try:
+        date_range = _parse_ist_range(date_from, date_to)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date formats must be YYYY-MM-DD")
+        
+    q: Dict[str, Any] = {}
+    if date_range:
+        q["at"] = date_range
+        
+    # Access control
+    if user["role"] == "executive":
+        q["by_user_id"] = user["id"]
+    elif user["role"] == "admin":
+        if user_id:
+            q["by_user_id"] = user_id
+            
+    cursor = db.call_logs.find(q, {"_id": 0, "by_user_id": 1, "by_user_name": 1, "duration_seconds": 1, "outcome": 1})
+    logs = await cursor.to_list(None)
+    
+    total_calls = len(logs)
+    total_talk_time_seconds = sum(c.get("duration_seconds") or 0 for c in logs)
+    talked_calls = sum(1 for c in logs if (c.get("duration_seconds") or 0) > 0)
+    
+    response_data = {
+        "total_calls": total_calls,
+        "total_talk_time_seconds": total_talk_time_seconds,
+        "talked_calls": talked_calls,
+        "date_from": date_from,
+        "date_to": date_to
+    }
+    
+    if user["role"] == "admin":
+        # Get active executives
+        executives = await db.users.find({"role": "executive"}, {"_id": 0, "id": 1, "name": 1, "username": 1}).to_list(100)
+        exec_map = {
+            e["id"]: {
+                "user_id": e["id"],
+                "user_name": e["name"],
+                "total_calls": 0,
+                "total_talk_time_seconds": 0,
+                "talked_calls": 0
+            } for e in executives
+        }
+        
+        for c in logs:
+            uid = c.get("by_user_id")
+            if not uid:
+                continue
+            if uid not in exec_map:
+                exec_map[uid] = {
+                    "user_id": uid,
+                    "user_name": c.get("by_user_name") or "Unknown Executive",
+                    "total_calls": 0,
+                    "total_talk_time_seconds": 0,
+                    "talked_calls": 0
+                }
+            dur = c.get("duration_seconds") or 0
+            exec_map[uid]["total_calls"] += 1
+            exec_map[uid]["total_talk_time_seconds"] += dur
+            if dur > 0:
+                exec_map[uid]["talked_calls"] += 1
+                
+        response_data["per_executive"] = list(exec_map.values())
+        
+    return response_data
+
+
+@api.get("/leads/phone-map")
+async def get_leads_phone_map(user: dict = Depends(get_current_user)):
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Access denied")
+    q = {}
+    if user["role"] == "executive":
+        q["assigned_to"] = user["id"]
+        
+    cursor = db.leads.find(q, {"_id": 0, "phone": 1, "customer_name": 1, "id": 1})
+    leads = await cursor.to_list(None)
+    
+    out = {}
+    for l in leads:
+        norm = normalize_phone_display(l.get("phone"))
+        if norm:
+            out[norm] = {
+                "name": l.get("customer_name") or "Unnamed",
+                "id": l.get("id")
+            }
+    return out
+
+
+@api.post("/leads/get-or-create")
+async def get_or_create_lead(body: PhoneInput, user: dict = Depends(get_current_user)):
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Access denied")
+    norm = normalize_phone_display(body.phone)
+    if not norm:
+        raise HTTPException(status_code=400, detail="Invalid phone number")
+        
+    lead = await _find_lead_by_phone(norm)
+    if not lead:
+        lead_id = str(uuid.uuid4())
+        lead_doc = {
+            "id": lead_id,
+            "phone": norm,
+            "customer_name": f"New Call Lead {norm}",
+            "status": "new",
+            "source": "Auto-Created",
+            "assigned_to": user["id"],
+            "created_at": iso(now_utc()),
+            "requirement": "Auto-created via calling app lookup",
+            "last_action_at": iso(now_utc()),
+        }
+        await db.leads.insert_one(lead_doc)
+        await log_activity(user["id"], "lead_created", lead_id, {"source": "Auto-Created", "phone": norm})
+        lead = lead_doc
+        
+    return {"lead_id": lead["id"]}
+
+
 @api.get("/reports/my")
 async def reports_my(user: dict = Depends(get_current_user)):
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Access denied")
     my_id = user["id"]
     total = await db.leads.count_documents({"assigned_to": my_id})
     new_count = await db.leads.count_documents({"assigned_to": my_id, "status": "new"})
@@ -3449,7 +4064,9 @@ async def list_conversations(
     limit = max(1, min(int(limit or 50), 200))
     offset = max(0, int(offset or 0))
     query: Dict[str, Any] = {}
-    if user["role"] == "executive":
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Access denied")
+    elif user["role"] == "executive":
         query["assigned_to"] = user["id"]
     elif assigned_to:
         query["assigned_to"] = assigned_to
@@ -3459,15 +4076,16 @@ async def list_conversations(
         query["starred"] = True
     if not include_all:
         query["has_whatsapp"] = True
-    if q:
+    q_clean = q.strip() if q else None
+    if q_clean:
         import re as _re
-        q_safe = _re.escape(q)
+        q_safe = _re.escape(q_clean)
         ors: List[Dict[str, Any]] = [
             {"customer_name": {"$regex": q_safe, "$options": "i"}},
             {"aliases": {"$regex": q_safe, "$options": "i"}},
             {"requirement": {"$regex": q_safe, "$options": "i"}},
         ]
-        phone_pat = phone_match_pattern(q)
+        phone_pat = phone_match_pattern(q_clean)
         if phone_pat:
             ors.append({"phone": {"$regex": phone_pat}})
             ors.append({"phones": {"$regex": phone_pat}})
@@ -3475,9 +4093,107 @@ async def list_conversations(
             ors.append({"phone": {"$regex": q_safe, "$options": "i"}})
             ors.append({"phones": {"$regex": q_safe, "$options": "i"}})
         query["$or"] = ors
-    leads = await db.leads.find(query, {
-        "_id": 0, "raw_email_html": 0, "raw_email_text": 0,
-    }).sort("last_action_at", -1).skip(offset).limit(limit).to_list(limit)
+    
+    # Retrieve WhatsApp-active leads sorted strictly by latest message timestamp
+    lead_pipeline: List[Dict[str, Any]] = [
+        {"$match": query},
+        {
+            "$lookup": {
+                "from": "messages",
+                "let": {"lead_id": "$id"},
+                "pipeline": [
+                    {"$match": {"$expr": {"$eq": ["$lead_id", "$$lead_id"]}}},
+                    {"$sort": {"at": -1}},
+                    {"$limit": 1}
+                ],
+                "as": "latest_msg"
+            }
+        },
+        {
+            "$addFields": {
+                "last_msg": {"$arrayElemAt": ["$latest_msg", 0]}
+            }
+        }
+    ]
+    if not include_all:
+        lead_pipeline.append({
+            "$match": {
+                "$or": [
+                    {"has_whatsapp": True},
+                    {"last_msg": {"$ne": None}}
+                ]
+            }
+        })
+    lead_pipeline.append({
+        "$addFields": {
+            "sort_time": {
+                "$ifNull": [
+                    "$last_msg.at",
+                    {"$ifNull": ["$last_action_at", "$created_at"]}
+                ]
+            }
+        }
+    })
+    # Pre-filter "replied" leads (those with at least one inbound message) BEFORE
+    # pagination so the $skip/$limit window is filled entirely with matching leads
+    # instead of fetching 50 arbitrary leads and then discarding most of them.
+    if only_replied:
+        lead_pipeline.append({
+            "$lookup": {
+                "from": "messages",
+                "let": {"lead_id": "$id"},
+                "pipeline": [
+                    {"$match": {"$expr": {"$and": [
+                        {"$eq": ["$lead_id", "$$lead_id"]},
+                        {"$eq": ["$direction", "in"]},
+                    ]}}},
+                    {"$limit": 1},
+                    {"$project": {"_id": 1}},
+                ],
+                "as": "_has_inbound"
+            }
+        })
+        lead_pipeline.append({
+            "$match": {"_has_inbound.0": {"$exists": True}}
+        })
+
+    # Pre-filter "unread" leads BEFORE pagination
+    if only_unread:
+        lead_pipeline.append({
+            "$lookup": {
+                "from": "messages",
+                "let": {"lead_id": "$id"},
+                "pipeline": [
+                    {"$match": {"$expr": {"$and": [
+                        {"$eq": ["$lead_id", "$$lead_id"]},
+                        {"$eq": ["$direction", "in"]},
+                        {"$ne": ["$read_by_agent", True]},
+                    ]}}},
+                    {"$limit": 1},
+                    {"$project": {"_id": 1}},
+                ],
+                "as": "_has_unread"
+            }
+        })
+        lead_pipeline.append({
+            "$match": {"_has_unread.0": {"$exists": True}}
+        })
+
+    # Pre-filter "unreplied" leads BEFORE pagination
+    if only_unreplied:
+        lead_pipeline.append({
+            "$match": {
+                "last_msg": {"$ne": None},
+                "last_msg.direction": "in"
+            }
+        })
+    lead_pipeline.extend([
+        {"$sort": {"sort_time": -1}},
+        {"$skip": offset},
+        {"$limit": limit},
+        {"$project": {"_id": 0, "raw_email_html": 0, "raw_email_text": 0, "latest_msg": 0, "last_msg": 0, "sort_time": 0, "_has_inbound": 0}}
+    ])
+    leads = await db.leads.aggregate(lead_pipeline).to_list(limit)
     if not leads:
         return []
     lead_ids = [ld["id"] for ld in leads]
@@ -3601,11 +4317,36 @@ async def search_messages(
     lead_q: Dict[str, Any] = {}
     if user["role"] == "executive":
         lead_q["assigned_to"] = user["id"]
-    visible_leads = await db.leads.find(lead_q, {"_id": 0, "id": 1, "customer_name": 1, "phone": 1, "assigned_to": 1}).to_list(20000)
+    visible_leads = await db.leads.find(lead_q, {
+        "_id": 0, "id": 1, "customer_name": 1, "aliases": 1, "phone": 1, "phones": 1, "assigned_to": 1
+    }).to_list(20000)
     if not visible_leads:
         return {"items": [], "total": 0, "limit": limit, "offset": offset}
     lead_index: Dict[str, Dict[str, Any]] = {ld["id"]: ld for ld in visible_leads}
-    # Search messages.body OR caption for case-insensitive substring match
+    
+    # Identify leads whose name or phone matches qq to support name-based message search
+    matched_lead_ids = []
+    phone_pat = phone_match_pattern(qq)
+    for lid, ld in lead_index.items():
+        name_val = (ld.get("customer_name") or "").lower()
+        aliases_val = [str(a).lower() for a in (ld.get("aliases") or [])]
+        name_match = qq.lower() in name_val
+        alias_match = any(qq.lower() in a for a in aliases_val)
+        phone_match = False
+        if phone_pat:
+            if ld.get("phone") and _re.search(phone_pat, ld.get("phone")):
+                phone_match = True
+            elif ld.get("phones") and any(_re.search(phone_pat, p) for p in ld.get("phones") if p):
+                phone_match = True
+        else:
+            if ld.get("phone") and qq.lower() in ld.get("phone").lower():
+                phone_match = True
+            elif ld.get("phones") and any(qq.lower() in str(p).lower() for p in ld.get("phones") if p):
+                phone_match = True
+        if name_match or alias_match or phone_match:
+            matched_lead_ids.append(lid)
+
+    # Search messages.body OR caption for case-insensitive substring match, or match by lead ID if the name matches
     msg_query: Dict[str, Any] = {
         "lead_id": {"$in": list(lead_index.keys())},
         "$or": [
@@ -3613,6 +4354,8 @@ async def search_messages(
             {"caption": {"$regex": _re.escape(qq), "$options": "i"}},
         ],
     }
+    if matched_lead_ids:
+        msg_query["$or"].append({"lead_id": {"$in": matched_lead_ids}})
     total = await db.messages.count_documents(msg_query)
     cursor = db.messages.find(msg_query, {
         "_id": 0, "id": 1, "lead_id": 1, "direction": 1, "body": 1, "caption": 1,
@@ -6227,7 +6970,11 @@ async def _auto_reassign_lead(lead_id: str, current_assigned_to: Optional[str], 
     result = await db.leads.find_one_and_update(
         {"id": lead_id, "assigned_to": current_assigned_to},   # ← optimistic lock condition
         {
-            "$set": {"assigned_to": chosen_id, "last_assignment_at": iso(now_utc())},
+            "$set": {
+                "assigned_to": chosen_id,
+                "last_assignment_at": iso(now_utc()),
+                "last_action_at": iso(now_utc())
+            },
             "$push": {"assignment_history": entry},
         },
         return_document=False,
@@ -6948,7 +7695,7 @@ GMAIL_SCOPES = [
 ]
 GMAIL_POLL_DEFAULT_SECONDS = max(10, int(os.environ.get("GMAIL_POLL_INTERVAL_SECONDS", "60")))
 GMAIL_POLL_MINUTES = max(1, int(os.environ.get("GMAIL_POLL_INTERVAL_MINUTES", "1")))  # legacy fallback
-GMAIL_QUERY = os.environ.get("GMAIL_JUSTDIAL_QUERY", "from:instantemail@justdial.com is:unread newer_than:7d")
+GMAIL_QUERY = os.environ.get("GMAIL_JUSTDIAL_QUERY", "from:instantemail@justdial.com is:unread newer_than:2d")
 GMAIL_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI)
 GMAIL_SLOTS = ("primary", "secondary")
 
@@ -7286,12 +8033,15 @@ async def _imap_poll_one_slot(slot: str, cfg: dict, summary: dict) -> dict:
     
     try:
         def _do_imap_poll():
+            from datetime import timedelta
             res_messages = []
             mail = imaplib.IMAP4_SSL(host, port, timeout=30)
             try:
                 mail.login(email_addr, password)
                 mail.select("INBOX")
-                status, data = mail.search(None, 'UNSEEN', 'FROM', 'instantemail@justdial.com')
+                since_dt = datetime.now(timezone.utc) - timedelta(days=2)
+                since_date = since_dt.strftime("%d-%b-%Y")
+                status, data = mail.search(None, 'UNSEEN', 'FROM', 'instantemail@justdial.com', 'SINCE', since_date)
                 if status == 'OK':
                     mail_ids = data[0].split()
                     for m_id in mail_ids[:20]:
@@ -7787,23 +8537,48 @@ async def gmail_sync_now(admin: dict = Depends(require_admin), slot: Optional[st
 
 # ------------- Seed -------------
 async def seed_data():
+    from pymongo.errors import DuplicateKeyError
     # admin
     admin_username = os.environ.get("ADMIN_USERNAME", "admin").strip().lower()
     admin_password = os.environ.get("ADMIN_PASSWORD", "Admin@123")
     admin_name = os.environ.get("ADMIN_NAME", "System Admin")
-    existing = await db.users.find_one({"username": admin_username})
-    if not existing:
-        await db.users.insert_one({
-            "id": str(uuid.uuid4()),
-            "username": admin_username,
-            "name": admin_name,
-            "password_hash": hash_password(admin_password),
-            "role": "admin",
-            "active": True,
-            "working_hours": [],
-            "created_at": iso(now_utc()),
-        })
-        logger.info("Seeded admin user")
+    try:
+        existing = await db.users.find_one({"username": admin_username})
+        if not existing:
+            await db.users.insert_one({
+                "id": str(uuid.uuid4()),
+                "username": admin_username,
+                "name": admin_name,
+                "password_hash": hash_password(admin_password),
+                "role": "admin",
+                "active": True,
+                "working_hours": [],
+                "created_at": iso(now_utc()),
+            })
+            logger.info("Seeded admin user")
+    except DuplicateKeyError:
+        pass
+
+    # Seed Gayatri (data_entry)
+    gayatri_uname = "gayatri"
+    gayatri_pwd = "Gayatri@123"
+    gayatri_name = "Gayatri"
+    try:
+        existing_gayatri = await db.users.find_one({"username": gayatri_uname})
+        if not existing_gayatri:
+            await db.users.insert_one({
+                "id": str(uuid.uuid4()),
+                "username": gayatri_uname,
+                "name": gayatri_name,
+                "password_hash": hash_password(gayatri_pwd),
+                "role": "data_entry",
+                "active": True,
+                "working_hours": [],
+                "created_at": iso(now_utc()),
+            })
+            logger.info("Seeded data entry user Gayatri")
+    except DuplicateKeyError:
+        pass
   
 
 
@@ -7840,6 +8615,7 @@ async def seed_data():
     await db.chat_options.create_index([("node_id", 1), ("position", 1)])
     await db.chat_options.create_index([("node_id", 1), ("option_id", 1)])
     await db.chat_sessions.create_index("phone_key", unique=True)
+    await db.system_locks.create_index("key", unique=True)
     # Phone canonicalization migration (one-shot per cold-start). Iterates through any
     # lead whose phone/phones haven't been flagged migrated yet and rewrites them in
     # canonical form (Indian → 10-digit national, others → +<digits>). Idempotent.
@@ -7862,6 +8638,153 @@ async def seed_data():
     if n_migrated:
         logger.info(f"Canonicalized phone format on {n_migrated} leads")
 
+# ------------- WebSocket Push Sync -------------
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, user_id: str, websocket: WebSocket):
+        await websocket.accept()
+        if user_id not in self.active_connections:
+            self.active_connections[user_id] = []
+        self.active_connections[user_id].append(websocket)
+        logger.info(f"WebSocket connected for user: {user_id}. Active connections: {len(self.active_connections[user_id])}")
+
+    def disconnect(self, user_id: str, websocket: WebSocket):
+        if user_id in self.active_connections:
+            if websocket in self.active_connections[user_id]:
+                self.active_connections[user_id].remove(websocket)
+            if not self.active_connections[user_id]:
+                del self.active_connections[user_id]
+        logger.info(f"WebSocket disconnected for user: {user_id}")
+
+    async def broadcast_to_user(self, user_id: str, message: dict):
+        if user_id in self.active_connections:
+            dead_connections = []
+            for ws in self.active_connections[user_id]:
+                try:
+                    await ws.send_json(message)
+                except Exception as e:
+                    logger.warning(f"Error sending message to WebSocket for user {user_id}: {e}")
+                    dead_connections.append(ws)
+            for ws in dead_connections:
+                self.disconnect(user_id, ws)
+
+manager = ConnectionManager()
+
+@api.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str, token: Optional[str] = Query(None)):
+    if not token:
+        logger.warning(f"WebSocket connection rejected for user {user_id}: missing token")
+        await websocket.close(code=1008, reason="Missing token")
+        return
+        
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("sub") != user_id:
+            logger.warning(f"WebSocket connection rejected: token subject {payload.get('sub')} does not match user_id {user_id}")
+            await websocket.close(code=1008, reason="User ID mismatch")
+            return
+    except Exception as e:
+        logger.warning(f"WebSocket connection rejected: invalid token: {e}")
+        await websocket.close(code=1008, reason="Invalid token")
+        return
+
+    await manager.connect(user_id, websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(user_id, websocket)
+    except Exception as e:
+        logger.warning(f"WebSocket error for user {user_id}: {e}")
+        manager.disconnect(user_id, websocket)
+
+async def check_due_followups_task():
+    try:
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        
+        query = {
+            "status": "pending",
+            "notified": {"$ne": True},
+            "$or": [
+                {"due_at": {"$lte": now_iso}},
+                {"snoozed_until": {"$lte": now_iso}}
+            ]
+        }
+        
+        due_followups = await db.followups.find(query).to_list(100)
+        for fu in due_followups:
+            lead = await db.leads.find_one({"id": fu.get("lead_id")}, {"_id": 0, "customer_name": 1, "phone": 1, "active_wa_phone": 1})
+            lead_customer_name = lead.get("customer_name") if lead else "Lead"
+            lead_phone = (lead.get("active_wa_phone") or lead.get("phone")) if lead else ""
+            
+            await db.followups.update_one({"id": fu["id"]}, {"$set": {"notified": True}})
+            
+            event = {
+                "type": "followup",
+                "action": "trigger",
+                "followup": {
+                    "id": fu["id"],
+                    "due_at": fu["due_at"],
+                    "note": fu.get("note", ""),
+                    "lead_customer_name": lead_customer_name,
+                    "lead_phone": lead_phone
+                }
+            }
+            await manager.broadcast_to_user(fu["executive_id"], event)
+    except Exception as e:
+        logger.error(f"Error in check_due_followups_task: {e}")
+
+@api.put("/followups/{fu_id}/snooze")
+async def snooze_followup(fu_id: str, user: dict = Depends(get_current_user)):
+    fu = await db.followups.find_one({"id": fu_id})
+    if not fu:
+        raise HTTPException(status_code=404, detail="Followup not found")
+    if user["role"] == "executive" and fu["executive_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    
+    now = datetime.now(timezone.utc)
+    snoozed_until = (now + timedelta(minutes=30)).isoformat()
+    
+    await db.followups.update_one(
+        {"id": fu_id},
+        {"$set": {"snoozed_until": snoozed_until, "notified": False}}
+    )
+    
+    clear_event = {
+        "type": "followup",
+        "action": "clear",
+        "fu_id": fu_id
+    }
+    await manager.broadcast_to_user(fu["executive_id"], clear_event)
+    return {"status": "success", "message": "Followup snoozed", "snoozed_until": snoozed_until}
+
+@api.put("/followups/{fu_id}/dismiss")
+async def dismiss_followup(fu_id: str, user: dict = Depends(get_current_user)):
+    fu = await db.followups.find_one({"id": fu_id})
+    if not fu:
+        raise HTTPException(status_code=404, detail="Followup not found")
+    if user["role"] == "executive" and fu["executive_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    
+    now = datetime.now(timezone.utc)
+    snoozed_until = (now + timedelta(days=1)).isoformat()
+    
+    await db.followups.update_one(
+        {"id": fu_id},
+        {"$set": {"notified": True, "snoozed_until": snoozed_until}}
+    )
+    
+    clear_event = {
+        "type": "followup",
+        "action": "clear",
+        "fu_id": fu_id
+    }
+    await manager.broadcast_to_user(fu["executive_id"], clear_event)
+    return {"status": "success", "message": "Followup dismissed"}
+
 scheduler: Optional[AsyncIOScheduler] = None
 
 @app.on_event("startup")
@@ -7872,6 +8795,7 @@ async def on_startup():
     logger.info("DEBUG STARTUP: seed_data complete. Initializing scheduler...")
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(auto_reassign_task, "interval", minutes=1, id="auto_reassign", max_instances=1, coalesce=True)
+    scheduler.add_job(check_due_followups_task, "interval", seconds=10, id="check_due_followups", max_instances=1, coalesce=True)
     logger.info("DEBUG STARTUP: counting gmail_connections...")
     has_gmail_conns = await db.gmail_connections.count_documents({}) > 0
     logger.info(f"DEBUG STARTUP: gmail connections count done (has_gmail_conns={has_gmail_conns}). GMAIL_ENABLED={GMAIL_ENABLED}")
@@ -7995,6 +8919,20 @@ async def create_admin_alert(body: dict, user=Depends(get_current_user)):
         # Let's save alert_doc to crm db as well for admin history purposes
         await db.admin_alerts.insert_one(alert_doc)
 
+    # Broadcast alert trigger to CRM recipients
+    for r_id in alert_doc["recipient_ids"]:
+        event = {
+            "type": "admin_alert",
+            "action": "trigger",
+            "alert": {
+                "id": alert_doc["id"],
+                "title": alert_doc["title"],
+                "message": alert_doc["message"],
+                "sent_by": alert_doc["sent_by"]
+            }
+        }
+        await manager.broadcast_to_user(r_id, event)
+
     # ─── Bidirectional Sync: Forward Alert to OMS ───
     try:
         # Find detail info of the CRM target recipients
@@ -8072,6 +9010,14 @@ async def acknowledge_alert(alert_id: str, user=Depends(get_current_user)):
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Alert not found")
 
+    # Broadcast clear alert to user
+    clear_event = {
+        "type": "admin_alert",
+        "action": "clear",
+        "alert_id": alert_id
+    }
+    await manager.broadcast_to_user(user["id"], clear_event)
+
     # ─── Bidirectional Sync: Acknowledge Alert in OMS ───
     try:
         # Check mapping first
@@ -8105,6 +9051,17 @@ async def cancel_alert(alert_id: str, user=Depends(get_current_user)):
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Alert not found")
+
+    # Broadcast clear (cancel) to all recipient_ids
+    alert = await db.admin_alerts.find_one({"id": alert_id})
+    if alert and alert.get("recipient_ids"):
+        for r_id in alert["recipient_ids"]:
+            clear_event = {
+                "type": "admin_alert",
+                "action": "clear",
+                "alert_id": alert_id
+            }
+            await manager.broadcast_to_user(r_id, clear_event)
 
     # ─── Bidirectional Sync: Cancel Alert in OMS ───
     try:
