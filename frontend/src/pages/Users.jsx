@@ -9,6 +9,7 @@ export default function UsersPage() {
   const [users, setUsers] = useState([]);
   const [showNew, setShowNew] = useState(false);
   const [editing, setEditing] = useState(null);
+  const [deletingUser, setDeletingUser] = useState(null);
 
   const load = async () => {
     try { const { data } = await api.get("/users"); setUsers(data); } catch (e) { toast.error(errMsg(e)); }
@@ -16,8 +17,21 @@ export default function UsersPage() {
   useEffect(() => { load(); }, []);
 
   const del = async (id) => {
-    if (!window.confirm("Delete this user?")) return;
-    try { await api.delete(`/users/${id}`); toast.success("Deleted"); load(); } catch (e) { toast.error(errMsg(e)); }
+    const targetUser = users.find(u => u.id === id);
+    if (!targetUser) return;
+    
+    if (targetUser.role === "executive") {
+      setDeletingUser(targetUser);
+    } else {
+      if (!window.confirm(`Delete ${targetUser.name}?`)) return;
+      try {
+        await api.delete(`/users/${id}`);
+        toast.success("Deleted");
+        load();
+      } catch (e) {
+        toast.error(errMsg(e));
+      }
+    }
   };
 
   const toggleActive = async (u) => {
@@ -107,6 +121,15 @@ export default function UsersPage() {
       {(showNew || editing) && (
         <UserModal user={editing} onClose={() => { setShowNew(false); setEditing(null); }} onSaved={() => { setShowNew(false); setEditing(null); load(); }} />
       )}
+
+      {deletingUser && (
+        <DeleteUserReassignModal
+          user={deletingUser}
+          users={users}
+          onClose={() => setDeletingUser(null)}
+          onDeleted={() => { setDeletingUser(null); load(); }}
+        />
+      )}
     </div>
   );
 }
@@ -163,6 +186,7 @@ function UserModal({ user, onClose, onSaved }) {
             <select value={f.role} onChange={(e) => setF({ ...f, role: e.target.value })} className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="user-role-select">
               <option value="executive">executive</option>
               <option value="admin">admin</option>
+              <option value="data_entry">data entry</option>
             </select>
           </Field>
         </div>
@@ -205,5 +229,179 @@ function Field({ label, children }) {
       <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">{label}</div>
       {children}
     </label>
+  );
+}
+
+function DeleteUserReassignModal({ user, users, onClose, onDeleted }) {
+  const [strategy, setStrategy] = useState("all_equally");
+  const [singleAgentId, setSingleAgentId] = useState("");
+  const [multipleAgentIds, setMultipleAgentIds] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  const activeExecs = users.filter((u) => u.role === "executive" && u.active && u.id !== user.id);
+
+  const handleCheckboxChange = (id) => {
+    setMultipleAgentIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+  };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (strategy === "single" && !singleAgentId) {
+      toast.error("Please select a single executive to reassign leads.");
+      return;
+    }
+    if (strategy === "multiple" && multipleAgentIds.length === 0) {
+      toast.error("Please select at least one executive to reassign leads.");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const params = {
+        strategy,
+        single_agent_id: strategy === "single" ? singleAgentId : undefined,
+        multiple_agent_ids: strategy === "multiple" ? multipleAgentIds.join(",") : undefined,
+      };
+      await api.delete(`/users/${user.id}`, { params });
+      toast.success("Executive deleted and leads reassigned!");
+      onDeleted();
+    } catch (err) {
+      toast.error(errMsg(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" onClick={onClose}>
+      <form
+        onClick={(e) => e.stopPropagation()}
+        onSubmit={submit}
+        className="w-full max-w-lg bg-white border border-gray-900 p-6 max-h-[90vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-150"
+        data-testid="delete-reassign-modal"
+      >
+        <div className="text-[10px] uppercase tracking-widest text-[#E60000] font-bold">Delete Executive</div>
+        <h2 className="font-chivo font-black text-2xl mt-1 mb-2">Delete {user.name}</h2>
+        <p className="text-sm text-gray-600 mb-6 font-chivo">
+          This user is an executive. To whom would you like to reassign their currently assigned leads?
+        </p>
+
+        {activeExecs.length === 0 ? (
+          <div className="bg-[#FFF4E5] border border-[#E67E00] text-[#B85F00] text-xs p-3 mb-6 font-semibold">
+            Warning: No other active executives are available. All leads assigned to {user.name} will become unassigned.
+          </div>
+        ) : (
+          <div className="space-y-4 mb-6">
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input
+                type="radio"
+                name="strategy"
+                value="all_equally"
+                checked={strategy === "all_equally"}
+                onChange={(e) => setStrategy(e.target.value)}
+                className="mt-1 text-[#002FA7] focus:ring-[#002FA7]"
+              />
+              <div>
+                <span className="text-sm font-semibold">Reassign equally among all active executives</span>
+                <p className="text-xs text-gray-500">Distributes leads evenly and randomly to all other {activeExecs.length} active executive(s).</p>
+              </div>
+            </label>
+
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input
+                type="radio"
+                name="strategy"
+                value="single"
+                checked={strategy === "single"}
+                onChange={(e) => setStrategy(e.target.value)}
+                className="mt-1 text-[#002FA7] focus:ring-[#002FA7]"
+              />
+              <div className="flex-1">
+                <span className="text-sm font-semibold">Reassign to one agent</span>
+                <p className="text-xs text-gray-500 mb-2">Transfer all leads to a single chosen executive.</p>
+                {strategy === "single" && (
+                  <select
+                    required
+                    value={singleAgentId}
+                    onChange={(e) => setSingleAgentId(e.target.value)}
+                    className="w-full border border-gray-300 px-2 py-2 text-sm bg-white outline-none focus:border-[#002FA7] focus:ring-1 focus:ring-[#002FA7]"
+                  >
+                    <option value="">— Select Executive —</option>
+                    {activeExecs.map((ae) => (
+                      <option key={ae.id} value={ae.id}>
+                        {ae.name} (@{ae.username})
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+            </label>
+
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input
+                type="radio"
+                name="strategy"
+                value="multiple"
+                checked={strategy === "multiple"}
+                onChange={(e) => setStrategy(e.target.value)}
+                className="mt-1 text-[#002FA7] focus:ring-[#002FA7]"
+              />
+              <div className="flex-1">
+                <span className="text-sm font-semibold">Reassign to multiple selected agents equally</span>
+                <p className="text-xs text-gray-500 mb-2">Equally (and randomly) distribute leads among specific executives.</p>
+                {strategy === "multiple" && (
+                  <div className="border border-gray-200 p-3 max-h-[150px] overflow-y-auto space-y-2 bg-gray-50 rounded-sm">
+                    {activeExecs.map((ae) => (
+                      <label key={ae.id} className="flex items-center gap-2 cursor-pointer text-xs font-semibold">
+                        <input
+                          type="checkbox"
+                          checked={multipleAgentIds.includes(ae.id)}
+                          onChange={() => handleCheckboxChange(ae.id)}
+                          className="text-[#002FA7] focus:ring-[#002FA7]"
+                        />
+                        <span>{ae.name} (@{ae.username})</span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </label>
+
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input
+                type="radio"
+                name="strategy"
+                value="none"
+                checked={strategy === "none"}
+                onChange={(e) => setStrategy(e.target.value)}
+                className="mt-1 text-[#002FA7] focus:ring-[#002FA7]"
+              />
+              <div>
+                <span className="text-sm font-semibold">Leave leads unassigned</span>
+                <p className="text-xs text-gray-500">Remove executive assignment, leaving leads unassigned.</p>
+              </div>
+            </label>
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2 mt-6">
+          <button
+            type="button"
+            onClick={onClose}
+            className="border border-gray-300 px-4 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-100 transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            disabled={loading}
+            className="bg-[#E60000] hover:bg-[#CC0000] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50 transition-colors"
+          >
+            {loading ? "Deleting & Reassigning…" : "Delete Executive"}
+          </button>
+        </div>
+      </form>
+    </div>
   );
 }

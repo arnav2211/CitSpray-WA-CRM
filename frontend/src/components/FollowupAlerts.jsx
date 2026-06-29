@@ -61,9 +61,14 @@ export default function FollowupAlerts() {
 
   const dismiss = useCallback(async () => {
     if (!active) return;
-    const ack = loadAck();
-    ack[active.id] = Date.now();
-    saveAck(ack);
+    try { await api.put(`/followups/${active.id}/dismiss`); } catch { /* empty */ }
+    stopRing();
+    setActive(null);
+  }, [active, stopRing]);
+
+  const snooze = useCallback(async () => {
+    if (!active) return;
+    try { await api.put(`/followups/${active.id}/snooze`); } catch { /* empty */ }
     stopRing();
     setActive(null);
   }, [active, stopRing]);
@@ -71,8 +76,9 @@ export default function FollowupAlerts() {
   const markDone = useCallback(async () => {
     if (!active) return;
     try { await api.patch(`/followups/${active.id}`, { status: "done" }); } catch { /* empty */ }
-    dismiss();
-  }, [active, dismiss]);
+    stopRing();
+    setActive(null);
+  }, [active, stopRing]);
 
   useEffect(() => {
     if (!user) return;
@@ -82,17 +88,29 @@ export default function FollowupAlerts() {
       try {
         const { data } = await api.get("/followups", { params: { status: "pending" } });
         if (cancelled) return;
-        const ack = loadAck();
+
+        const followups = data || [];
+
+        // If we have an active popup, but it is no longer pending or has been snoozed/dismissed elsewhere, clear it
+        if (active) {
+          const stillPending = followups.some((f) => f.id === active.id);
+          if (!stillPending) {
+            stopRing();
+            setActive(null);
+            return;
+          }
+        }
+
         const now = Date.now();
-        const due = (data || []).find((f) => {
+        const due = followups.find((f) => {
           const at = new Date(f.due_at).getTime();
           if (Number.isNaN(at)) return false;
           const deltaSec = (at - now) / 1000;
-          // ring once due time is within +/- window AND not already acknowledged in last 30 min
+          // ring once due time is within window
           if (deltaSec > RING_WINDOW_S) return false;
-          if (ack[f.id] && (now - ack[f.id]) < 30 * 60 * 1000) return false;
           return true;
         });
+
         if (due && (!active || active.id !== due.id)) {
           setActive(due);
           stopRing();
@@ -104,7 +122,7 @@ export default function FollowupAlerts() {
     const id = setInterval(tick, POLL_MS);
     return () => { cancelled = true; clearInterval(id); stopRing(); };
     // eslint-disable-next-line
-  }, [user]);
+  }, [user, active]);
 
   if (!active) return null;
   const dueDate = new Date(active.due_at);
@@ -138,7 +156,7 @@ export default function FollowupAlerts() {
           <button onClick={markDone} className="flex-1 bg-[#008A00] hover:bg-[#006600] text-white px-3 py-3 text-[11px] uppercase tracking-widest font-bold" data-testid="followup-done-btn">
             Mark Done
           </button>
-          <button onClick={dismiss} className="flex-1 border border-gray-900 hover:bg-gray-900 hover:text-white px-3 py-3 text-[11px] uppercase tracking-widest font-bold flex items-center justify-center gap-1" data-testid="followup-snooze-btn">
+          <button onClick={snooze} className="flex-1 border border-gray-900 hover:bg-gray-900 hover:text-white px-3 py-3 text-[11px] uppercase tracking-widest font-bold flex items-center justify-center gap-1" data-testid="followup-snooze-btn">
             <Bell size={12} weight="bold" /> Snooze 30 min
           </button>
         </div>

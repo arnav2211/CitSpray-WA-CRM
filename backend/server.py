@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import UpdateOne
 from pydantic import BaseModel, Field, ConfigDict
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -614,9 +615,67 @@ async def update_user(user_id: str, body: UserUpdate, admin: dict = Depends(requ
     return doc
 
 @api.delete("/users/{user_id}")
-async def delete_user(user_id: str, admin: dict = Depends(require_admin)):
+async def delete_user(
+    user_id: str,
+    strategy: str = "none",
+    single_agent_id: Optional[str] = None,
+    multiple_agent_ids: Optional[str] = None,
+    admin: dict = Depends(require_admin)
+):
     if user_id == admin["id"]:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
+    
+    u = await db.users.find_one({"id": user_id})
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    if u.get("role") == "executive":
+        leads = await db.leads.find({"assigned_to": user_id}).to_list(100000)
+        if leads:
+            active_execs = await db.users.find(
+                {"role": "executive", "active": True, "id": {"$ne": user_id}},
+                {"id": 1}
+            ).to_list(500)
+            active_exec_ids = [ae["id"] for ae in active_execs]
+            
+            targets = []
+            if strategy == "all_equally":
+                targets = active_exec_ids
+            elif strategy == "single" and single_agent_id:
+                targets = [single_agent_id]
+            elif strategy == "multiple" and multiple_agent_ids:
+                sel_ids = [i.strip() for i in multiple_agent_ids.split(",") if i.strip()]
+                targets = [uid for uid in sel_ids if uid in active_exec_ids]
+                
+            if not targets:
+                await db.leads.update_many(
+                    {"assigned_to": user_id},
+                    {"$set": {"assigned_to": None, "last_reassigned_at": iso(now_utc()), "sort_at": iso(now_utc())}}
+                )
+            else:
+                import random
+                random.shuffle(targets)
+                bulk_ops = []
+                for idx, lead in enumerate(leads):
+                    target_agent = targets[idx % len(targets)]
+                    entry = {"user_id": target_agent, "at": iso(now_utc()), "by": admin["id"]}
+                    bulk_ops.append(
+                        UpdateOne(
+                            {"id": lead["id"]},
+                            {
+                                "$set": {
+                                    "assigned_to": target_agent,
+                                    "last_reassigned_at": iso(now_utc()),
+                                    "sort_at": iso(now_utc()),
+                                    "opened_at": None
+                                },
+                                "$push": {"assignment_history": entry}
+                            }
+                        )
+                    )
+                if bulk_ops:
+                    await db.leads.bulk_write(bulk_ops)
+                    
     await db.users.delete_one({"id": user_id})
     return {"ok": True}
 
@@ -1298,6 +1357,7 @@ async def assign_lead(lead_id: str, target_user_id: Optional[str] = None, by_use
     set_ops: Dict[str, Any] = {"assigned_to": chosen_id, "last_assignment_at": iso(now_utc()), "opened_at": None}
     if is_reassignment:
         set_ops["last_reassigned_at"] = iso(now_utc())
+        set_ops["sort_at"] = set_ops["last_reassigned_at"]
     await db.leads.update_one(
         {"id": lead_id},
         {"$set": set_ops, "$push": {"assignment_history": entry}},
@@ -1361,7 +1421,7 @@ async def auto_send_whatsapp_on_create(lead: dict):
     }
     await db.messages.insert_one(msg.copy())
     if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
-        await db.leads.update_one({"id": lead["id"]}, {"$set": {"has_whatsapp": True}})
+        await db.leads.update_one({"id": lead["id"]}, {"$set": {"has_whatsapp": True, "last_message_at": msg["at"]}})
 
 # ------------- Leads -------------
 def _lead_dedup_hash(name: str, ts: Optional[str], extra: str = "") -> str:
@@ -1623,6 +1683,7 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         "has_whatsapp": bool(data.get("has_whatsapp")),
         "last_action_at": iso(now_utc()),
         "created_at": data.get("_created_at_override") or iso(now_utc()),
+        "sort_at": data.get("_created_at_override") or iso(now_utc()),
         "enquiries": [initial_enquiry],
     }
     from pymongo.errors import DuplicateKeyError
@@ -1760,18 +1821,10 @@ async def list_leads(
     #     last_reassigned_at).
     pipeline: List[Dict[str, Any]] = [
         {"$match": query},
-        {"$addFields": {
-            "_sort_at": {
-                "$ifNull": [
-                    {"$max": ["$created_at", "$last_reassigned_at"]},
-                    "$created_at",
-                ],
-            },
-        }},
-        {"$sort": {"_sort_at": -1, "created_at": -1}},
+        {"$sort": {"sort_at": -1, "created_at": -1}},
         {"$skip": safe_offset},
         {"$limit": safe_limit},
-        {"$project": {"_id": 0, "raw_email_html": 0, "raw_email_text": 0, "_sort_at": 0}},
+        {"$project": {"_id": 0, "raw_email_html": 0, "raw_email_text": 0}},
     ]
     items = await db.leads.aggregate(pipeline).to_list(safe_limit)
     if paginate:
@@ -2318,7 +2371,13 @@ async def lead_activity(lead_id: str, user: dict = Depends(get_current_user)):
 
 # ------------- Messages (WhatsApp mock) -------------
 @api.get("/leads/{lead_id}/messages")
-async def list_messages(lead_id: str, user: dict = Depends(get_current_user), phone: Optional[str] = None):
+async def list_messages(
+    lead_id: str,
+    user: dict = Depends(get_current_user),
+    phone: Optional[str] = None,
+    limit: Optional[int] = Query(None),
+    offset: Optional[int] = Query(None),
+):
     """List WhatsApp messages for a lead. When `phone` is supplied, restrict the
     result to only messages addressed to/from that specific phone (matched by
     last-10-digit suffix). This lets the lead drawer show a per-number chat
@@ -2337,7 +2396,12 @@ async def list_messages(lead_id: str, user: dict = Depends(get_current_user), ph
                 {"to_phone": {"$regex": pat}},
                 {"from": {"$regex": pat}},
             ]
-    msgs = await db.messages.find(query, {"_id": 0}).sort("at", 1).to_list(2000)
+    if limit is not None:
+        skip = offset or 0
+        msgs = await db.messages.find(query, {"_id": 0}).sort("at", -1).skip(skip).limit(limit).to_list(limit)
+        msgs.reverse()
+    else:
+        msgs = await db.messages.find(query, {"_id": 0}).sort("at", 1).to_list(2000)
     return msgs
 
 
@@ -2467,6 +2531,7 @@ async def sync_call_batch(body: CallSyncBatchInput, user: dict = Depends(get_cur
                 "created_at": record.timestamp,
                 "requirement": "Auto-created via calling app sync",
                 "last_action_at": record.timestamp,
+                "sort_at": record.timestamp,
             }
             await db.leads.insert_one(lead_doc)
             await log_activity(user["id"], "lead_created", lead_id, {"source": "Auto-Created", "phone": norm})
@@ -2773,7 +2838,7 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
         if 'reply_ctx_preview' in locals() and reply_ctx_preview:
             msg["reply_to_preview"] = reply_ctx_preview
     await db.messages.insert_one(msg.copy())
-    update_lead = {"last_action_at": iso(now_utc())}
+    update_lead = {"last_action_at": iso(now_utc()), "last_message_at": msg["at"]}
     if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
         update_lead["has_whatsapp"] = True
     await db.leads.update_one({"id": body.lead_id}, {"$set": update_lead})
@@ -2898,7 +2963,7 @@ async def _record_sent_message(lead_id: str, user_id: str, target_phone: str, bo
     if reply_ctx.get("preview"):
         msg["reply_to_preview"] = reply_ctx["preview"]
     await db.messages.insert_one(msg.copy())
-    update_lead = {"last_action_at": iso(now_utc())}
+    update_lead = {"last_action_at": iso(now_utc()), "last_message_at": msg["at"]}
     if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
         update_lead["has_whatsapp"] = True
     await db.leads.update_one({"id": lead_id}, {"$set": update_lead})
@@ -3547,7 +3612,7 @@ async def reports_overview(
 @api.get("/reports/executive-detail/{exec_id}")
 async def executive_detail_report(
     exec_id: str,
-    admin: dict = Depends(require_admin),
+    user: dict = Depends(get_current_user),
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
 ):
@@ -3559,6 +3624,9 @@ async def executive_detail_report(
     - leads_worked: how many of those leads the exec actually touched (called,
       messaged, or changed status on) in the window.
     """
+    if user["role"] != "admin" and user["id"] != exec_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
     target = await db.users.find_one({"id": exec_id}, {"_id": 0, "password_hash": 0})
     if not target:
         raise HTTPException(status_code=404, detail="Executive not found")
@@ -3641,6 +3709,42 @@ async def executive_detail_report(
 
     total_talk_time_seconds = sum(c.get("duration_seconds") or 0 for c in raw_calls)
 
+    # --- Additional metrics for executive's own breakdown ---
+    base = {**lead_q, "assigned_to": exec_id}
+    count = leads_assigned
+    conv = await db.leads.count_documents({**base, "status": "converted"})
+    qualified = await db.leads.count_documents({**base, "status": "qualified"})
+    lost = await db.leads.count_documents({**base, "status": "lost"})
+    contacted = await db.leads.count_documents({**base, "status": "contacted"})
+    new_leads = await db.leads.count_documents({**base, "status": "new"})
+
+    fup_q: Dict[str, Any] = {}
+    if date_range:
+        fup_q["created_at"] = date_range
+    fu_base = {**fup_q, "executive_id": exec_id}
+    fu_total = await db.followups.count_documents(fu_base)
+    fu_done = await db.followups.count_documents({**fu_base, "status": "done"})
+    fu_pending = await db.followups.count_documents({**fu_base, "status": "pending"})
+    fu_completion = round((fu_done / fu_total) * 100, 1) if fu_total else 0
+
+    msg_out_q: Dict[str, Any] = {"by_user_id": exec_id, "direction": "out"}
+    if date_range:
+        msg_out_q["at"] = date_range
+    wa_messages_sent = await db.messages.count_documents(msg_out_q)
+
+    calls_by_outcome = {
+        "connected": 0,
+        "no_response": 0,
+        "rejected": 0,
+        "not_reachable": 0,
+        "busy": 0,
+        "invalid": 0,
+    }
+    for c in call_log:
+        oc = c.get("outcome")
+        if oc in calls_by_outcome:
+            calls_by_outcome[oc] += 1
+
     return {
         "executive": {
             "id": target["id"],
@@ -3652,6 +3756,21 @@ async def executive_detail_report(
         "total_talk_time_seconds": total_talk_time_seconds,
         "leads_assigned": leads_assigned,
         "leads_worked": leads_worked,
+        "conversions": conv,
+        "conversion_rate": round((conv / (count - new_leads)) * 100, 1) if (count - new_leads) else 0,
+        "leads_by_status": {
+            "new": new_leads,
+            "contacted": contacted,
+            "qualified": qualified,
+            "converted": conv,
+            "lost": lost,
+        },
+        "followup_total": fu_total,
+        "followup_done": fu_done,
+        "followup_pending": fu_pending,
+        "followup_completion_pct": fu_completion,
+        "wa_messages_sent": wa_messages_sent,
+        "calls_by_outcome": calls_by_outcome,
         "date_from": date_from,
         "date_to": date_to,
     }
@@ -3786,6 +3905,7 @@ async def get_or_create_lead(body: PhoneInput, user: dict = Depends(get_current_
             "created_at": iso(now_utc()),
             "requirement": "Auto-created via calling app lookup",
             "last_action_at": iso(now_utc()),
+            "sort_at": iso(now_utc()),
         }
         await db.leads.insert_one(lead_doc)
         await log_activity(user["id"], "lead_created", lead_id, {"source": "Auto-Created", "phone": norm})
@@ -4098,45 +4218,19 @@ async def list_conversations(
     lead_pipeline: List[Dict[str, Any]] = [
         {"$match": query},
         {
-            "$lookup": {
-                "from": "messages",
-                "let": {"lead_id": "$id"},
-                "pipeline": [
-                    {"$match": {"$expr": {"$eq": ["$lead_id", "$$lead_id"]}}},
-                    {"$sort": {"at": -1}},
-                    {"$limit": 1}
-                ],
-                "as": "latest_msg"
+            "$addFields": {
+                "sort_time": {
+                    "$ifNull": [
+                        "$last_message_at",
+                        {"$ifNull": ["$last_action_at", "$created_at"]}
+                    ]
+                }
             }
         },
-        {
-            "$addFields": {
-                "last_msg": {"$arrayElemAt": ["$latest_msg", 0]}
-            }
-        }
+        {"$sort": {"sort_time": -1}},
     ]
-    if not include_all:
-        lead_pipeline.append({
-            "$match": {
-                "$or": [
-                    {"has_whatsapp": True},
-                    {"last_msg": {"$ne": None}}
-                ]
-            }
-        })
-    lead_pipeline.append({
-        "$addFields": {
-            "sort_time": {
-                "$ifNull": [
-                    "$last_msg.at",
-                    {"$ifNull": ["$last_action_at", "$created_at"]}
-                ]
-            }
-        }
-    })
     # Pre-filter "replied" leads (those with at least one inbound message) BEFORE
     # pagination so the $skip/$limit window is filled entirely with matching leads
-    # instead of fetching 50 arbitrary leads and then discarding most of them.
     if only_replied:
         lead_pipeline.append({
             "$lookup": {
@@ -4181,17 +4275,35 @@ async def list_conversations(
 
     # Pre-filter "unreplied" leads BEFORE pagination
     if only_unreplied:
-        lead_pipeline.append({
-            "$match": {
-                "last_msg": {"$ne": None},
-                "last_msg.direction": "in"
+        lead_pipeline.extend([
+            {
+                "$lookup": {
+                    "from": "messages",
+                    "let": {"lead_id": "$id"},
+                    "pipeline": [
+                        {"$match": {"$expr": {"$eq": ["$lead_id", "$$lead_id"]}}},
+                        {"$sort": {"at": -1}},
+                        {"$limit": 1}
+                    ],
+                    "as": "latest_msg"
+                }
+            },
+            {
+                "$addFields": {
+                    "last_msg": {"$arrayElemAt": ["$latest_msg", 0]}
+                }
+            },
+            {
+                "$match": {
+                    "last_msg": {"$ne": None},
+                    "last_msg.direction": "in"
+                }
             }
-        })
+        ])
     lead_pipeline.extend([
-        {"$sort": {"sort_time": -1}},
         {"$skip": offset},
         {"$limit": limit},
-        {"$project": {"_id": 0, "raw_email_html": 0, "raw_email_text": 0, "latest_msg": 0, "last_msg": 0, "sort_time": 0, "_has_inbound": 0}}
+        {"$project": {"_id": 0, "raw_email_html": 0, "raw_email_text": 0, "latest_msg": 0, "last_msg": 0, "_has_inbound": 0, "_has_unread": 0, "sort_time": 0}}
     ])
     leads = await db.leads.aggregate(lead_pipeline).to_list(limit)
     if not leads:
@@ -4313,78 +4425,111 @@ async def search_messages(
     offset = max(0, int(offset or 0))
     import re as _re
     rx = _re.compile(_re.escape(qq), _re.IGNORECASE)
-    # Restrict to leads visible to this user (executives see only their assignments)
-    lead_q: Dict[str, Any] = {}
-    if user["role"] == "executive":
-        lead_q["assigned_to"] = user["id"]
-    visible_leads = await db.leads.find(lead_q, {
-        "_id": 0, "id": 1, "customer_name": 1, "aliases": 1, "phone": 1, "phones": 1, "assigned_to": 1
-    }).to_list(20000)
-    if not visible_leads:
-        return {"items": [], "total": 0, "limit": limit, "offset": offset}
-    lead_index: Dict[str, Dict[str, Any]] = {ld["id"]: ld for ld in visible_leads}
-    
-    # Identify leads whose name or phone matches qq to support name-based message search
-    matched_lead_ids = []
-    phone_pat = phone_match_pattern(qq)
-    for lid, ld in lead_index.items():
-        name_val = (ld.get("customer_name") or "").lower()
-        aliases_val = [str(a).lower() for a in (ld.get("aliases") or [])]
-        name_match = qq.lower() in name_val
-        alias_match = any(qq.lower() in a for a in aliases_val)
-        phone_match = False
-        if phone_pat:
-            if ld.get("phone") and _re.search(phone_pat, ld.get("phone")):
-                phone_match = True
-            elif ld.get("phones") and any(_re.search(phone_pat, p) for p in ld.get("phones") if p):
-                phone_match = True
-        else:
-            if ld.get("phone") and qq.lower() in ld.get("phone").lower():
-                phone_match = True
-            elif ld.get("phones") and any(qq.lower() in str(p).lower() for p in ld.get("phones") if p):
-                phone_match = True
-        if name_match or alias_match or phone_match:
-            matched_lead_ids.append(lid)
 
-    # Search messages.body OR caption for case-insensitive substring match, or match by lead ID if the name matches
-    msg_query: Dict[str, Any] = {
-        "lead_id": {"$in": list(lead_index.keys())},
+    # 1. Find leads whose name, aliases, or phone match qq
+    # We do a targeted MongoDB search rather than loading 20,000 leads in memory!
+    match_query: Dict[str, Any] = {
         "$or": [
-            {"body": {"$regex": _re.escape(qq), "$options": "i"}},
-            {"caption": {"$regex": _re.escape(qq), "$options": "i"}},
-        ],
+            {"customer_name": {"$regex": _re.escape(qq), "$options": "i"}},
+            {"aliases": {"$regex": _re.escape(qq), "$options": "i"}},
+        ]
     }
-    if matched_lead_ids:
-        msg_query["$or"].append({"lead_id": {"$in": matched_lead_ids}})
+    phone_pat = phone_match_pattern(qq)
+    if phone_pat:
+        match_query["$or"].append({"phone": {"$regex": phone_pat}})
+        match_query["$or"].append({"phones": {"$regex": phone_pat}})
+    else:
+        match_query["$or"].append({"phone": {"$regex": _re.escape(qq), "$options": "i"}})
+        match_query["$or"].append({"phones": {"$regex": _re.escape(qq), "$options": "i"}})
+
+    if user["role"] == "executive":
+        match_query["assigned_to"] = user["id"]
+
+    matched_leads = await db.leads.find(match_query, {
+        "id": 1, "customer_name": 1, "aliases": 1, "phone": 1, "phones": 1, "assigned_to": 1
+    }).to_list(1000)
+    matched_lead_ids = [ld["id"] for ld in matched_leads]
+
+    # 2. Build the lead index of matched leads
+    lead_index: Dict[str, Dict[str, Any]] = {ld["id"]: ld for ld in matched_leads}
+
+    # Build the query for messages
+    msg_query: Dict[str, Any] = {}
+    
+    # We restrict search based on executive's assigned leads
+    if user["role"] == "executive":
+        # Get executive's assigned leads
+        assigned_leads = await db.leads.find({"assigned_to": user["id"]}, {"id": 1}).to_list(10000)
+        assigned_lead_ids = [ld["id"] for ld in assigned_leads]
+        if not assigned_lead_ids:
+            return {"items": [], "total": 0, "limit": limit, "offset": offset}
+        
+        msg_query = {
+            "$or": [
+                {
+                    "lead_id": {"$in": assigned_lead_ids},
+                    "$or": [
+                        {"body": {"$regex": _re.escape(qq), "$options": "i"}},
+                        {"caption": {"$regex": _re.escape(qq), "$options": "i"}},
+                    ]
+                }
+            ]
+        }
+        if matched_lead_ids:
+            msg_query["$or"].append({"lead_id": {"$in": matched_lead_ids}})
+    else:
+        # Admin: search all messages globally matching regex, OR messages belonging to matched leads
+        msg_query = {
+            "$or": [
+                {"body": {"$regex": _re.escape(qq), "$options": "i"}},
+                {"caption": {"$regex": _re.escape(qq), "$options": "i"}},
+            ]
+        }
+        if matched_lead_ids:
+            msg_query["$or"].append({"lead_id": {"$in": matched_lead_ids}})
+
     total = await db.messages.count_documents(msg_query)
     cursor = db.messages.find(msg_query, {
         "_id": 0, "id": 1, "lead_id": 1, "direction": 1, "body": 1, "caption": 1,
         "msg_type": 1, "at": 1, "media_url": 1,
     }).sort("at", -1).skip(offset).limit(limit)
+
     items = []
-    async for m in cursor:
-        ld = lead_index.get(m.get("lead_id")) or {}
-        text = (m.get("body") or "") or (m.get("caption") or "")
-        # Build a 120-char snippet centered on the match
-        snippet = text
-        match = rx.search(text)
-        if match and len(text) > 120:
-            start = max(0, match.start() - 40)
-            end = min(len(text), match.end() + 80)
-            snippet = ("…" if start > 0 else "") + text[start:end] + ("…" if end < len(text) else "")
-        items.append({
-            "message_id": m.get("id"),
-            "lead_id": m.get("lead_id"),
-            "lead_name": ld.get("customer_name"),
-            "lead_phone": ld.get("phone"),
-            "lead_assigned_to": ld.get("assigned_to"),
-            "direction": m.get("direction"),
-            "msg_type": m.get("msg_type"),
-            "body": text,
-            "snippet": snippet,
-            "at": m.get("at"),
-            "has_media": bool(m.get("media_url")),
-        })
+    fetched_messages = await cursor.to_list(limit)
+    if fetched_messages:
+        # Find any lead_ids from messages that are not yet in lead_index
+        missing_lead_ids = list({m["lead_id"] for m in fetched_messages if m.get("lead_id") and m["lead_id"] not in lead_index})
+        if missing_lead_ids:
+            missing_leads = await db.leads.find({"id": {"$in": missing_lead_ids}}, {
+                "id": 1, "customer_name": 1, "aliases": 1, "phone": 1, "phones": 1, "assigned_to": 1
+            }).to_list(len(missing_lead_ids))
+            for ld in missing_leads:
+                lead_index[ld["id"]] = ld
+
+        for m in fetched_messages:
+            ld = lead_index.get(m.get("lead_id")) or {}
+            text = (m.get("body") or "") or (m.get("caption") or "")
+            # Build a 120-char snippet centered on the match
+            snippet = text
+            match = rx.search(text)
+            if match and len(text) > 120:
+                start = max(0, match.start() - 40)
+                end = min(len(text), match.end() + 80)
+                snippet = ("…" if start > 0 else "") + text[start:end] + ("…" if end < len(text) else "")
+            items.append({
+                "message_id": m.get("id"),
+                "lead_id": m.get("lead_id"),
+                "lead_name": ld.get("customer_name"),
+                "lead_phone": ld.get("phone"),
+                "lead_assigned_to": ld.get("assigned_to"),
+                "direction": m.get("direction"),
+                "msg_type": m.get("msg_type"),
+                "body": text,
+                "snippet": snippet,
+                "at": m.get("at"),
+                "has_media": bool(m.get("media_url")),
+            })
+            
     return {"items": items, "total": total, "limit": limit, "offset": offset, "q": qq}
 
 
@@ -6047,7 +6192,7 @@ async def send_flow_message(to_phone: str, node_id: str, lead: Optional[dict] = 
             msg_doc["cards"] = content.get("cards") or []
         await db.messages.insert_one(msg_doc)
         if api_result.get("status") in ("sent", "sent_mock"):
-            await db.leads.update_one({"id": lead["id"]}, {"$set": {"has_whatsapp": True, "last_action_at": iso(now_utc())}})
+            await db.leads.update_one({"id": lead["id"]}, {"$set": {"has_whatsapp": True, "last_action_at": iso(now_utc()), "last_message_at": msg_doc["at"]}})
     target_phone = _normalize_phone(to_phone)[-10:]
     if target_phone and api_result.get("status") in ("sent", "sent_mock"):
         await db.chat_sessions.update_one(
@@ -6889,6 +7034,7 @@ async def webhook_whatsapp(request: Request):
                         {"$set": {
                             "last_action_at": iso(now_utc()),
                             "last_user_message_at": iso(now_utc()),
+                            "last_message_at": msg_doc["at"],
                             "has_whatsapp": True,
                             f"wa_status_map.{(_normalize_phone(from_phone or '')[-10:] or 'unk')}": True,
                         }},
@@ -6973,7 +7119,8 @@ async def _auto_reassign_lead(lead_id: str, current_assigned_to: Optional[str], 
             "$set": {
                 "assigned_to": chosen_id,
                 "last_assignment_at": iso(now_utc()),
-                "last_action_at": iso(now_utc())
+                "last_action_at": iso(now_utc()),
+                "opened_at": None
             },
             "$push": {"assignment_history": entry},
         },
@@ -7047,7 +7194,7 @@ async def auto_reassign_task():
             "opened_at": None,
             "status": "new",
             "last_assignment_at": {"$lt": unopened_cutoff},
-        }, {"_id": 0}).limit(20)
+        }, {"_id": 0}).sort("last_assignment_at", -1).limit(20)
         async for lead in cursor:
             await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_unopened")
 
@@ -7057,7 +7204,7 @@ async def auto_reassign_task():
             "status": "new",
             "last_action_at": {"$lt": noaction_cutoff},
             "opened_at": {"$ne": None},
-        }, {"_id": 0}).limit(20)
+        }, {"_id": 0}).sort("last_action_at", -1).limit(20)
         async for lead in cursor2:
             await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_noaction")
 
@@ -7269,6 +7416,14 @@ async def _trigger_auto_sequence(lead_id: str, target_phone: str):
                 **extra
             }
             await db.messages.insert_one(msg)
+            await db.leads.update_one(
+                {"id": lead_id},
+                {"$set": {
+                    "last_action_at": iso(now_utc()),
+                    "last_message_at": msg["at"],
+                    "has_whatsapp": True,
+                }}
+            )
             # Short wait before sending next to guarantee order on client device
             await asyncio.sleep(1.5)
             
@@ -8587,6 +8742,9 @@ async def seed_data():
     # indexes
     await db.users.create_index("username", unique=True)
     await db.leads.create_index("dedup_hash")
+    await db.leads.create_index("id", unique=True)
+    await db.leads.create_index([("sort_at", -1), ("created_at", -1)])
+    await db.leads.create_index([("last_message_at", -1), ("created_at", -1)])
     try:
         await db.leads.create_index(
             "justdial_profile_url",
@@ -8599,6 +8757,7 @@ async def seed_data():
     await db.leads.create_index("status")
     await db.leads.create_index("created_at")
     await db.leads.create_index("last_action_at")
+    await db.leads.create_index([("last_assignment_at", -1)])
     await db.messages.create_index("lead_id")
     await db.messages.create_index([("lead_id", 1), ("at", -1)])
     await db.messages.create_index("wamid")

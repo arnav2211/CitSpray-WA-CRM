@@ -15,8 +15,8 @@ export function AlertListener() {
     const poll = async () => {
       try {
         const res = await api.get("/admin/alerts/pending");
-        if (mounted && res.data?.length > 0) {
-          setAlerts(res.data);
+        if (mounted) {
+          setAlerts(res.data || []);
         }
       } catch {}
     };

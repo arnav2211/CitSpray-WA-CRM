@@ -491,6 +491,20 @@ export default function LeadDrawer({ leadId, onClose }) {
               )}
             </section>
 
+            {(lead.gst_no || lead.enquiry_type) && (
+              <section data-testid="general-details-section">
+                <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2">General Details</div>
+                <div className="border border-gray-200 bg-white divide-y divide-gray-200">
+                  {lead.gst_no && (
+                    <DetailRow k="GSTIN" v={lead.gst_no} mono testId="lead-gst-detail" />
+                  )}
+                  {lead.enquiry_type && (
+                    <DetailRow k="Enquiry Type" v={lead.enquiry_type} testId="lead-enquiry-type-detail" />
+                  )}
+                </div>
+              </section>
+            )}
+
             {lead.source === "IndiaMART" && lead.source_data && (
               <section data-testid="indiamart-details-section">
                 <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2">IndiaMART Details</div>
@@ -905,6 +919,13 @@ function CallLogSection({ lead, calls, canEdit, callOutcome, setCallOutcome, cal
                   <span className={`text-[10px] uppercase tracking-widest font-bold ${OUTCOME_COLOR[c.outcome] || "text-gray-500"}`}>
                     {o?.label || c.outcome}
                   </span>
+                  {c.direction && (
+                    <span className={`text-[9px] uppercase font-bold px-1.5 py-0.5 rounded ${
+                      c.direction === "incoming" ? "bg-blue-100 text-blue-800" : "bg-gray-100 text-gray-800"
+                    }`}>
+                      {c.direction}
+                    </span>
+                  )}
                   <span className="text-xs font-mono text-gray-500">{c.phone}</span>
                 </div>
                 <div className="text-[10px] text-gray-400 font-mono">{fmtIST(c.at)} · {c.by_user_name}</div>

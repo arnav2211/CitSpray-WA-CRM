@@ -2,13 +2,22 @@ import React, { useEffect, useState } from "react";
 import Sidebar from "@/components/Sidebar";
 import FollowupAlerts from "@/components/FollowupAlerts";
 import { AlertListener } from "@/components/AlertListener";
-import { Outlet, useLocation } from "react-router-dom";
+import { Outlet, useLocation, useNavigate } from "react-router-dom";
 import { List } from "@phosphor-icons/react";
+import { useAuth } from "@/context/AuthContext";
 
 export default function AppShell() {
   const loc = useLocation();
+  const navigate = useNavigate();
+  const { user } = useAuth();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const onChat = loc.pathname.startsWith("/chat");
+
+  useEffect(() => {
+    if (user && user.role === "data_entry" && loc.pathname !== "/data-entry") {
+      navigate("/data-entry", { replace: true });
+    }
+  }, [user, loc.pathname, navigate]);
 
   // Close mobile drawer on route change
   useEffect(() => { setSidebarOpen(false); }, [loc.pathname]);
@@ -56,6 +65,8 @@ export default function AppShell() {
 }
 
 function pageTitle(path) {
+  if (path.startsWith("/data-entry-inspect")) return "Data Entry Stats";
+  if (path.startsWith("/data-entry")) return "Lead Entry";
   if (path.startsWith("/chatflows")) return "Chatbot Flows";
   if (path.startsWith("/chat")) return "WhatsApp";
   if (path.startsWith("/leads")) return "Leads";

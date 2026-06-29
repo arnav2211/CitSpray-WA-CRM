@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
@@ -91,17 +91,31 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
         </div>
 
         <nav className="flex-1 py-3 space-y-0.5 overflow-y-auto">
-          <div className="px-5 pt-2 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Workspace</div>
-          <Item to="/dashboard" icon={ChartBar} testId="nav-dashboard" onNavigate={handleNavigate}>Dashboard</Item>
-          <Item to="/chat" icon={ChatTeardropDots} testId="nav-chat" onNavigate={handleNavigate}>WhatsApp</Item>
-          <Item to="/leads" icon={Kanban} testId="nav-leads" onNavigate={handleNavigate}>Leads</Item>
-          <Item to="/followups" icon={Bell} testId="nav-followups" onNavigate={handleNavigate}>Follow-ups</Item>
-          <Item to="/qa" icon={ChatTeardropText} testId="nav-qa" onNavigate={handleNavigate}>Internal Q&amp;A</Item>
-          <Item to="/transfer-requests" icon={ArrowsLeftRight} testId="nav-transfer-requests" onNavigate={handleNavigate} badge={pendingTransfers}>Reassign Requests</Item>
+          {user?.role !== "data_entry" && (
+            <>
+              <div className="px-5 pt-2 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Workspace</div>
+              <Item to="/dashboard" icon={ChartBar} testId="nav-dashboard" onNavigate={handleNavigate}>Dashboard</Item>
+              <Item to="/chat" icon={ChatTeardropDots} testId="nav-chat" onNavigate={handleNavigate}>WhatsApp</Item>
+              <Item to="/leads" icon={Kanban} testId="nav-leads" onNavigate={handleNavigate}>Leads</Item>
+              <Item to="/followups" icon={Bell} testId="nav-followups" onNavigate={handleNavigate}>Follow-ups</Item>
+              <Item to="/qa" icon={ChatTeardropText} testId="nav-qa" onNavigate={handleNavigate}>Internal Q&amp;A</Item>
+              <Item to="/transfer-requests" icon={ArrowsLeftRight} testId="nav-transfer-requests" onNavigate={handleNavigate} badge={pendingTransfers}>Reassign Requests</Item>
+              <Item to="/reports" icon={PaperPlaneTilt} testId="nav-reports" onNavigate={handleNavigate}>Reports</Item>
+            </>
+          )}
+
+          {user?.role === "data_entry" && (
+            <>
+              <div className="px-5 pt-2 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Data Entry</div>
+              <Item to="/data-entry" icon={PlusCircle} testId="nav-data-entry" onNavigate={handleNavigate}>Lead Entry</Item>
+            </>
+          )}
+
           {isAdmin && (
             <>
               <div className="px-5 pt-4 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Admin</div>
               <Item to="/users" icon={Users} testId="nav-users" onNavigate={handleNavigate}>Executives</Item>
+              <Item to="/data-entry-inspect" icon={ClipboardText} testId="nav-data-entry-inspect" onNavigate={handleNavigate}>Data Entry Stats</Item>
               <Item to="/alerts" icon={Megaphone} testId="nav-alerts" onNavigate={handleNavigate}>Admin Alerts</Item>
               <Item to="/routing" icon={Gear} testId="nav-routing" onNavigate={handleNavigate}>Routing Rules</Item>
               <Item to="/integrations" icon={Plug} testId="nav-integrations" onNavigate={handleNavigate}>Integrations</Item>
@@ -110,7 +124,6 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
               <Item to="/quick-replies" icon={Lightning} testId="nav-quick-replies" onNavigate={handleNavigate}>Quick Replies</Item>
               <Item to="/payment-settings" icon={QrCode} testId="nav-payment-settings" onNavigate={handleNavigate}>Payment QR</Item>
               <Item to="/settings" icon={Sliders} testId="nav-settings" onNavigate={handleNavigate}>Settings</Item>
-              <Item to="/reports" icon={PaperPlaneTilt} testId="nav-reports" onNavigate={handleNavigate}>Reports</Item>
             </>
           )}
         </nav>

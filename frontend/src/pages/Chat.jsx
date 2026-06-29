@@ -53,6 +53,16 @@ function previewText(m) {
   return `${prefix}${(m.body || m.template_name || "(message)").slice(0, 80)}`;
 }
 
+function getEpoch(isoStr) {
+  if (!isoStr) return 0;
+  let clean = isoStr;
+  if (typeof clean === "string") {
+    clean = clean.replace(/\.(\d{3})\d+/, ".$1");
+  }
+  const d = new Date(clean);
+  return isNaN(d.getTime()) ? 0 : d.getTime();
+}
+
 // ---------------- Page ----------------
 export default function Chat() {
   const { user } = useAuth();
@@ -60,12 +70,11 @@ export default function Chat() {
   const [convs, setConvs] = useState([]);
   const [activeId, setActiveId] = useState(params.get("lead") || null);
   const [search, setSearch] = useState("");
-  const [filterUnread, setFilterUnread] = useState(false);
   const [filterUnreplied, setFilterUnreplied] = useState(false);
   const [filterReplied, setFilterReplied] = useState(false);
   const [filterStarred, setFilterStarred] = useState(false);
   const [filterStatus, setFilterStatus] = useState("");
-  const [filterAssignee, setFilterAssignee] = useState("");
+  const [filterAssignee, setFilterAssignee] = useState(params.get("agent") || "");
   const [execs, setExecs] = useState([]);
   const [showNewChat, setShowNewChat] = useState(false);
 
@@ -135,7 +144,6 @@ export default function Chat() {
       const { data } = await api.get("/inbox/conversations", {
         params: {
           q: search || undefined,
-          only_unread: filterUnread || undefined,
           only_unreplied: filterUnreplied || undefined,
           only_replied: filterReplied || undefined,
           status: filterStatus || undefined,
@@ -155,7 +163,7 @@ export default function Chat() {
         merged.sort((a, b) => {
           const ta = a.last_message?.at || a.last_in_at || a.last_out_at || a.last_action_at || "";
           const tb = b.last_message?.at || b.last_in_at || b.last_out_at || b.last_action_at || "";
-          return tb.localeCompare(ta);
+          return getEpoch(tb) - getEpoch(ta);
         });
         return merged;
       });
@@ -170,7 +178,7 @@ export default function Chat() {
     } finally {
       setLoadingMore(false);
     }
-  }, [search, filterUnread, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred, page, loadingMore, hasMore]);
+  }, [search, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred, page, loadingMore, hasMore]);
 
   // Refresh-only fetch — re-pulls page 0 for live unread updates without
   // disrupting any further pages the user has scrolled into.
@@ -179,7 +187,6 @@ export default function Chat() {
       const { data } = await api.get("/inbox/conversations", {
         params: {
           q: search || undefined,
-          only_unread: filterUnread || undefined,
           only_unreplied: filterUnreplied || undefined,
           only_replied: filterReplied || undefined,
           status: filterStatus || undefined,
@@ -197,12 +204,12 @@ export default function Chat() {
         merged.sort((a, b) => {
           const ta = a.last_message?.at || a.last_in_at || a.last_out_at || a.last_action_at || "";
           const tb = b.last_message?.at || b.last_in_at || b.last_out_at || b.last_action_at || "";
-          return tb.localeCompare(ta);
+          return getEpoch(tb) - getEpoch(ta);
         });
         return merged;
       });
     } catch (_) { /* silent */ }
-  }, [search, filterUnread, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred]);
+  }, [search, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred]);
 
   // Run global message search (debounced 250ms via the effect re-trigger)
   const runMessageSearch = useCallback(async (term) => {
@@ -239,13 +246,25 @@ export default function Chat() {
     setPage(0);
     fetchConvs({ reset: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search, filterUnread, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred]);
+  }, [search, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred]);
 
   // Live polling — refresh ONLY page 0 (keeps further pages stable while user scrolls)
   useEffect(() => {
     const id = setInterval(refreshFirstPage, POLL_MS);
     return () => clearInterval(id);
   }, [refreshFirstPage]);
+
+  // Escape key closes active chat thread
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === "Escape") {
+        if (document.querySelector('[data-testid="lightbox"]')) return;
+        setActiveId(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
   // Debounced message search trigger — re-runs 250ms after the user stops typing
   // when in 'messages' search mode.
@@ -267,13 +286,18 @@ export default function Chat() {
     const p = {};
     if (activeId) p.lead = activeId;
     const tab = params.get("tab");
-    const agent = params.get("agent");
     const phone = params.get("phone");
     if (tab) p.tab = tab;
-    if (agent) p.agent = agent;
+    if (filterAssignee) p.agent = filterAssignee;
     if (phone) p.phone = phone;
     setParams(p, { replace: true });
-  }, [activeId, setParams]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [activeId, filterAssignee, setParams]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Keep `filterAssignee` in sync with URL parameter changes
+  useEffect(() => {
+    const urlAgent = params.get("agent") || "";
+    setFilterAssignee((cur) => (cur === urlAgent ? cur : urlAgent));
+  }, [params.get("agent")]);
 
   // Keep `activeId` in sync when the URL `?lead=` param changes (e.g. user
   // navigates from Internal Q&A → /chat?lead=X while already on /chat — the
@@ -368,9 +392,14 @@ export default function Chat() {
           {/* Filters only relevant in chats mode */}
           {searchMode === "chats" && (
           <div className="flex items-center gap-2 flex-wrap">
-            <FilterChip active={filterUnread} onClick={() => setFilterUnread(v => !v)} testId="filter-unread">Unread</FilterChip>
-            <FilterChip active={filterUnreplied} onClick={() => setFilterUnreplied(v => !v)} testId="filter-unreplied">Not replied</FilterChip>
-            <FilterChip active={filterReplied} onClick={() => setFilterReplied(v => !v)} testId="filter-replied">Replied</FilterChip>
+            <FilterChip active={filterUnreplied} onClick={() => {
+              setFilterUnreplied(v => !v);
+              setFilterReplied(false);
+            }} testId="filter-unreplied">Not replied</FilterChip>
+            <FilterChip active={filterReplied} onClick={() => {
+              setFilterReplied(v => !v);
+              setFilterUnreplied(false);
+            }} testId="filter-replied">Replied</FilterChip>
             <FilterChip active={filterStarred} onClick={() => setFilterStarred(v => !v)} testId="filter-starred">Starred</FilterChip>
             <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)} className="border border-gray-300 px-2 py-1 text-xs" data-testid="filter-status">
               <option value="">All status</option>
@@ -631,6 +660,8 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   const isAdmin = user.role === "admin";
   const canMessage = isAdmin || conv.assigned_to === user.id;
   const [messages, setMessages] = useState([]);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [hasOlder, setHasOlder] = useState(true);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [showQR, setShowQR] = useState(false);
@@ -775,31 +806,62 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   // /leads-only concern. The filter here is purely a view-side restriction.
   const [phoneFilter, setPhoneFilter] = useState(initialPhone || "");
 
+  const lastConvIdRef = useRef(conv.id);
+  const messagesLengthRef = useRef(0);
+
+  if (lastConvIdRef.current !== conv.id) {
+    lastConvIdRef.current = conv.id;
+    messagesLengthRef.current = 0;
+  }
+
+  useEffect(() => {
+    messagesLengthRef.current = messages.length;
+  }, [messages.length]);
+
   const loadMessages = useCallback(async () => {
     try {
-      const params = phoneFilter ? { phone: phoneFilter } : {};
+      const currentCount = messagesLengthRef.current > 0 ? messagesLengthRef.current : 20;
+      const params = { limit: currentCount, offset: 0 };
+      if (phoneFilter) params.phone = phoneFilter;
       const { data } = await api.get(`/leads/${conv.id}/messages`, { params });
-      // Stable-identity merge: keep the previous object reference for any message
-      // whose body hasn't changed since the last poll. This lets React.memo bail
-      // out of re-rendering thousands of bubbles on every 4-second poll. We use
-      // a shallow-key signature of the mutable fields (status, reactions, edited
-      // body/caption) so updates still flow through.
+      
+      // Ignore if the lead has changed since the request was started
+      if (lastConvIdRef.current !== conv.id) return;
+
       setMessages((prev) => {
         if (!Array.isArray(data)) return prev;
-        if (!prev || prev.length === 0) return data;
-        const byId = new Map(prev.map((m) => [m.id, m]));
+        const cleanPrev = (prev && prev.length > 0 && prev[0].lead_id === conv.id) ? prev : [];
+        if (cleanPrev.length === 0) return data;
         const sig = (m) => `${m.status || ""}|${m.body || ""}|${m.caption || ""}|${m.media_url || ""}|${(m.reactions || []).length}|${m.error || ""}`;
-        return data.map((m) => {
-          const old = byId.get(m.id);
+        
+        const updatedIncoming = data.map((m) => {
+          const old = cleanPrev.find(p => p.id === m.id);
           if (old && sig(old) === sig(m)) return old;
           return m;
         });
+
+        const map = new Map(cleanPrev.map((m) => [m.id, m]));
+        for (const m of updatedIncoming) {
+          map.set(m.id, m);
+        }
+        const merged = Array.from(map.values());
+        merged.sort((a, b) => getEpoch(a.at) - getEpoch(b.at));
+        return merged;
       });
     } catch (e) {
       const msg = errMsg(e, "");
       if (msg && !msg.toLowerCase().includes("network")) toast.error(msg);
     }
   }, [conv.id, phoneFilter]);
+
+  const isInitialLoadRef = useRef(true);
+
+  useEffect(() => {
+    setMessages([]);
+    setHasOlder(true);
+    setLoadingOlder(false);
+    isInitialLoadRef.current = true;
+  }, [conv.id]);
 
   useEffect(() => { loadMessages(); }, [loadMessages]);
   useEffect(() => {
@@ -842,10 +904,76 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
 
   // Scroll to bottom on new messages
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    const el = scrollRef.current;
+    if (!el) return;
+    if (isInitialLoadRef.current) {
+      el.scrollTop = el.scrollHeight;
+      if (messages.length > 0) {
+        isInitialLoadRef.current = false;
+      }
+      return;
+    }
+    const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+    if (isNearBottom) {
+      el.scrollTop = el.scrollHeight;
     }
   }, [messages.length]);
+
+  const onMessagesScroll = useCallback(async () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    if (el.scrollTop < 50 && !loadingOlder && hasOlder) {
+      setLoadingOlder(true);
+      const prevScrollHeight = el.scrollHeight;
+      const prevScrollTop = el.scrollTop;
+      try {
+        const currentLength = messages.length;
+        const params = { limit: 10, offset: currentLength };
+        if (phoneFilter) params.phone = phoneFilter;
+        const { data } = await api.get(`/leads/${conv.id}/messages`, { params });
+        
+        // Ignore if the lead has changed since the request was started
+        if (lastConvIdRef.current !== conv.id) return;
+
+        if (Array.isArray(data)) {
+          if (data.length < 10) {
+            setHasOlder(false);
+          }
+          if (data.length > 0) {
+            const sig = (m) => `${m.status || ""}|${m.body || ""}|${m.caption || ""}|${m.media_url || ""}|${(m.reactions || []).length}|${m.error || ""}`;
+            setMessages((prev) => {
+              const cleanPrev = (prev && prev.length > 0 && prev[0].lead_id === conv.id) ? prev : [];
+              const byId = new Map(cleanPrev.map((m) => [m.id, m]));
+              const updatedIncoming = data.map((m) => {
+                const old = byId.get(m.id);
+                if (old && sig(old) === sig(m)) return old;
+                return m;
+              });
+
+              const map = new Map(cleanPrev.map(m => [m.id, m]));
+              for (const m of updatedIncoming) {
+                map.set(m.id, m);
+              }
+              const merged = Array.from(map.values());
+              merged.sort((a, b) => getEpoch(a.at) - getEpoch(b.at));
+              return merged;
+            });
+
+            setTimeout(() => {
+              if (scrollRef.current) {
+                const newScrollHeight = scrollRef.current.scrollHeight;
+                scrollRef.current.scrollTop = prevScrollTop + (newScrollHeight - prevScrollHeight);
+              }
+            }, 50);
+          }
+        }
+      } catch (e) {
+        console.error("Failed to load older messages", e);
+      } finally {
+        setLoadingOlder(false);
+      }
+    }
+  }, [conv.id, messages.length, phoneFilter, loadingOlder, hasOlder]);
 
   // WhatsApp-style jump-to-quoted-message. Scrolls the bubble into view + adds
   // a temporary highlight ring so the user knows where it landed.
@@ -858,7 +986,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
     }
     el.scrollIntoView({ behavior: "smooth", block: "center" });
     // Drop a transient highlight class on the inner bubble div.
-    const inner = el.querySelector("div");
+    const inner = el.querySelector('[data-testid="bubble-inner"]') || el.querySelector("div");
     if (inner) {
       inner.classList.add("ring-4", "ring-[#FF8800]", "ring-offset-1");
       setTimeout(() => {
@@ -1350,7 +1478,12 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
               ><X size={14} /></button>
             </div>
           )}
-          <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-1.5" style={{ background: "#EFEAE2", contain: "strict", overscrollBehavior: "contain", willChange: "scroll-position" }} data-testid="messages-area">
+          <div ref={scrollRef} onScroll={onMessagesScroll} className="flex-1 overflow-y-auto p-4 space-y-1.5" style={{ background: "#EFEAE2", contain: "content", overscrollBehavior: "contain", willChange: "scroll-position" }} data-testid="messages-area">
+            {loadingOlder && (
+              <div className="text-center py-2 text-xs text-gray-500 font-semibold" data-testid="older-messages-loading">
+                Loading older messages...
+              </div>
+            )}
             {messages.length === 0 && (
               <div className="text-center text-xs uppercase tracking-widest text-gray-500 py-12">No messages yet</div>
             )}
@@ -1701,9 +1834,18 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                     return (
                       <div key={c.id} className="bg-gray-50 border border-gray-200 p-2 text-xs" data-testid={`chat-call-row-${c.id}`}>
                         <div className="flex items-center justify-between gap-1 flex-wrap">
-                          <span className={`text-[10px] uppercase tracking-widest font-bold ${OUTCOME_COLOR[c.outcome] || "text-gray-500"}`}>
-                            {o?.label || c.outcome}
-                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <span className={`text-[10px] uppercase tracking-widest font-bold ${OUTCOME_COLOR[c.outcome] || "text-gray-500"}`}>
+                              {o?.label || c.outcome}
+                            </span>
+                            {c.direction && (
+                              <span className={`text-[9px] uppercase font-bold px-1.5 py-0.5 rounded ${
+                                c.direction === "incoming" ? "bg-blue-100 text-blue-800" : "bg-gray-100 text-gray-800"
+                              }`}>
+                                {c.direction}
+                              </span>
+                            )}
+                          </div>
                           <span className="text-[10px] text-gray-500 font-mono">{fmtIST(c.at)}</span>
                         </div>
                         <div className="text-[10px] text-gray-400 font-mono mt-0.5">{c.phone} · logged by {c.by_user_name}</div>
@@ -2173,7 +2315,7 @@ const DayGroup = React.memo(function DayGroup({
 });
 
 
-function BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, canMessage = true, currentUserId = null, isHighlighted = false, isFocused = false, searchQuery = "" }) {
+function BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, onJumpTo, canMessage = true, currentUserId = null, isHighlighted = false, isFocused = false, searchQuery = "" }) {
   const isOut = m.direction === "out";
   const isSystem = m.direction === "system";
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -2208,9 +2350,11 @@ function BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmi
   const media = renderMedia(m);
   const hasStructured = media || m.msg_type === "location" || m.msg_type === "contacts";
   const captionText = m.caption || (hasStructured ? "" : m.body);
-  const quoted = m.reply_to_message_id
+  const quoted = (m.reply_to_message_id
     ? allMessages.find((x) => x.id === m.reply_to_message_id)
-    : null;
+    : null) || (m.reply_to_wamid
+    ? allMessages.find((x) => x.wamid === m.reply_to_wamid)
+    : null);
   const quotedPreview = quoted
     ? ((quoted.caption || quoted.body || "").slice(0, 120))
     : (m.reply_to_preview ? m.reply_to_preview.slice(0, 120) : null);
@@ -2252,7 +2396,7 @@ function BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmi
           )}
         </div>
       )}
-      <div className={`max-w-[75%] ${media ? "p-1.5" : "px-3 py-2"} ${isOut ? "bg-[#D9FDD3]" : "bg-white"} text-sm shadow-sm relative ${isHighlighted ? "ring-2 ring-[#FFCC00]" : ""} ${isFocused ? "ring-4 ring-[#FF8800] ring-offset-1" : ""}`}>
+      <div data-testid="bubble-inner" className={`max-w-[75%] ${media ? "p-1.5" : "px-3 py-2"} ${isOut ? "bg-[#D9FDD3]" : "bg-white"} text-sm shadow-sm relative ${isHighlighted ? "ring-2 ring-[#FFCC00]" : ""} ${isFocused ? "ring-4 ring-[#FF8800] ring-offset-1" : ""}`}>
         {m.template_name && (
           <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold mb-1 px-2 pt-1">Template · {m.template_name}</div>
         )}
@@ -2263,7 +2407,12 @@ function BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmi
               e.stopPropagation();
               if (!onJumpTo) return;
               const targetId = quoted?.id || m.reply_to_message_id;
-              if (targetId) onJumpTo(targetId);
+              if (targetId) {
+                onJumpTo(targetId);
+              } else if (m.reply_to_wamid) {
+                const foundByWamid = allMessages.find((x) => x.wamid === m.reply_to_wamid);
+                if (foundByWamid) onJumpTo(foundByWamid.id);
+              }
             }}
             className={`block w-full text-left mb-1.5 border-l-[3px] pl-2 py-1 text-xs bg-black/5 hover:bg-black/10 active:bg-black/15 transition-colors cursor-pointer ${media ? "mx-1.5 mt-1.5" : ""}`}
             style={{ borderColor: quotedDirection === "out" ? "#25D366" : "#002FA7" }}

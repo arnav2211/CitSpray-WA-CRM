@@ -9,7 +9,12 @@ export default function Login() {
   const [password, setP] = useState("");
   const [loading, setLoading] = useState(false);
 
-  if (user) return <Navigate to="/dashboard" replace />;
+  if (user) {
+    if (user.role === "data_entry") {
+      return <Navigate to="/data-entry" replace />;
+    }
+    return <Navigate to="/dashboard" replace />;
+  }
 
   const submit = async (e) => {
     e.preventDefault();

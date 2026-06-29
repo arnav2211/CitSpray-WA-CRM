@@ -3,7 +3,7 @@ import "@/App.css";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { Toaster } from "sonner";
 import { AuthProvider } from "@/context/AuthContext";
-import { ProtectedRoute, AdminOnly } from "@/components/ProtectedRoute";
+import { ProtectedRoute, AdminOnly, ExecutiveOrAdminOnly } from "@/components/ProtectedRoute";
 import AppShell from "@/components/AppShell";
 import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
@@ -23,6 +23,8 @@ import InternalQA from "@/pages/InternalQA";
 import TransferRequests from "@/pages/TransferRequests";
 import PaymentSettings from "@/pages/PaymentSettings";
 import AdminAlerts from "@/pages/AdminAlerts";
+import DataEntry from "@/pages/DataEntry";
+import DataEntryInspect from "@/pages/DataEntryInspect";
 
 export default function App() {
   return (
@@ -34,13 +36,13 @@ export default function App() {
             <Route path="/login" element={<Login />} />
             <Route element={<ProtectedRoute><AppShell /></ProtectedRoute>}>
               <Route path="/" element={<Navigate to="/dashboard" replace />} />
-              <Route path="/dashboard" element={<Dashboard />} />
-              <Route path="/chat" element={<Chat />} />
-              <Route path="/leads" element={<Leads />} />
-              <Route path="/leads/:id" element={<><Leads /><LeadDetail /></>} />
-              <Route path="/followups" element={<Followups />} />
-              <Route path="/qa" element={<InternalQA />} />
-              <Route path="/transfer-requests" element={<TransferRequests />} />
+              <Route path="/dashboard" element={<ExecutiveOrAdminOnly><Dashboard /></ExecutiveOrAdminOnly>} />
+              <Route path="/chat" element={<ExecutiveOrAdminOnly><Chat /></ExecutiveOrAdminOnly>} />
+              <Route path="/leads" element={<ExecutiveOrAdminOnly><Leads /></ExecutiveOrAdminOnly>} />
+              <Route path="/leads/:id" element={<ExecutiveOrAdminOnly><><Leads /><LeadDetail /></></ExecutiveOrAdminOnly>} />
+              <Route path="/followups" element={<ExecutiveOrAdminOnly><Followups /></ExecutiveOrAdminOnly>} />
+              <Route path="/qa" element={<ExecutiveOrAdminOnly><InternalQA /></ExecutiveOrAdminOnly>} />
+              <Route path="/transfer-requests" element={<ExecutiveOrAdminOnly><TransferRequests /></ExecutiveOrAdminOnly>} />
               <Route path="/users" element={<AdminOnly><UsersPage /></AdminOnly>} />
               <Route path="/routing" element={<AdminOnly><RoutingRules /></AdminOnly>} />
               <Route path="/integrations" element={<AdminOnly><Integrations /></AdminOnly>} />
@@ -49,8 +51,10 @@ export default function App() {
               <Route path="/quick-replies" element={<AdminOnly><QuickReplies /></AdminOnly>} />
               <Route path="/settings" element={<AdminOnly><Settings /></AdminOnly>} />
               <Route path="/payment-settings" element={<AdminOnly><PaymentSettings /></AdminOnly>} />
-              <Route path="/reports" element={<AdminOnly><Reports /></AdminOnly>} />
+              <Route path="/reports" element={<ExecutiveOrAdminOnly><Reports /></ExecutiveOrAdminOnly>} />
               <Route path="/alerts" element={<AdminOnly><AdminAlerts /></AdminOnly>} />
+              <Route path="/data-entry" element={<DataEntry />} />
+              <Route path="/data-entry-inspect" element={<AdminOnly><DataEntryInspect /></AdminOnly>} />
             </Route>
             <Route path="*" element={<Navigate to="/dashboard" replace />} />
           </Routes>

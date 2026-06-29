@@ -446,7 +446,7 @@ function Kanban_({ leads, onOpen, execMap, onToggleStar }) {
 }
 
 function NewLeadModal({ onClose, onCreated, execs, isAdmin }) {
-  const [f, setF] = useState({ customer_name: "", phone: "", requirement: "", city: "", state: "", area: "", source: "Manual", assigned_to: "" });
+  const [f, setF] = useState({ customer_name: "", phone: "", requirement: "", city: "", state: "", area: "", source: "Manual", gst_no: "", enquiry_type: "", assigned_to: "" });
   const [loading, setLoading] = useState(false);
   const [conflict, setConflict] = useState(null); // { existing_lead_id, owned_by_name, message }
   const [requesting, setRequesting] = useState(false);
@@ -532,6 +532,8 @@ function NewLeadModal({ onClose, onCreated, execs, isAdmin }) {
           <Field label="Area"><input value={f.area} onChange={(e) => setF({ ...f, area: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-area-input" /></Field>
           <Field label="City"><input value={f.city} onChange={(e) => setF({ ...f, city: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-city-input" /></Field>
           <Field label="State"><input value={f.state} onChange={(e) => setF({ ...f, state: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-state-input" /></Field>
+          <Field label="GST No."><input value={f.gst_no} onChange={(e) => setF({ ...f, gst_no: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="new-lead-gst-input" /></Field>
+          <Field label="Enquiry Type"><input value={f.enquiry_type} onChange={(e) => setF({ ...f, enquiry_type: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" placeholder="e.g. direct, buyleads" data-testid="new-lead-enquiry-type-input" /></Field>
           <Field label="Source">
             <select value={f.source} onChange={(e) => setF({ ...f, source: e.target.value })} className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="new-lead-source-select">
               {SOURCES.map((s) => <option key={s} value={s}>{s}</option>)}
@@ -560,6 +562,7 @@ function NewLeadModal({ onClose, onCreated, execs, isAdmin }) {
 function UploadLeadsModal({ onClose, onUploaded, execs, isAdmin }) {
   const [file, setFile] = useState(null);
   const [assignedTo, setAssignedTo] = useState("");
+  const [source, setSource] = useState("");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [dragActive, setDragActive] = useState(false);
@@ -625,6 +628,9 @@ function UploadLeadsModal({ onClose, onUploaded, execs, isAdmin }) {
     if (assignedTo) {
       formData.append("assigned_to", assignedTo);
     }
+    if (source) {
+      formData.append("source", source);
+    }
 
     try {
       const { data } = await api.post("/leads/upload", formData, {
@@ -668,23 +674,38 @@ function UploadLeadsModal({ onClose, onUploaded, execs, isAdmin }) {
 
         {!result ? (
           <form onSubmit={submit} className="space-y-4 mt-4">
-            {isAdmin && (
-              <Field label="Assign Imported Leads To" full>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {isAdmin && (
+                <Field label="Assign Imported Leads To">
+                  <select 
+                    value={assignedTo} 
+                    onChange={(e) => setAssignedTo(e.target.value)} 
+                    className="w-full border border-gray-300 px-2 py-2 text-sm"
+                    data-testid="upload-assign-select"
+                  >
+                    <option value="">Auto (round-robin)</option>
+                    {execs.map((x) => (
+                      <option key={x.id} value={x.id}>
+                        {x.role === "admin" ? `${x.name} (admin)` : x.name}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              )}
+              <Field label="Enquiry Source (Default/Override)" full={!isAdmin}>
                 <select 
-                  value={assignedTo} 
-                  onChange={(e) => setAssignedTo(e.target.value)} 
+                  value={source} 
+                  onChange={(e) => setSource(e.target.value)} 
                   className="w-full border border-gray-300 px-2 py-2 text-sm"
-                  data-testid="upload-assign-select"
+                  data-testid="upload-source-select"
                 >
-                  <option value="">Auto (round-robin)</option>
-                  {execs.map((x) => (
-                    <option key={x.id} value={x.id}>
-                      {x.role === "admin" ? `${x.name} (admin)` : x.name}
-                    </option>
+                  <option value="">Use source from file (fallback to "Excel Upload")</option>
+                  {SOURCES.map((s) => (
+                    <option key={s} value={s}>{s}</option>
                   ))}
                 </select>
               </Field>
-            )}
+            </div>
 
             <div 
               onDragEnter={handleDrag}

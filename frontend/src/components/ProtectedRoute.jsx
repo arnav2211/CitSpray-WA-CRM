@@ -20,3 +20,17 @@ export function AdminOnly({ children }) {
   if (!user || user.role !== "admin") return <Navigate to="/dashboard" replace />;
   return children;
 }
+
+export function ExecutiveOrAdminOnly({ children }) {
+  const { user } = useAuth();
+  if (user === null) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-xs uppercase tracking-widest text-gray-500">Authenticating…</div>
+      </div>
+    );
+  }
+  if (!user) return <Navigate to="/login" replace />;
+  if (user.role === "data_entry") return <Navigate to="/data-entry" replace />;
+  return children;
+}

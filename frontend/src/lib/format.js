@@ -12,7 +12,11 @@ const TF_IST = new Intl.DateTimeFormat("en-GB", {
 
 function _parse(iso) {
   if (!iso) return null;
-  const d = iso instanceof Date ? iso : new Date(iso);
+  let clean = iso;
+  if (typeof clean === "string") {
+    clean = clean.replace(/\.(\d{3})\d+/, ".$1");
+  }
+  const d = clean instanceof Date ? clean : new Date(clean);
   return isNaN(d.getTime()) ? null : d;
 }
 
