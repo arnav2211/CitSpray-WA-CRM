@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
@@ -100,6 +100,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
               <Item to="/followups" icon={Bell} testId="nav-followups" onNavigate={handleNavigate}>Follow-ups</Item>
               <Item to="/qa" icon={ChatTeardropText} testId="nav-qa" onNavigate={handleNavigate}>Internal Q&amp;A</Item>
               <Item to="/transfer-requests" icon={ArrowsLeftRight} testId="nav-transfer-requests" onNavigate={handleNavigate} badge={pendingTransfers}>Reassign Requests</Item>
+              <Item to="/calls" icon={PhoneCall} testId="nav-calls" onNavigate={handleNavigate}>Call Logs</Item>
               <Item to="/reports" icon={PaperPlaneTilt} testId="nav-reports" onNavigate={handleNavigate}>Reports</Item>
             </>
           )}

@@ -1382,7 +1382,11 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
             </select>
           </div>
           <div className="text-xs text-gray-500 flex items-center gap-3 flex-wrap">
-            {conv.phone && <span className="font-mono flex items-center gap-1" data-testid="chat-phone-display"><Phone size={11} /> {conv.phone}</span>}
+            {conv.phone && (
+              <a href={`tel:${conv.phone}`} className="font-mono flex items-center gap-1 hover:underline hover:text-blue-600" data-testid="chat-phone-display">
+                <Phone size={11} /> {conv.phone}
+              </a>
+            )}
             {/* Admin: reassign dropdown ; executive: read-only assignee */}
             {isAdmin ? (
               <span className="flex items-center gap-1">
@@ -1748,7 +1752,15 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
             {panelTab === "details" ? (
             <div className="p-4 space-y-4 text-sm overflow-y-auto">
               <InfoRow label="Customer">{conv.customer_name || "—"}</InfoRow>
-              <InfoRow label="Phone"><span className="font-mono">{conv.phone || "—"}</span></InfoRow>
+              <InfoRow label="Phone">
+                {conv.phone ? (
+                  <a href={`tel:${conv.phone}`} className="font-mono hover:underline hover:text-blue-600">
+                    {conv.phone}
+                  </a>
+                ) : (
+                  "—"
+                )}
+              </InfoRow>
               {conv.email && <InfoRow label="Email"><span className="font-mono text-xs break-all">{conv.email}</span></InfoRow>}
               <InfoRow label="Source"><SourceBadge source={conv.source} /></InfoRow>
               <InfoRow label="Status"><StatusBadge status={conv.status} /></InfoRow>

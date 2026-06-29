@@ -926,6 +926,11 @@ function CallLogSection({ lead, calls, canEdit, callOutcome, setCallOutcome, cal
                       {c.direction}
                     </span>
                   )}
+                  {c.duration_seconds > 0 && (
+                    <span className="text-[9px] font-mono font-bold text-gray-500 bg-gray-50 border border-gray-250 px-1.5 py-0.5 rounded">
+                      {Math.floor(c.duration_seconds / 60) > 0 ? `${Math.floor(c.duration_seconds / 60)}m ${c.duration_seconds % 60}s` : `${c.duration_seconds}s`}
+                    </span>
+                  )}
                   <span className="text-xs font-mono text-gray-500">{c.phone}</span>
                 </div>
                 <div className="text-[10px] text-gray-400 font-mono">{fmtIST(c.at)} · {c.by_user_name}</div>

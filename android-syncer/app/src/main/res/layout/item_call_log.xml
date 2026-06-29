@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:paddingVertical="12dp"
+        android:paddingHorizontal="16dp"
+        android:background="#0A0A0A"
+        android:gravity="center_vertical">
+
+        <!-- Call Type Indicator (Icon) -->
+        <ImageView
+            android:id="@+id/imgCallType"
+            android:layout_width="24dp"
+            android:layout_height="24dp"
+            android:src="@drawable/ic_mic"
+            android:scaleType="centerInside"
+            android:layout_marginEnd="12dp"
+            app:tint="#8E8E93"
+            android:contentDescription="Type" />
+
+        <!-- Text Information -->
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <!-- Names (Contact Name + CRM Lead Name) -->
+            <TextView
+                android:id="@+id/txtNames"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="John Doe (Contacts) / CRM Lead"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:textStyle="bold"
+                android:ellipsize="end"
+                android:maxLines="2" />
+
+            <!-- Phone Number -->
+            <TextView
+                android:id="@+id/txtPhone"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="+91 98765 43210"
+                android:textColor="#8E8E93"
+                android:textSize="12sp"
+                android:layout_marginTop="2dp" />
+
+            <!-- Time & Duration -->
+            <TextView
+                android:id="@+id/txtTime"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Today, 10:15 AM (1m 15s)"
+                android:textColor="#555555"
+                android:textSize="11sp"
+                android:layout_marginTop="2dp" />
+        </LinearLayout>
+
+        <!-- Deep-Link Actions Row -->
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center"
+            android:layout_marginStart="8dp">
+
+            <!-- View Lead Button -->
+            <ImageButton
+                android:id="@+id/btnViewLead"
+                android:layout_width="38dp"
+                android:layout_height="38dp"
+                android:background="@drawable/circle_shape"
+                android:backgroundTint="#1C1C1E"
+                android:src="@drawable/ic_launcher"
+                android:padding="10dp"
+                android:scaleType="fitCenter"
+                android:layout_marginEnd="6dp"
+                app:tint="#002FA7"
+                android:contentDescription="Lead" />
+
+            <!-- Open WhatsApp Button -->
+            <ImageButton
+                android:id="@+id/btnViewChat"
+                android:layout_width="38dp"
+                android:layout_height="38dp"
+                android:background="@drawable/circle_shape"
+                android:backgroundTint="#1C1C1E"
+                android:src="@drawable/ic_dialpad"
+                android:padding="10dp"
+                android:scaleType="fitCenter"
+                android:layout_marginEnd="6dp"
+                app:tint="#30D158"
+                android:contentDescription="Chat" />
+
+            <!-- Call Button -->
+            <ImageButton
+                android:id="@+id/btnCallLogCall"
+                android:layout_width="38dp"
+                android:layout_height="38dp"
+                android:background="@drawable/circle_shape"
+                android:backgroundTint="#1C1C1E"
+                android:src="@drawable/ic_mic"
+                android:padding="10dp"
+                android:scaleType="fitCenter"
+                app:tint="#FFFFFF"
+                android:contentDescription="Call" />
+        </LinearLayout>
+
+    </LinearLayout>
+
+    <!-- Row Divider -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="#1C1C1E" />
+
+</LinearLayout>

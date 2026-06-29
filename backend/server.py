@@ -390,13 +390,14 @@ class LeadUpdate(BaseModel):
     gst_no: Optional[str] = None
 
 
-CALL_OUTCOMES = ("connected", "no_response", "rejected", "not_reachable", "busy", "invalid")
+CALL_OUTCOMES = ("connected", "no_response", "rejected", "not_reachable", "busy", "invalid", "initiated")
 
 
 class CallLogInput(BaseModel):
     phone: str
-    outcome: Literal["connected", "no_response", "rejected", "not_reachable", "busy", "invalid"]
+    outcome: Literal["connected", "no_response", "rejected", "not_reachable", "busy", "invalid", "initiated"]
     summary: Optional[str] = None  # required only for outcome=connected
+    lead_status: Optional[str] = None
 
 
 class SyncedCallRecord(BaseModel):
@@ -406,6 +407,7 @@ class SyncedCallRecord(BaseModel):
     duration_seconds: int
     note: Optional[str] = None
     direction: Optional[str] = None
+    lead_status: Optional[str] = None
 
 
 class CallSyncBatchInput(BaseModel):
@@ -2426,8 +2428,6 @@ async def log_call(lead_id: str, body: CallLogInput, user: dict = Depends(get_cu
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
-    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
-        raise HTTPException(status_code=403, detail="Not allowed")
     if body.outcome == "connected" and not (body.summary or "").strip():
         raise HTTPException(status_code=400, detail="Conversation summary is required for a connected call")
     doc = {
@@ -2447,9 +2447,14 @@ async def log_call(lead_id: str, body: CallLogInput, user: dict = Depends(get_cu
         "last_call_at": doc["at"],
         "last_action_at": doc["at"],
     }
-    # Auto-promote status: if lead is still "new", move to "contacted" on first call log
-    if lead.get("status") == "new":
+    # Auto-promote status if not initiated call
+    if body.outcome != "initiated" and lead.get("status") == "new":
         update_fields["status"] = "contacted"
+        
+    # Directly update status if lead_status is provided and valid
+    if body.lead_status and body.lead_status in ["new", "contacted", "qualified", "converted", "lost"]:
+        update_fields["status"] = body.lead_status
+
     await db.leads.update_one(
         {"id": lead_id},
         {"$set": update_fields},
@@ -2458,24 +2463,37 @@ async def log_call(lead_id: str, body: CallLogInput, user: dict = Depends(get_cu
 
     # Intelligent Reassignment Logic
     current_assignee = lead.get("assigned_to")
-    if body.outcome == "connected" and current_assignee and current_assignee != user["id"]:
-        has_connected = await db.call_logs.find_one({
-            "lead_id": lead_id,
-            "by_user_id": current_assignee,
-            "outcome": "connected"
-        })
-        if not has_connected:
+    if body.outcome == "connected" and user["role"] == "executive":
+        if not current_assignee:
             await assign_lead(lead_id, target_user_id=user["id"], by_user_id=user["id"])
             await log_activity(
                 user["id"],
-                "lead_auto_reassigned_connected_call",
+                "lead_auto_assigned_callback",
                 lead_id,
                 {
-                    "previous_assignee": current_assignee,
+                    "previous_assignee": None,
                     "new_assignee": user["id"],
-                    "reason": "Successful call connection by another executive while current assignee had no successful contact"
+                    "reason": "Connected call on unassigned lead"
                 }
             )
+        elif current_assignee != user["id"]:
+            has_connected = await db.call_logs.find_one({
+                "lead_id": lead_id,
+                "by_user_id": current_assignee,
+                "outcome": "connected"
+            })
+            if not has_connected:
+                await assign_lead(lead_id, target_user_id=user["id"], by_user_id=user["id"])
+                await log_activity(
+                    user["id"],
+                    "lead_auto_reassigned_connected_call",
+                    lead_id,
+                    {
+                        "previous_assignee": current_assignee,
+                        "new_assignee": user["id"],
+                        "reason": "Successful call connection by another executive while current assignee had no successful contact"
+                    }
+                )
 
     return strip_mongo(doc)
 
@@ -2485,7 +2503,7 @@ async def list_lead_calls(lead_id: str, user: dict = Depends(get_current_user)):
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
-    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+    if user["role"] == "data_entry":
         raise HTTPException(status_code=403, detail="Not allowed")
     return await db.call_logs.find({"lead_id": lead_id}, {"_id": 0}).sort("at", -1).to_list(500)
 
@@ -2546,23 +2564,25 @@ async def sync_call_batch(body: CallSyncBatchInput, user: dict = Depends(get_cur
         if existing:
             # If the sync payload contains a user note/outcome (e.g. from PostCallActivity),
             # we should update the existing call log with the note and outcome!
-            if record.note and record.note.strip():
-                note_str = record.note.strip()
-                update_fields = {
-                    "outcome": outcome,
-                    "summary": note_str,
+            note_str = record.note.strip() if record.note else ""
+            update_fields = {
+                "outcome": outcome,
+            }
+            if note_str:
+                update_fields["summary"] = note_str
+            await db.call_logs.update_one({"id": existing["id"]}, {"$set": update_fields})
+            
+            if lead:
+                lead_update = {
+                    "last_call_outcome": outcome,
+                    "last_call_at": record.timestamp,
+                    "last_action_at": record.timestamp,
                 }
-                await db.call_logs.update_one({"id": existing["id"]}, {"$set": update_fields})
-                
-                if lead:
-                    lead_update = {
-                        "last_call_outcome": outcome,
-                        "last_call_at": record.timestamp,
-                        "last_action_at": record.timestamp,
-                    }
-                    if lead.get("status") == "new":
-                        lead_update["status"] = "contacted"
-                    await db.leads.update_one({"id": lead["id"]}, {"$set": lead_update})
+                if outcome != "initiated" and lead.get("status") == "new":
+                    lead_update["status"] = "contacted"
+                if record.lead_status and record.lead_status in ["new", "contacted", "qualified", "converted", "lost"]:
+                    lead_update["status"] = record.lead_status
+                await db.leads.update_one({"id": lead["id"]}, {"$set": lead_update})
             continue
 
         note_str = record.note.strip() if record.note else ""
@@ -2595,8 +2615,10 @@ async def sync_call_batch(body: CallSyncBatchInput, user: dict = Depends(get_cur
                 "last_call_at": doc["at"],
                 "last_action_at": doc["at"],
             }
-            if lead.get("status") == "new":
+            if outcome != "initiated" and lead.get("status") == "new":
                 update_fields["status"] = "contacted"
+            if record.lead_status and record.lead_status in ["new", "contacted", "qualified", "converted", "lost"]:
+                update_fields["status"] = record.lead_status
             await db.leads.update_one({"id": lead_id}, {"$set": update_fields})
             
             # Log standard activity
@@ -2644,6 +2666,121 @@ async def sync_call_batch(body: CallSyncBatchInput, user: dict = Depends(get_cur
         "matched": matched_count,
         "reassigned": reassigned_count
     }
+
+
+class CallEventInput(BaseModel):
+    phone: str
+    event: Literal["started", "answered", "ended"]
+    duration_seconds: Optional[int] = 0
+    outcome: Optional[str] = None
+    direction: Optional[str] = "outgoing"
+
+
+@api.post("/calls/events")
+async def report_call_event(body: CallEventInput, user: dict = Depends(get_current_user)):
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Access denied")
+        
+    norm = normalize_phone_display(body.phone)
+    if not norm:
+        raise HTTPException(status_code=400, detail="Invalid phone number")
+        
+    lead = await _find_lead_by_phone(norm)
+    if not lead:
+        return {"success": True, "detail": "Lead not found, event skipped"}
+        
+    lead_id = lead["id"]
+    now_str = iso(now_utc())
+    
+    if body.event == "started":
+        await db.leads.update_one(
+            {"id": lead_id},
+            {"$set": {
+                "last_call_outcome": "initiated",
+                "last_call_at": now_str,
+                "last_action_at": now_str
+            }}
+        )
+    elif body.event == "answered":
+        update_q = {
+            "last_call_outcome": "connected",
+            "last_call_at": now_str,
+            "last_action_at": now_str
+        }
+        if lead.get("status") == "new":
+            update_q["status"] = "contacted"
+        await db.leads.update_one({"id": lead_id}, {"$set": update_q})
+    elif body.event == "ended":
+        outcome = body.outcome or "no_response"
+        duration = body.duration_seconds or 0
+        
+        # Save call log
+        doc = {
+            "id": str(uuid.uuid4()),
+            "lead_id": lead_id,
+            "phone": norm,
+            "outcome": outcome,
+            "summary": f"Call ended. Duration: {duration}s. (Auto-logged via app)",
+            "by_user_id": user["id"],
+            "by_user_name": user["name"],
+            "at": now_str,
+            "duration_seconds": duration,
+            "direction": body.direction or "outgoing",
+            "synced_from_app": True
+        }
+        await db.call_logs.insert_one(doc.copy())
+        
+        update_q = {
+            "last_call_outcome": outcome,
+            "last_call_at": now_str,
+            "last_action_at": now_str
+        }
+        if outcome == "connected" and lead.get("status") == "new":
+            update_q["status"] = "contacted"
+            
+        await db.leads.update_one({"id": lead_id}, {"$set": update_q})
+        await log_activity(user["id"], "call_logged", lead_id, {
+            "outcome": outcome,
+            "phone": norm,
+            "duration_seconds": duration,
+            "synced_from_app": True
+        })
+        
+        # Intelligent Reassignment
+        current_assignee = lead.get("assigned_to")
+        if outcome == "connected" and user["role"] == "executive":
+            if not current_assignee:
+                await assign_lead(lead_id, target_user_id=user["id"], by_user_id=user["id"])
+                await log_activity(
+                    user["id"],
+                    "lead_auto_assigned_callback",
+                    lead_id,
+                    {
+                        "previous_assignee": None,
+                        "new_assignee": user["id"],
+                        "reason": "Connected call event on unassigned lead"
+                    }
+                )
+            elif current_assignee != user["id"]:
+                has_connected = await db.call_logs.find_one({
+                    "lead_id": lead_id,
+                    "by_user_id": current_assignee,
+                    "outcome": "connected"
+                })
+                if not has_connected:
+                    await assign_lead(lead_id, target_user_id=user["id"], by_user_id=user["id"])
+                    await log_activity(
+                        user["id"],
+                        "lead_auto_reassigned_connected_call",
+                        lead_id,
+                        {
+                            "previous_assignee": current_assignee,
+                            "new_assignee": user["id"],
+                            "reason": "Successful call connection event by another executive while current assignee had no successful contact"
+                        }
+                    )
+                    
+    return {"success": True}
 
 
 @api.get("/calls")
@@ -3870,7 +4007,7 @@ async def get_leads_phone_map(user: dict = Depends(get_current_user)):
     if user["role"] == "executive":
         q["assigned_to"] = user["id"]
         
-    cursor = db.leads.find(q, {"_id": 0, "phone": 1, "customer_name": 1, "id": 1})
+    cursor = db.leads.find(q, {"_id": 0, "phone": 1, "customer_name": 1, "id": 1, "status": 1})
     leads = await cursor.to_list(None)
     
     out = {}
@@ -3879,7 +4016,8 @@ async def get_leads_phone_map(user: dict = Depends(get_current_user)):
         if norm:
             out[norm] = {
                 "name": l.get("customer_name") or "Unnamed",
-                "id": l.get("id")
+                "id": l.get("id"),
+                "status": l.get("status") or "new"
             }
     return out
 

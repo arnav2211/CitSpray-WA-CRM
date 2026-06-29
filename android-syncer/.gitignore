@@ -1,0 +1,13 @@
+.gradle
+/local.properties
+/.idea/caches
+/.idea/workspace.xml
+/.idea/gradle.xml
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/navigation.xml
+/build
+.cxx
+*.apk
+*.aar
+**/build

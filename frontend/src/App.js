@@ -25,6 +25,7 @@ import PaymentSettings from "@/pages/PaymentSettings";
 import AdminAlerts from "@/pages/AdminAlerts";
 import DataEntry from "@/pages/DataEntry";
 import DataEntryInspect from "@/pages/DataEntryInspect";
+import CallLogs from "@/pages/CallLogs";
 
 export default function App() {
   return (
@@ -40,6 +41,7 @@ export default function App() {
               <Route path="/chat" element={<ExecutiveOrAdminOnly><Chat /></ExecutiveOrAdminOnly>} />
               <Route path="/leads" element={<ExecutiveOrAdminOnly><Leads /></ExecutiveOrAdminOnly>} />
               <Route path="/leads/:id" element={<ExecutiveOrAdminOnly><><Leads /><LeadDetail /></></ExecutiveOrAdminOnly>} />
+              <Route path="/calls" element={<ExecutiveOrAdminOnly><CallLogs /></ExecutiveOrAdminOnly>} />
               <Route path="/followups" element={<ExecutiveOrAdminOnly><Followups /></ExecutiveOrAdminOnly>} />
               <Route path="/qa" element={<ExecutiveOrAdminOnly><InternalQA /></ExecutiveOrAdminOnly>} />
               <Route path="/transfer-requests" element={<ExecutiveOrAdminOnly><TransferRequests /></ExecutiveOrAdminOnly>} />

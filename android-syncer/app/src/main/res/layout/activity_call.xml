@@ -1,0 +1,373 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/bg_call_gradient">
+
+    <!-- Top Contact Info Section -->
+    <LinearLayout
+        android:id="@+id/callerInfoContainer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_alignParentTop="true"
+        android:layout_marginTop="80dp"
+        android:gravity="center"
+        android:orientation="vertical">
+
+        <!-- Avatar Circle -->
+        <FrameLayout
+            android:layout_width="110dp"
+            android:layout_height="110dp"
+            android:background="@drawable/circle_shape"
+            android:backgroundTint="#1C1D24">
+
+            <TextView
+                android:id="@+id/callerInitial"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:gravity="center"
+                android:text="?"
+                android:textColor="#FFFFFF"
+                android:textSize="44sp"
+                android:textStyle="bold" />
+        </FrameLayout>
+
+        <TextView
+            android:id="@+id/callerName"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="LeadOrbit Call"
+            android:textColor="#FFFFFF"
+            android:textSize="30sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/callerNumber"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="+91 00000 00000"
+            android:textColor="#8E8E93"
+            android:textSize="16sp"
+            android:letterSpacing="0.05" />
+
+        <TextView
+            android:id="@+id/callStatus"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Connecting..."
+            android:textColor="#8E8E93"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <Chronometer
+            android:id="@+id/callTimer"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:textColor="#FFFFFF"
+            android:textSize="20sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+    </LinearLayout>
+
+    <!-- Bottom Action Row (Answer & Hangup) -->
+    <LinearLayout
+        android:id="@+id/callActionContainer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_alignParentBottom="true"
+        android:layout_marginBottom="64dp"
+        android:gravity="center"
+        android:orientation="horizontal">
+
+        <!-- Answer Button (hidden by default) -->
+        <ImageButton
+            android:id="@+id/answerButton"
+            android:layout_width="76dp"
+            android:layout_height="76dp"
+            android:layout_marginEnd="48dp"
+            android:background="@drawable/circle_shape"
+            android:backgroundTint="#30D158"
+            android:src="@drawable/ic_call_answer"
+            android:scaleType="fitCenter"
+            android:padding="22dp"
+            android:visibility="gone"
+            android:contentDescription="Answer Call" />
+
+        <!-- Hangup Button -->
+        <ImageButton
+            android:id="@+id/hangupButton"
+            android:layout_width="76dp"
+            android:layout_height="76dp"
+            android:background="@drawable/circle_shape"
+            android:backgroundTint="#FF3B30"
+            android:src="@drawable/ic_call_end"
+            android:scaleType="fitCenter"
+            android:padding="22dp"
+            android:contentDescription="End Call" />
+
+    </LinearLayout>
+
+    <!-- DTMF Dialer Overlay (hidden by default) -->
+    <LinearLayout
+        android:id="@+id/dtmfDialerContainer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_above="@id/controlsContainer"
+        android:layout_below="@id/callerInfoContainer"
+        android:background="#1C1D24"
+        android:padding="16dp"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:visibility="gone"
+        android:layout_marginHorizontal="32dp"
+        android:layout_marginVertical="16dp">
+        
+        <TextView
+            android:id="@+id/dtmfDisplay"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:textColor="#FFFFFF"
+            android:textSize="20sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="12dp" />
+            
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+            
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+                <Button android:id="@+id/dtmf1" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="1" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
+                <Button android:id="@+id/dtmf2" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="2" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
+                <Button android:id="@+id/dtmf3" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="3" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
+            </LinearLayout>
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+                <Button android:id="@+id/dtmf4" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="4" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
+                <Button android:id="@+id/dtmf5" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="5" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
+                <Button android:id="@+id/dtmf6" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="6" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
+            </LinearLayout>
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+                <Button android:id="@+id/dtmf7" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="7" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
+                <Button android:id="@+id/dtmf8" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="8" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
+                <Button android:id="@+id/dtmf9" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="9" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
+            </LinearLayout>
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+                <Button android:id="@+id/dtmfStar" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="*" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
+                <Button android:id="@+id/dtmf0" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="0" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
+                <Button android:id="@+id/dtmfHash" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="#" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
+            </LinearLayout>
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- Mid-Bottom Call Controls (Mute, Speaker, Keypad, Rec, Add, Merge) -->
+    <LinearLayout
+        android:id="@+id/controlsContainer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_above="@id/callActionContainer"
+        android:layout_marginBottom="24dp"
+        android:gravity="center"
+        android:orientation="vertical">
+
+        <!-- Row 1: Mute, Speaker, Keypad -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:orientation="horizontal"
+            android:layout_marginBottom="12dp">
+
+            <!-- Mute -->
+            <LinearLayout
+                android:layout_width="100dp"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:orientation="vertical">
+                <ImageButton
+                    android:id="@+id/muteButton"
+                    android:layout_width="60dp"
+                    android:layout_height="60dp"
+                    android:background="@drawable/circle_shape"
+                    android:backgroundTint="#1C1D24"
+                    android:src="@drawable/ic_mic"
+                    android:scaleType="fitCenter"
+                    android:padding="16dp"
+                    app:tint="#FFFFFF"
+                    android:contentDescription="Mute" />
+                <TextView
+                    android:id="@+id/muteLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="Mute"
+                    android:textColor="#A0A5B5"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <!-- Speaker -->
+            <LinearLayout
+                android:layout_width="100dp"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:orientation="vertical">
+                <ImageButton
+                    android:id="@+id/speakerButton"
+                    android:layout_width="60dp"
+                    android:layout_height="60dp"
+                    android:background="@drawable/circle_shape"
+                    android:backgroundTint="#1C1D24"
+                    android:src="@drawable/ic_speaker"
+                    android:scaleType="fitCenter"
+                    android:padding="16dp"
+                    app:tint="#FFFFFF"
+                    android:contentDescription="Speaker" />
+                <TextView
+                    android:id="@+id/speakerLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="Speaker"
+                    android:textColor="#A0A5B5"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <!-- Keypad (DTMF Toggle) -->
+            <LinearLayout
+                android:layout_width="100dp"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:orientation="vertical">
+                <ImageButton
+                    android:id="@+id/keypadButton"
+                    android:layout_width="60dp"
+                    android:layout_height="60dp"
+                    android:background="@drawable/circle_shape"
+                    android:backgroundTint="#1C1D24"
+                    android:src="@drawable/ic_dialpad"
+                    android:scaleType="fitCenter"
+                    android:padding="16dp"
+                    app:tint="#FFFFFF"
+                    android:contentDescription="Keypad" />
+                <TextView
+                    android:id="@+id/keypadLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="Keypad"
+                    android:textColor="#A0A5B5"
+                    android:textSize="12sp" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- Row 2: Record, Add Call, Merge -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:orientation="horizontal">
+
+            <!-- Record Button -->
+            <LinearLayout
+                android:layout_width="100dp"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:orientation="vertical">
+                <ImageButton
+                    android:id="@+id/recordButton"
+                    android:layout_width="60dp"
+                    android:layout_height="60dp"
+                    android:background="@drawable/circle_shape"
+                    android:backgroundTint="#1C1D24"
+                    android:src="@drawable/ic_record"
+                    android:scaleType="fitCenter"
+                    android:padding="16dp"
+                    app:tint="#FFFFFF"
+                    android:contentDescription="Record" />
+                <TextView
+                    android:id="@+id/recordLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="Record"
+                    android:textColor="#A0A5B5"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <!-- Add Call Button -->
+            <LinearLayout
+                android:layout_width="100dp"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:orientation="vertical">
+                <ImageButton
+                    android:id="@+id/addCallButton"
+                    android:layout_width="60dp"
+                    android:layout_height="60dp"
+                    android:background="@drawable/circle_shape"
+                    android:backgroundTint="#1C1D24"
+                    android:src="@drawable/ic_add_call"
+                    android:scaleType="fitCenter"
+                    android:padding="16dp"
+                    app:tint="#FFFFFF"
+                    android:contentDescription="Add Call" />
+                <TextView
+                    android:id="@+id/addCallLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="Add Call"
+                    android:textColor="#A0A5B5"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <!-- Merge Button -->
+            <LinearLayout
+                android:id="@+id/mergeContainer"
+                android:layout_width="100dp"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:orientation="vertical"
+                android:visibility="gone">
+                <ImageButton
+                    android:id="@+id/mergeButton"
+                    android:layout_width="60dp"
+                    android:layout_height="60dp"
+                    android:background="@drawable/circle_shape"
+                    android:backgroundTint="#1C1D24"
+                    android:src="@drawable/ic_merge"
+                    android:scaleType="fitCenter"
+                    android:padding="16dp"
+                    app:tint="#FFFFFF"
+                    android:contentDescription="Merge" />
+                <TextView
+                    android:id="@+id/mergeLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="Merge"
+                    android:textColor="#A0A5B5"
+                    android:textSize="12sp" />
+            </LinearLayout>
+        </LinearLayout>
+
+    </LinearLayout>
+
+</RelativeLayout>

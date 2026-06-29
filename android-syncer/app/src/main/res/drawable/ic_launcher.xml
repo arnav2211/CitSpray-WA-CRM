@@ -1,0 +1,23 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="32"
+    android:viewportHeight="32">
+    
+    <!-- Background rounded rectangle (similar to the favicon shape) -->
+    <!-- We make it 32x32 viewbox. Rx of 4 in 32x32 translates to standard paths. -->
+    <path
+        android:fillColor="#002FA7"
+        android:pathData="M 4,0 C 1.8,0 0,1.8 0,4 V 28 C 0,30.2 1.8,32 4,32 H 28 C 30.2,32 32,30.2 32,28 V 4 C 32,1.8 30.2,0 28,0 Z" />
+
+    <!-- Compass Graphic translated and scaled in the center -->
+    <group
+        android:translateX="8"
+        android:translateY="8"
+        android:scaleX="0.0625"
+        android:scaleY="0.0625">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M128,20A108,108,0,1,0,236,128,108.12,108.12,0,0,0,128,20Zm0,192a84,84,0,1,1,84-84A84.09,84.09,0,0,1,128,212ZM163.27,77l-56,24a12,12,0,0,0-6.3,6.3l-24,56A12,12,0,0,0,92.73,179l56-24a12,12,0,0,0,6.3-6.3l24-56A12,12,0,0,0,163.27,77Zm-28.41,57.89-24,10.29,10.29-24,24-10.29Z" />
+    </group>
+</vector>
