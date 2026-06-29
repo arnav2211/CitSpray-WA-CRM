@@ -76,7 +76,7 @@
         app:layout_constraintEnd_toEndOf="parent" />
 
     <!-- Floating Active Call Banner (hidden by default) -->
-    <com.google.android.material.card.MaterialCardView
+    <androidx.cardview.widget.CardView
         android:id="@+id/activeCallBanner"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -85,7 +85,6 @@
         app:cardCornerRadius="12dp"
         app:cardElevation="6dp"
         app:cardBackgroundColor="#1C1D24"
-        app:strokeWidth="0dp"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
@@ -142,6 +141,6 @@
                 android:padding="10dp"
                 android:contentDescription="End Call" />
         </LinearLayout>
-    </com.google.android.material.card.MaterialCardView>
+    </androidx.cardview.widget.CardView>
 
 </androidx.constraintlayout.widget.ConstraintLayout>
