@@ -2,8 +2,8 @@ import React, { useEffect, useState } from "react";
 import Sidebar from "@/components/Sidebar";
 import FollowupAlerts from "@/components/FollowupAlerts";
 import { AlertListener } from "@/components/AlertListener";
-import { Outlet, useLocation, useNavigate, NavLink } from "react-router-dom";
-import { List, House, ChatTeardropDots, Kanban, Phone, PhoneCall } from "@phosphor-icons/react";
+import { Outlet, useLocation, useNavigate } from "react-router-dom";
+import { List } from "@phosphor-icons/react";
 import { useAuth } from "@/context/AuthContext";
 
 export default function AppShell() {
@@ -54,33 +54,9 @@ export default function AppShell() {
             <span className="kbd">v1.0</span> · Command Console
           </div>
         </header>
-        <div className={`flex-1 min-h-0 ${onChat ? "overflow-hidden" : "overflow-auto"} ${user?.role !== "data_entry" ? "pb-14" : ""} md:pb-0`}>
+        <div className={`flex-1 min-h-0 ${onChat ? "overflow-hidden" : "overflow-auto"}`}>
           <Outlet />
         </div>
-        {user?.role !== "data_entry" && (
-          <div className="md:hidden shrink-0 fixed bottom-0 left-0 right-0 z-30 bg-white border-t border-gray-200 flex items-center justify-around h-14 shadow-[0_-2px_10px_rgba(0,0,0,0.05)] pb-safe">
-            <NavLink to="/dashboard" className={({ isActive }) => `flex flex-col items-center justify-center flex-1 h-full text-[10px] ${isActive ? "text-[#002FA7] font-semibold" : "text-gray-500"}`}>
-              <House size={20} weight="regular" />
-              <span className="mt-0.5">Dashboard</span>
-            </NavLink>
-            <NavLink to="/chat" className={({ isActive }) => `flex flex-col items-center justify-center flex-1 h-full text-[10px] ${isActive ? "text-[#002FA7] font-semibold" : "text-gray-500"}`}>
-              <ChatTeardropDots size={20} weight="regular" />
-              <span className="mt-0.5">WhatsApp</span>
-            </NavLink>
-            <NavLink to="/leads" className={({ isActive }) => `flex flex-col items-center justify-center flex-1 h-full text-[10px] ${isActive ? "text-[#002FA7] font-semibold" : "text-gray-500"}`}>
-              <Kanban size={20} weight="regular" />
-              <span className="mt-0.5">Leads</span>
-            </NavLink>
-            <a href="tel:dialer" className="flex flex-col items-center justify-center flex-1 h-full text-[10px] text-gray-500">
-              <Phone size={20} weight="regular" />
-              <span className="mt-0.5">Dialer</span>
-            </a>
-            <NavLink to="/calls" className={({ isActive }) => `flex flex-col items-center justify-center flex-1 h-full text-[10px] ${isActive ? "text-[#002FA7] font-semibold" : "text-gray-500"}`}>
-              <PhoneCall size={20} weight="regular" />
-              <span className="mt-0.5">Calls</span>
-            </NavLink>
-          </div>
-        )}
       </main>
       <FollowupAlerts />
       <AlertListener />
