@@ -1,126 +1,228 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<androidx.cardview.widget.CardView xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:orientation="vertical">
+    android:layout_marginHorizontal="12dp"
+    android:layout_marginVertical="6dp"
+    app:cardCornerRadius="12dp"
+    app:cardElevation="3dp"
+    app:cardBackgroundColor="#15161C">
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:paddingVertical="12dp"
-        android:paddingHorizontal="16dp"
-        android:background="#0A0A0A"
-        android:gravity="center_vertical">
+        android:orientation="vertical"
+        android:padding="12dp">
 
-        <!-- Call Type Indicator (Icon) -->
-        <ImageView
-            android:id="@+id/imgCallType"
-            android:layout_width="24dp"
-            android:layout_height="24dp"
-            android:src="@drawable/ic_mic"
-            android:scaleType="centerInside"
-            android:layout_marginEnd="12dp"
-            app:tint="#8E8E93"
-            android:contentDescription="Type" />
-
-        <!-- Text Information -->
+        <!-- Top Header: Call Status Icon + Name & Phone + Expand Chevron -->
         <LinearLayout
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:orientation="vertical">
-
-            <!-- Names (Contact Name + CRM Lead Name) -->
-            <TextView
-                android:id="@+id/txtNames"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="John Doe (Contacts) / CRM Lead"
-                android:textColor="#FFFFFF"
-                android:textSize="15sp"
-                android:textStyle="bold"
-                android:ellipsize="end"
-                android:maxLines="2" />
-
-            <!-- Phone Number -->
-            <TextView
-                android:id="@+id/txtPhone"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="+91 98765 43210"
-                android:textColor="#8E8E93"
-                android:textSize="12sp"
-                android:layout_marginTop="2dp" />
-
-            <!-- Time & Duration -->
-            <TextView
-                android:id="@+id/txtTime"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="Today, 10:15 AM (1m 15s)"
-                android:textColor="#555555"
-                android:textSize="11sp"
-                android:layout_marginTop="2dp" />
-        </LinearLayout>
-
-        <!-- Deep-Link Actions Row -->
-        <LinearLayout
-            android:layout_width="wrap_content"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
-            android:gravity="center"
-            android:layout_marginStart="8dp">
+            android:gravity="center_vertical">
 
-            <!-- View Lead Button -->
-            <ImageButton
-                android:id="@+id/btnViewLead"
-                android:layout_width="38dp"
-                android:layout_height="38dp"
-                android:background="@drawable/circle_shape"
-                android:backgroundTint="#1C1C1E"
-                android:src="@drawable/ic_launcher"
-                android:padding="10dp"
-                android:scaleType="fitCenter"
-                android:layout_marginEnd="6dp"
-                app:tint="#002FA7"
-                android:contentDescription="Lead" />
+            <ImageView
+                android:id="@+id/imgCallType"
+                android:layout_width="32dp"
+                android:layout_height="32dp"
+                android:src="@drawable/ic_call_incoming"
+                android:scaleType="centerInside"
+                android:layout_marginEnd="12dp"
+                app:tint="#8E8E93"
+                android:contentDescription="Call status type" />
 
-            <!-- Open WhatsApp Button -->
-            <ImageButton
-                android:id="@+id/btnViewChat"
-                android:layout_width="38dp"
-                android:layout_height="38dp"
-                android:background="@drawable/circle_shape"
-                android:backgroundTint="#1C1C1E"
-                android:src="@drawable/ic_dialpad"
-                android:padding="10dp"
-                android:scaleType="fitCenter"
-                android:layout_marginEnd="6dp"
-                app:tint="#30D158"
-                android:contentDescription="Chat" />
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
 
-            <!-- Call Button -->
+                <TextView
+                    android:id="@+id/txtNames"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Lead Name"
+                    android:textColor="#FFFFFF"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:ellipsize="end"
+                    android:maxLines="1" />
+
+                <TextView
+                    android:id="@+id/txtPhone"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="+91 99999 99999"
+                    android:textColor="#A0A5B5"
+                    android:textSize="12sp"
+                    android:layout_marginTop="2dp" />
+
+                <TextView
+                    android:id="@+id/txtTime"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Date &amp; Time"
+                    android:textColor="#6B6E7B"
+                    android:textSize="11sp"
+                    android:layout_marginTop="2dp" />
+            </LinearLayout>
+
             <ImageButton
-                android:id="@+id/btnCallLogCall"
-                android:layout_width="38dp"
-                android:layout_height="38dp"
-                android:background="@drawable/circle_shape"
-                android:backgroundTint="#1C1C1E"
-                android:src="@drawable/ic_mic"
-                android:padding="10dp"
+                android:id="@+id/btnExpand"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:background="@android:color/transparent"
+                android:src="@drawable/ic_chevron_down"
                 android:scaleType="fitCenter"
-                app:tint="#FFFFFF"
-                android:contentDescription="Call" />
+                android:padding="8dp"
+                app:tint="#A0A5B5"
+                android:contentDescription="Expand details" />
         </LinearLayout>
 
+        <!-- Expanded Details (visible only when clicked expand button) -->
+        <LinearLayout
+            android:id="@+id/layoutExpandedDetails"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone"
+            android:layout_marginTop="8dp">
+
+            <!-- Divider line -->
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:background="#22232A"
+                android:layout_marginVertical="6dp" />
+
+            <!-- Grid-like list of details -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:weightSum="2">
+
+                <!-- Left Column -->
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="EXECUTIVE"
+                        android:textColor="#555761"
+                        android:textSize="9sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/txtExecutive"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Executive Name"
+                        android:textColor="#FFFFFF"
+                        android:textSize="12sp"
+                        android:layout_marginTop="1dp" />
+                </LinearLayout>
+
+                <!-- Right Column -->
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="DURATION"
+                        android:textColor="#555761"
+                        android:textSize="9sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/txtDuration"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="0s"
+                        android:textColor="#FFFFFF"
+                        android:textSize="12sp"
+                        android:layout_marginTop="1dp" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- Action buttons divider -->
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:background="#22232A"
+                android:layout_marginVertical="10dp" />
+
+            <!-- Row for CRM deep-link and Call buttons -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:weightSum="3">
+
+                <!-- View Lead Button -->
+                <Button
+                    android:id="@+id/btnViewLead"
+                    android:layout_width="0dp"
+                    android:layout_height="36dp"
+                    android:layout_weight="1"
+                    android:layout_marginEnd="4dp"
+                    android:backgroundTint="#2C2E3B"
+                    android:text="View Lead"
+                    android:textSize="11sp"
+                    android:textColor="#FFFFFF"
+                    android:insetTop="0dp"
+                    android:insetBottom="0dp"
+                    app:icon="@drawable/ic_launcher"
+                    app:iconSize="14dp"
+                    app:iconTint="#FFFFFF"
+                    app:iconPadding="4dp" />
+
+                <!-- WhatsApp Button -->
+                <Button
+                    android:id="@+id/btnViewChat"
+                    android:layout_width="0dp"
+                    android:layout_height="36dp"
+                    android:layout_weight="1"
+                    android:layout_marginHorizontal="2dp"
+                    android:backgroundTint="#128C7E"
+                    android:text="WhatsApp"
+                    android:textSize="11sp"
+                    android:textColor="#FFFFFF"
+                    android:insetTop="0dp"
+                    android:insetBottom="0dp"
+                    app:icon="@drawable/ic_dialpad"
+                    app:iconSize="14dp"
+                    app:iconTint="#FFFFFF"
+                    app:iconPadding="4dp" />
+
+                <!-- Direct Call Back Button -->
+                <Button
+                    android:id="@+id/btnCallLogCall"
+                    android:layout_width="0dp"
+                    android:layout_height="36dp"
+                    android:layout_weight="1"
+                    android:layout_marginStart="4dp"
+                    android:backgroundTint="#30D158"
+                    android:text="Call Back"
+                    android:textSize="11sp"
+                    android:textColor="#FFFFFF"
+                    android:insetTop="0dp"
+                    android:insetBottom="0dp"
+                    app:icon="@drawable/ic_call_incoming"
+                    app:iconSize="14dp"
+                    app:iconTint="#FFFFFF"
+                    app:iconPadding="4dp" />
+            </LinearLayout>
+        </LinearLayout>
     </LinearLayout>
-
-    <!-- Row Divider -->
-    <View
-        android:layout_width="match_parent"
-        android:layout_height="1dp"
-        android:background="#1C1C1E" />
-
-</LinearLayout>
+</androidx.cardview.widget.CardView>

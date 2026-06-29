@@ -182,8 +182,9 @@ class MainActivity : AppCompatActivity() {
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val url = request?.url?.toString() ?: ""
-                if (url.startsWith("tel:")) {
-                    placeCall(url.substring(4))
+                if (url.startsWith("tel:") || url.contains("dialer")) {
+                    val rawNum = if (url.startsWith("tel:")) url.substring(4) else "dialer"
+                    placeCall(rawNum)
                     return true
                 }
                 return super.shouldOverrideUrlLoading(view, request)
@@ -191,8 +192,9 @@ class MainActivity : AppCompatActivity() {
 
             @Deprecated("Deprecated in Java")
             override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
-                if (url != null && url.startsWith("tel:")) {
-                    placeCall(url.substring(4))
+                if (url != null && (url.startsWith("tel:") || url.contains("dialer"))) {
+                    val rawNum = if (url.startsWith("tel:")) url.substring(4) else "dialer"
+                    placeCall(rawNum)
                     return true
                 }
                 @Suppress("DEPRECATION")
@@ -230,7 +232,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun placeCall(phoneNumber: String) {
-        if (phoneNumber == "dialer" || phoneNumber.trim().isEmpty()) {
+        val cleanNumber = phoneNumber.replace("/", "").trim().lowercase()
+        if (cleanNumber == "dialer" || cleanNumber.isEmpty()) {
             startActivity(Intent(this, DialpadActivity::class.java))
         } else {
             CallHelper.placeCall(this, phoneNumber)

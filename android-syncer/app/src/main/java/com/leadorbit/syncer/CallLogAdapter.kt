@@ -6,11 +6,11 @@ import android.text.format.DateUtils
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.Button
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
-import java.util.Locale
 
 data class CallLogItem(
     val number: String,
@@ -33,9 +33,13 @@ class CallLogAdapter(
         val txtNames: TextView = view.findViewById(R.id.txtNames)
         val txtPhone: TextView = view.findViewById(R.id.txtPhone)
         val txtTime: TextView = view.findViewById(R.id.txtTime)
-        val btnViewLead: ImageButton = view.findViewById(R.id.btnViewLead)
-        val btnViewChat: ImageButton = view.findViewById(R.id.btnViewChat)
-        val btnCallLogCall: ImageButton = view.findViewById(R.id.btnCallLogCall)
+        val btnViewLead: Button = view.findViewById(R.id.btnViewLead)
+        val btnViewChat: Button = view.findViewById(R.id.btnViewChat)
+        val btnCallLogCall: Button = view.findViewById(R.id.btnCallLogCall)
+        val btnExpand: ImageButton = view.findViewById(R.id.btnExpand)
+        val layoutExpandedDetails: View = view.findViewById(R.id.layoutExpandedDetails)
+        val txtExecutive: TextView = view.findViewById(R.id.txtExecutive)
+        val txtDuration: TextView = view.findViewById(R.id.txtDuration)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
@@ -52,10 +56,10 @@ class CallLogAdapter(
         
         holder.txtNames.text = when {
             hasContact && hasCrm && item.contactName != item.crmName -> {
-                "${item.contactName} [Phone] / ${item.crmName} [CRM]"
+                "${item.contactName} / ${item.crmName}"
             }
-            hasCrm -> "${item.crmName} [CRM]"
-            hasContact -> "${item.contactName} [Phone]"
+            hasCrm -> item.crmName
+            hasContact -> item.contactName
             else -> item.number
         }
         
@@ -67,12 +71,18 @@ class CallLogAdapter(
             System.currentTimeMillis(),
             DateUtils.MINUTE_IN_MILLIS
         )
-        
+        holder.txtTime.text = relativeTime
+
         // Format Duration
         val min = item.duration / 60
         val sec = item.duration % 60
         val durationStr = if (min > 0) "${min}m ${sec}s" else "${sec}s"
-        holder.txtTime.text = "$relativeTime ($durationStr)"
+        holder.txtDuration.text = durationStr
+
+        // Executive Name from SharedPreferences
+        val sharedPrefs = context.getSharedPreferences("CRM_PREFS", Context.MODE_PRIVATE)
+        val execName = sharedPrefs.getString("user_name", null) ?: "Executive"
+        holder.txtExecutive.text = execName
 
         // Bind Call Type Icon & Tint
         val (iconRes, tintColor) = when (item.type) {
@@ -86,6 +96,23 @@ class CallLogAdapter(
         holder.imgCallType.setImageResource(iconRes)
         holder.imgCallType.setColorFilter(android.graphics.Color.parseColor(tintColor))
 
+        // Expand/Collapse Details Logic
+        holder.layoutExpandedDetails.visibility = View.GONE
+        holder.btnExpand.setImageResource(R.drawable.ic_chevron_down)
+        
+        val toggleExpand = View.OnClickListener {
+            if (holder.layoutExpandedDetails.visibility == View.VISIBLE) {
+                holder.layoutExpandedDetails.visibility = View.GONE
+                holder.btnExpand.setImageResource(R.drawable.ic_chevron_down)
+            } else {
+                holder.layoutExpandedDetails.visibility = View.VISIBLE
+                holder.btnExpand.setImageResource(R.drawable.ic_chevron_up)
+            }
+        }
+        
+        holder.btnExpand.setOnClickListener(toggleExpand)
+        holder.itemView.setOnClickListener(toggleExpand)
+
         // Actions
         holder.btnCallLogCall.setOnClickListener {
             onAction(item.number, "call")
@@ -95,9 +122,6 @@ class CallLogAdapter(
         }
         holder.btnViewChat.setOnClickListener {
             onAction(item.number, "whatsapp")
-        }
-        holder.itemView.setOnClickListener {
-            onAction(item.number, "call")
         }
     }
 

@@ -122,7 +122,7 @@
             android:layout_height="64dp"
             android:background="@drawable/circle_shape"
             android:backgroundTint="#30D158"
-            android:src="@drawable/ic_mic"
+            android:src="@drawable/ic_call_answer"
             android:scaleType="centerInside"
             android:padding="16dp"
             android:contentDescription="Call" />
