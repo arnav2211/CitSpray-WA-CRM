@@ -58,22 +58,7 @@
             android:textColor="#FFFFFF" />
     </LinearLayout>
 
-    <!-- Floating Dialpad Button -->
-    <ImageButton
-        android:id="@+id/dialpadFab"
-        android:layout_width="56dp"
-        android:layout_height="56dp"
-        android:layout_marginEnd="16dp"
-        android:layout_marginBottom="24dp"
-        android:background="@android:drawable/btn_default"
-        android:backgroundTint="#002FA7"
-        android:src="@drawable/ic_dialpad"
-        android:scaleType="center"
-        android:padding="14dp"
-        android:elevation="6dp"
-        android:contentDescription="Open Dialpad"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintEnd_toEndOf="parent" />
+
 
     <!-- Floating Active Call Banner (hidden by default) -->
     <androidx.cardview.widget.CardView

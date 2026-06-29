@@ -76,11 +76,11 @@ class CallLogAdapter(
 
         // Bind Call Type Icon & Tint
         val (iconRes, tintColor) = when (item.type) {
-            CallLog.Calls.INCOMING_TYPE -> Pair(R.drawable.ic_mic, "#30D158") // Green
-            CallLog.Calls.OUTGOING_TYPE -> Pair(R.drawable.ic_mic, "#0A84FF") // Blue
-            CallLog.Calls.MISSED_TYPE -> Pair(R.drawable.ic_mic_off, "#FF453A") // Red
-            CallLog.Calls.REJECTED_TYPE -> Pair(R.drawable.ic_mic_off, "#FF9F0A") // Orange
-            else -> Pair(R.drawable.ic_mic, "#8E8E93")
+            CallLog.Calls.INCOMING_TYPE -> Pair(R.drawable.ic_call_incoming, "#30D158") // Green
+            CallLog.Calls.OUTGOING_TYPE -> Pair(R.drawable.ic_call_outgoing, "#0A84FF") // Blue
+            CallLog.Calls.MISSED_TYPE -> Pair(R.drawable.ic_call_missed, "#FF453A") // Red
+            CallLog.Calls.REJECTED_TYPE -> Pair(R.drawable.ic_call_missed, "#FF9F0A") // Orange
+            else -> Pair(R.drawable.ic_call_incoming, "#8E8E93")
         }
         
         holder.imgCallType.setImageResource(iconRes)

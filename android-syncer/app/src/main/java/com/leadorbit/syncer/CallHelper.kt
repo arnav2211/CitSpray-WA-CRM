@@ -17,13 +17,13 @@ import org.json.JSONObject
 
 object CallHelper {
 
-    fun placeCall(context: Context, phoneNumber: String) {
+    fun placeCall(context: Context, phoneNumber: String, onCallPlaced: (() -> Unit)? = null) {
         val cleanNumber = phoneNumber.replace(Regex("[^0-9+]"), "")
         if (cleanNumber.isEmpty()) return
 
         val telecomManager = context.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
         if (telecomManager == null) {
-            placeCallDirectly(context, cleanNumber, null)
+            placeCallDirectly(context, cleanNumber, null, onCallPlaced)
             return
         }
 
@@ -35,7 +35,7 @@ object CallHelper {
 
         if (!hasPhoneStatePermission) {
             // No permission to get SIM list, place call directly
-            placeCallDirectly(context, cleanNumber, null)
+            placeCallDirectly(context, cleanNumber, null, onCallPlaced)
             return
         }
 
@@ -53,27 +53,27 @@ object CallHelper {
                     .setTitle("Select SIM for Call")
                     .setItems(items) { _, which ->
                         val selectedHandle = accounts[which]
-                        placeCallDirectly(context, cleanNumber, selectedHandle)
+                        placeCallDirectly(context, cleanNumber, selectedHandle, onCallPlaced)
                     }
                     .setNegativeButton("Cancel", null)
                     .show()
             } else if (accounts != null && accounts.size == 1) {
                 // Single active SIM: place call using that account handle explicitly
-                placeCallDirectly(context, cleanNumber, accounts[0])
+                placeCallDirectly(context, cleanNumber, accounts[0], onCallPlaced)
             } else {
                 // No accounts or empty list: place call directly
-                placeCallDirectly(context, cleanNumber, null)
+                placeCallDirectly(context, cleanNumber, null, onCallPlaced)
             }
         } catch (e: SecurityException) {
             android.util.Log.e("CallHelper", "SecurityException checking phone accounts", e)
-            placeCallDirectly(context, cleanNumber, null)
+            placeCallDirectly(context, cleanNumber, null, onCallPlaced)
         } catch (e: Exception) {
             android.util.Log.e("CallHelper", "Error checking phone accounts", e)
-            placeCallDirectly(context, cleanNumber, null)
+            placeCallDirectly(context, cleanNumber, null, onCallPlaced)
         }
     }
 
-    private fun placeCallDirectly(context: Context, cleanNumber: String, handle: PhoneAccountHandle?) {
+    private fun placeCallDirectly(context: Context, cleanNumber: String, handle: PhoneAccountHandle?, onCallPlaced: (() -> Unit)? = null) {
         val uri = Uri.parse("tel:$cleanNumber")
         val intent = Intent(Intent.ACTION_CALL, uri)
         if (handle != null) {
@@ -85,6 +85,7 @@ object CallHelper {
 
         try {
             context.startActivity(intent)
+            onCallPlaced?.invoke()
         } catch (e: SecurityException) {
             android.util.Log.e("CallHelper", "CALL_PHONE permission not granted", e)
         } catch (e: Exception) {

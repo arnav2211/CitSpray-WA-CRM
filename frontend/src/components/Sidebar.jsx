@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Phone,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
@@ -11,6 +11,15 @@ const navBase = "flex items-center gap-3 px-4 py-3 md:py-2.5 text-sm border-l-2 
 const navActive = "bg-white border-l-2 border-[#002FA7] text-gray-900 font-semibold";
 
 function Item({ to, icon: Icon, children, testId, onNavigate, badge }) {
+  const isExternal = to.startsWith("tel:") || to.startsWith("http");
+  if (isExternal) {
+    return (
+      <a href={to} data-testid={testId} onClick={onNavigate} className={`${navBase} text-gray-700`}>
+        <Icon size={18} weight="regular" />
+        <span className="flex-1">{children}</span>
+      </a>
+    );
+  }
   return (
     <NavLink to={to} data-testid={testId} onClick={onNavigate}
       className={({ isActive }) => `${navBase} ${isActive ? navActive : "text-gray-700"}`}>
@@ -97,6 +106,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
               <Item to="/dashboard" icon={ChartBar} testId="nav-dashboard" onNavigate={handleNavigate}>Dashboard</Item>
               <Item to="/chat" icon={ChatTeardropDots} testId="nav-chat" onNavigate={handleNavigate}>WhatsApp</Item>
               <Item to="/leads" icon={Kanban} testId="nav-leads" onNavigate={handleNavigate}>Leads</Item>
+              <Item to="tel:dialer" icon={Phone} testId="nav-dialer" onNavigate={handleNavigate}>Keypad Dialer</Item>
               <Item to="/followups" icon={Bell} testId="nav-followups" onNavigate={handleNavigate}>Follow-ups</Item>
               <Item to="/qa" icon={ChatTeardropText} testId="nav-qa" onNavigate={handleNavigate}>Internal Q&amp;A</Item>
               <Item to="/transfer-requests" icon={ArrowsLeftRight} testId="nav-transfer-requests" onNavigate={handleNavigate} badge={pendingTransfers}>Reassign Requests</Item>

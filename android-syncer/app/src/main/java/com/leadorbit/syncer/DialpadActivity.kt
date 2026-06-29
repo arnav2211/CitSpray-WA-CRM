@@ -85,8 +85,9 @@ class DialpadActivity : AppCompatActivity() {
         findViewById<ImageButton>(R.id.dialCallButton).setOnClickListener {
             val number = dialInput.text.toString().trim()
             if (number.isNotEmpty()) {
-                CallHelper.placeCall(this, number)
-                finish()
+                CallHelper.placeCall(this, number) {
+                    finish()
+                }
             }
         }
     }
@@ -184,8 +185,9 @@ class DialpadActivity : AppCompatActivity() {
 
     private fun handleCallLogAction(phone: String, action: String) {
         if (action == "call") {
-            CallHelper.placeCall(this, phone)
-            finish()
+            CallHelper.placeCall(this, phone) {
+                finish()
+            }
         } else {
             // "lead" or "whatsapp": deep link to web app
             val token = sharedPrefs.getString("auth_token", null)

@@ -90,10 +90,6 @@ class MainActivity : AppCompatActivity() {
             checkAndRequestPermissions()
         }
 
-        // Dialpad FAB
-        findViewById<ImageButton>(R.id.dialpadFab).setOnClickListener {
-            startActivity(Intent(this, DialpadActivity::class.java))
-        }
 
         activeCallBanner = findViewById(R.id.activeCallBanner)
         bannerCallerName = findViewById(R.id.bannerCallerName)
@@ -234,7 +230,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun placeCall(phoneNumber: String) {
-        CallHelper.placeCall(this, phoneNumber)
+        if (phoneNumber == "dialer" || phoneNumber.trim().isEmpty()) {
+            startActivity(Intent(this, DialpadActivity::class.java))
+        } else {
+            CallHelper.placeCall(this, phoneNumber)
+        }
     }
 
     private fun extractTokenFromWebView() {
