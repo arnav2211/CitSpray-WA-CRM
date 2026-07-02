@@ -2,16 +2,19 @@ import React, { useState, useEffect, useCallback } from "react";
 import { Link } from "react-router-dom";
 import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
-import { 
-  Phone, 
-  PhoneCall, 
-  CalendarBlank, 
-  User, 
-  Funnel, 
+import {
+  Phone,
+  PhoneCall,
+  PhoneIncoming,
+  PhoneOutgoing,
+  CalendarBlank,
+  User,
+  Funnel,
   ArrowClockwise,
   PhoneDisconnect,
   XCircle,
-  ChatTeardropText
+  ChatTeardropText,
+  CaretRight
 } from "@phosphor-icons/react";
 import { toast } from "sonner";
 
@@ -169,7 +172,7 @@ export default function CallLogs() {
       </div>
       
       {/* Filters Bar */}
-      <div className="bg-gray-50 border border-gray-200 p-4 grid grid-cols-1 md:grid-cols-4 gap-4">
+      <div className="bg-gray-50 border border-gray-200 p-3 md:p-4 grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4">
         {/* Date Range Option */}
         <div className="space-y-1.5">
           <label className="text-[10px] font-bold uppercase tracking-wider text-gray-500 flex items-center gap-1">
@@ -282,7 +285,64 @@ export default function CallLogs() {
             </div>
           </div>
         ) : (
-          <div className="overflow-x-auto">
+          <>
+          {/* Mobile: phone-style call log list */}
+          <div className="md:hidden divide-y divide-gray-100">
+            {logs.map((log) => {
+              const missed = ["no_response", "rejected", "not_reachable", "busy"].includes(log.outcome);
+              const incoming = log.direction === "incoming";
+              const DirIcon = incoming ? PhoneIncoming : PhoneOutgoing;
+              return (
+                <div key={log.id} className="flex items-center gap-3 px-3 py-3" data-testid={`call-log-card-${log.id}`}>
+                  {/* Direction / status icon */}
+                  <div className={`shrink-0 w-10 h-10 rounded-full flex items-center justify-center ${
+                    missed ? "bg-red-50 text-red-500" : incoming ? "bg-blue-50 text-blue-600" : "bg-emerald-50 text-emerald-600"
+                  }`}>
+                    <DirIcon size={18} weight="bold" />
+                  </div>
+                  {/* Main info */}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      {log.lead_id ? (
+                        <Link to={`/leads/${log.lead_id}`} className={`text-sm font-semibold truncate ${missed ? "text-red-600" : "text-gray-900"}`}>
+                          {log.lead_name || log.phone}
+                        </Link>
+                      ) : (
+                        <span className={`text-sm font-semibold truncate ${missed ? "text-red-600" : "text-gray-900"}`}>
+                          {log.phone}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-1.5 mt-0.5 text-[11px] text-gray-500">
+                      <span>{formatIST(log.at)}</span>
+                      {log.duration_seconds > 0 && <span>· {formatDuration(log.duration_seconds)}</span>}
+                      {isAdmin && log.by_user_name && <span className="truncate">· {log.by_user_name}</span>}
+                    </div>
+                    <div className="flex items-center gap-1.5 mt-1 flex-wrap">
+                      <span className={`text-[9px] uppercase font-bold px-1.5 py-0.5 rounded border ${OUTCOME_COLOR[log.outcome] || "bg-gray-100 text-gray-800 border-gray-200"}`}>
+                        {OUTCOME_LABELS[log.outcome] || log.outcome}
+                      </span>
+                    </div>
+                    {log.summary && (
+                      <div className="mt-1.5 text-[11px] text-gray-600 bg-gray-50 border border-gray-100 rounded p-1.5 whitespace-pre-wrap break-words">
+                        {log.summary}
+                      </div>
+                    )}
+                  </div>
+                  {/* Tap-to-call */}
+                  <a
+                    href={`tel:${log.phone}`}
+                    className="shrink-0 w-10 h-10 rounded-full bg-[#002FA7]/5 text-[#002FA7] flex items-center justify-center active:scale-95"
+                    aria-label={`Call ${log.phone}`}
+                  >
+                    <Phone size={18} weight="fill" />
+                  </a>
+                </div>
+              );
+            })}
+          </div>
+          {/* Desktop: full table */}
+          <div className="hidden md:block overflow-x-auto">
             <table className="w-full text-left border-collapse">
               <thead>
                 <tr className="bg-gray-50 border-b border-gray-200 text-[10px] font-bold uppercase tracking-wider text-gray-500">
@@ -308,7 +368,7 @@ export default function CallLogs() {
                           to={`/leads/${log.lead_id}`} 
                           className="text-xs font-semibold text-blue-600 hover:underline font-chivo"
                         >
-                          Lead Link
+                          {log.lead_name || "Lead Link"}
                         </Link>
                       ) : (
                         <span className="text-xs font-semibold text-gray-700">Orphan Call</span>
@@ -353,6 +413,7 @@ export default function CallLogs() {
               </tbody>
             </table>
           </div>
+          </>
         )}
       </div>
     </div>

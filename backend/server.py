@@ -1290,7 +1290,7 @@ async def _pick_buyleads_executive(source: str) -> Optional[dict]:
 async def pick_next_executive(exclude_user_id: Optional[str] = None) -> Optional[dict]:
     rules = await get_routing_rules()
     execs = await db.users.find(
-        {"role": "executive", "active": True}, {"_id": 0, "password_hash": 0}
+        {"role": "executive", "active": True, "username": {"$ne": "test_user"}}, {"_id": 0, "password_hash": 0}
     ).to_list(500)
     if not execs:
         return None
@@ -2809,7 +2809,18 @@ async def list_all_calls(
         if end:
             rng["$lte"] = end
         query["at"] = rng
-    return await db.call_logs.find(query, {"_id": 0}).sort("at", -1).to_list(limit)
+    calls = await db.call_logs.find(query, {"_id": 0}).sort("at", -1).to_list(limit)
+    # Enrich with lead names so clients can show who the call was with
+    lead_ids = list({c["lead_id"] for c in calls if c.get("lead_id")})
+    if lead_ids:
+        leads = await db.leads.find(
+            {"id": {"$in": lead_ids}}, {"_id": 0, "id": 1, "customer_name": 1}
+        ).to_list(len(lead_ids))
+        name_map = {ld["id"]: ld.get("customer_name") for ld in leads}
+        for c in calls:
+            if c.get("lead_id"):
+                c["lead_name"] = name_map.get(c["lead_id"])
+    return calls
 
 
 @api.put("/leads/{lead_id}/active-wa-phone")

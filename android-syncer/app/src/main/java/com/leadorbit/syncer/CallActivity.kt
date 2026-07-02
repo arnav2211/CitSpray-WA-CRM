@@ -38,7 +38,10 @@ class CallActivity : AppCompatActivity() {
     private lateinit var speakerButton: ImageButton
     private lateinit var speakerLabel: TextView
     private lateinit var hangupButton: ImageButton
+    private lateinit var hangupLabel: TextView
     private lateinit var answerButton: ImageButton
+    private lateinit var answerContainer: LinearLayout
+    private lateinit var controlsContainer: LinearLayout
 
     // New Dialer, Record, and Conference Buttons
     private lateinit var keypadButton: ImageButton
@@ -51,10 +54,12 @@ class CallActivity : AppCompatActivity() {
     // DTMF Overlay Views
     private lateinit var dtmfDialerContainer: LinearLayout
     private lateinit var dtmfDisplay: TextView
+    private lateinit var dtmfHideButton: Button
 
     private var isMuted = false
     private var isSpeakerOn = false
     private var isDtmfVisible = false
+    private var isTimerRunning = false
     
     private var toneGenerator: ToneGenerator? = null
     private var phoneNumber: String = ""
@@ -86,7 +91,10 @@ class CallActivity : AppCompatActivity() {
         speakerButton = findViewById(R.id.speakerButton)
         speakerLabel = findViewById(R.id.speakerLabel)
         hangupButton = findViewById(R.id.hangupButton)
+        hangupLabel = findViewById(R.id.hangupLabel)
         answerButton = findViewById(R.id.answerButton)
+        answerContainer = findViewById(R.id.answerContainer)
+        controlsContainer = findViewById(R.id.controlsContainer)
 
         // Bind New Controls
         keypadButton = findViewById(R.id.keypadButton)
@@ -99,6 +107,7 @@ class CallActivity : AppCompatActivity() {
         // Bind DTMF Overlay
         dtmfDialerContainer = findViewById(R.id.dtmfDialerContainer)
         dtmfDisplay = findViewById(R.id.dtmfDisplay)
+        dtmfHideButton = findViewById(R.id.dtmfHideButton)
 
         // Initialize local tone generator for DTMF key feedback
         try {
@@ -140,11 +149,12 @@ class CallActivity : AppCompatActivity() {
             updateSpeakerUI()
         }
 
-        // Keypad toggle (DTMF)
+        // Keypad toggle (DTMF) — the keypad replaces the controls grid while open
         keypadButton.setOnClickListener {
-            isDtmfVisible = !isDtmfVisible
-            dtmfDialerContainer.visibility = if (isDtmfVisible) View.VISIBLE else View.GONE
-            dtmfDisplay.text = ""
+            if (isDtmfVisible) hideDtmfKeypad() else showDtmfKeypad()
+        }
+        dtmfHideButton.setOnClickListener {
+            hideDtmfKeypad()
         }
 
         // Record call toggle
@@ -185,9 +195,14 @@ class CallActivity : AppCompatActivity() {
             }
         }
 
-        // End call
+        // End call (acts as Decline while an incoming call is ringing)
         hangupButton.setOnClickListener {
-            CallService.hangUp()
+            val call = CallService.activeCall
+            if (call != null && call.state == Call.STATE_RINGING) {
+                call.reject(false, null)
+            } else {
+                CallService.hangUp()
+            }
         }
 
         // Answer call
@@ -226,7 +241,8 @@ class CallActivity : AppCompatActivity() {
             else -> "LeadOrbit Call"
         }
 
-        val initial = (crmLead?.name ?: contactName ?: phone.filter { it.isDigit() }).lastOrNull()?.toString() ?: "?"
+        val initial = (crmLead?.name ?: contactName)?.trim()?.firstOrNull()?.toString()
+            ?: phone.filter { it.isDigit() }.lastOrNull()?.toString() ?: "?"
         callerInitial.text = initial.uppercase()
     }
 
@@ -256,39 +272,83 @@ class CallActivity : AppCompatActivity() {
         }
     }
 
+    private fun showDtmfKeypad() {
+        isDtmfVisible = true
+        dtmfDisplay.text = ""
+        dtmfDialerContainer.visibility = View.VISIBLE
+        controlsContainer.visibility = View.GONE
+    }
+
+    private fun hideDtmfKeypad() {
+        isDtmfVisible = false
+        dtmfDialerContainer.visibility = View.GONE
+        // Restore the controls grid only when the call is not ringing
+        val state = CallService.activeCall?.state
+        if (state != Call.STATE_RINGING) {
+            controlsContainer.visibility = View.VISIBLE
+        }
+    }
+
+    private fun startTimerFromConnectTime(call: Call) {
+        // Base the chronometer on the real connect time so re-opening this
+        // screen mid-call keeps the correct elapsed duration
+        val connectTime = call.details.connectTimeMillis
+        val baseTime = if (connectTime > 0L) {
+            SystemClock.elapsedRealtime() - (System.currentTimeMillis() - connectTime)
+        } else {
+            SystemClock.elapsedRealtime()
+        }
+        callTimer.base = baseTime
+        if (!isTimerRunning) {
+            callTimer.start()
+            isTimerRunning = true
+        }
+        callTimer.visibility = View.VISIBLE
+    }
+
     private fun updateCallState(state: Int) {
+        val call = CallService.activeCall
         when (state) {
             Call.STATE_DIALING -> {
                 callStatus.text = "Dialing..."
                 callStatus.setTextColor(Color.parseColor("#FFD60A"))
                 callTimer.visibility = View.GONE
-                answerButton.visibility = View.GONE
+                answerContainer.visibility = View.GONE
+                hangupLabel.text = "End Call"
+                if (!isDtmfVisible) controlsContainer.visibility = View.VISIBLE
             }
             Call.STATE_RINGING -> {
+                // Incoming call, not yet answered: show only Answer / Decline —
+                // in-call controls (keypad, mute, etc.) make no sense yet
                 callStatus.text = "Incoming Call..."
                 callStatus.setTextColor(Color.parseColor("#30D158"))
                 callTimer.visibility = View.GONE
-                answerButton.visibility = View.VISIBLE
+                answerContainer.visibility = View.VISIBLE
+                hangupLabel.text = "Decline"
+                hideDtmfKeypad()
+                controlsContainer.visibility = View.GONE
             }
             Call.STATE_ACTIVE -> {
                 callStatus.text = "Connected"
                 callStatus.setTextColor(Color.parseColor("#30D158"))
-                callTimer.visibility = View.VISIBLE
-                callTimer.base = SystemClock.elapsedRealtime()
-                callTimer.start()
-                answerButton.visibility = View.GONE
+                answerContainer.visibility = View.GONE
+                hangupLabel.text = "End Call"
+                if (!isDtmfVisible) controlsContainer.visibility = View.VISIBLE
+                if (call != null) startTimerFromConnectTime(call)
             }
             Call.STATE_DISCONNECTED -> {
                 callStatus.text = "Call Ended"
                 callStatus.setTextColor(Color.parseColor("#FF453A"))
                 callTimer.stop()
-                answerButton.visibility = View.GONE
+                isTimerRunning = false
+                answerContainer.visibility = View.GONE
                 finish()
             }
             else -> {
                 callStatus.text = "Connecting..."
                 callStatus.setTextColor(Color.parseColor("#8E8E93"))
-                answerButton.visibility = View.GONE
+                answerContainer.visibility = View.GONE
+                hangupLabel.text = "End Call"
             }
         }
         checkConferenceState()

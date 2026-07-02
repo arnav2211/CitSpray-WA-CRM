@@ -42,6 +42,8 @@ class DialpadActivity : AppCompatActivity() {
         setContentView(R.layout.activity_dialpad)
 
         dialInput = findViewById(R.id.dialInput)
+        // The on-screen dialpad is the input method; keep the soft keyboard away
+        dialInput.showSoftInputOnFocus = false
         callLogRecyclerView = findViewById(R.id.callLogRecyclerView)
         sharedPrefs = getSharedPreferences("CRM_PREFS", Context.MODE_PRIVATE)
 

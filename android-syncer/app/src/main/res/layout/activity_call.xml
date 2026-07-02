@@ -11,14 +11,14 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_alignParentTop="true"
-        android:layout_marginTop="80dp"
+        android:layout_marginTop="64dp"
         android:gravity="center"
         android:orientation="vertical">
 
         <!-- Avatar Circle -->
         <FrameLayout
-            android:layout_width="110dp"
-            android:layout_height="110dp"
+            android:layout_width="100dp"
+            android:layout_height="100dp"
             android:background="@drawable/circle_shape"
             android:backgroundTint="#1C1D24">
 
@@ -29,7 +29,7 @@
                 android:gravity="center"
                 android:text="?"
                 android:textColor="#FFFFFF"
-                android:textSize="44sp"
+                android:textSize="40sp"
                 android:textStyle="bold" />
         </FrameLayout>
 
@@ -37,17 +37,21 @@
             android:id="@+id/callerName"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="24dp"
+            android:layout_marginTop="20dp"
+            android:layout_marginHorizontal="24dp"
+            android:gravity="center"
             android:text="LeadOrbit Call"
             android:textColor="#FFFFFF"
-            android:textSize="30sp"
-            android:textStyle="bold" />
+            android:textSize="26sp"
+            android:textStyle="bold"
+            android:maxLines="2"
+            android:ellipsize="end" />
 
         <TextView
             android:id="@+id/callerNumber"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
+            android:layout_marginTop="6dp"
             android:text="+91 00000 00000"
             android:textColor="#8E8E93"
             android:textSize="16sp"
@@ -57,7 +61,7 @@
             android:id="@+id/callStatus"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
+            android:layout_marginTop="14dp"
             android:text="Connecting..."
             android:textColor="#8E8E93"
             android:textSize="15sp"
@@ -80,101 +84,70 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_alignParentBottom="true"
-        android:layout_marginBottom="64dp"
+        android:layout_marginBottom="48dp"
         android:gravity="center"
         android:orientation="horizontal">
 
-        <!-- Answer Button (hidden by default) -->
-        <ImageButton
-            android:id="@+id/answerButton"
-            android:layout_width="76dp"
-            android:layout_height="76dp"
-            android:layout_marginEnd="48dp"
-            android:background="@drawable/circle_shape"
-            android:backgroundTint="#30D158"
-            android:src="@drawable/ic_call_answer"
-            android:scaleType="fitCenter"
-            android:padding="22dp"
-            android:visibility="gone"
-            android:contentDescription="Answer Call" />
+        <!-- Answer (visible only while ringing) -->
+        <LinearLayout
+            android:id="@+id/answerContainer"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="64dp"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:visibility="gone">
 
-        <!-- Hangup Button -->
-        <ImageButton
-            android:id="@+id/hangupButton"
-            android:layout_width="76dp"
-            android:layout_height="76dp"
-            android:background="@drawable/circle_shape"
-            android:backgroundTint="#FF3B30"
-            android:src="@drawable/ic_call_end"
-            android:scaleType="fitCenter"
-            android:padding="22dp"
-            android:contentDescription="End Call" />
+            <ImageButton
+                android:id="@+id/answerButton"
+                android:layout_width="76dp"
+                android:layout_height="76dp"
+                android:background="@drawable/circle_shape"
+                android:backgroundTint="#30D158"
+                android:src="@drawable/ic_call_answer"
+                android:scaleType="fitCenter"
+                android:padding="22dp"
+                android:contentDescription="Answer Call" />
 
-    </LinearLayout>
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Answer"
+                android:textColor="#30D158"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+        </LinearLayout>
 
-    <!-- DTMF Dialer Overlay (hidden by default) -->
-    <LinearLayout
-        android:id="@+id/dtmfDialerContainer"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_above="@id/controlsContainer"
-        android:layout_below="@id/callerInfoContainer"
-        android:background="#1C1D24"
-        android:padding="16dp"
-        android:orientation="vertical"
-        android:gravity="center"
-        android:visibility="gone"
-        android:layout_marginHorizontal="32dp"
-        android:layout_marginVertical="16dp">
-        
-        <TextView
-            android:id="@+id/dtmfDisplay"
-            android:layout_width="match_parent"
+        <!-- Hangup / Decline -->
+        <LinearLayout
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:gravity="center"
-            android:textColor="#FFFFFF"
-            android:textSize="20sp"
-            android:textStyle="bold"
-            android:layout_marginBottom="12dp" />
-            
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
             android:orientation="vertical">
-            
-            <LinearLayout
-                android:layout_width="match_parent"
+
+            <ImageButton
+                android:id="@+id/hangupButton"
+                android:layout_width="76dp"
+                android:layout_height="76dp"
+                android:background="@drawable/circle_shape"
+                android:backgroundTint="#FF3B30"
+                android:src="@drawable/ic_call_end"
+                android:scaleType="fitCenter"
+                android:padding="22dp"
+                android:contentDescription="End Call" />
+
+            <TextView
+                android:id="@+id/hangupLabel"
+                android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:orientation="horizontal">
-                <Button android:id="@+id/dtmf1" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="1" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
-                <Button android:id="@+id/dtmf2" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="2" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
-                <Button android:id="@+id/dtmf3" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="3" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
-            </LinearLayout>
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal">
-                <Button android:id="@+id/dtmf4" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="4" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
-                <Button android:id="@+id/dtmf5" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="5" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
-                <Button android:id="@+id/dtmf6" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="6" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
-            </LinearLayout>
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal">
-                <Button android:id="@+id/dtmf7" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="7" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
-                <Button android:id="@+id/dtmf8" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="8" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
-                <Button android:id="@+id/dtmf9" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="9" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
-            </LinearLayout>
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal">
-                <Button android:id="@+id/dtmfStar" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="*" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
-                <Button android:id="@+id/dtmf0" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="0" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
-                <Button android:id="@+id/dtmfHash" android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1" android:text="#" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="2dp" />
-            </LinearLayout>
+                android:layout_marginTop="8dp"
+                android:text="End Call"
+                android:textColor="#FF6B61"
+                android:textSize="13sp"
+                android:textStyle="bold" />
         </LinearLayout>
+
     </LinearLayout>
 
     <!-- Mid-Bottom Call Controls (Mute, Speaker, Keypad, Rec, Add, Merge) -->
@@ -368,6 +341,83 @@
             </LinearLayout>
         </LinearLayout>
 
+    </LinearLayout>
+
+    <!-- DTMF Dialer Overlay (hidden by default, drawn on top of the controls) -->
+    <LinearLayout
+        android:id="@+id/dtmfDialerContainer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_above="@id/callActionContainer"
+        android:layout_marginHorizontal="20dp"
+        android:layout_marginBottom="16dp"
+        android:background="@drawable/bg_rounded_panel"
+        android:elevation="8dp"
+        android:padding="16dp"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/dtmfDisplay"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:textColor="#FFFFFF"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:minHeight="28dp"
+            android:layout_marginBottom="10dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+                <Button android:id="@+id/dtmf1" android:layout_width="0dp" android:layout_height="52dp" android:layout_weight="1" android:text="1" android:textSize="18sp" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="3dp" />
+                <Button android:id="@+id/dtmf2" android:layout_width="0dp" android:layout_height="52dp" android:layout_weight="1" android:text="2" android:textSize="18sp" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="3dp" />
+                <Button android:id="@+id/dtmf3" android:layout_width="0dp" android:layout_height="52dp" android:layout_weight="1" android:text="3" android:textSize="18sp" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="3dp" />
+            </LinearLayout>
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+                <Button android:id="@+id/dtmf4" android:layout_width="0dp" android:layout_height="52dp" android:layout_weight="1" android:text="4" android:textSize="18sp" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="3dp" />
+                <Button android:id="@+id/dtmf5" android:layout_width="0dp" android:layout_height="52dp" android:layout_weight="1" android:text="5" android:textSize="18sp" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="3dp" />
+                <Button android:id="@+id/dtmf6" android:layout_width="0dp" android:layout_height="52dp" android:layout_weight="1" android:text="6" android:textSize="18sp" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="3dp" />
+            </LinearLayout>
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+                <Button android:id="@+id/dtmf7" android:layout_width="0dp" android:layout_height="52dp" android:layout_weight="1" android:text="7" android:textSize="18sp" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="3dp" />
+                <Button android:id="@+id/dtmf8" android:layout_width="0dp" android:layout_height="52dp" android:layout_weight="1" android:text="8" android:textSize="18sp" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="3dp" />
+                <Button android:id="@+id/dtmf9" android:layout_width="0dp" android:layout_height="52dp" android:layout_weight="1" android:text="9" android:textSize="18sp" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="3dp" />
+            </LinearLayout>
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+                <Button android:id="@+id/dtmfStar" android:layout_width="0dp" android:layout_height="52dp" android:layout_weight="1" android:text="*" android:textSize="18sp" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="3dp" />
+                <Button android:id="@+id/dtmf0" android:layout_width="0dp" android:layout_height="52dp" android:layout_weight="1" android:text="0" android:textSize="18sp" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="3dp" />
+                <Button android:id="@+id/dtmfHash" android:layout_width="0dp" android:layout_height="52dp" android:layout_weight="1" android:text="#" android:textSize="18sp" android:textColor="#FFFFFF" android:backgroundTint="#2C2C2E" android:layout_margin="3dp" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/dtmfHideButton"
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:layout_marginTop="6dp"
+            android:layout_marginHorizontal="3dp"
+            android:backgroundTint="#3A3B44"
+            android:text="Hide Keypad"
+            android:textSize="13sp"
+            android:textColor="#FFFFFF" />
     </LinearLayout>
 
 </RelativeLayout>

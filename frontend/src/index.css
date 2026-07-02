@@ -24,6 +24,13 @@ h1, h2, h3, h4, h5 {
 .font-chivo { font-family: 'Chivo', system-ui, sans-serif; }
 .font-mono  { font-family: 'IBM Plex Mono', monospace; }
 
+/* On mobile browsers 100vh extends behind the URL bar, cutting off
+   bottom-anchored buttons (e.g. Add Note in chat). Prefer the dynamic
+   viewport height where supported. */
+@supports (height: 100dvh) {
+  .app-shell-viewport { height: 100dvh; }
+}
+
 .login-grid-bg {
   background-image:
     linear-gradient(#e5e7eb 1px, transparent 1px),
