@@ -10,7 +10,7 @@
         android:layout_width="match_parent"
         android:layout_height="0dp"
         app:layout_constraintTop_toBottomOf="@id/activeCallBanner"
-        app:layout_constraintBottom_toTopOf="@id/bottomNavbar"
+        app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
@@ -123,107 +123,5 @@
                 android:contentDescription="End Call" />
         </LinearLayout>
     </androidx.cardview.widget.CardView>
-
-    <!-- Native Bottom Navigation Bar -->
-    <LinearLayout
-        android:id="@+id/bottomNavbar"
-        android:layout_width="match_parent"
-        android:layout_height="56dp"
-        android:orientation="horizontal"
-        android:background="#15161C"
-        android:elevation="8dp"
-        android:weightSum="3"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent">
-
-        <!-- Tab: Leads -->
-        <LinearLayout
-            android:id="@+id/navLeads"
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="1"
-            android:orientation="vertical"
-            android:gravity="center"
-            android:clickable="true"
-            android:focusable="true"
-            android:background="?android:attr/selectableItemBackground">
-
-            <ImageView
-                android:id="@+id/imgNavLeads"
-                android:layout_width="22dp"
-                android:layout_height="22dp"
-                android:src="@drawable/ic_bottom_nav_leads"
-                app:tint="#A0A5B5" />
-
-            <TextView
-                android:id="@+id/txtNavLeads"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Leads"
-                android:textColor="#A0A5B5"
-                android:textSize="10sp"
-                android:layout_marginTop="2dp" />
-        </LinearLayout>
-
-        <!-- Tab: WhatsApp -->
-        <LinearLayout
-            android:id="@+id/navChat"
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="1"
-            android:orientation="vertical"
-            android:gravity="center"
-            android:clickable="true"
-            android:focusable="true"
-            android:background="?android:attr/selectableItemBackground">
-
-            <ImageView
-                android:id="@+id/imgNavChat"
-                android:layout_width="22dp"
-                android:layout_height="22dp"
-                android:src="@drawable/ic_bottom_nav_chat"
-                app:tint="#A0A5B5" />
-
-            <TextView
-                android:id="@+id/txtNavChat"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="WhatsApp"
-                android:textColor="#A0A5B5"
-                android:textSize="10sp"
-                android:layout_marginTop="2dp" />
-        </LinearLayout>
-
-        <!-- Tab: Keypad -->
-        <LinearLayout
-            android:id="@+id/navDialer"
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="1"
-            android:orientation="vertical"
-            android:gravity="center"
-            android:clickable="true"
-            android:focusable="true"
-            android:background="?android:attr/selectableItemBackground">
-
-            <ImageView
-                android:id="@+id/imgNavDialer"
-                android:layout_width="22dp"
-                android:layout_height="22dp"
-                android:src="@drawable/ic_bottom_nav_dialer"
-                app:tint="#30D158" />
-
-            <TextView
-                android:id="@+id/txtNavDialer"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Keypad"
-                android:textColor="#30D158"
-                android:textSize="10sp"
-                android:layout_marginTop="2dp" />
-        </LinearLayout>
-
-    </LinearLayout>
 
 </androidx.constraintlayout.widget.ConstraintLayout>

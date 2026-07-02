@@ -148,7 +148,6 @@ class MainActivity : AppCompatActivity() {
         webView.visibility = View.VISIBLE
         
         setupWebView()
-        setupBottomNavbar()
         setupBackgroundSyncWorker()
         
         if (sharedPrefs.getString("auth_token", null) != null) {
@@ -163,65 +162,6 @@ class MainActivity : AppCompatActivity() {
 
         // Process any pending deep-link navigation path
         handleNavPath(intent)
-    }
-
-    private fun setupBottomNavbar() {
-        val navLeads = findViewById<LinearLayout>(R.id.navLeads)
-        val navChat = findViewById<LinearLayout>(R.id.navChat)
-        val navDialer = findViewById<LinearLayout>(R.id.navDialer)
-
-        val imgNavLeads = findViewById<ImageView>(R.id.imgNavLeads)
-        val txtNavLeads = findViewById<TextView>(R.id.txtNavLeads)
-        val imgNavChat = findViewById<ImageView>(R.id.imgNavChat)
-        val txtNavChat = findViewById<TextView>(R.id.txtNavChat)
-
-        navLeads.setOnClickListener {
-            // highlight active tab
-            imgNavLeads.setColorFilter(android.graphics.Color.parseColor("#002FA7"))
-            txtNavLeads.setTextColor(android.graphics.Color.parseColor("#002FA7"))
-            imgNavChat.setColorFilter(android.graphics.Color.parseColor("#A0A5B5"))
-            txtNavChat.setTextColor(android.graphics.Color.parseColor("#A0A5B5"))
-            webView.loadUrl("https://crm.mangalamagro.in/leads")
-        }
-
-        navChat.setOnClickListener {
-            // highlight active tab
-            imgNavLeads.setColorFilter(android.graphics.Color.parseColor("#A0A5B5"))
-            txtNavLeads.setTextColor(android.graphics.Color.parseColor("#A0A5B5"))
-            imgNavChat.setColorFilter(android.graphics.Color.parseColor("#002FA7"))
-            txtNavChat.setTextColor(android.graphics.Color.parseColor("#002FA7"))
-            webView.loadUrl("https://crm.mangalamagro.in/chat")
-        }
-
-        navDialer.setOnClickListener {
-            startActivity(Intent(this, DialpadActivity::class.java))
-        }
-    }
-
-    fun updateTabHighlight(url: String?) {
-        val imgNavLeads = findViewById<ImageView>(R.id.imgNavLeads) ?: return
-        val txtNavLeads = findViewById<TextView>(R.id.txtNavLeads) ?: return
-        val imgNavChat = findViewById<ImageView>(R.id.imgNavChat) ?: return
-        val txtNavChat = findViewById<TextView>(R.id.txtNavChat) ?: return
-
-        if (url != null) {
-            if (url.contains("/leads")) {
-                imgNavLeads.setColorFilter(android.graphics.Color.parseColor("#002FA7"))
-                txtNavLeads.setTextColor(android.graphics.Color.parseColor("#002FA7"))
-                imgNavChat.setColorFilter(android.graphics.Color.parseColor("#A0A5B5"))
-                txtNavChat.setTextColor(android.graphics.Color.parseColor("#A0A5B5"))
-            } else if (url.contains("/chat")) {
-                imgNavLeads.setColorFilter(android.graphics.Color.parseColor("#A0A5B5"))
-                txtNavLeads.setTextColor(android.graphics.Color.parseColor("#A0A5B5"))
-                imgNavChat.setColorFilter(android.graphics.Color.parseColor("#002FA7"))
-                txtNavChat.setTextColor(android.graphics.Color.parseColor("#002FA7"))
-            } else {
-                imgNavLeads.setColorFilter(android.graphics.Color.parseColor("#A0A5B5"))
-                txtNavLeads.setTextColor(android.graphics.Color.parseColor("#A0A5B5"))
-                imgNavChat.setColorFilter(android.graphics.Color.parseColor("#A0A5B5"))
-                txtNavChat.setTextColor(android.graphics.Color.parseColor("#A0A5B5"))
-            }
-        }
     }
 
     private fun setupWebView() {
@@ -243,10 +183,6 @@ class MainActivity : AppCompatActivity() {
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val url = request?.url?.toString() ?: ""
-                if (url.contains("/calls") || url.endsWith("calls")) {
-                    startActivity(Intent(this@MainActivity, DialpadActivity::class.java))
-                    return true
-                }
                 if (url.startsWith("tel:") || url.contains("dialer")) {
                     val rawNum = if (url.startsWith("tel:")) url.substring(4) else "dialer"
                     placeCall(rawNum)
@@ -258,10 +194,6 @@ class MainActivity : AppCompatActivity() {
             @Deprecated("Deprecated in Java")
             override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
                 if (url != null) {
-                    if (url.contains("/calls") || url.endsWith("calls")) {
-                        startActivity(Intent(this@MainActivity, DialpadActivity::class.java))
-                        return true
-                    }
                     if (url.startsWith("tel:") || url.contains("dialer")) {
                         val rawNum = if (url.startsWith("tel:")) url.substring(4) else "dialer"
                         placeCall(rawNum)
@@ -274,11 +206,17 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                updateTabHighlight(url)
                 // Start extraction loops once the page loads
                 handler.removeCallbacks(tokenCheckRunnable)
                 handler.post(tokenCheckRunnable)
             }
+        }
+
+        // One-time cache purge so this update immediately picks up the freshly
+        // deployed frontend instead of a stale cached bundle
+        if (!sharedPrefs.getBoolean("webview_cache_cleared_v2", false)) {
+            webView.clearCache(true)
+            sharedPrefs.edit().putBoolean("webview_cache_cleared_v2", true).apply()
         }
 
         // Default CRM URL on the VPS
