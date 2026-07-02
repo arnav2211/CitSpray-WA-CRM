@@ -81,10 +81,10 @@ class SyncWorker(
 
         var lastSyncTime = sharedPrefs.getLong("last_synced_timestamp", 0L)
         if (lastSyncTime == 0L) {
-            // First run: set watermark to 24 hours ago to sync recent calls but prevent overloading with full history
-            lastSyncTime = System.currentTimeMillis() - (24 * 60 * 60 * 1000)
+            // First run: set watermark to current time so only calls made after app installation are synced
+            lastSyncTime = System.currentTimeMillis()
             sharedPrefs.edit().putLong("last_synced_timestamp", lastSyncTime).apply()
-            Log.d("SyncWorker", "First run: initialized watermark to 24 hours ago.")
+            Log.d("SyncWorker", "First run: initialized watermark to current time.")
         }
 
         val unsyncedLogs = fetchCallLogsSince(lastSyncTime)
