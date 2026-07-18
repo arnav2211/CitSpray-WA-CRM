@@ -9,7 +9,7 @@ import LeadDrawer from "@/components/LeadDrawer";
 import { fmtIST } from "@/lib/format";
 
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
-const SOURCES = ["IndiaMART", "ExportersIndia", "Justdial", "Manual", "WhatsApp"];
+const SOURCES = ["IndiaMART", "ExportersIndia", "Justdial", "Manual", "WhatsApp", "Website"];
 
 export default function Leads() {
   const { user } = useAuth();

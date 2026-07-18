@@ -25,6 +25,7 @@ export function SourceBadge({ source }) {
     Justdial: "border-[#E60000] text-[#E60000]",
     Manual: "border-gray-500 text-gray-700",
     WhatsApp: "border-[#008A00] text-[#008A00]",
+    Website: "border-[#1E3A2A] text-[#1E3A2A]",
   };
   const cls = map[source] || "border-gray-300 text-gray-600";
   return (
