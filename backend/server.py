@@ -604,12 +604,40 @@ async def require_admin(user: dict = Depends(get_current_user)) -> dict:
     return user
 
 # ------------- Auth endpoints -------------
+
+# Simple in-memory login throttle: after 5 failed attempts for a username+IP
+# pair, block further attempts for 15 minutes. Per-worker (4 workers), which
+# still caps brute force at ~20 attempts / 15 min — plenty for a small team.
+_LOGIN_FAILS: Dict[str, List[float]] = {}
+_LOGIN_MAX_FAILS = 5
+_LOGIN_WINDOW_SECS = 15 * 60
+
+def _login_throttle_key(uname: str, request: Optional[Request]) -> str:
+    ip = request.client.host if (request and request.client) else "?"
+    return f"{uname}|{ip}"
+
+def _login_blocked(key: str) -> bool:
+    import time as _time
+    now = _time.time()
+    fails = [t for t in _LOGIN_FAILS.get(key, []) if now - t < _LOGIN_WINDOW_SECS]
+    _LOGIN_FAILS[key] = fails
+    return len(fails) >= _LOGIN_MAX_FAILS
+
+def _login_record_fail(key: str):
+    import time as _time
+    _LOGIN_FAILS.setdefault(key, []).append(_time.time())
+
 @api.post("/auth/login")
-async def login(body: LoginInput, response: Response):
+async def login(body: LoginInput, response: Response, request: Request):
     uname = body.username.strip().lower()
+    throttle_key = _login_throttle_key(uname, request)
+    if _login_blocked(throttle_key):
+        raise HTTPException(status_code=429, detail="Too many failed attempts — try again in 15 minutes")
     user = await db.users.find_one({"username": uname})
     if not user or not verify_password(body.password, user.get("password_hash", "")):
+        _login_record_fail(throttle_key)
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    _LOGIN_FAILS.pop(throttle_key, None)
     if not user.get("active", True):
         raise HTTPException(status_code=403, detail="Account disabled")
     # Block login during an active leave (executives only). Admins stay active.
@@ -627,7 +655,9 @@ async def login(body: LoginInput, response: Response):
             )
     token = create_access_token(user["id"], user["username"], user["role"], user.get("token_version", 0))
     response.set_cookie(
-        key="access_token", value=token, httponly=True, secure=False,
+        key="access_token", value=token, httponly=True,
+        # HTTPS-only by default (prod runs behind TLS); set COOKIE_SECURE=0 for local http dev
+        secure=os.environ.get("COOKIE_SECURE", "1") != "0",
         samesite="lax", max_age=43200, path="/",
     )
     user.pop("_id", None)
@@ -6283,8 +6313,18 @@ async def _handle_indiamart_payload(payload: Any, identifier: Optional[str] = No
     # IndiaMART expects HTTP 200; echoing CODE/STATUS is a safe acknowledgement pattern
     return {"CODE": 200, "STATUS": "SUCCESS", "ok": True, "created": created_ids, "received": len(entries)}
 
+# Optional shared secret: when INDIAMART_WEBHOOK_KEY is set in .env, the push
+# URL must include ?key=<value>. Unset = open (current behavior) so enabling it
+# is an explicit step done together with updating the URL in IndiaMART.
+_INDIAMART_WEBHOOK_KEY = os.environ.get("INDIAMART_WEBHOOK_KEY", "").strip()
+
+def _check_indiamart_key(request: Request):
+    if _INDIAMART_WEBHOOK_KEY and request.query_params.get("key") != _INDIAMART_WEBHOOK_KEY:
+        raise HTTPException(status_code=403, detail="Invalid webhook key")
+
 @api.post("/webhooks/indiamart")
 async def webhook_indiamart(request: Request):
+    _check_indiamart_key(request)
     try:
         payload = await request.json()
     except Exception:
@@ -6294,6 +6334,7 @@ async def webhook_indiamart(request: Request):
 @api.post("/webhooks/indiamart/{identifier}")
 async def webhook_indiamart_tenant(identifier: str, request: Request):
     """Tenant-identifier variant per IndiaMART docs: https://{host}/indiamart/{identifier}"""
+    _check_indiamart_key(request)
     try:
         payload = await request.json()
     except Exception:
@@ -8411,7 +8452,22 @@ async def reorder_reminder_task():
                     {"_id": 0, "id": 1, "assigned_to": 1, "customer_name": 1})
                 if lead:
                     break
-            if not lead or not lead.get("assigned_to"):
+            owner = None
+            if lead and lead.get("assigned_to"):
+                owner = await db.users.find_one(
+                    {"id": lead["assigned_to"], "active": True}, {"_id": 0, "id": 1})
+            if not owner:
+                # No CRM lead / no live owner — tell the admin instead of dropping it
+                if not await db.admin_alerts.find_one({"meta.dedup_key": dedup}, {"_id": 1}):
+                    await create_system_alert(
+                        "reorder_unrouted",
+                        f"Reorder chance needs an owner: {cust.get('name')}",
+                        f"OMS customer {cust.get('name')} (last order {o.get('order_number')} on "
+                        f"{str(o.get('created_at'))[:10]}, ₹{o.get('grand_total')}) hasn't ordered in 30+ days, "
+                        f"but has no CRM lead or no active executive assigned. Assign someone to chase the repeat order.",
+                        dedup_key=dedup,
+                    )
+                    created += 1
                 continue
             items = o.get("items") or []
             if not isinstance(items, list):
@@ -10245,6 +10301,14 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, token: Optional
         await websocket.close(code=1008, reason="Invalid token")
         return
 
+    # Enforce the same liveness checks as HTTP auth: the account must still be
+    # active and the token not revoked by a password change / forced logout.
+    ws_user = await db.users.find_one({"id": user_id}, {"_id": 0, "active": 1, "token_version": 1})
+    if not ws_user or not ws_user.get("active", True) or \
+            ws_user.get("token_version", 0) != payload.get("token_version", 0):
+        await websocket.close(code=1008, reason="Session revoked")
+        return
+
     await manager.connect(user_id, websocket)
     try:
         while True:
@@ -11883,10 +11947,13 @@ async def root():
 
 app.include_router(api)
 
+# Never combine wildcard origins with credentials — default to the known
+# production hosts; override with a comma-separated CORS_ORIGINS in .env.
+_default_origins = "https://crm.mangalamagro.in,http://localhost:3000,http://127.0.0.1:3000"
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_origins=[o.strip() for o in os.environ.get("CORS_ORIGINS", _default_origins).split(",") if o.strip()],
     allow_methods=["*"],
     allow_headers=["*"],
 )
