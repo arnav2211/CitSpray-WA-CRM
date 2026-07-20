@@ -2069,11 +2069,10 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
                     return refreshed or existing
         raise
 
-    # auto-assign if no explicit assignee — ONLY for round-robin sources
-    # (IndiaMART / JustDial / ExportersIndia). Other sources (Website orders,
-    # WhatsApp, manual, Excel without assignee) stay unassigned for the admin
-    # to distribute, so they never pollute the rotation.
-    if not lead["assigned_to"] and _is_round_robin_source(lead.get("source")) and not lead.get("is_backlog"):
+    # auto-assign if no explicit assignee. Every live source goes through the
+    # round-robin so no lead ever sits unassigned; only Excel-backlog uploads
+    # stay out of the rotation (they are old leads distributed manually).
+    if not lead["assigned_to"] and not lead.get("is_backlog"):
         try:
             # Buyleads routing: if the lead qualifies as a "buylead" for its source
             # and an admin has configured mode=selected with agent_ids, route it
