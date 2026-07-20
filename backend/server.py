@@ -506,6 +506,7 @@ class WhatsAppSendInput(BaseModel):
     template_lang: Optional[str] = None
     template_params: Optional[List[str]] = None  # explicit body params; if omitted backend infers
     reply_to_message_id: Optional[str] = None  # local UUID of the message being replied to
+    to_all_numbers: Optional[bool] = False  # send the same message to every number on the lead
 
 class TemplateCreate(BaseModel):
     name: str
@@ -3368,10 +3369,23 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
         raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
-    # Pick the recipient: explicit active_wa_phone wins, else primary
-    target_phone = lead.get("active_wa_phone") or lead.get("phone")
-    if not target_phone:
+    # Pick the recipient(s): explicit active_wa_phone wins, else primary.
+    # to_all_numbers=True sends the same message to EVERY number on the lead
+    # (deduped on the last 10 digits).
+    if body.to_all_numbers:
+        seen_digits: set = set()
+        targets: List[str] = []
+        for p in [lead.get("phone")] + list(lead.get("phones") or []):
+            digits = re.sub(r"\D", "", p or "")[-10:]
+            if p and digits and digits not in seen_digits:
+                seen_digits.add(digits)
+                targets.append(p)
+    else:
+        targets = [lead.get("active_wa_phone") or lead.get("phone")]
+    targets = [t for t in targets if t]
+    if not targets:
         raise HTTPException(status_code=400, detail="Lead has no phone number")
+    target_phone = targets[0]
 
     # If a template_name is given, send as template; else send freeform text.
     if body.template_name:
@@ -3399,12 +3413,15 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
                         detail=f"Incorrect number of template parameters: template '{body.template_name}' requires {params_required}, got {len(provided)}",
                     )
                 params_to_send = provided
-        api_result = await wa_send_template(
-            to_phone=target_phone,
-            template_name=body.template_name,
-            lang_code=tpl_meta.get("language") or body.template_lang or cfg["default_template_lang"],
-            body_params=params_to_send,
-        )
+        send_results: List[tuple] = []
+        for tp in targets:
+            r = await wa_send_template(
+                to_phone=tp,
+                template_name=body.template_name,
+                lang_code=tpl_meta.get("language") or body.template_lang or cfg["default_template_lang"],
+                body_params=params_to_send,
+            )
+            send_results.append((tp, r))
     else:
         # Free-text: enforce WhatsApp's 24-hour customer-care window
         last_in = lead.get("last_user_message_at")
@@ -3436,47 +3453,65 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
                 reply_ctx_local_id = src["id"]
                 reply_ctx_preview = (src.get("caption") or src.get("body") or "")[:120]
             # If src not found or has no wamid (e.g. mock), we skip the context — fallback to plain send.
-        api_result = await wa_send_text(to_phone=target_phone, body=body.body, reply_to_wamid=reply_ctx_wamid)
+        send_results = []
+        for i, tp in enumerate(targets):
+            # Reply context only applies to the first (active) number — the quoted
+            # message lives in that number's conversation.
+            r = await wa_send_text(to_phone=tp, body=body.body, reply_to_wamid=reply_ctx_wamid if i == 0 else None)
+            send_results.append((tp, r))
 
-    msg = {
-        "id": str(uuid.uuid4()),
-        "lead_id": body.lead_id,
-        "direction": "out",
-        "body": body.body,
-        "to_phone": target_phone,
-        "template_name": body.template_name,
-        "status": api_result.get("status", "failed"),
-        "wamid": api_result.get("wamid"),
-        "error": api_result.get("error"),
-        "error_code": api_result.get("code"),
-        "at": iso(now_utc()),
-        "by_user_id": user["id"],
-    }
-    # Attach reply-context metadata so the chat bubble can render a quoted preview
-    if not body.template_name and body.reply_to_message_id:
-        # Use the same resolved ids from the block above (still in scope)
-        if 'reply_ctx_local_id' in locals() and reply_ctx_local_id:
-            msg["reply_to_message_id"] = reply_ctx_local_id
-        if 'reply_ctx_wamid' in locals() and reply_ctx_wamid:
-            msg["reply_to_wamid"] = reply_ctx_wamid
-        if 'reply_ctx_preview' in locals() and reply_ctx_preview:
-            msg["reply_to_preview"] = reply_ctx_preview
-    await db.messages.insert_one(msg.copy())
-    update_lead = {"last_action_at": iso(now_utc()), "last_message_at": msg["at"]}
-    if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
+    msgs_out: List[dict] = []
+    ok_count = 0
+    any_ok = False
+    for i, (tp, api_result) in enumerate(send_results):
+        msg = {
+            "id": str(uuid.uuid4()),
+            "lead_id": body.lead_id,
+            "direction": "out",
+            "body": body.body,
+            "to_phone": tp,
+            "template_name": body.template_name,
+            "status": api_result.get("status", "failed"),
+            "wamid": api_result.get("wamid"),
+            "error": api_result.get("error"),
+            "error_code": api_result.get("code"),
+            "at": iso(now_utc()),
+            "by_user_id": user["id"],
+        }
+        # Attach reply-context metadata so the chat bubble can render a quoted preview
+        if i == 0 and not body.template_name and body.reply_to_message_id:
+            if 'reply_ctx_local_id' in locals() and reply_ctx_local_id:
+                msg["reply_to_message_id"] = reply_ctx_local_id
+            if 'reply_ctx_wamid' in locals() and reply_ctx_wamid:
+                msg["reply_to_wamid"] = reply_ctx_wamid
+            if 'reply_ctx_preview' in locals() and reply_ctx_preview:
+                msg["reply_to_preview"] = reply_ctx_preview
+        await db.messages.insert_one(msg.copy())
+        sent_ok = msg["status"] in ("sent", "delivered", "read", "sent_mock")
+        if sent_ok:
+            ok_count += 1
+            any_ok = True
+            await _set_wa_status(body.lead_id, tp, True)
+        elif msg["status"] == "failed" and (msg.get("error_code") in (131026, 131047, 470, 100) or "not on whatsapp" in (msg.get("error") or "").lower()):
+            # Meta returns 131026 / "not in WhatsApp" type errors when the number isn't on WA
+            await _set_wa_status(body.lead_id, tp, False)
+        await log_activity(user["id"], "whatsapp_sent", body.lead_id, {"status": msg["status"], "wamid": msg["wamid"], "error": msg["error"], "to_phone": tp})
+        msgs_out.append(strip_mongo(msg))
+
+    update_lead = {"last_action_at": iso(now_utc()), "last_message_at": msgs_out[-1]["at"]}
+    if any_ok:
         update_lead["has_whatsapp"] = True
     await db.leads.update_one({"id": body.lead_id}, {"$set": update_lead})
-    # Per-phone WA status
-    if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
-        await _set_wa_status(body.lead_id, target_phone, True)
-    elif msg["status"] == "failed" and (msg.get("error_code") in (131026, 131047, 470, 100) or "not on whatsapp" in (msg.get("error") or "").lower()):
-        # Meta returns 131026 / "not in WhatsApp" type errors when the number isn't on WA
-        await _set_wa_status(body.lead_id, target_phone, False)
-    await log_activity(user["id"], "whatsapp_sent", body.lead_id, {"status": msg["status"], "wamid": msg["wamid"], "error": msg["error"]})
-    if msg["status"] == "failed":
-        # Surface the Meta error so the executive sees what to fix
-        raise HTTPException(status_code=400, detail=msg["error"] or "WhatsApp send failed")
-    return strip_mongo(msg)
+
+    if len(msgs_out) == 1:
+        if msgs_out[0]["status"] == "failed":
+            # Surface the Meta error so the executive sees what to fix
+            raise HTTPException(status_code=400, detail=msgs_out[0].get("error") or "WhatsApp send failed")
+        return msgs_out[0]
+    failed = len(msgs_out) - ok_count
+    if ok_count == 0:
+        raise HTTPException(status_code=400, detail=f"Send failed on all {len(msgs_out)} numbers: {msgs_out[0].get('error') or 'unknown error'}")
+    return {"multi": True, "sent": ok_count, "failed": failed, "messages": msgs_out}
 
 
 # ------------- Rich-media composer endpoints (image / video / document / audio / location / contact / resend) -------------
@@ -6024,6 +6059,12 @@ async def _merge_leads(source_lead: dict, dest_lead: dict, by_user_id: Optional[
 
     # 6. Re-key activities to the destination lead ID
     await db.activities.update_many({"lead_id": source_id}, {"$set": {"lead_id": dest_id}})
+    # 6b. Re-key everything else that hangs off the lead so history survives
+    for coll in (db.followups, db.call_logs, db.internal_messages, db.activity_logs):
+        try:
+            await coll.update_many({"lead_id": source_id}, {"$set": {"lead_id": dest_id}})
+        except Exception as e:
+            logger.warning(f"merge re-key failed for {coll.name}: {e}")
     
     # Also log a specific activity for the merge
     await log_activity(by_user_id, "lead_merged", dest_id, {
@@ -6037,6 +6078,30 @@ async def _merge_leads(source_lead: dict, dest_lead: dict, by_user_id: Optional[
     # Retrieve and return the updated destination lead
     refreshed = await db.leads.find_one({"id": dest_id}, {"_id": 0})
     return refreshed
+
+
+class MergeLeadsInput(BaseModel):
+    source_lead_id: str
+
+@api.post("/leads/{lead_id}/merge")
+async def merge_leads_manual(lead_id: str, body: MergeLeadsInput, user: dict = Depends(get_current_user)):
+    """Manually merge another lead INTO this one. This lead (dest) survives with
+    all phones/emails/notes/enquiries/chats/calls/followups; the source lead is
+    deleted. Admin: any two leads. Executive: both must be assigned to them."""
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
+    if lead_id == body.source_lead_id:
+        raise HTTPException(status_code=400, detail="Cannot merge a lead into itself")
+    dest = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    source = await db.leads.find_one({"id": body.source_lead_id}, {"_id": 0})
+    if not dest or not source:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "executive" and (
+        dest.get("assigned_to") != user["id"] or source.get("assigned_to") != user["id"]
+    ):
+        raise HTTPException(status_code=403, detail="You can only merge leads that are both assigned to you — ask an admin")
+    merged = await _merge_leads(source_lead=source, dest_lead=dest, by_user_id=user["id"])
+    return {"merged": True, "lead": merged}
 
 
 async def _find_lead_by_justdial_link(url: Optional[str]) -> Optional[dict]:
@@ -8302,6 +8367,82 @@ async def auto_reassign_task():
         await _release_reassign_lock()
 
 
+async def reorder_reminder_task():
+    """Daily: find OMS customers whose LAST order is 30+ days old, match them to
+    their CRM lead, and drop a follow-up on the lead owner's queue with the
+    previous order's details so they can pitch a repeat order.
+    One reminder per (customer, last order) — dedup key prevents daily nagging;
+    a fresh reminder only fires after the customer places (and then lapses on)
+    a NEW order."""
+    try:
+        cutoff = iso(now_utc() - timedelta(days=30))
+        created = 0
+        pipeline = [
+            {"$sort": {"created_at": -1}},
+            {"$group": {"_id": "$customer_id", "last": {"$first": "$$ROOT"}}},
+            {"$match": {"last.created_at": {"$lt": cutoff}}},
+        ]
+        async for doc in oms_db.orders.aggregate(pipeline):
+            if created >= 30:  # cap per day so the first run doesn't flood queues
+                break
+            o = doc.get("last") or {}
+            cust_id = doc.get("_id")
+            if not cust_id or not o.get("id"):
+                continue
+            dedup = f"reorder:{cust_id}:{o['id']}"
+            if await db.followups.find_one({"meta.dedup_key": dedup}, {"_id": 1}):
+                continue
+            cust = await oms_db.customers.find_one({"id": cust_id}, {"_id": 0})
+            if not cust:
+                continue
+            # Match OMS customer → CRM lead by any phone number (suffix match)
+            lead = None
+            for pn in (cust.get("phone_numbers") or []):
+                pat = phone_match_pattern(pn or "")
+                if not pat:
+                    continue
+                lead = await db.leads.find_one(
+                    {"$or": [{"phone": {"$regex": pat}}, {"phones": {"$regex": pat}}]},
+                    {"_id": 0, "id": 1, "assigned_to": 1, "customer_name": 1})
+                if lead:
+                    break
+            if not lead or not lead.get("assigned_to"):
+                continue
+            items = o.get("items") or []
+            if not isinstance(items, list):
+                items = []
+            summary = ", ".join(
+                f"{i.get('product_name')} × {i.get('qty'):g} {i.get('unit', '')}".strip()
+                for i in items[:4] if isinstance(i, dict) and i.get("product_name")
+            ) or "items unavailable"
+            try:
+                days_ago = (now_utc() - datetime.fromisoformat(str(o["created_at"]).replace("Z", "+00:00"))).days
+            except Exception:
+                days_ago = 30
+            note = (f"REORDER NUDGE: {cust.get('name') or lead.get('customer_name')} hasn't ordered in {days_ago} days. "
+                    f"Last order {o.get('order_number') or ''} on {str(o.get('created_at'))[:10]}: {summary} "
+                    f"(₹{o.get('grand_total')}). Remind them of this order and try to take a repeat order.")
+            fu = {
+                "id": str(uuid.uuid4()),
+                "lead_id": lead["id"],
+                "executive_id": lead["assigned_to"],
+                "created_by": None,
+                "due_at": iso(now_utc() + timedelta(minutes=30)),
+                "note": note,
+                "status": "pending",
+                "created_at": iso(now_utc()),
+                "completed_at": None,
+                "meta": {"type": "reorder", "dedup_key": dedup, "oms_customer_id": cust_id, "oms_order_id": o["id"]},
+            }
+            await db.followups.insert_one(fu)
+            await log_activity(None, "reorder_reminder_created", lead["id"], {"customer": cust.get("name"), "order": o.get("order_number")})
+            created += 1
+        if created:
+            logger.info(f"reorder_reminder_task: created {created} reorder follow-ups")
+    except Exception as e:
+        logger.exception(f"reorder_reminder_task failed: {e}")
+
+
 async def attendance_monitor_task():
     """Every 10 min: raise admin flags for attendance rule breaches.
     All alerts are deduped per employee+date, so re-runs are harmless."""
@@ -10206,6 +10347,7 @@ async def on_startup():
     scheduler.add_job(auto_reassign_task, "interval", minutes=1, id="auto_reassign", max_instances=1, coalesce=True)
     scheduler.add_job(check_due_followups_task, "interval", seconds=10, id="check_due_followups", max_instances=1, coalesce=True)
     scheduler.add_job(attendance_monitor_task, "interval", minutes=10, id="attendance_monitor", max_instances=1, coalesce=True)
+    scheduler.add_job(reorder_reminder_task, "cron", hour=10, minute=45, timezone="Asia/Kolkata", id="reorder_reminder", max_instances=1, coalesce=True)
     scheduler.add_job(abandoned_checkout_task, "interval", minutes=10, id="abandoned_checkout", max_instances=1, coalesce=True)
     try:
         await db.attendance_logs.create_index([("user_id", 1), ("date", 1)])

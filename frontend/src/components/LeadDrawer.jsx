@@ -4,7 +4,7 @@ import { api, errMsg } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { toast } from "sonner";
 import { StatusBadge, SourceBadge, QueryTypeBadge } from "@/components/Badges";
-import { X, Phone, EnvelopeSimple, MapPin, ArrowSquareOut, PaperPlaneRight, Clock, CalendarBlank, NotePencil, Plus, Trash, Info, PhoneCall, WhatsappLogo, Star, PencilSimple, Check, Lightning, MagnifyingGlass } from "@phosphor-icons/react";
+import { X, Phone, EnvelopeSimple, MapPin, ArrowSquareOut, PaperPlaneRight, Clock, CalendarBlank, NotePencil, Plus, Trash, Info, PhoneCall, WhatsappLogo, Star, PencilSimple, Check, Lightning, MagnifyingGlass, GitMerge } from "@phosphor-icons/react";
 import { fmtIST, fmtISTTime, fmtTime12, fmtSmartLong, fmtDaySeparator, istDayKey, queryTypeInfo } from "@/lib/format";
 import OMSDataSection from "@/components/OMSDataSection";
 
@@ -60,6 +60,7 @@ export default function LeadDrawer({ leadId, onClose }) {
   const [savingCall, setSavingCall] = useState(false);
   const [followups, setFollowups] = useState([]);
   const [showEnquiries, setShowEnquiries] = useState(false);
+  const [showMerge, setShowMerge] = useState(false);
 
   const loadAll = async (targetId) => {
     const currentId = targetId || activeLeadId;
@@ -332,6 +333,9 @@ export default function LeadDrawer({ leadId, onClose }) {
   return (
     <div className="fixed inset-0 bg-black/40 z-40 flex justify-end" onClick={onClose} data-testid="lead-drawer">
       <div className="w-full max-w-5xl bg-white border-l border-gray-200 overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        {showMerge && (
+          <MergeDialog destLead={lead} onClose={() => setShowMerge(false)} onMerged={() => { setShowMerge(false); loadAll(); }} />
+        )}
         {/* Header */}
         <div className="sticky top-0 bg-white border-b border-gray-200 p-4 md:p-5 flex items-start justify-between z-10">
           <div className="min-w-0 flex-1">
@@ -444,6 +448,14 @@ export default function LeadDrawer({ leadId, onClose }) {
               {execs.map((x) => <option key={x.id} value={x.id}>{x.role === "admin" ? `${x.name} (admin)` : x.name}</option>)}
             </select>
           )}
+          <button
+            onClick={() => setShowMerge(true)}
+            className="border border-gray-900 px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 hover:bg-gray-900 hover:text-white"
+            title="Merge another lead into this one (same person/company with a second number)"
+            data-testid="lead-merge-btn"
+          >
+            <GitMerge size={12} weight="bold" /> Merge
+          </button>
           {isAdmin && (
             <button
               onClick={deleteLead}
@@ -1260,3 +1272,91 @@ function EmailsRow({ lead, canEdit, onChanged }) {
   );
 }
 
+
+function MergeDialog({ destLead, onClose, onMerged }) {
+  const [q, setQ] = React.useState("");
+  const [results, setResults] = React.useState([]);
+  const [searching, setSearching] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!q.trim()) { setResults([]); return; }
+    const t = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const { data } = await api.get("/leads", { params: { q: q.trim(), paginate: true, limit: 8, offset: 0 } });
+        setResults((data?.items || []).filter((l) => l.id !== destLead.id));
+      } catch { /* empty */ }
+      finally { setSearching(false); }
+    }, 300);
+    return () => clearTimeout(t);
+  }, [q, destLead.id]);
+
+  const doMerge = async (src) => {
+    const ok = window.confirm(
+      `Merge "${src.customer_name || "Unknown"}" (${src.phone || "no phone"}) INTO "${destLead.customer_name}"?\n\n` +
+      `All numbers, WhatsApp chats, notes, calls and follow-ups move into this lead; ` +
+      `the other lead is deleted and this lead's status resets to New.\n\nThis cannot be undone.`
+    );
+    if (!ok) return;
+    setBusy(true);
+    try {
+      await api.post(`/leads/${destLead.id}/merge`, { source_lead_id: src.id });
+      toast.success("Leads merged");
+      onMerged?.();
+    } catch (e) { toast.error(errMsg(e, "Merge failed")); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/60 z-[70] flex items-center justify-center p-4" onClick={onClose} data-testid="merge-dialog">
+      <div onClick={(e) => e.stopPropagation()} className="w-full max-w-lg bg-white border border-gray-900 p-5 space-y-3">
+        <div className="flex items-start justify-between gap-2">
+          <div>
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Merge duplicate lead</div>
+            <h3 className="font-chivo font-black text-lg leading-tight mt-0.5">
+              Into: {destLead.customer_name} <span className="text-xs font-mono text-gray-500">{destLead.phone}</span>
+            </h3>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-900 font-bold px-1">✕</button>
+        </div>
+        <p className="text-[11px] text-gray-500 leading-relaxed">
+          Search the OTHER lead (the duplicate with the second number). Its numbers, chats, notes,
+          calls and follow-ups will be moved into this lead, then it is deleted.
+        </p>
+        <div className="flex items-center border border-gray-300">
+          <MagnifyingGlass size={14} className="ml-2 text-gray-400" />
+          <input
+            autoFocus
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Search by name / phone / company…"
+            className="flex-1 px-2 py-2 text-sm outline-none"
+            data-testid="merge-search-input"
+          />
+        </div>
+        <div className="max-h-64 overflow-y-auto divide-y divide-gray-100 border border-gray-200">
+          {searching && <div className="p-3 text-xs text-gray-400">Searching…</div>}
+          {!searching && q.trim() && results.length === 0 && (
+            <div className="p-3 text-xs text-gray-400">No other leads match.</div>
+          )}
+          {results.map((l) => (
+            <button
+              key={l.id}
+              onClick={() => !busy && doMerge(l)}
+              disabled={busy}
+              className="w-full text-left p-2.5 hover:bg-gray-50 disabled:opacity-50"
+              data-testid={`merge-candidate-${l.id}`}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-semibold text-sm truncate">{l.customer_name || "Unknown"}</span>
+                <span className="text-[10px] uppercase font-bold text-gray-400 shrink-0">{l.source}</span>
+              </div>
+              <div className="text-[11px] text-gray-500 font-mono">{l.phone || "no phone"} · {l.status}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}

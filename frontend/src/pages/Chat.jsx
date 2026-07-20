@@ -690,6 +690,16 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   const [showAI, setShowAI] = useState(false);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiSuggestions, setAiSuggestions] = useState([]);
+  const [sendToAll, setSendToAll] = useState(false);
+  // Unique numbers on this lead (primary + extras, deduped on last 10 digits)
+  const uniquePhoneCount = React.useMemo(() => {
+    const seen = new Set();
+    [conv.phone, ...(conv.phones || [])].filter(Boolean).forEach((p) => {
+      const d = String(p).replace(/\D/g, "").slice(-10);
+      if (d) seen.add(d);
+    });
+    return seen.size;
+  }, [conv.phone, conv.phones]);
 
   const askAI = async (intent) => {
     setAiLoading(true);
@@ -1089,7 +1099,12 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
     try {
       const payload = { lead_id: conv.id, body: draft };
       if (replyTo?.id) payload.reply_to_message_id = replyTo.id;
-      await api.post("/whatsapp/send", payload);
+      if (sendToAll) payload.to_all_numbers = true;
+      const { data } = await api.post("/whatsapp/send", payload);
+      if (data?.multi) {
+        toast[data.failed > 0 ? "warning" : "success"](
+          `Sent to ${data.sent}/${data.sent + data.failed} numbers${data.failed > 0 ? " — some failed (number may be outside its 24h window)" : ""}`);
+      }
       setDraft("");
       setReplyTo(null);
       loadMessages();
@@ -1124,8 +1139,13 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
         template_name: tplName,
       };
       if (templateParams !== null) payload.template_params = templateParams;
-      await api.post("/whatsapp/send", payload);
-      toast.success(`Template "${tplName}" sent`);
+      if (sendToAll) payload.to_all_numbers = true;
+      const { data } = await api.post("/whatsapp/send", payload);
+      if (data?.multi) {
+        toast[data.failed > 0 ? "warning" : "success"](`Template sent to ${data.sent}/${data.sent + data.failed} numbers`);
+      } else {
+        toast.success(`Template "${tplName}" sent`);
+      }
       setShowTpl(false);
       loadMessages();
       onChanged?.();
@@ -1722,6 +1742,15 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                     {translatingInput ? "..." : "Translate"}
                   </button>
                 </div>
+                {uniquePhoneCount > 1 && (
+                  <label className={`flex items-center gap-1.5 px-2 py-1.5 border rounded cursor-pointer select-none shrink-0 ${sendToAll ? "bg-[#25D366] border-[#25D366] text-white" : "border-gray-300 bg-white text-gray-600 hover:bg-gray-50"}`}
+                    title={`This lead has ${uniquePhoneCount} numbers — when on, every message/template goes to all of them`}
+                    data-testid="send-all-numbers-toggle">
+                    <input type="checkbox" checked={sendToAll} onChange={(e) => setSendToAll(e.target.checked)} className="hidden" />
+                    <Phone size={13} weight="bold" />
+                    <span className="text-[10px] uppercase tracking-widest font-bold">All {uniquePhoneCount} numbers</span>
+                  </label>
+                )}
               </div>
 
               {/* Message Input & Send Row */}
