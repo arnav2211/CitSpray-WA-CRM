@@ -160,6 +160,10 @@ class MainActivity : AppCompatActivity() {
         // devices), while CallReceiver + SyncWorker still pull every call from
         // the CallLog in near-real-time.
 
+        // Self-update: if a newer APK is published on the server, offer a
+        // one-tap "Install now" dialog
+        handler.postDelayed({ UpdateManager.checkForUpdate(this) }, 3000)
+
         // Process any pending deep-link navigation path
         handleNavPath(intent)
     }

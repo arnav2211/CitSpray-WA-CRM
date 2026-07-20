@@ -10853,6 +10853,23 @@ Return STRICT JSON only: {{"suggestions": ["option 1", "option 2"]}}"""
 async def ai_status(user: dict = Depends(get_current_user)):
     return {"configured": bool(GEMINI_API_KEY), "model": GEMINI_MODEL if GEMINI_API_KEY else None}
 
+# ------------- Android app self-update -------------
+# The LeadOrbit app polls this on launch. Publish a new version by dropping
+# the APK + version.json into backend/uploads/app/ (see version.json keys:
+# version_code, version_name, apk_url, notes). Public endpoint — the app may
+# check before login; the payload is not sensitive.
+
+@api.get("/app/version")
+async def app_version():
+    vf = UPLOAD_DIR / "app" / "version.json"
+    if not vf.exists():
+        raise HTTPException(status_code=404, detail="No app version published")
+    try:
+        return json.loads(vf.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.error(f"app_version: bad version.json: {e}")
+        raise HTTPException(status_code=500, detail="version.json is invalid")
+
 # ------------- Attendance & Payroll Endpoints -------------
 
 @api.get("/holidays")
