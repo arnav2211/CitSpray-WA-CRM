@@ -155,10 +155,10 @@ class MainActivity : AppCompatActivity() {
             syncPhoneLeadMap()
         }
         
-        // Prompt user to set LeadOrbit as default phone dialer
-        handler.postDelayed({
-            checkAndRequestDefaultDialer()
-        }, 1500)
+        // LeadOrbit no longer takes over as the default phone app: calls run
+        // through the phone's regular dialer (fast + familiar, works on old
+        // devices), while CallReceiver + SyncWorker still pull every call from
+        // the CallLog in near-real-time.
 
         // Process any pending deep-link navigation path
         handleNavPath(intent)

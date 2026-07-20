@@ -89,19 +89,9 @@
             android:theme="@style/Theme.AppCompat.Light.NoActionBar"
             android:exported="false" />
 
-        <!-- InCallService implementation to bind to the system calling stack -->
-        <service
-            android:name=".CallService"
-            android:permission="android.permission.BIND_INCALL_SERVICE"
-            android:foregroundServiceType="phoneCall"
-            android:exported="true">
-            <meta-data
-                android:name="android.telecom.IN_CALL_SERVICE_UI"
-                android:value="true" />
-            <intent-filter>
-                <action android:name="android.telecom.InCallService" />
-            </intent-filter>
-        </service>
+        <!-- InCallService REMOVED: the phone's regular dialer now handles all
+             call UI. LeadOrbit only places calls (CallHelper) and syncs the
+             CallLog (CallReceiver + SyncWorker). -->
 
         <!-- Real-time notification WebSocket sync service -->
         <service
