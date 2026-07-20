@@ -33,7 +33,11 @@ export default function Leads() {
   const [pageSize, setPageSize] = useState(parseInt(params.get("size") || "25", 10) || 25);
   const [total, setTotal] = useState(0);
 
+  // Monotonic request id: a slow earlier response must never overwrite the
+  // results of a newer search (classic stale-response race while typing).
+  const loadSeq = React.useRef(0);
   const load = async () => {
+    const seq = ++loadSeq.current;
     try {
       const { data } = await api.get("/leads", {
         params: {
@@ -50,10 +54,11 @@ export default function Leads() {
           offset: (page - 1) * pageSize,
         },
       });
+      if (seq !== loadSeq.current) return; // superseded by a newer request
       // /api/leads returns {items,total,...} when paginate=true is sent.
       setLeads(data?.items || []);
       setTotal(typeof data?.total === "number" ? data.total : (data?.items || []).length);
-    } catch (e) { toast.error(errMsg(e)); }
+    } catch (e) { if (seq === loadSeq.current) toast.error(errMsg(e)); }
   };
 
   const toggleStar = async (leadId, currentStarred) => {

@@ -48,6 +48,10 @@ oms_db = client[OMS_DB_NAME]
 
 JWT_ALGORITHM = "HS256"
 JWT_SECRET = os.environ.get("JWT_SECRET", "devsecret")
+if JWT_SECRET == "devsecret":
+    logging.getLogger("crm").critical(
+        "JWT_SECRET is not set — running with the default dev secret. "
+        "Every auth token is forgeable. Set JWT_SECRET in backend/.env immediately.")
 
 # ------------- WhatsApp Cloud API config -------------
 # Fallback defaults come from .env; the effective config can be overridden at
@@ -641,8 +645,15 @@ async def me(user: dict = Depends(get_current_user)):
 # ------------- Users management -------------
 @api.get("/users")
 async def list_users(user: dict = Depends(get_current_user)):
-    # executives can list colleagues to see names, but not passwords
-    users = await db.users.find({}, {"_id": 0, "password_hash": 0}).to_list(500)
+    # Admins get the full record; everyone else only needs names/roles for
+    # dropdowns — never salaries, face embeddings, or receiver numbers.
+    if user.get("role") == "admin":
+        users = await db.users.find({}, {"_id": 0, "password_hash": 0}).to_list(500)
+    else:
+        users = await db.users.find({}, {
+            "_id": 0, "id": 1, "name": 1, "username": 1, "role": 1,
+            "active": 1, "department": 1, "employee_code": 1,
+        }).to_list(500)
     return users
 
 @api.post("/users")
@@ -688,7 +699,11 @@ async def update_user(user_id: str, body: UserUpdate, admin: dict = Depends(requ
     if body.password:
         updates["password_hash"] = hash_password(body.password)
     if updates:
-        await db.users.update_one({"id": user_id}, {"$set": updates})
+        ops: Dict[str, Any] = {"$set": updates}
+        if body.password:
+            # Revoke all existing sessions when the password changes
+            ops["$inc"] = {"token_version": 1}
+        await db.users.update_one({"id": user_id}, ops)
     doc = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
     return doc
 
@@ -1439,6 +1454,19 @@ async def _get_buyleads_routing(source: str) -> dict:
     }
 
 
+def _is_round_robin_source(source: Optional[str]) -> bool:
+    """Only portal enquiries take part in automatic round-robin assignment and
+    auto-reassignment. Historic data has messy casing ('indiamart', 'INDIAMART',
+    'india mart', 'Justdial'...), so normalize before comparing."""
+    s = (source or "").strip().lower().replace(" ", "")
+    return s in ("indiamart", "justdial", "exportersindia")
+
+
+# Mongo-side filter matching the same three sources (case/space-insensitive) for
+# the auto-reassign queries.
+ROUND_ROBIN_SOURCE_REGEX = r"^\s*(india\s*mart|just\s*dial|exporters\s*india)\s*$"
+
+
 def _is_buylead(lead_data: dict) -> bool:
     """Strict buylead detection per spec:
     IndiaMART: source_data.QUERY_TYPE == 'B'
@@ -1596,12 +1624,12 @@ async def _pick_buyleads_executive(source: str) -> Optional[dict]:
     if not eligible:
         return None
     eligible.sort(key=lambda e: e["username"])
-    # Round-robin pointer stored per-source under buyleads_routing doc
-    ptr_doc = await db.buyleads_routing.find_one({"source": source}, {"_id": 0, "last_assigned_index": 1})
-    idx = int((ptr_doc or {}).get("last_assigned_index", -1))
-    idx = (idx + 1) % len(eligible)
-    chosen = eligible[idx]
-    await db.buyleads_routing.update_one({"source": source}, {"$set": {"last_assigned_index": idx}}, upsert=True)
+    # Round-robin on a stored username pointer per source (robust to the
+    # eligible set changing between calls — see pick_next_executive).
+    ptr_doc = await db.buyleads_routing.find_one({"source": source}, {"_id": 0, "last_assigned_username": 1})
+    last_uname = (ptr_doc or {}).get("last_assigned_username") or ""
+    chosen = next((e for e in eligible if e["username"] > last_uname), eligible[0])
+    await db.buyleads_routing.update_one({"source": source}, {"$set": {"last_assigned_username": chosen["username"]}}, upsert=True)
     return chosen
 
 
@@ -1645,13 +1673,15 @@ async def pick_next_executive(exclude_user_id: Optional[str] = None) -> Optional
         eligible = fallback or []
     if not eligible:
         return None
-    # sort deterministic
+    # Round-robin on a stored USERNAME pointer, not a positional index: the
+    # eligible set changes constantly (attendance, leave, working hours), so an
+    # index into it skips/double-serves people. "First username after the last
+    # assigned one" stays fair no matter how the set changes.
     eligible.sort(key=lambda e: e["username"])
-    idx = int(rules.get("last_assigned_index", -1))
-    idx = (idx + 1) % len(eligible)
-    chosen = eligible[idx]
+    last_uname = (rules.get("last_assigned_username") or "")
+    chosen = next((e for e in eligible if e["username"] > last_uname), eligible[0])
     await db.routing_rules.update_one(
-        {"key": "default"}, {"$set": {"last_assigned_index": idx}}, upsert=True
+        {"key": "default"}, {"$set": {"last_assigned_username": chosen["username"]}}, upsert=True
     )
     return chosen
 
@@ -2037,8 +2067,11 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
                     return refreshed or existing
         raise
 
-    # auto-assign if no explicit assignee
-    if not lead["assigned_to"]:
+    # auto-assign if no explicit assignee — ONLY for round-robin sources
+    # (IndiaMART / JustDial / ExportersIndia). Other sources (Website orders,
+    # WhatsApp, manual, Excel without assignee) stay unassigned for the admin
+    # to distribute, so they never pollute the rotation.
+    if not lead["assigned_to"] and _is_round_robin_source(lead.get("source")):
         try:
             # Buyleads routing: if the lead qualifies as a "buylead" for its source
             # and an admin has configured mode=selected with agent_ids, route it
@@ -2140,6 +2173,10 @@ async def list_leads(
             {"aliases": {"$regex": q_safe, "$options": "i"}},
             {"requirement": {"$regex": q_safe, "$options": "i"}},
             {"city": {"$regex": q_safe, "$options": "i"}},
+            {"email": {"$regex": q_safe, "$options": "i"}},
+            {"gst_no": {"$regex": q_safe, "$options": "i"}},
+            {"source_data.SENDER_COMPANY": {"$regex": q_safe, "$options": "i"}},
+            {"source_data.company_name": {"$regex": q_safe, "$options": "i"}},
         ]
         # Phone-aware match: if the search query contains 7+ digits, treat it as a phone
         # search and look it up by canonical-suffix regex (so '+918790934618',
@@ -2514,12 +2551,14 @@ async def get_lead(lead_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Lead not found")
     if user["role"] == "data_entry":
         raise HTTPException(status_code=403, detail="Not allowed")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     # mark opened (only assignee)
     if user["role"] == "executive" and not lead.get("opened_at"):
         await db.leads.update_one(
-            {"id": lead_id}, {"$set": {"opened_at": iso(now_utc()), "last_action_at": iso(now_utc())}}
+            {"id": lead_id}, {"$set": {"opened_at": iso(now_utc()), "last_action_at": iso(now_utc()), "auto_reassign_count": 0}}
         )
         lead["opened_at"] = iso(now_utc())
         await log_activity(user["id"], "lead_opened", lead_id)
@@ -2530,6 +2569,8 @@ async def update_lead(lead_id: str, body: LeadUpdate, user: dict = Depends(get_c
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "data_entry":
         raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
@@ -2590,6 +2631,8 @@ async def add_note(lead_id: str, body: NoteInput, user: dict = Depends(get_curre
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     note = {
@@ -2612,6 +2655,8 @@ async def add_phone(lead_id: str, body: PhoneInput, user: dict = Depends(get_cur
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     new_phone = normalize_phone_display((body.phone or "").strip())
@@ -2663,6 +2708,8 @@ async def remove_phone(lead_id: str, phone: str = Query(...), user: dict = Depen
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     target = normalize_phone_display(phone)
@@ -2693,6 +2740,8 @@ async def lead_activity(lead_id: str, user: dict = Depends(get_current_user)):
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     logs = await db.activity_logs.find({"lead_id": lead_id}, {"_id": 0}).sort("at", -1).to_list(200)
@@ -2727,6 +2776,8 @@ async def list_messages(
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     query: Dict[str, Any] = {"lead_id": lead_id}
@@ -3247,6 +3298,8 @@ async def set_active_wa_phone(lead_id: str, body: ActiveWaPhoneInput, user: dict
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     target = (body.phone or "").strip()
@@ -3265,6 +3318,8 @@ async def get_lead_oms_data(lead_id: str, user: dict = Depends(get_current_user)
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
 
@@ -3309,6 +3364,8 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
     lead = await db.leads.find_one({"id": body.lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     # Pick the recipient: explicit active_wa_phone wins, else primary
@@ -3472,6 +3529,8 @@ async def _assert_chat_permitted(user: dict, lead_id: str) -> dict:
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     target_phone = lead.get("active_wa_phone") or lead.get("phone")
@@ -3943,6 +4002,8 @@ async def create_followup(body: FollowupCreate, user: dict = Depends(get_current
     lead = await db.leads.find_one({"id": body.lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     doc = {
@@ -5137,6 +5198,8 @@ async def get_one_conversation(lead_id: str, user: dict = Depends(get_current_us
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     last = await db.messages.find_one({"lead_id": lead_id}, {"_id": 0}, sort=[("at", -1)])
@@ -5187,6 +5250,8 @@ async def mark_thread_read(lead_id: str, user: dict = Depends(get_current_user))
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     res = await db.messages.update_many(
@@ -6727,8 +6792,6 @@ async def whatsapp_verify(request: Request):
     challenge = params.get("hub.challenge")
     if mode == "subscribe" and token == cfg["verify_token"] and challenge:
         return Response(content=challenge, media_type="text/plain")
-    if challenge and not token:
-        return Response(content=challenge, media_type="text/plain")
     raise HTTPException(status_code=403, detail="Verify token mismatch")
 
 
@@ -7757,8 +7820,25 @@ async def list_chat_sessions(admin: dict = Depends(require_admin), limit: int = 
 @api.post("/webhooks/whatsapp")
 async def webhook_whatsapp(request: Request):
     """Receive incoming WhatsApp messages and delivery status updates from Meta."""
+    body_bytes = await request.body()
+    # Verify Meta's HMAC signature when an app secret is configured. Reject a
+    # PRESENT-but-wrong signature outright; tolerate a missing header only so a
+    # misconfigured secret can't silently kill all inbound WhatsApp.
     try:
-        payload = await request.json()
+        cfg_sig = await get_wa_config()
+        app_secret = (cfg_sig.get("app_secret") or "").strip()
+        sig_header = request.headers.get("x-hub-signature-256", "")
+        if app_secret and sig_header:
+            expected = "sha256=" + hmac_mod.new(app_secret.encode(), body_bytes, hashlib.sha256).hexdigest()
+            if not hmac_mod.compare_digest(expected, sig_header):
+                logger.warning("WhatsApp webhook: X-Hub-Signature-256 mismatch — rejecting payload")
+                raise HTTPException(status_code=403, detail="Invalid signature")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"WhatsApp webhook signature check failed open: {e}")
+    try:
+        payload = json.loads(body_bytes.decode("utf-8"))
     except Exception:
         payload = {}
     raw = {
@@ -8060,15 +8140,21 @@ async def webhook_whatsapp(request: Request):
 
 # ------------- Auto-reassignment task -------------
 
-async def _auto_reassign_lead(lead_id: str, current_assigned_to: Optional[str], reason: str) -> Optional[str]:
-    """Auto-reassign a lead WITHOUT resetting opened_at.
+MAX_AUTO_REASSIGN_HOPS = 3
 
-    Critical differences from assign_lead():
-    1. Does NOT set opened_at=None — so the lead never re-enters the 'unopened'
-       queue after an auto-reassign, breaking the infinite reassignment loop.
-    2. Uses a conditional findOneAndUpdate (optimistic lock) — if two uvicorn
-       workers race on the same lead, only the first write succeeds; the second
-       sees a non-matching assigned_to and writes nothing (no duplicate history).
+async def _auto_reassign_lead(lead_id: str, current_assigned_to: Optional[str], reason: str,
+                              reset_hop_count: bool = False) -> Optional[str]:
+    """Auto-reassign a lead to the next executive in the rotation.
+
+    - opened_at IS reset (the new owner hasn't opened it), but every hop
+      increments auto_reassign_count; the cron passes stop picking a lead up
+      once it hits MAX_AUTO_REASSIGN_HOPS, so a lead nobody opens can bounce at
+      most 3 times instead of ping-ponging every 10 minutes forever.
+    - last_reassigned_at / sort_at are set so the lead bubbles to the TOP of
+      the new owner's list (before this, auto-reassigned leads stayed buried
+      under newer leads and the new owner never saw them).
+    - Conditional findOneAndUpdate (optimistic lock): if two workers race on
+      the same lead, only the first write succeeds.
     """
     chosen = await pick_next_executive(exclude_user_id=current_assigned_to)
     if not chosen:
@@ -8076,18 +8162,26 @@ async def _auto_reassign_lead(lead_id: str, current_assigned_to: Optional[str], 
     chosen_id = chosen["id"]
     if chosen_id == current_assigned_to:
         return None  # no eligible alternative
-    entry = {"user_id": chosen_id, "at": iso(now_utc()), "by": None}
+    now_iso = iso(now_utc())
+    entry = {"user_id": chosen_id, "at": now_iso, "by": None}
+    update: Dict[str, Any] = {
+        "$set": {
+            "assigned_to": chosen_id,
+            "last_assignment_at": now_iso,
+            "last_action_at": now_iso,
+            "last_reassigned_at": now_iso,
+            "sort_at": now_iso,
+            "opened_at": None,
+        },
+        "$push": {"assignment_history": entry},
+    }
+    if reset_hop_count:
+        update["$set"]["auto_reassign_count"] = 1
+    else:
+        update["$inc"] = {"auto_reassign_count": 1}
     result = await db.leads.find_one_and_update(
         {"id": lead_id, "assigned_to": current_assigned_to},   # ← optimistic lock condition
-        {
-            "$set": {
-                "assigned_to": chosen_id,
-                "last_assignment_at": iso(now_utc()),
-                "last_action_at": iso(now_utc()),
-                "opened_at": None
-            },
-            "$push": {"assignment_history": entry},
-        },
+        update,
         return_document=False,
     )
     if result is None:
@@ -8147,18 +8241,23 @@ async def auto_reassign_task():
         unopened_cutoff = iso(now_utc() - timedelta(minutes=unopened_mins))
         noaction_cutoff = iso(now_utc() - timedelta(minutes=noaction_mins))
 
-        # BUG FIX: Use _auto_reassign_lead() instead of assign_lead() so that
-        # opened_at is NOT reset to None on every reassignment. The old code
-        # was setting opened_at=None which immediately put the lead back into
-        # the "unopened" query, causing infinite reassignment every 15 minutes.
+        # Only portal leads (IndiaMART / JustDial / ExportersIndia) take part in
+        # auto-reassignment; hop cap stops the infinite ping-pong that was
+        # generating ~80k reassignments/day and scrambling the round robin.
+        rr_source = {"$regex": ROUND_ROBIN_SOURCE_REGEX, "$options": "i"}
+        under_cap = {"$or": [{"auto_reassign_count": {"$exists": False}},
+                             {"auto_reassign_count": {"$lt": MAX_AUTO_REASSIGN_HOPS}}]}
 
-        # Unopened: assigned but not opened within X minutes
+        # Unopened: assigned but not opened within X minutes (oldest first so a
+        # backlog never starves the oldest leads)
         cursor = db.leads.find({
             "assigned_to": {"$ne": None},
             "opened_at": None,
             "status": "new",
+            "source": rr_source,
             "last_assignment_at": {"$lt": unopened_cutoff},
-        }, {"_id": 0}).sort("last_assignment_at", -1).limit(20)
+            **under_cap,
+        }, {"_id": 0, "id": 1, "assigned_to": 1}).sort("last_assignment_at", 1).limit(20)
         async for lead in cursor:
             await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_unopened")
 
@@ -8166,14 +8265,17 @@ async def auto_reassign_task():
         cursor2 = db.leads.find({
             "assigned_to": {"$ne": None},
             "status": "new",
+            "source": rr_source,
             "last_action_at": {"$lt": noaction_cutoff},
             "opened_at": {"$ne": None},
-        }, {"_id": 0}).sort("last_action_at", -1).limit(20)
+            **under_cap,
+        }, {"_id": 0, "id": 1, "assigned_to": 1}).sort("last_action_at", 1).limit(20)
         async for lead in cursor2:
             await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_noaction")
 
         # Stale: leads still status='new' N days (default 3) after their last assignment
-        # → force a fresh round-robin so no enquiry rots in a dead queue.
+        # → force a fresh round-robin so no enquiry rots in a dead queue. This pass
+        # RESETS the hop counter, giving capped leads a fresh chance every N days.
         try:
             att_cfg = await get_attendance_config()
             stale_days = int(att_cfg.get("stale_new_days") or 3)
@@ -8181,10 +8283,11 @@ async def auto_reassign_task():
             cursor3 = db.leads.find({
                 "assigned_to": {"$ne": None},
                 "status": "new",
+                "source": rr_source,
                 "last_assignment_at": {"$lt": stale_cutoff},
             }, {"_id": 0, "id": 1, "assigned_to": 1}).sort("last_assignment_at", 1).limit(20)
             async for lead in cursor3:
-                await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_stale")
+                await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_stale", reset_hop_count=True)
         except Exception as e:
             logger.warning(f"stale-new reassign pass failed: {e}")
 
@@ -8902,6 +9005,8 @@ async def add_email(lead_id: str, body: LeadEmailInput, user: dict = Depends(get
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     new_email = (body.email or "").strip()
@@ -8933,6 +9038,8 @@ async def remove_email(lead_id: str, email: str = Query(...), user: dict = Depen
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
     target = (email or "").strip()
@@ -10445,6 +10552,96 @@ async def translate_text(body: TranslateRequest, user: dict = Depends(get_curren
         logger.error(f"Translation failed: {e}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
 
+# ------------- AI Assistant (Gemini free tier) -------------
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
+
+class AISuggestRequest(BaseModel):
+    lead_id: str
+    intent: str = "reply"   # 'reply' | 'followup' | 'close_order'
+    extra: Optional[str] = None  # optional hint from the executive
+
+_AI_INTENT_BRIEF = {
+    "reply": "Draft the next WhatsApp reply to the customer, moving the sale forward.",
+    "followup": "Draft a short, polite follow-up nudge — the customer has gone quiet.",
+    "close_order": "Draft a message that pushes to FINALIZE the order: confirm quantity, price, delivery and payment, and ask for the go-ahead.",
+}
+
+@api.post("/ai/suggest")
+async def ai_suggest(body: AISuggestRequest, user: dict = Depends(get_current_user)):
+    """Suggest 2 message drafts for a lead using Gemini (free tier).
+    Executives can only use it on their own leads."""
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=503, detail=(
+            "AI is not configured yet. Get a FREE API key at aistudio.google.com/apikey "
+            "and add GEMINI_API_KEY=<key> to backend/.env, then restart."))
+    lead = await db.leads.find_one({"id": body.lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not your lead")
+
+    msgs = await db.messages.find(
+        {"lead_id": body.lead_id}, {"_id": 0, "direction": 1, "body": 1, "caption": 1, "at": 1}
+    ).sort("at", -1).to_list(25)
+    msgs.reverse()
+    convo_lines = []
+    for m in msgs:
+        text = (m.get("body") or m.get("caption") or "").strip()
+        if not text:
+            continue
+        who = "Customer" if m.get("direction") == "in" else "Us"
+        convo_lines.append(f"{who}: {text[:400]}")
+    convo = "\n".join(convo_lines[-25:]) or "(no WhatsApp conversation yet)"
+
+    brief = _AI_INTENT_BRIEF.get(body.intent, _AI_INTENT_BRIEF["reply"])
+    prompt = f"""You are a sales assistant for CitSpray / Mangalam Agro, an Indian agro-products company selling citrus sprays and related products. An executive needs help writing a WhatsApp message to a customer.
+
+LEAD:
+- Customer: {lead.get('customer_name') or 'Unknown'} ({lead.get('city') or ''} {lead.get('state') or ''})
+- Requirement: {(lead.get('requirement') or 'not specified')[:300]}
+- Lead status: {lead.get('status')} | Source: {lead.get('source')}
+- Last call outcome: {lead.get('last_call_outcome') or 'none'}
+
+RECENT CONVERSATION:
+{convo}
+
+TASK: {brief}
+{('Executive note: ' + body.extra.strip()) if body.extra else ''}
+
+Rules: WhatsApp tone (short, warm, professional), Indian business English (Hinglish OK if the customer used it), no placeholders like [Name] — use what you know, max 60 words per option.
+Return STRICT JSON only: {{"suggestions": ["option 1", "option 2"]}}"""
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as cli:
+            resp = await cli.post(url, params={"key": GEMINI_API_KEY}, json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.7, "maxOutputTokens": 500, "responseMimeType": "application/json"},
+            })
+        if resp.status_code != 200:
+            detail = (resp.json().get("error", {}) or {}).get("message", resp.text[:200]) if resp.text else str(resp.status_code)
+            raise HTTPException(status_code=502, detail=f"Gemini error: {detail}")
+        data = resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = json.loads(text)
+        suggestions = [s.strip() for s in (parsed.get("suggestions") or []) if isinstance(s, str) and s.strip()][:3]
+        if not suggestions:
+            raise ValueError("empty suggestions")
+        return {"suggestions": suggestions, "intent": body.intent}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"ai_suggest failed: {e}")
+        raise HTTPException(status_code=502, detail="AI suggestion failed — try again")
+
+@api.get("/ai/status")
+async def ai_status(user: dict = Depends(get_current_user)):
+    return {"configured": bool(GEMINI_API_KEY), "model": GEMINI_MODEL if GEMINI_API_KEY else None}
+
 # ------------- Attendance & Payroll Endpoints -------------
 
 @api.get("/holidays")
@@ -10778,9 +10975,19 @@ async def iclock_get(request: Request, SN: Optional[str] = Query(None)):
     )
     return Response(content=res_text, media_type="text/plain")
 
+# Comma-separated allow-list of fingerprint-device serial numbers. Empty = allow
+# all (backward compatible); set ICLOCK_ALLOWED_SN in .env to lock it down.
+_ICLOCK_ALLOWED_SN = {s.strip() for s in os.environ.get("ICLOCK_ALLOWED_SN", "").split(",") if s.strip()}
+
+def _iclock_sn_allowed(sn: Optional[str]) -> bool:
+    return not _ICLOCK_ALLOWED_SN or (sn or "").strip() in _ICLOCK_ALLOWED_SN
+
 @api.post("/iclock/cdata")
 @api.post("/iclock/cdata.aspx")
 async def iclock_post(request: Request, table: str = Query(...), SN: str = Query(...)):
+    if not _iclock_sn_allowed(SN):
+        logger.warning(f"iclock: rejected punch data from unknown device SN={SN}")
+        raise HTTPException(status_code=403, detail="Unknown device")
     body = await request.body()
     content = body.decode('utf-8', errors='ignore')
     logger.info(f"ADMS Post received: table={table}, SN={SN}, body={content}")

@@ -8,6 +8,7 @@ import {
   Funnel, Lightning, ArrowsLeftRight, X, Tag, NotePencil, Info,
   Paperclip, Image as ImageIcon, VideoCamera, FileText, Microphone, MapPin, IdentificationCard, Stop,
   DownloadSimple, Question, ChatTeardropText, CaretLeft, QrCode, PhoneCall, CalendarBlank, Check, Clock, Star,
+  Sparkle,
 } from "@phosphor-icons/react";
 import { fmtIST, fmtISTTime, fmtSmartShort, fmtSmartLong, fmtTime12, fmtDaySeparator, istDayKey } from "@/lib/format";
 import { StatusBadge, SourceBadge } from "@/components/Badges";
@@ -686,6 +687,22 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   const [recording, setRecording] = useState(null);  // {recorder, chunks, startedAt} or null
   const [targetLang, setTargetLang] = useState("hi");
   const [translatingInput, setTranslatingInput] = useState(false);
+  const [showAI, setShowAI] = useState(false);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiSuggestions, setAiSuggestions] = useState([]);
+
+  const askAI = async (intent) => {
+    setAiLoading(true);
+    setAiSuggestions([]);
+    try {
+      const { data } = await api.post("/ai/suggest", { lead_id: conv.id, intent });
+      setAiSuggestions(data.suggestions || []);
+    } catch (e) {
+      toast.error(errMsg(e, "AI suggestion failed"));
+    } finally {
+      setAiLoading(false);
+    }
+  };
 
   const handleTranslateInput = async () => {
     if (!draft.trim()) return;
@@ -1641,6 +1658,37 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                     className={`px-3 py-2 text-[10px] uppercase tracking-widest font-bold rounded ${showTpl ? "bg-gray-900 text-white" : "border border-gray-300 hover:bg-gray-200"}`} data-testid="tpl-toggle">
                     Tpl
                   </button>
+                  <button onClick={() => { setShowAI(v => !v); setAiSuggestions([]); setShowQR(false); setShowTpl(false); setShowAttach(false); }} title="AI message suggestions"
+                    className={`px-2.5 py-2 text-[10px] uppercase tracking-widest font-bold rounded flex items-center gap-1 ${showAI ? "bg-[#7C3AED] text-white" : "border border-[#7C3AED] text-[#7C3AED] hover:bg-[#7C3AED]/10"}`} data-testid="ai-toggle">
+                    <Sparkle size={13} weight="fill" /> AI
+                  </button>
+                  {showAI && (
+                    <div className="absolute bottom-full mb-2 left-3 right-3 sm:right-auto sm:w-[420px] bg-white border border-gray-200 shadow-lg z-20 rounded-md p-3" data-testid="ai-menu">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        {[["reply", "Suggest reply"], ["followup", "Follow-up nudge"], ["close_order", "Close the order"]].map(([k, label]) => (
+                          <button key={k} onClick={() => askAI(k)} disabled={aiLoading}
+                            className="px-2.5 py-1.5 text-[10px] uppercase tracking-widest font-bold border border-[#7C3AED] text-[#7C3AED] hover:bg-[#7C3AED] hover:text-white rounded disabled:opacity-50"
+                            data-testid={`ai-intent-${k}`}>
+                            {label}
+                          </button>
+                        ))}
+                        <button onClick={() => setShowAI(false)} className="ml-auto text-gray-400 hover:text-gray-900 px-1 font-bold">✕</button>
+                      </div>
+                      {aiLoading && <div className="text-xs text-gray-500 mt-3 animate-pulse">Thinking…</div>}
+                      {!aiLoading && aiSuggestions.length > 0 && (
+                        <div className="mt-3 space-y-2">
+                          {aiSuggestions.map((s, i) => (
+                            <button key={i} onClick={() => { setDraft(s); setShowAI(false); }}
+                              className="w-full text-left text-sm border border-gray-200 hover:border-[#7C3AED] hover:bg-[#7C3AED]/5 rounded p-2 leading-snug"
+                              data-testid={`ai-suggestion-${i}`}>
+                              {s}
+                            </button>
+                          ))}
+                          <div className="text-[10px] text-gray-400">Tap a suggestion to put it in the message box — edit before sending.</div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
                 
                 <div className="flex items-center gap-1 border border-gray-300 px-1.5 py-1 bg-white rounded shadow-sm shrink-0" data-testid="composer-translator">
