@@ -2193,12 +2193,9 @@ async def list_leads(
         query["$or"] = ors
     safe_limit = max(1, min(int(limit), 500))
     safe_offset = max(0, int(offset))
-    # Sort by MAX(created_at, last_reassigned_at) DESC so:
-    #   - Brand-new leads (no reassignment yet) sort by their created_at — newest top.
-    #   - Reassigned leads bubble up via their last_reassigned_at — but only above
-    #     leads created BEFORE the reassignment. New leads created AFTER any
-    #     reassignment automatically stay on top (their created_at > all earlier
-    #     last_reassigned_at).
+    # Sort STRICTLY by creation date, newest first — a lead enquired TODAY always
+    # outranks anything older. Reassignments must NOT bump a lead up the list
+    # (that was burying today's enquiries under recycled 2023/24 leads).
     pipeline: List[Dict[str, Any]] = [
         {"$match": query},
         # Excel-uploaded leads are OLD backlog fed into the CRM — they must never
@@ -2206,7 +2203,7 @@ async def list_leads(
         # else regardless of upload date.
         {"$addFields": {"_src_tier": {"$cond": [
             {"$or": [{"$eq": ["$source", "Excel Upload"]}, {"$eq": ["$is_backlog", True]}]}, 1, 0]}}},
-        {"$sort": {"_src_tier": 1, "sort_at": -1, "created_at": -1}},
+        {"$sort": {"_src_tier": 1, "created_at": -1}},
         {"$skip": safe_offset},
         {"$limit": safe_limit},
         {"$project": {"_id": 0, "raw_email_html": 0, "raw_email_text": 0, "_src_tier": 0}},

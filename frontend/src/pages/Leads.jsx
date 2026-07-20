@@ -836,11 +836,18 @@ function Field({ label, children, full }) {
 }
 
 function PaginationBar({ page, pageSize, total, totalPages, onPage, onPageSize }) {
+  const [jump, setJump] = React.useState("");
   if (total === 0) return null;
   const start = (page - 1) * pageSize + 1;
   const end = Math.min(page * pageSize, total);
   const goPrev = () => onPage(Math.max(1, page - 1));
   const goNext = () => onPage(Math.min(totalPages, page + 1));
+  const goToPage = () => {
+    const n = parseInt(jump, 10);
+    if (!Number.isFinite(n)) return;
+    onPage(Math.min(totalPages, Math.max(1, n)));
+    setJump("");
+  };
   return (
     <div
       className="flex flex-wrap items-center justify-between gap-2 border border-gray-200 bg-white px-3 py-2"
@@ -880,6 +887,27 @@ function PaginationBar({ page, pageSize, total, totalPages, onPage, onPageSize }
         >
           Next
         </button>
+        <span className="flex items-center gap-1 text-[10px] uppercase tracking-widest text-gray-500 font-bold">
+          Go to
+          <input
+            type="number"
+            min={1}
+            max={totalPages}
+            value={jump}
+            onChange={(e) => setJump(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") goToPage(); }}
+            placeholder={String(page)}
+            className="border border-gray-300 px-1.5 py-1 text-xs w-16 font-mono"
+            data-testid="leads-pagination-jump-input"
+          />
+          <button
+            onClick={goToPage}
+            className="border border-gray-900 px-2 py-1 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-900 hover:text-white"
+            data-testid="leads-pagination-jump-btn"
+          >
+            Go
+          </button>
+        </span>
       </div>
     </div>
   );
