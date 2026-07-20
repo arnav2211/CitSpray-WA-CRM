@@ -3,7 +3,7 @@ import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
 import {
   Calendar, FileText, Printer, Trash, CheckCircle, Warning, XCircle, Spinner,
-  Clock, Buildings, Gear, UsersThree, CaretDown, CaretUp, Flag, Pencil,
+  Clock, Buildings, Gear, UsersThree, CaretDown, CaretUp, Flag, Pencil, Eye, EyeSlash,
 } from "@phosphor-icons/react";
 
 /* ---------------- date helpers (pay cycles are joining-day based) ---------------- */
@@ -34,6 +34,14 @@ function cycleFor(joiningDate, offset = 0) {
 }
 
 const inr = (n) => `₹${Number(n || 0).toLocaleString("en-IN", { maximumFractionDigits: 0 })}`;
+
+/* Privacy mode: hide every salary figure so the page can be shown to an
+   executive (attendance stays visible). Toggled by the eye in the header. */
+const HideMoneyContext = React.createContext(false);
+function useMoney() {
+  const hidden = React.useContext(HideMoneyContext);
+  return (n) => (hidden ? "₹ ●●●●" : inr(n));
+}
 
 const STATUS_STYLE = {
   present: "bg-emerald-50 text-emerald-700 border-emerald-200",
@@ -74,6 +82,15 @@ const OVERRIDES = [
 /* =================================================================== */
 export default function PayrollPage() {
   const [tab, setTab] = useState("register"); // register | today | holidays | settings
+  // Hidden by default so the page is safe to open in front of an executive;
+  // remembers the last choice.
+  const [hideMoney, setHideMoney] = useState(() => localStorage.getItem("payroll_hide_money") !== "0");
+  const toggleMoney = () => {
+    setHideMoney((h) => {
+      localStorage.setItem("payroll_hide_money", h ? "0" : "1");
+      return !h;
+    });
+  };
   return (
     <div className="p-4 md:p-8 space-y-5 font-chivo text-gray-900 print:p-0">
       <div className="flex items-center justify-between gap-4 flex-wrap print:hidden">
@@ -81,26 +98,37 @@ export default function PayrollPage() {
           <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Admin Portal</div>
           <h1 className="font-chivo font-black text-2xl md:text-4xl">Payroll &amp; Attendance</h1>
         </div>
-        <div className="flex gap-1 border border-gray-200 bg-white p-1">
-          {[["register", "Payroll Register", Calendar], ["today", "Today Live", Clock], ["holidays", "Holidays", Buildings], ["settings", "Rules & WFH", Gear]].map(([k, label, Icon]) => (
-            <button key={k} onClick={() => setTab(k)}
-              className={`flex items-center gap-1.5 text-[10px] uppercase tracking-widest font-bold px-3 py-2 ${tab === k ? "bg-[#002FA7] text-white" : "text-gray-600 hover:bg-gray-50"}`}>
-              <Icon size={14} /> {label}
-            </button>
-          ))}
+        <div className="flex items-center gap-2 flex-wrap">
+          <button onClick={toggleMoney} data-testid="payroll-money-toggle"
+            title={hideMoney ? "Salary amounts are hidden — click to reveal" : "Salary amounts are visible — click to hide before showing this screen to an employee"}
+            className={`flex items-center gap-1.5 text-[10px] uppercase tracking-widest font-bold px-3 py-2 border ${hideMoney ? "border-gray-300 bg-gray-100 text-gray-600" : "bg-[#E67E00] border-[#E67E00] text-white"}`}>
+            {hideMoney ? <EyeSlash size={15} weight="bold" /> : <Eye size={15} weight="bold" />}
+            {hideMoney ? "Salaries Hidden" : "Salaries Visible"}
+          </button>
+          <div className="flex gap-1 border border-gray-200 bg-white p-1">
+            {[["register", "Payroll Register", Calendar], ["today", "Today Live", Clock], ["holidays", "Holidays", Buildings], ["settings", "Rules & WFH", Gear]].map(([k, label, Icon]) => (
+              <button key={k} onClick={() => setTab(k)}
+                className={`flex items-center gap-1.5 text-[10px] uppercase tracking-widest font-bold px-3 py-2 ${tab === k ? "bg-[#002FA7] text-white" : "text-gray-600 hover:bg-gray-50"}`}>
+                <Icon size={14} /> {label}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
-      {tab === "register" && <RegisterTab />}
-      {tab === "today" && <TodayTab />}
-      {tab === "holidays" && <HolidaysTab />}
-      {tab === "settings" && <SettingsTab />}
+      <HideMoneyContext.Provider value={hideMoney}>
+        {tab === "register" && <RegisterTab />}
+        {tab === "today" && <TodayTab />}
+        {tab === "holidays" && <HolidaysTab />}
+        {tab === "settings" && <SettingsTab />}
+      </HideMoneyContext.Provider>
     </div>
   );
 }
 
 /* ======================= REGISTER (payroll) ======================= */
 function RegisterTab() {
+  const money = useMoney();
   const [mode, setMode] = useState("cycle"); // cycle | month | custom
   const [cycleOffset, setCycleOffset] = useState(-1); // -1 last completed, 0 running
   const [selectedMonth, setSelectedMonth] = useState(() => {
@@ -247,7 +275,7 @@ function RegisterTab() {
       {/* Summary cards */}
       {!loading && rows.length > 0 && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 print:hidden">
-          {[["Employees", rows.length, ""], ["Gross (period)", inr(totals.gross), ""], ["Deductions", `-${inr(totals.ded)}`, "text-red-600"], ["Net Payout", inr(totals.net), "text-[#002FA7]"]].map(([label, val, cls]) => (
+          {[["Employees", rows.length, ""], ["Gross (period)", money(totals.gross), ""], ["Deductions", `-${money(totals.ded)}`, "text-red-600"], ["Net Payout", money(totals.net), "text-[#002FA7]"]].map(([label, val, cls]) => (
             <div key={label} className="bg-white border border-gray-200 p-4">
               <div className="text-[10px] uppercase tracking-widest text-gray-400 font-bold">{label}</div>
               <div className={`font-black text-xl md:text-2xl mt-1 font-mono ${cls}`}>{val}</div>
@@ -307,7 +335,7 @@ function RegisterTab() {
                       </div>
                     </td>
                     <td className="px-3 py-2.5 font-mono text-[11px] text-gray-600 whitespace-nowrap">{p.period_start}<br />{p.period_end}</td>
-                    <td className="px-3 py-2.5 text-right font-mono">{inr(p.base_salary)}</td>
+                    <td className="px-3 py-2.5 text-right font-mono">{money(p.base_salary)}</td>
                     <td className="px-3 py-2.5 text-center font-bold text-emerald-700">{p.counts.present}</td>
                     <td className="px-3 py-2.5 text-center text-amber-700">{p.counts.half_day + (p.counts.missing_punch_out || 0)}</td>
                     <td className="px-3 py-2.5 text-center text-blue-700">{p.counts.leave_approved + (p.counts.absent_informed || 0)}</td>
@@ -319,8 +347,8 @@ function RegisterTab() {
                       )}
                     </td>
                     <td className="px-3 py-2.5 text-center text-gray-500">{p.counts.late || 0}</td>
-                    <td className="px-3 py-2.5 text-right font-mono text-red-600">-{inr(p.total_deductions)}</td>
-                    <td className="px-3 py-2.5 text-right font-mono font-black text-[#002FA7] print:text-black">{inr(p.final_salary_payout)}</td>
+                    <td className="px-3 py-2.5 text-right font-mono text-red-600">-{money(p.total_deductions)}</td>
+                    <td className="px-3 py-2.5 text-right font-mono font-black text-[#002FA7] print:text-black">{money(p.final_salary_payout)}</td>
                     <td className="px-3 py-2.5 font-mono text-[11px]">{p.pay_date || "—"}</td>
                     <td className="px-3 py-2.5 text-center whitespace-nowrap">
                       {mode !== "cycle" ? (
@@ -362,8 +390,8 @@ function RegisterTab() {
             <tfoot className="border-t-2 border-gray-300 bg-gray-50 font-bold">
               <tr>
                 <td className="px-3 py-2.5" colSpan={9}>TOTAL</td>
-                <td className="px-3 py-2.5 text-right font-mono text-red-600">-{inr(totals.ded)}</td>
-                <td className="px-3 py-2.5 text-right font-mono font-black">{inr(totals.net)}</td>
+                <td className="px-3 py-2.5 text-right font-mono text-red-600">-{money(totals.ded)}</td>
+                <td className="px-3 py-2.5 text-right font-mono font-black">{money(totals.net)}</td>
                 <td colSpan={3}></td>
               </tr>
             </tfoot>
@@ -394,6 +422,7 @@ function RegisterTab() {
 }
 
 function DayGrid({ p, onOverride, onEditPunch }) {
+  const money = useMoney();
   const [editDay, setEditDay] = useState(null);
   const [inVal, setInVal] = useState("");
   const [outVal, setOutVal] = useState("");
@@ -403,7 +432,7 @@ function DayGrid({ p, onOverride, onEditPunch }) {
     <div>
       <div className="flex items-center justify-between mb-2">
         <div className="text-[10px] uppercase tracking-widest font-bold text-gray-500">
-          {p.name} — day-by-day ({p.period_start} → {p.period_end}) · daily rate {inr(p.daily_rate)}
+          {p.name} — day-by-day ({p.period_start} → {p.period_end}) · daily rate {money(p.daily_rate)}
         </div>
         {(p.flags || []).length > 0 && (
           <div className="text-[11px] text-[#E60000] font-semibold flex items-center gap-1">
@@ -560,6 +589,7 @@ function AttendanceCalendar({ p }) {
 
 /* Shared salary-sheet body: shown on screen to the admin AND used for print */
 function SalarySheetContent({ p }) {
+  const money = useMoney();
   const days = (p.daily_breakdown || []).filter((d) => !["future", "not_joined"].includes(d.status));
   const groups = breakdownGroups(days);
   const paidDays = days.filter((d) => (d.earning || 0) > 0).length;
@@ -614,8 +644,8 @@ function SalarySheetContent({ p }) {
               <td className="py-0.5 pr-2 font-mono">{d.work_hours ?? "—"}</td>
               <td className="py-0.5 pr-2 whitespace-nowrap">{STATUS_LABEL[d.status] ?? d.status}</td>
               <td className="py-0.5 pr-2 text-[9px] text-gray-700 max-w-[220px]">{d.details}</td>
-              <td className="py-0.5 pr-2 text-right font-mono">{d.earning ? inr(d.earning) : "—"}</td>
-              <td className="py-0.5 text-right font-mono">{d.deduction ? `-${inr(d.deduction)}` : "—"}</td>
+              <td className="py-0.5 pr-2 text-right font-mono">{d.earning ? money(d.earning) : "—"}</td>
+              <td className="py-0.5 text-right font-mono">{d.deduction ? `-${money(d.deduction)}` : "—"}</td>
             </tr>
           ))}
         </tbody>
@@ -626,24 +656,24 @@ function SalarySheetContent({ p }) {
         <div className="font-black text-xs uppercase tracking-widest mb-2">How this salary was calculated</div>
         <table className="w-full text-[12px] font-mono">
           <tbody>
-            <tr><td className="py-0.5">Monthly base salary</td><td className="text-right">{inr(p.base_salary)}</td></tr>
+            <tr><td className="py-0.5">Monthly base salary</td><td className="text-right">{money(p.base_salary)}</td></tr>
             <tr className="border-b border-gray-400">
-              <td className="py-0.5">Daily rate = {inr(p.base_salary)} ÷ 31</td>
-              <td className="text-right">{inr(p.daily_rate)} / day</td>
+              <td className="py-0.5">Daily rate = {money(p.base_salary)} ÷ 31</td>
+              <td className="text-right">{money(p.daily_rate)} / day</td>
             </tr>
             <tr>
-              <td className="py-0.5">Period gross ({days.filter((d) => d.status !== "pending_today").length} days × {inr(p.daily_rate)}; {paidDays} paid)</td>
-              <td className="text-right">{inr(p.pro_rated_target_salary)}</td>
+              <td className="py-0.5">Period gross ({days.filter((d) => d.status !== "pending_today").length} days × {money(p.daily_rate)}; {paidDays} paid)</td>
+              <td className="text-right">{money(p.pro_rated_target_salary)}</td>
             </tr>
             {groups.map(([status, g]) => (
               <tr key={status} className="text-red-700">
                 <td className="py-0.5 pl-3">− {DEDUCTION_LABEL[status] || status}: {g.count} day(s)</td>
-                <td className="text-right">-{inr(g.amt)}</td>
+                <td className="text-right">-{money(g.amt)}</td>
               </tr>
             ))}
             <tr className="border-t-2 border-black font-black text-base">
               <td className="py-1">NET PAYABLE on {p.pay_date || "pay date"}</td>
-              <td className="text-right">{inr(p.final_salary_payout)}</td>
+              <td className="text-right">{money(p.final_salary_payout)}</td>
             </tr>
           </tbody>
         </table>
