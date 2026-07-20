@@ -207,6 +207,14 @@ export default function Leads() {
 
       {view === "table" ? (
         <>
+          <PaginationBar
+            page={page}
+            pageSize={pageSize}
+            total={total}
+            totalPages={totalPages}
+            onPage={setPage}
+            onPageSize={setPageSize}
+          />
           {/* MOBILE: card list */}
           <div className="md:hidden space-y-2" data-testid="leads-mobile-list">
             {leads.length === 0 ? (
@@ -384,7 +392,17 @@ export default function Leads() {
         />
         </>
       ) : (
-        <Kanban_ leads={leads} onOpen={setOpenId} execMap={execMap} onToggleStar={toggleStar} />
+        <>
+          <PaginationBar
+            page={page}
+            pageSize={pageSize}
+            total={total}
+            totalPages={totalPages}
+            onPage={setPage}
+            onPageSize={setPageSize}
+          />
+          <Kanban_ leads={leads} onOpen={setOpenId} execMap={execMap} onToggleStar={toggleStar} />
+        </>
       )}
 
       {openId && <LeadDrawer leadId={openId} onClose={() => { setOpenId(null); load(); }} />}

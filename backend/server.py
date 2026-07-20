@@ -2051,6 +2051,7 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         "last_action_at": iso(now_utc()),
         "created_at": data.get("_created_at_override") or iso(now_utc()),
         "sort_at": data.get("_created_at_override") or iso(now_utc()),
+        "is_backlog": bool(data.get("_is_backlog")),
         "enquiries": [initial_enquiry],
     }
     from pymongo.errors import DuplicateKeyError
@@ -2072,7 +2073,7 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
     # (IndiaMART / JustDial / ExportersIndia). Other sources (Website orders,
     # WhatsApp, manual, Excel without assignee) stay unassigned for the admin
     # to distribute, so they never pollute the rotation.
-    if not lead["assigned_to"] and _is_round_robin_source(lead.get("source")):
+    if not lead["assigned_to"] and _is_round_robin_source(lead.get("source")) and not lead.get("is_backlog"):
         try:
             # Buyleads routing: if the lead qualifies as a "buylead" for its source
             # and an admin has configured mode=selected with agent_ids, route it
@@ -2200,10 +2201,15 @@ async def list_leads(
     #     last_reassigned_at).
     pipeline: List[Dict[str, Any]] = [
         {"$match": query},
-        {"$sort": {"sort_at": -1, "created_at": -1}},
+        # Excel-uploaded leads are OLD backlog fed into the CRM — they must never
+        # outrank live enquiries, so they sort in a lower tier below everything
+        # else regardless of upload date.
+        {"$addFields": {"_src_tier": {"$cond": [
+            {"$or": [{"$eq": ["$source", "Excel Upload"]}, {"$eq": ["$is_backlog", True]}]}, 1, 0]}}},
+        {"$sort": {"_src_tier": 1, "sort_at": -1, "created_at": -1}},
         {"$skip": safe_offset},
         {"$limit": safe_limit},
-        {"$project": {"_id": 0, "raw_email_html": 0, "raw_email_text": 0}},
+        {"$project": {"_id": 0, "raw_email_html": 0, "raw_email_text": 0, "_src_tier": 0}},
     ]
     items = await db.leads.aggregate(pipeline).to_list(safe_limit)
     if paginate:
@@ -2317,7 +2323,10 @@ async def _process_upload_task(
             "source": row_source,
             "enquiry_type": enquiry_type,
             "gst_no": gst_no,
-            "assigned_to": target_assignee
+            "assigned_to": target_assignee,
+            # Excel rows are backlog: they sort below live leads and never
+            # enter the round-robin, whatever their Source column says.
+            "_is_backlog": True,
         }
         if override_date:
             lead_payload["_created_at_override"] = iso(override_date + timedelta(seconds=index))
