@@ -213,11 +213,20 @@ export default function AttendanceScanner() {
         photo_base64: photoBase64
       });
 
+      if (data.status === "ignored" || data.status === "already_completed") {
+        setStatus("active");
+        setMessage(data.message || "Punch ignored.");
+        setTimeout(() => {
+          setMessage("Ready for next face...");
+        }, 4000);
+        return;
+      }
+
       setStatus("success");
       setResultData(data);
-      
-      const greetingMsg = data.action === "check_in" 
-        ? `${data.user_name} clocked in successfully.` 
+
+      const greetingMsg = data.action === "check_in"
+        ? `${data.user_name} clocked in successfully.`
         : `${data.user_name} clocked out successfully.`;
         
       setMessage(greetingMsg);

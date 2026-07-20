@@ -10474,6 +10474,27 @@ class ManualPunchInput(BaseModel):
     username: str
     password: str
 
+PUNCH_FREEZE_MINUTES_DEFAULT = 2
+
+def _punch_freeze_seconds(settings_doc: dict) -> float:
+    try:
+        return float(settings_doc.get("punch_freeze_minutes", PUNCH_FREEZE_MINUTES_DEFAULT)) * 60.0
+    except Exception:
+        return PUNCH_FREEZE_MINUTES_DEFAULT * 60.0
+
+def _seconds_since_punch(prev_iso: str, now_dt: datetime):
+    """Wall-clock seconds between a stored punch time and now. Punch times are
+    IST wall time from mixed sources (some naive, some with a stale tz offset),
+    so compare naively."""
+    try:
+        prev = datetime.fromisoformat(prev_iso)
+        if prev.tzinfo is not None:
+            prev = prev.replace(tzinfo=None)
+        cur = now_dt.replace(tzinfo=None) if now_dt.tzinfo is not None else now_dt
+        return abs((cur - prev).total_seconds())
+    except Exception:
+        return None
+
 @api.post("/attendance/punch")
 async def punch_attendance(user: dict = Depends(get_current_user)):
     today_ist = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
@@ -10518,6 +10539,11 @@ async def punch_attendance(user: dict = Depends(get_current_user)):
         
     elif "check_out" not in log:
         # Punch Out
+        freeze_secs = _punch_freeze_seconds(settings_doc)
+        since_in = _seconds_since_punch(log.get("check_in", {}).get("time", ""), now_ist)
+        if since_in is not None and since_in < freeze_secs:
+            raise HTTPException(status_code=429, detail=f"Punch ignored: checked in {int(since_in)}s ago. Wait {int(freeze_secs // 60)} min before punching again.")
+
         total_hours = 0.0
         try:
             in_time = datetime.fromisoformat(log["check_in"]["time"])
@@ -10597,6 +10623,11 @@ async def manual_punch(body: ManualPunchInput):
         
     elif "check_out" not in log:
         # Check out
+        freeze_secs = _punch_freeze_seconds(settings_doc)
+        since_in = _seconds_since_punch(log.get("check_in", {}).get("time", ""), now_ist)
+        if since_in is not None and since_in < freeze_secs:
+            raise HTTPException(status_code=429, detail=f"Punch ignored: checked in {int(since_in)}s ago. Wait {int(freeze_secs // 60)} min before punching again.")
+
         total_hours = 0.0
         try:
             in_time = datetime.fromisoformat(log["check_in"]["time"])
@@ -10677,6 +10708,14 @@ async def _register_device_punch(emp_code: str, time_str: str):
         return True
         
     elif "check_out" not in log:
+        # Freeze window: fingerprint readers often register the same finger
+        # 2-3 times in a row; don't let a duplicate scan become a check-out.
+        freeze_secs = _punch_freeze_seconds(settings_doc)
+        since_in = _seconds_since_punch(log.get("check_in", {}).get("time", ""), dt)
+        if since_in is not None and since_in < freeze_secs:
+            logger.info(f"Ignoring duplicate device punch for {user['name']}: {since_in:.0f}s since check-in (freeze {freeze_secs:.0f}s)")
+            return False
+
         total_hours = 0.0
         try:
             in_time = datetime.fromisoformat(log["check_in"]["time"])
@@ -10684,7 +10723,7 @@ async def _register_device_punch(emp_code: str, time_str: str):
             total_hours = round(diff.total_seconds() / 3600.0, 2)
         except Exception:
             pass
-            
+
         update_fields = {
             "check_out": {
                 "time": punch_time_str,
@@ -10855,6 +10894,15 @@ async def verify_attendance(body: FaceVerifyInput, request: Request, scanner_use
         }
         
     elif "check_out" not in log:
+        freeze_secs = _punch_freeze_seconds(settings_doc)
+        since_in = _seconds_since_punch(log.get("check_in", {}).get("time", ""), now_ist)
+        if since_in is not None and since_in < freeze_secs:
+            return {
+                "status": "ignored",
+                "user_name": best_user["name"],
+                "message": f"Duplicate scan ignored: checked in {int(since_in)}s ago"
+            }
+
         total_hours = 0.0
         try:
             in_time = datetime.fromisoformat(log["check_in"]["time"])
@@ -10862,7 +10910,7 @@ async def verify_attendance(body: FaceVerifyInput, request: Request, scanner_use
             total_hours = round(diff.total_seconds() / 3600.0, 2)
         except Exception:
             pass
-            
+
         update_fields = {
             "check_out": {
                 "time": now_str,
