@@ -10,6 +10,9 @@ export default function Login() {
   const [loading, setLoading] = useState(false);
 
   if (user) {
+    if (user.username === "scanner") {
+      return <Navigate to="/attendance-scanner" replace />;
+    }
     if (user.role === "data_entry") {
       return <Navigate to="/data-entry" replace />;
     }

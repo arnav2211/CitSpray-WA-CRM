@@ -2,10 +2,11 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
-import { api } from "@/lib/api";
+import { api, errMsg } from "@/lib/api";
+import { toast } from "sonner";
 
 const navBase = "flex items-center gap-3 px-4 py-3 md:py-2.5 text-sm border-l-2 border-transparent hover:bg-gray-100 transition-colors";
 const navActive = "bg-white border-l-2 border-[#002FA7] text-gray-900 font-semibold";
@@ -30,6 +31,24 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
   const nav = useNavigate();
   const isAdmin = user?.role === "admin";
   const [pendingTransfers, setPendingTransfers] = useState(0);
+  const [pendingLeaves, setPendingLeaves] = useState(0);
+  const [att, setAtt] = useState({ checked_in: false, checked_out: false });
+  const [punching, setPunching] = useState(false);
+
+  // Admin: poll pending leave-request count for the sidebar badge
+  useEffect(() => {
+    if (!user || user.role !== "admin") return;
+    let stop = false;
+    const tick = async () => {
+      try {
+        const { data } = await api.get("/leaves", { params: { status: "pending" } });
+        if (!stop) setPendingLeaves((data || []).length);
+      } catch { /* ignore */ }
+    };
+    tick();
+    const id = setInterval(tick, 20000);
+    return () => { stop = true; clearInterval(id); };
+  }, [user?.id]);
 
   // Poll the transfer-request count so admins see a badge with pending approvals.
   // Executives see their own pending requests count instead.
@@ -46,6 +65,34 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
     const id = setInterval(tick, 15000);
     return () => { stop = true; clearInterval(id); };
   }, [user?.id]);
+
+  // Load and poll attendance status for executives
+  const loadAttStatus = async () => {
+    if (!user) return;
+    try {
+      const { data } = await api.get("/attendance/status");
+      setAtt(data);
+    } catch { /* ignore */ }
+  };
+
+  useEffect(() => {
+    loadAttStatus();
+    const id = setInterval(loadAttStatus, 20000); // poll every 20s
+    return () => clearInterval(id);
+  }, [user?.id]);
+
+  const handlePunch = async () => {
+    setPunching(true);
+    try {
+      const { data } = await api.post("/attendance/punch");
+      toast.success(data.action === "check_in" ? "Clocked In Successfully!" : "Clocked Out Successfully!");
+      loadAttStatus();
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setPunching(false);
+    }
+  };
 
   // When a nav item is clicked on mobile, close the drawer
   const handleNavigate = () => { if (mobileOpen && onClose) onClose(); };
@@ -102,6 +149,9 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
               <Item to="/transfer-requests" icon={ArrowsLeftRight} testId="nav-transfer-requests" onNavigate={handleNavigate} badge={pendingTransfers}>Reassign Requests</Item>
               <Item to="/calls" icon={PhoneCall} testId="nav-calls" onNavigate={handleNavigate}>Call Logs</Item>
               <Item to="/reports" icon={PaperPlaneTilt} testId="nav-reports" onNavigate={handleNavigate}>Reports</Item>
+              {!isAdmin && (
+                <Item to="/leaves" icon={CalendarCheck} testId="nav-leaves" onNavigate={handleNavigate}>My Leaves</Item>
+              )}
             </>
           )}
 
@@ -109,6 +159,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
             <>
               <div className="px-5 pt-2 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Data Entry</div>
               <Item to="/data-entry" icon={PlusCircle} testId="nav-data-entry" onNavigate={handleNavigate}>Lead Entry</Item>
+              <Item to="/leaves" icon={CalendarCheck} testId="nav-leaves-de" onNavigate={handleNavigate}>My Leaves</Item>
             </>
           )}
 
@@ -116,6 +167,8 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
             <>
               <div className="px-5 pt-4 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Admin</div>
               <Item to="/users" icon={Users} testId="nav-users" onNavigate={handleNavigate}>Executives</Item>
+              <Item to="/payroll" icon={Calculator} testId="nav-payroll" onNavigate={handleNavigate}>Payroll &amp; Attendance</Item>
+              <Item to="/leaves" icon={CalendarCheck} testId="nav-leave-approvals" onNavigate={handleNavigate} badge={pendingLeaves}>Leave Approvals</Item>
               <Item to="/data-entry-inspect" icon={ClipboardText} testId="nav-data-entry-inspect" onNavigate={handleNavigate}>Data Entry Stats</Item>
               <Item to="/alerts" icon={Megaphone} testId="nav-alerts" onNavigate={handleNavigate}>Admin Alerts</Item>
               <Item to="/routing" icon={Gear} testId="nav-routing" onNavigate={handleNavigate}>Routing Rules</Item>
@@ -135,6 +188,33 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
           <div className="text-xs text-gray-500">
             <span className="kbd">{user?.role}</span> · @{user?.username}
           </div>
+
+          {/* Punch In / Punch Out Button for Executive */}
+          {user?.role === "executive" && (
+            <div className="mt-3 border border-gray-200 p-2 bg-white rounded-sm">
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-[9px] uppercase font-bold text-gray-400">Attendance</span>
+                <span className="flex items-center gap-1 text-[10px] font-bold">
+                  <span className={`w-2 h-2 rounded-full ${att.checked_out ? "bg-gray-400" : att.checked_in ? "bg-[#008A00]" : "bg-[#E60000]"}`}></span>
+                  {att.checked_out ? "Clocked Out" : att.checked_in ? "Clocked In" : "Not Clocked In"}
+                </span>
+              </div>
+              {user.bypass_attendance ? (
+                <div className="text-[9px] font-bold text-gray-500 uppercase text-center py-1">Bypass Active (WFH)</div>
+              ) : !att.checked_in ? (
+                <button
+                  onClick={handlePunch}
+                  disabled={punching}
+                  className="w-full py-1.5 text-[10px] uppercase tracking-wider font-black text-white bg-[#008A00] hover:bg-[#007000]"
+                >
+                  {punching ? "Processing…" : "Punch In"}
+                </button>
+              ) : (
+                <div className="text-[9px] font-bold text-[#008A00] uppercase text-center py-1">Shift In Progress</div>
+              )}
+            </div>
+          )}
+
           <button
             className="mt-3 w-full flex items-center justify-center gap-2 border border-gray-300 py-2 text-xs uppercase tracking-wider font-bold hover:bg-gray-100"
             onClick={async () => { await logout(); nav("/login"); }}

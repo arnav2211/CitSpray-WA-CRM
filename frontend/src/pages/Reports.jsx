@@ -216,10 +216,11 @@ export default function Reports() {
         </div>
 
         {/* Summary cards */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
           <SummaryCard label="Leads Assigned" value={data.leads_assigned} color="bg-blue-50 text-[#002FA7] border-blue-200" />
           <SummaryCard label="Conversions" value={data.conversions} color="bg-green-50 text-green-700 border-green-200" />
           <SummaryCard label="Conversion Rate" value={`${data.conversion_rate}%`} color="bg-amber-50 text-amber-700 border-amber-200" />
+          <SummaryCard label="Unique Called" value={data.unique_numbers_called || 0} color="bg-purple-50 text-purple-700 border-purple-200" />
           <SummaryCard label="Total Calls" value={data.total_calls} color="bg-gray-50 text-gray-700 border-gray-200" />
         </div>
 
@@ -424,6 +425,7 @@ export default function Reports() {
                 <Stat label="Leads" value={e.leads} />
                 <Stat label="Converted" value={e.converted} accent="text-[#008A00]" />
                 <Stat label="Calls total" value={e.calls_total} />
+                <Stat label="Unique numbers" value={e.calls_unique_numbers || 0} />
                 <Stat label="Connected" value={e.calls_connected} accent="text-[#008A00]" />
                 <Stat label="No response" value={e.calls_no_response} accent="text-[#FF8800]" />
                 <Stat label="WA messages" value={e.wa_messages_sent} />
@@ -445,6 +447,7 @@ export default function Reports() {
               <th className="text-right px-3 py-2 text-[#E60000]" title="Lost">Lost</th>
               <th className="text-right px-3 py-2">Conv %</th>
               <th className="text-right px-3 py-2 border-l border-gray-200" title="Total calls attempted">Calls</th>
+              <th className="text-right px-3 py-2" title="Unique numbers called">Unique</th>
               <th className="text-right px-3 py-2 text-[#008A00]" title="Connected">Conn</th>
               <th className="text-right px-3 py-2 text-[#FF8800]" title="No Response (PNR)">PNR</th>
               <th className="text-right px-3 py-2" title="Not Reachable">N/R</th>
@@ -468,6 +471,7 @@ export default function Reports() {
                 <td className="px-3 py-3 text-right font-mono text-[#E60000]">{e.lost}</td>
                 <td className="px-3 py-3 text-right font-mono">{e.conversion_rate}</td>
                 <td className="px-3 py-3 text-right font-mono border-l border-gray-200">{e.calls_total}</td>
+                <td className="px-3 py-3 text-right font-mono">{e.calls_unique_numbers || 0}</td>
                 <td className="px-3 py-3 text-right font-mono text-[#008A00]">{e.calls_connected}</td>
                 <td className="px-3 py-3 text-right font-mono text-[#FF8800]">{e.calls_no_response}</td>
                 <td className="px-3 py-3 text-right font-mono">{e.calls_not_reachable}</td>
@@ -528,10 +532,11 @@ function ExecDetailPanel({ exec, data, loading, onClose }) {
         ) : (
           <div className="p-5 space-y-6">
             {/* Summary cards */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
               <SummaryCard label="Leads Assigned" value={data.leads_assigned} color="bg-blue-50 text-[#002FA7] border-blue-200" />
               <SummaryCard label="Leads Worked" value={data.leads_worked} color="bg-green-50 text-green-700 border-green-200" />
               <SummaryCard label="Work Rate" value={data.leads_assigned > 0 ? `${Math.round((data.leads_worked / data.leads_assigned) * 100)}%` : "—"} color="bg-amber-50 text-amber-700 border-amber-200" />
+              <SummaryCard label="Unique Called" value={data.unique_numbers_called || 0} color="bg-purple-50 text-purple-700 border-purple-200" />
               <SummaryCard label="Total Calls" value={data.total_calls} color="bg-gray-50 text-gray-700 border-gray-200" />
             </div>
 

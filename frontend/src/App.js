@@ -26,6 +26,9 @@ import AdminAlerts from "@/pages/AdminAlerts";
 import DataEntry from "@/pages/DataEntry";
 import DataEntryInspect from "@/pages/DataEntryInspect";
 import CallLogs from "@/pages/CallLogs";
+// AttendanceScanner import removed
+import PayrollPage from "@/pages/Payroll";
+import LeavesPage from "@/pages/Leaves";
 
 export default function App() {
   return (
@@ -35,6 +38,7 @@ export default function App() {
           <Toaster position="top-right" richColors closeButton />
           <Routes>
             <Route path="/login" element={<Login />} />
+            // AttendanceScanner route removed
             <Route element={<ProtectedRoute><AppShell /></ProtectedRoute>}>
               <Route path="/" element={<Navigate to="/dashboard" replace />} />
               <Route path="/dashboard" element={<ExecutiveOrAdminOnly><Dashboard /></ExecutiveOrAdminOnly>} />
@@ -53,6 +57,8 @@ export default function App() {
               <Route path="/quick-replies" element={<AdminOnly><QuickReplies /></AdminOnly>} />
               <Route path="/settings" element={<AdminOnly><Settings /></AdminOnly>} />
               <Route path="/payment-settings" element={<AdminOnly><PaymentSettings /></AdminOnly>} />
+              <Route path="/payroll" element={<AdminOnly><PayrollPage /></AdminOnly>} />
+              <Route path="/leaves" element={<LeavesPage />} />
               <Route path="/reports" element={<ExecutiveOrAdminOnly><Reports /></ExecutiveOrAdminOnly>} />
               <Route path="/alerts" element={<AdminOnly><AdminAlerts /></AdminOnly>} />
               <Route path="/data-entry" element={<DataEntry />} />

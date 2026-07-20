@@ -143,6 +143,11 @@ function UserModal({ user, onClose, onSaved }) {
     role: user?.role || "executive",
     active: user?.active ?? true,
     working_hours: user?.working_hours || [],
+    joining_date: user?.joining_date || new Date().toISOString().split("T")[0],
+    base_salary: user?.base_salary || 0,
+    bypass_attendance: user?.bypass_attendance ?? false,
+    employee_code: user?.employee_code || "",
+    department: user?.department || "",
   });
   const [loading, setLoading] = useState(false);
 
@@ -155,11 +160,21 @@ function UserModal({ user, onClose, onSaved }) {
     setLoading(true);
     try {
       if (isEdit) {
-        const body = { name: f.name, role: f.role, active: f.active, working_hours: f.working_hours };
+        const body = { 
+          name: f.name, 
+          role: f.role, 
+          active: f.active, 
+          working_hours: f.working_hours, 
+          joining_date: f.joining_date, 
+          base_salary: Number(f.base_salary),
+          bypass_attendance: f.bypass_attendance,
+          employee_code: f.employee_code || null,
+          department: f.department || null
+        };
         if (f.password) body.password = f.password;
         await api.patch(`/users/${user.id}`, body);
       } else {
-        await api.post("/users", f);
+        await api.post("/users", { ...f, base_salary: Number(f.base_salary), employee_code: f.employee_code || null, department: f.department || null });
       }
       toast.success("Saved"); onSaved();
     } catch (err) { toast.error(errMsg(err)); }
@@ -167,59 +182,90 @@ function UserModal({ user, onClose, onSaved }) {
   };
 
   return (
-    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" onClick={onClose}>
-      <form onClick={(e) => e.stopPropagation()} onSubmit={submit} className="w-full max-w-2xl bg-white border border-gray-900 p-6 max-h-[90vh] overflow-y-auto" data-testid="user-modal">
-        <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">{isEdit ? "Edit" : "Create"}</div>
-        <h2 className="font-chivo font-black text-2xl mt-1 mb-4">{isEdit ? "Edit User" : "New Executive"}</h2>
+    <>
+      <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" onClick={onClose}>
+        <form onClick={(e) => e.stopPropagation()} onSubmit={submit} className="w-full max-w-2xl bg-white border border-gray-900 p-6 max-h-[90vh] overflow-y-auto" data-testid="user-modal">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">{isEdit ? "Edit" : "Create"}</div>
+          <h2 className="font-chivo font-black text-2xl mt-1 mb-4">{isEdit ? "Edit User" : "New Executive"}</h2>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <Field label="Username *">
-            <input required disabled={isEdit} value={f.username} onChange={(e) => setF({ ...f, username: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm disabled:bg-gray-100" data-testid="user-username-input" />
-          </Field>
-          <Field label="Full Name *">
-            <input required value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="user-name-input" />
-          </Field>
-          <Field label={isEdit ? "New Password (optional)" : "Password *"}>
-            <input type="password" required={!isEdit} value={f.password} onChange={(e) => setF({ ...f, password: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="user-password-input" />
-          </Field>
-          <Field label="Role">
-            <select value={f.role} onChange={(e) => setF({ ...f, role: e.target.value })} className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="user-role-select">
-              <option value="executive">executive</option>
-              <option value="admin">admin</option>
-              <option value="data_entry">data entry</option>
-            </select>
-          </Field>
-        </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <Field label="Username *">
+              <input required disabled={isEdit} value={f.username} onChange={(e) => setF({ ...f, username: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm disabled:bg-gray-100" data-testid="user-username-input" />
+            </Field>
+            <Field label="Full Name *">
+              <input required value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="user-name-input" />
+            </Field>
+            <Field label={isEdit ? "New Password (optional)" : "Password *"}>
+              <input type="password" required={!isEdit} value={f.password} onChange={(e) => setF({ ...f, password: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="user-password-input" />
+            </Field>
+            <Field label="Role">
+              <select value={f.role} onChange={(e) => setF({ ...f, role: e.target.value })} className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="user-role-select">
+                <option value="executive">executive (telecalling)</option>
+                <option value="staff">staff (packing / accounts / media…)</option>
+                <option value="data_entry">data entry</option>
+                <option value="admin">admin</option>
+              </select>
+            </Field>
 
-        <div className="mt-5">
-          <div className="flex items-center justify-between mb-2">
-            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Working Hours</div>
-            <button type="button" onClick={addSlot} className="text-[10px] uppercase tracking-widest font-bold text-[#002FA7]" data-testid="add-slot-btn">+ Add slot</button>
+            {f.role !== "admin" && (
+              <>
+                <Field label="Department">
+                  <input type="text" list="dept-suggestions" placeholder="telecalling / packing / accounts / media…" value={f.department} onChange={(e) => setF({ ...f, department: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" />
+                  <datalist id="dept-suggestions">
+                    <option value="telecalling" /><option value="packing" /><option value="accounts" /><option value="media" />
+                  </datalist>
+                </Field>
+                <Field label="Joining Date">
+                  <input type="date" value={f.joining_date} onChange={(e) => setF({ ...f, joining_date: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" />
+                </Field>
+                <Field label="Monthly Base Salary (₹)">
+                  <input type="number" value={f.base_salary} onChange={(e) => setF({ ...f, base_salary: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" />
+                </Field>
+                <Field label="Fingerprint Device ID / Code">
+                  <input type="text" placeholder="e.g. 5 (user ID in the attendance machine)" value={f.employee_code} onChange={(e) => setF({ ...f, employee_code: e.target.value })} className="w-full border border-gray-300 px-3 py-2 text-sm" />
+                </Field>
+                <div className="flex flex-col justify-center">
+                  <div className="flex items-center gap-2 py-2">
+                    <input type="checkbox" id="bypass_attendance" checked={f.bypass_attendance} onChange={(e) => setF({ ...f, bypass_attendance: e.target.checked })} className="rounded border-gray-300 text-[#002FA7] focus:ring-[#002FA7]" />
+                    <label htmlFor="bypass_attendance" className="text-xs font-semibold text-gray-700 cursor-pointer">Bypass Attendance Check (always gets leads)</label>
+                  </div>
+                </div>
+                {/* Biometric facial data registration removed */}
+              </>
+            )}
           </div>
-          <div className="space-y-2">
-            {f.working_hours.map((w, i) => (
-              <div key={i} className="flex items-center gap-2">
-                <select value={w.weekday} onChange={(e) => updSlot(i, { weekday: Number(e.target.value) })} className="border border-gray-300 px-2 py-2 text-sm">
-                  {WEEK.map((d, idx) => <option key={idx} value={idx}>{d}</option>)}
-                </select>
-                <input type="time" value={w.start} onChange={(e) => updSlot(i, { start: e.target.value })} className="border border-gray-300 px-2 py-2 text-sm" />
-                <span className="text-xs">to</span>
-                <input type="time" value={w.end} onChange={(e) => updSlot(i, { end: e.target.value })} className="border border-gray-300 px-2 py-2 text-sm" />
-                <button type="button" onClick={() => removeSlot(i)} className="text-[#E60000]"><Trash size={14} /></button>
-              </div>
-            ))}
-            {f.working_hours.length === 0 && <div className="text-xs text-gray-400 uppercase tracking-widest">No slots — always available</div>}
-          </div>
-        </div>
 
-        <div className="flex justify-end gap-2 mt-6">
-          <button type="button" onClick={onClose} className="border border-gray-300 px-4 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-100">Cancel</button>
-          <button disabled={loading} className="bg-[#002FA7] hover:bg-[#002288] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50" data-testid="user-save-btn">
-            {loading ? "Saving…" : "Save"}
-          </button>
-        </div>
-      </form>
-    </div>
+          <div className="mt-5">
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Working Hours</div>
+              <button type="button" onClick={addSlot} className="text-[10px] uppercase tracking-widest font-bold text-[#002FA7]" data-testid="add-slot-btn">+ Add slot</button>
+            </div>
+            <div className="space-y-2">
+              {f.working_hours.map((w, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <select value={w.weekday} onChange={(e) => updSlot(i, { weekday: Number(e.target.value) })} className="border border-gray-300 px-2 py-2 text-sm">
+                    {WEEK.map((d, idx) => <option key={idx} value={idx}>{d}</option>)}
+                  </select>
+                  <input type="time" value={w.start} onChange={(e) => updSlot(i, { start: e.target.value })} className="border border-gray-300 px-2 py-2 text-sm" />
+                  <span className="text-xs">to</span>
+                  <input type="time" value={w.end} onChange={(e) => updSlot(i, { end: e.target.value })} className="border border-gray-300 px-2 py-2 text-sm" />
+                  <button type="button" onClick={() => removeSlot(i)} className="text-[#E60000]"><Trash size={14} /></button>
+                </div>
+              ))}
+              {f.working_hours.length === 0 && <div className="text-xs text-gray-400 uppercase tracking-widest">No slots — always available</div>}
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-2 mt-6">
+            <button type="button" onClick={onClose} className="border border-gray-300 px-4 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-100">Cancel</button>
+            <button disabled={loading} className="bg-[#002FA7] hover:bg-[#002288] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50" data-testid="user-save-btn">
+              {loading ? "Saving…" : "Save"}
+            </button>
+          </div>
+        </form>
+      </div>
+
+    </>
   );
 }
 
@@ -356,10 +402,10 @@ function DeleteUserReassignModal({ user, users, onClose, onDeleted }) {
                     {activeExecs.map((ae) => (
                       <label key={ae.id} className="flex items-center gap-2 cursor-pointer text-xs font-semibold">
                         <input
-                          type="checkbox"
-                          checked={multipleAgentIds.includes(ae.id)}
-                          onChange={() => handleCheckboxChange(ae.id)}
-                          className="text-[#002FA7] focus:ring-[#002FA7]"
+                           type="checkbox"
+                           checked={multipleAgentIds.includes(ae.id)}
+                           onChange={() => handleCheckboxChange(ae.id)}
+                           className="text-[#002FA7] focus:ring-[#002FA7]"
                         />
                         <span>{ae.name} (@{ae.username})</span>
                       </label>

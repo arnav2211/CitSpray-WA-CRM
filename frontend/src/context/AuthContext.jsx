@@ -7,12 +7,14 @@ const AuthContext = createContext(null);
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null); // null = loading, false = anon
   const [error, setError] = useState("");
+  const [isAttendanceLocked, setAttendanceLocked] = useState(false);
   const leaveNoticeRef = useRef(false);
 
   const fetchMe = useCallback(async () => {
     try {
       const { data } = await api.get("/auth/me");
       setUser(data);
+      setAttendanceLocked(false);
     } catch {
       setUser(false);
     }
@@ -29,7 +31,7 @@ export function AuthProvider({ children }) {
 
   // Global soft-logout interceptor: if any request returns 401 with a
   // `user_on_leave` code (or the user has been deactivated), clear the token
-  // and redirect to the login screen.
+  // and redirect to the login screen. Intercepts 403 attendance lockout as well.
   useEffect(() => {
     const id = api.interceptors.response.use(
       (r) => r,
@@ -37,9 +39,8 @@ export function AuthProvider({ children }) {
         const status = err?.response?.status;
         const detail = err?.response?.data?.detail;
         const code = typeof detail === "object" ? detail?.code : null;
+        
         if (status === 401 && localStorage.getItem("token")) {
-          // Any 401 on an authenticated session means the token is no longer
-          // accepted — log the user out. Show a dedicated notice for leave.
           if (!leaveNoticeRef.current) {
             leaveNoticeRef.current = true;
             if (code === "user_on_leave") {
@@ -52,10 +53,12 @@ export function AuthProvider({ children }) {
           }
           localStorage.removeItem("token");
           setUser(false);
-          // Hard-redirect so any in-flight pollers are killed.
+          setAttendanceLocked(false);
           if (window.location.pathname !== "/login") {
             window.location.href = "/login";
           }
+        } else if (status === 403 && code === "attendance_required") {
+          setAttendanceLocked(true);
         }
         return Promise.reject(err);
       },
@@ -69,9 +72,9 @@ export function AuthProvider({ children }) {
       const { data } = await api.post("/auth/login", { username, password });
       localStorage.setItem("token", data.token);
       setUser(data.user);
+      setAttendanceLocked(false);
       return true;
     } catch (e) {
-      // Leave-specific login block returns 403 with code=user_on_leave
       const detail = e?.response?.data?.detail;
       const code = typeof detail === "object" ? detail?.code : null;
       if (code === "user_on_leave") {
@@ -88,10 +91,11 @@ export function AuthProvider({ children }) {
     try { await api.post("/auth/logout"); } catch { /* ignore */ }
     localStorage.removeItem("token");
     setUser(false);
+    setAttendanceLocked(false);
   };
 
   return (
-    <AuthContext.Provider value={{ user, login, logout, error, refresh: fetchMe }}>
+    <AuthContext.Provider value={{ user, login, logout, error, refresh: fetchMe, isAttendanceLocked, setAttendanceLocked }}>
       {children}
     </AuthContext.Provider>
   );

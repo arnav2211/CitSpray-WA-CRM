@@ -9,6 +9,7 @@ import re
 import json
 import uuid
 import hashlib
+import hmac as hmac_mod
 import logging
 import smtplib
 import ssl
@@ -301,13 +302,14 @@ def verify_password(pw: str, hashed: str) -> bool:
     except Exception:
         return False
 
-def create_access_token(user_id: str, username: str, role: str) -> str:
+def create_access_token(user_id: str, username: str, role: str, token_version: int = 0) -> str:
     payload = {
         "sub": user_id,
         "username": username,
         "role": role,
         "exp": now_utc() + timedelta(hours=12),
         "type": "access",
+        "token_version": token_version,
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
@@ -331,23 +333,80 @@ class UserOut(BaseModel):
     active: bool = True
     working_hours: List[Dict[str, Any]] = []
     created_at: Optional[str] = None
+    joining_date: Optional[str] = None
+    base_salary: float = 0.0
+    bypass_attendance: bool = False
+    employee_code: Optional[str] = None
 
 class UserCreate(BaseModel):
     username: str
     password: str
     name: str
-    role: Literal["admin", "executive", "data_entry"] = "executive"
+    role: Literal["admin", "executive", "data_entry", "staff"] = "executive"
     active: bool = True
     working_hours: List[Dict[str, Any]] = []
     receiver_numbers: List[str] = []
+    joining_date: Optional[str] = None
+    base_salary: float = 0.0
+    bypass_attendance: bool = False
+    employee_code: Optional[str] = None
+    department: Optional[str] = None
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
     password: Optional[str] = None
-    role: Optional[Literal["admin", "executive", "data_entry"]] = None
+    role: Optional[Literal["admin", "executive", "data_entry", "staff"]] = None
     active: Optional[bool] = None
     working_hours: Optional[List[Dict[str, Any]]] = None
     receiver_numbers: Optional[List[str]] = None
+    joining_date: Optional[str] = None
+    base_salary: Optional[float] = None
+    bypass_attendance: Optional[bool] = None
+    employee_code: Optional[str] = None
+    department: Optional[str] = None
+
+class HolidayCreate(BaseModel):
+    date: str  # YYYY-MM-DD
+    name: str
+    is_paid: bool = True
+    holiday_type: Literal["full", "early_off"] = "full"
+    early_off_time: Optional[str] = None  # "HH:MM" — punch-outs at/after this count as full day
+
+class FaceRegisterInput(BaseModel):
+    user_id: str
+    face_embedding: List[float]
+
+class FaceVerifyInput(BaseModel):
+    face_embedding: List[float]
+    photo_base64: str
+
+class PayrollAdjustInput(BaseModel):
+    user_id: str
+    date: str  # YYYY-MM-DD
+    status: Literal["informed", "uninformed", "present", "half_day", "leave", "paid", "wfh", "auto"]
+
+
+class PunchEditInput(BaseModel):
+    user_id: str
+    date: str                      # YYYY-MM-DD
+    check_in: Optional[str] = None   # "HH:MM" (IST) or null to leave unchanged
+    check_out: Optional[str] = None  # "HH:MM" (IST) or null to leave unchanged
+    clear_check_out: bool = False    # remove the punch-out
+    remove: bool = False             # delete the whole day's log
+
+
+class AttendanceSettingsInput(BaseModel):
+    office_start: Optional[str] = None            # "10:30"
+    late_grace_until: Optional[str] = None        # "11:00"
+    office_end: Optional[str] = None              # "19:00"
+    full_day_out_grace_minutes: Optional[int] = None
+    half_day_cutoff: Optional[str] = None         # "15:00"
+    late_streak_threshold: Optional[int] = None
+    stale_new_days: Optional[int] = None
+    wfh_pool_user_ids: Optional[List[str]] = None
+    wfh_afterhours_enabled: Optional[bool] = None
+    attendance_routing_enabled: Optional[bool] = None
+
 
 class ReceiverNumbersInput(BaseModel):
     receiver_numbers: List[str]
@@ -479,6 +538,14 @@ class LeaveUpdate(BaseModel):
     end_date: Optional[str] = None
     reason: Optional[str] = None
 
+class LeaveApplyInput(BaseModel):
+    start_date: str                     # "YYYY-MM-DD"
+    end_date: str                       # "YYYY-MM-DD"
+    reason: str                         # required — employees must give a proper reason
+
+class LeaveDecisionInput(BaseModel):
+    note: Optional[str] = ""
+
 # Internal Admin↔Agent Q&A
 class InternalChatSend(BaseModel):
     lead_id: str
@@ -504,6 +571,8 @@ async def get_current_user(request: Request) -> dict:
     user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0})
     if not user or not user.get("active", True):
         raise HTTPException(status_code=401, detail="User not found or inactive")
+    if user.get("token_version", 0) != payload.get("token_version", 0):
+        raise HTTPException(status_code=401, detail="Session expired or logged out from all devices")
     # Soft-logout: if this is an executive currently on leave, force-401 so the
     # frontend's global 401 interceptor logs them out on the next poll (~4s).
     # Admins are never blocked even if they are marked on leave (edge-case safety).
@@ -519,6 +588,8 @@ async def get_current_user(request: Request) -> dict:
                     "leave_end": leave.get("end_date"),
                 },
             )
+        # Attendance lockout enforcement (completely disabled as requested)
+        pass
     user.pop("password_hash", None)
     return user
 
@@ -549,7 +620,7 @@ async def login(body: LoginInput, response: Response):
                     "leave_end": leave.get("end_date"),
                 },
             )
-    token = create_access_token(user["id"], user["username"], user["role"])
+    token = create_access_token(user["id"], user["username"], user["role"], user.get("token_version", 0))
     response.set_cookie(
         key="access_token", value=token, httponly=True, secure=False,
         samesite="lax", max_age=43200, path="/",
@@ -591,6 +662,11 @@ async def create_user(body: UserCreate, admin: dict = Depends(require_admin)):
         "working_hours": body.working_hours,
         "receiver_numbers": rx,
         "created_at": iso(now_utc()),
+        "joining_date": body.joining_date or (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d"),
+        "base_salary": body.base_salary or 0.0,
+        "bypass_attendance": body.bypass_attendance or False,
+        "employee_code": body.employee_code,
+        "department": body.department,
     }
     await db.users.insert_one(doc.copy())
     return strip_mongo(doc)
@@ -601,7 +677,7 @@ async def update_user(user_id: str, body: UserUpdate, admin: dict = Depends(requ
     if not u:
         raise HTTPException(status_code=404, detail="User not found")
     updates: Dict[str, Any] = {}
-    for f in ["name", "role", "active", "working_hours"]:
+    for f in ["name", "role", "active", "working_hours", "joining_date", "base_salary", "bypass_attendance", "employee_code", "department"]:
         v = getattr(body, f)
         if v is not None:
             updates[f] = v
@@ -826,10 +902,16 @@ def _valid_date_str(s: str) -> bool:
 
 
 @api.get("/leaves")
-async def list_leaves(admin: dict = Depends(require_admin), user_id: Optional[str] = None, active_only: bool = False):
+async def list_leaves(admin: dict = Depends(require_admin), user_id: Optional[str] = None, active_only: bool = False, status: Optional[str] = None):
     query: Dict[str, Any] = {"cancelled": {"$ne": True}}
     if user_id:
         query["user_id"] = user_id
+    if status == "pending":
+        query["status"] = "pending"
+    elif status == "approved":
+        query["status"] = {"$nin": ["pending", "rejected"]}
+    elif status == "rejected":
+        query["status"] = "rejected"
     if active_only:
         today = now_utc().strftime("%Y-%m-%d")
         query["start_date"] = {"$lte": today}
@@ -848,6 +930,8 @@ async def list_leaves(admin: dict = Depends(require_admin), user_id: Optional[st
         lv["user_username"] = u.get("username")
         today = now_utc().strftime("%Y-%m-%d")
         lv["is_active"] = (lv.get("start_date", "") <= today <= lv.get("end_date", ""))
+        if not lv.get("status"):
+            lv["status"] = "approved"  # legacy admin-created leaves
     return leaves
 
 
@@ -866,6 +950,9 @@ async def create_leave(body: LeaveCreate, admin: dict = Depends(require_admin)):
         "start_date": body.start_date,
         "end_date": body.end_date,
         "reason": (body.reason or "").strip(),
+        "status": "approved",          # admin-created leaves are approved by definition
+        "decided_by": admin["id"],
+        "decided_at": iso(now_utc()),
         "cancelled": False,
         "created_at": iso(now_utc()),
         "created_by": admin["id"],
@@ -874,6 +961,89 @@ async def create_leave(body: LeaveCreate, admin: dict = Depends(require_admin)):
     leave.pop("_id", None)
     await log_activity(admin["id"], "leave_created", None, {"user_id": body.user_id, "start_date": body.start_date, "end_date": body.end_date})
     return leave
+
+
+@api.post("/leaves/apply")
+async def apply_leave(body: LeaveApplyInput, user: dict = Depends(get_current_user)):
+    """Employee self-service leave application. Requires a proper reason.
+    Goes to the admin as 'pending'; approved leave costs 1 day's salary per day,
+    absence without approval costs 2 days per day."""
+    if user.get("role") == "admin":
+        raise HTTPException(status_code=400, detail="Admins add leaves directly from the Payroll page")
+    if not _valid_date_str(body.start_date) or not _valid_date_str(body.end_date):
+        raise HTTPException(status_code=400, detail="start_date/end_date must be YYYY-MM-DD")
+    if body.start_date > body.end_date:
+        raise HTTPException(status_code=400, detail="start_date cannot be after end_date")
+    reason = (body.reason or "").strip()
+    if len(reason) < 5:
+        raise HTTPException(status_code=400, detail="Please give a proper reason for the leave")
+    overlap = await db.leaves.find_one({
+        "user_id": user["id"],
+        "cancelled": {"$ne": True},
+        "status": {"$ne": "rejected"},
+        "start_date": {"$lte": body.end_date},
+        "end_date": {"$gte": body.start_date},
+    }, {"_id": 0, "id": 1})
+    if overlap:
+        raise HTTPException(status_code=409, detail="You already have a leave request overlapping these dates")
+    leave = {
+        "id": str(uuid.uuid4()),
+        "user_id": user["id"],
+        "start_date": body.start_date,
+        "end_date": body.end_date,
+        "reason": reason,
+        "status": "pending",
+        "cancelled": False,
+        "created_at": iso(now_utc()),
+        "created_by": user["id"],
+    }
+    await db.leaves.insert_one(leave.copy())
+    leave.pop("_id", None)
+    await log_activity(user["id"], "leave_applied", None, {"start_date": body.start_date, "end_date": body.end_date})
+    await create_system_alert(
+        "leave_request",
+        f"Leave request: {user['name']}",
+        f"{user['name']} applied for leave {body.start_date} → {body.end_date}. Reason: {reason}",
+        dedup_key=f"leave_request:{leave['id']}",
+    )
+    return leave
+
+
+@api.get("/leaves/my")
+async def my_leaves(user: dict = Depends(get_current_user)):
+    leaves = await db.leaves.find(
+        {"user_id": user["id"], "cancelled": {"$ne": True}}, {"_id": 0}
+    ).sort("start_date", -1).to_list(100)
+    for lv in leaves:
+        if not lv.get("status"):
+            lv["status"] = "approved"  # legacy admin-created
+    return leaves
+
+
+@api.post("/leaves/{leave_id}/approve")
+async def approve_leave(leave_id: str, body: LeaveDecisionInput, admin: dict = Depends(require_admin)):
+    existing = await db.leaves.find_one({"id": leave_id, "cancelled": {"$ne": True}}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="leave not found")
+    await db.leaves.update_one({"id": leave_id}, {"$set": {
+        "status": "approved", "decision_note": (body.note or "").strip(),
+        "decided_by": admin["id"], "decided_at": iso(now_utc()),
+    }})
+    await log_activity(admin["id"], "leave_approved", None, {"leave_id": leave_id, "user_id": existing.get("user_id")})
+    return {"ok": True, "status": "approved"}
+
+
+@api.post("/leaves/{leave_id}/reject")
+async def reject_leave(leave_id: str, body: LeaveDecisionInput, admin: dict = Depends(require_admin)):
+    existing = await db.leaves.find_one({"id": leave_id, "cancelled": {"$ne": True}}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="leave not found")
+    await db.leaves.update_one({"id": leave_id}, {"$set": {
+        "status": "rejected", "decision_note": (body.note or "").strip(),
+        "decided_by": admin["id"], "decided_at": iso(now_utc()),
+    }})
+    await log_activity(admin["id"], "leave_rejected", None, {"leave_id": leave_id, "user_id": existing.get("user_id")})
+    return {"ok": True, "status": "rejected"}
 
 
 @api.patch("/leaves/{leave_id}")
@@ -1227,6 +1397,8 @@ async def _is_user_on_leave(user_id: str, at: Optional[datetime] = None) -> Opti
     leave = await db.leaves.find_one({
         "user_id": user_id,
         "cancelled": {"$ne": True},
+        # legacy admin-created leaves have no status field → treat as approved
+        "status": {"$nin": ["pending", "rejected"]},
         "start_date": {"$lte": today},
         "end_date": {"$gte": today},
     }, {"_id": 0})
@@ -1259,6 +1431,128 @@ def _is_buylead(lead_data: dict) -> bool:
     return False
 
 
+ATTENDANCE_DEFAULTS = {
+    "office_start": "10:30",
+    "late_grace_until": "11:00",
+    "office_end": "19:00",
+    "full_day_out_grace_minutes": 15,   # punch-out within 15 min before office_end still = full day
+    "half_day_cutoff": "15:00",         # punch-out before this = full day cut (no half day)
+    "late_streak_threshold": 3,          # consecutive late arrivals (after office_start) → admin flag
+    "stale_new_days": 3,                 # leads still 'new' after this many days → round-robin reassign
+    "wfh_pool_user_ids": [],             # execs allowed to receive leads outside office hours (WFH)
+    "wfh_afterhours_enabled": True,
+    "attendance_routing_enabled": True,  # master switch: gate lead assignment on punch-in status
+}
+
+
+async def get_attendance_config() -> dict:
+    doc = await db.attendance_settings.find_one({"key": "general_settings"}, {"_id": 0}) or {}
+    cfg = dict(ATTENDANCE_DEFAULTS)
+    for k in cfg:
+        if doc.get(k) is not None:
+            cfg[k] = doc[k]
+    # legacy fields kept for the device punch endpoints
+    cfg["shift_start"] = doc.get("shift_start", cfg["office_start"])
+    cfg["grace_period_minutes"] = doc.get("grace_period_minutes", 30)
+    return cfg
+
+
+def _ist_now() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+
+
+def _hhmm_to_minutes(hhmm: str, fallback: int = 0) -> int:
+    try:
+        h, m = map(int, hhmm.split(":"))
+        return h * 60 + m
+    except Exception:
+        return fallback
+
+
+async def _office_open_now(cfg: Optional[dict] = None) -> bool:
+    """True when the office is currently open in IST: Mon–Sat between office_start
+    and office_end, and today is not a declared full holiday (early-off holidays
+    close the office at early_off_time)."""
+    cfg = cfg or await get_attendance_config()
+    now = _ist_now()
+    if now.weekday() == 6:  # Sunday
+        return False
+    mins = now.hour * 60 + now.minute
+    start = _hhmm_to_minutes(cfg["office_start"], 630)
+    end = _hhmm_to_minutes(cfg["office_end"], 1140)
+    hol = await db.holidays.find_one({"date": now.strftime("%Y-%m-%d")}, {"_id": 0})
+    if hol:
+        if (hol.get("holiday_type") or "full") == "full":
+            return False
+        if hol.get("early_off_time"):
+            end = min(end, _hhmm_to_minutes(hol["early_off_time"], end))
+    return start <= mins < end
+
+
+async def _is_user_available_by_attendance(user: dict) -> bool:
+    """Gate lead assignment on real attendance:
+    - bypass_attendance users are always available;
+    - while the office is open: available only if punched IN today and NOT punched out
+      (early punch-out closes their queue for the day);
+    - outside office hours / Sundays / holidays: only the configured WFH pool
+      (e.g. Ankita & Anmol) receives leads."""
+    cfg = await get_attendance_config()
+    if not cfg.get("attendance_routing_enabled", True):
+        return True
+    if user.get("bypass_attendance"):
+        return True
+    if await _office_open_now(cfg):
+        today = _ist_now().strftime("%Y-%m-%d")
+        log = await db.attendance_logs.find_one(
+            {"user_id": user["id"], "date": today}, {"_id": 0, "check_in": 1, "check_out": 1}
+        )
+        return bool(log and log.get("check_in") and not log.get("check_out"))
+    # office closed → WFH pool only
+    if not cfg.get("wfh_afterhours_enabled", True):
+        return False
+    return user["id"] in (cfg.get("wfh_pool_user_ids") or [])
+
+
+async def create_system_alert(alert_type: str, title: str, message: str, dedup_key: Optional[str] = None):
+    """Raise an alert to all admins through the existing admin-alert pipeline
+    (bell + websocket toast). dedup_key prevents re-raising the same flag."""
+    try:
+        if dedup_key:
+            existing = await db.admin_alerts.find_one({"meta.dedup_key": dedup_key}, {"_id": 1})
+            if existing:
+                return
+        admin_ids = [a["id"] for a in await db.users.find(
+            {"role": "admin", "active": True}, {"_id": 0, "id": 1}).to_list(50)]
+        if not admin_ids:
+            return
+        alert_doc = {
+            "id": str(uuid.uuid4()),
+            "title": title,
+            "message": message,
+            "sent_by": "System",
+            "sent_by_id": None,
+            "order_id": "",
+            "customer_name": "",
+            "recipient_ids": admin_ids,
+            "recipient_roles": [],
+            "acknowledgements": {},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "meta": {"type": alert_type, "dedup_key": dedup_key},
+        }
+        await db.admin_alerts.insert_one(alert_doc.copy())
+        for r_id in admin_ids:
+            try:
+                await manager.broadcast_to_user(r_id, {
+                    "type": "admin_alert",
+                    "action": "trigger",
+                    "alert": {"id": alert_doc["id"], "title": title, "message": message, "sent_by": "System"},
+                })
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"create_system_alert failed: {e}")
+
+
 async def _pick_buyleads_executive(source: str) -> Optional[dict]:
     """Round-robin across the allow-listed agents for a given buyleads source.
     Respects leave status and `active` flag. Falls back to `pick_next_executive` if
@@ -1273,6 +1567,8 @@ async def _pick_buyleads_executive(source: str) -> Optional[dict]:
         if not u:
             continue
         if await _is_user_on_leave(uid):
+            continue
+        if not await _is_user_available_by_attendance(u):
             continue
         eligible.append(u)
     if not eligible:
@@ -1292,6 +1588,14 @@ async def pick_next_executive(exclude_user_id: Optional[str] = None) -> Optional
     execs = await db.users.find(
         {"role": "executive", "active": True, "username": {"$ne": "test_user"}}, {"_id": 0, "password_hash": 0}
     ).to_list(500)
+    
+    # Filter by attendance (punched in or bypass)
+    after_attendance = []
+    for e in execs:
+        if await _is_user_available_by_attendance(e):
+            after_attendance.append(e)
+    execs = after_attendance
+    
     if not execs:
         return None
     # filter by working hours if enabled
@@ -1538,9 +1842,17 @@ async def _handle_repeat_enquiry(existing: dict, new_data: dict) -> None:
     # Determine if the current assignee is still eligible
     keep_owner = False
     if current_uid:
-        u = await db.users.find_one({"id": current_uid, "active": True}, {"_id": 0, "id": 1, "role": 1})
+        u = await db.users.find_one({"id": current_uid, "active": True}, {"_id": 0, "id": 1, "role": 1, "bypass_attendance": 1})
         if u and not await _is_user_on_leave(current_uid):
             keep_owner = True
+            # During office hours, an exec who never punched in / already punched
+            # out should not keep hoarding repeat enquiries either.
+            try:
+                att_cfg = await get_attendance_config()
+                if att_cfg.get("attendance_routing_enabled", True) and await _office_open_now(att_cfg):
+                    keep_owner = await _is_user_available_by_attendance(u)
+            except Exception:
+                pass
 
     if keep_owner:
         # Retain existing assignment — no change needed; just touch timestamps.
@@ -1726,16 +2038,21 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         )
     lead = await db.leads.find_one({"id": lead["id"]}, {"_id": 0})
     await log_activity(by_user_id, "lead_created", lead["id"], {"source": lead["source"]})
+    # Website-order leads get an order-confirmation utility template instead of the
+    # generic welcome — callers set _suppress_auto_welcome to avoid double-messaging.
+    suppress_welcome = bool(data.get("_suppress_auto_welcome"))
     # auto WhatsApp welcome (mock)
-    try:
-        await auto_send_whatsapp_on_create(lead)
-    except Exception as e:
-        logger.warning(f"auto whatsapp failed: {e}")
+    if not suppress_welcome:
+        try:
+            await auto_send_whatsapp_on_create(lead)
+        except Exception as e:
+            logger.warning(f"auto whatsapp failed: {e}")
     # auto email welcome (SMTP) — best-effort; never blocks lead creation
-    try:
-        await auto_send_email_on_create(lead)
-    except Exception as e:
-        logger.warning(f"auto email failed: {e}")
+    if not suppress_welcome:
+        try:
+            await auto_send_email_on_create(lead)
+        except Exception as e:
+            logger.warning(f"auto email failed: {e}")
     return lead
 
 @api.get("/leads")
@@ -2408,6 +2725,37 @@ async def list_messages(
 
 
 # ------------- Call logs -------------
+def _check_duplicate_call(norm_phone: str, user_id: str, new_at_str: str, new_duration: int, existing_logs: list) -> Optional[dict]:
+    try:
+        new_dt = datetime.fromisoformat(new_at_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+        
+    for doc in existing_logs:
+        if doc.get("phone") != norm_phone or doc.get("by_user_id") != user_id:
+            continue
+            
+        doc_at = doc.get("at")
+        if not doc_at:
+            continue
+            
+        try:
+            doc_dt = datetime.fromisoformat(doc_at.replace("Z", "+00:00"))
+            doc_duration = doc.get("duration_seconds") or 0
+            
+            diff_time = abs((new_dt - doc_dt).total_seconds())
+            diff_new_end = abs((new_dt - doc_dt).total_seconds() - new_duration)
+            diff_doc_end = abs((doc_dt - new_dt).total_seconds() - doc_duration)
+            
+            # If any of the differences is within 60 seconds, it's a duplicate
+            if diff_time <= 60 or diff_new_end <= 60 or diff_doc_end <= 60:
+                return doc
+        except Exception:
+            pass
+            
+    return None
+
+
 async def _set_wa_status(lead_id: str, phone: Optional[str], has_wa: bool):
     """Track per-phone WhatsApp availability on a lead. Updates `wa_status_map` (suffix-key
     → bool) plus the overall `has_whatsapp` rollup (true if any phone is WA-active)."""
@@ -2430,22 +2778,34 @@ async def log_call(lead_id: str, body: CallLogInput, user: dict = Depends(get_cu
         raise HTTPException(status_code=404, detail="Lead not found")
     if body.outcome == "connected" and not (body.summary or "").strip():
         raise HTTPException(status_code=400, detail="Conversation summary is required for a connected call")
-    doc = {
+        
+    outcome_str = {
+        "connected": "Connected",
+        "no_response": "No Response (PNR)",
+        "rejected": "Rejected",
+        "not_reachable": "Not Reachable",
+        "busy": "Busy",
+        "invalid": "Invalid Number",
+        "initiated": "Initiated"
+    }.get(body.outcome, body.outcome.title())
+    
+    summary_val = (body.summary or "").strip()
+    note_body = f"Manual Call ({outcome_str}): {summary_val}" if summary_val else f"Manual Call ({outcome_str})"
+    
+    now_str = iso(now_utc())
+    
+    note = {
         "id": str(uuid.uuid4()),
-        "lead_id": lead_id,
-        "phone": body.phone,
-        "outcome": body.outcome,
-        "summary": (body.summary or "").strip() if body.outcome == "connected" else None,
         "by_user_id": user["id"],
-        "by_user_name": user["name"],
-        "at": iso(now_utc()),
-        "direction": "outgoing",
+        "by_name": user["name"],
+        "body": note_body,
+        "at": now_str,
     }
-    await db.call_logs.insert_one(doc.copy())
+    
     update_fields: Dict[str, Any] = {
         "last_call_outcome": body.outcome,
-        "last_call_at": doc["at"],
-        "last_action_at": doc["at"],
+        "last_call_at": now_str,
+        "last_action_at": now_str,
     }
     # Auto-promote status if not initiated call
     if body.outcome != "initiated" and lead.get("status") == "new":
@@ -2457,8 +2817,9 @@ async def log_call(lead_id: str, body: CallLogInput, user: dict = Depends(get_cu
 
     await db.leads.update_one(
         {"id": lead_id},
-        {"$set": update_fields},
+        {"$push": {"notes": note}, "$set": update_fields},
     )
+    
     await log_activity(user["id"], "call_logged", lead_id, {"outcome": body.outcome, "phone": body.phone})
 
     # Intelligent Reassignment Logic
@@ -2495,7 +2856,18 @@ async def log_call(lead_id: str, body: CallLogInput, user: dict = Depends(get_cu
                     }
                 )
 
-    return strip_mongo(doc)
+    mock_doc = {
+        "id": note["id"],
+        "lead_id": lead_id,
+        "phone": body.phone,
+        "outcome": body.outcome,
+        "summary": summary_val if body.outcome == "connected" else None,
+        "by_user_id": user["id"],
+        "by_user_name": user["name"],
+        "at": now_str,
+        "direction": "outgoing",
+    }
+    return mock_doc
 
 
 @api.get("/leads/{lead_id}/calls")
@@ -2555,12 +2927,13 @@ async def sync_call_batch(body: CallSyncBatchInput, user: dict = Depends(get_cur
             await log_activity(user["id"], "lead_created", lead_id, {"source": "Auto-Created", "phone": norm})
             lead = lead_doc
 
-        # Duplicate check (same phone, same user, same timestamp)
-        existing = await db.call_logs.find_one({
+        # Duplicate check (same phone, same user, same timestamp or duration-adjusted matching)
+        existing_logs = await db.call_logs.find({
             "phone": norm,
-            "by_user_id": user["id"],
-            "at": record.timestamp
-        })
+            "by_user_id": user["id"]
+        }).sort("at", -1).to_list(50)
+        existing = _check_duplicate_call(norm, user["id"], record.timestamp, record.duration_seconds or 0, existing_logs)
+        
         if existing:
             # If the sync payload contains a user note/outcome (e.g. from PostCallActivity),
             # we should update the existing call log with the note and outcome!
@@ -2570,6 +2943,9 @@ async def sync_call_batch(body: CallSyncBatchInput, user: dict = Depends(get_cur
             }
             if note_str:
                 update_fields["summary"] = note_str
+            if record.duration_seconds and not existing.get("duration_seconds"):
+                update_fields["duration_seconds"] = record.duration_seconds
+                
             await db.call_logs.update_one({"id": existing["id"]}, {"$set": update_fields})
             
             if lead:
@@ -2714,21 +3090,42 @@ async def report_call_event(body: CallEventInput, user: dict = Depends(get_curre
         outcome = body.outcome or "no_response"
         duration = body.duration_seconds or 0
         
-        # Save call log
-        doc = {
-            "id": str(uuid.uuid4()),
-            "lead_id": lead_id,
+        # Duplicate check (same phone, same user, same timestamp or duration-adjusted matching)
+        existing_logs = await db.call_logs.find({
             "phone": norm,
-            "outcome": outcome,
-            "summary": f"Call ended. Duration: {duration}s. (Auto-logged via app)",
-            "by_user_id": user["id"],
-            "by_user_name": user["name"],
-            "at": now_str,
-            "duration_seconds": duration,
-            "direction": body.direction or "outgoing",
-            "synced_from_app": True
-        }
-        await db.call_logs.insert_one(doc.copy())
+            "by_user_id": user["id"]
+        }).sort("at", -1).to_list(50)
+        existing = _check_duplicate_call(norm, user["id"], now_str, duration, existing_logs)
+        
+        if existing:
+            # If it already exists, update duration, outcome, and summary
+            update_fields = {
+                "outcome": outcome,
+                "duration_seconds": duration,
+            }
+            # Only overwrite summary if existing one is empty or generic/auto-logged
+            existing_summary = existing.get("summary") or ""
+            if not existing_summary or "Auto-logged" in existing_summary or "Synced via" in existing_summary:
+                update_fields["summary"] = f"Call ended. Duration: {duration}s. (Auto-logged via app)"
+                
+            await db.call_logs.update_one({"id": existing["id"]}, {"$set": update_fields})
+            doc_id = existing["id"]
+        else:
+            doc = {
+                "id": str(uuid.uuid4()),
+                "lead_id": lead_id,
+                "phone": norm,
+                "outcome": outcome,
+                "summary": f"Call ended. Duration: {duration}s. (Auto-logged via app)",
+                "by_user_id": user["id"],
+                "by_user_name": user["name"],
+                "at": now_str,
+                "duration_seconds": duration,
+                "direction": body.direction or "outgoing",
+                "synced_from_app": True
+            }
+            await db.call_logs.insert_one(doc.copy())
+            doc_id = doc["id"]
         
         update_q = {
             "last_call_outcome": outcome,
@@ -3667,6 +4064,19 @@ async def reports_overview(
     msgs_sent: Dict[str, int] = {}
     async for d in db.messages.aggregate(msg_pipeline):
         msgs_sent[d["_id"]] = d["c"]
+        
+    # Pre-aggregate unique numbers called by user
+    unique_calls_pipeline = [
+        {"$match": call_q} if call_q else {"$match": {}},
+        {"$group": {"_id": {"user": "$by_user_id", "phone": "$phone"}}},
+        {"$group": {"_id": "$_id.user", "unique_count": {"$sum": 1}}}
+    ]
+    unique_calls: Dict[str, int] = {}
+    async for d in db.call_logs.aggregate(unique_calls_pipeline):
+        u = d.get("_id")
+        if u:
+            unique_calls[u] = d.get("unique_count", 0)
+
     for e in execs:
         base = {**lead_q, "assigned_to": e["id"]}
         count = await db.leads.count_documents(base)
@@ -3709,6 +4119,7 @@ async def reports_overview(
             "conversion_rate": round((conv / (count - new_leads)) * 100, 1) if (count - new_leads) else 0,
             "avg_response_seconds": int(avg_ms / 1000) if avg_ms else 0,
             "calls_total": total_calls,
+            "calls_unique_numbers": unique_calls.get(e["id"], 0),
             "calls_talk_time_seconds": call_durations.get(e["id"], 0),
             "calls_connected": calls.get("connected", 0),
             "calls_no_response": calls.get("no_response", 0),
@@ -3856,6 +4267,7 @@ async def executive_detail_report(
         leads_worked = 0
 
     total_talk_time_seconds = sum(c.get("duration_seconds") or 0 for c in raw_calls)
+    unique_numbers_called = len({c.get("customer_phone") for c in call_log if c.get("customer_phone")})
 
     # --- Additional metrics for executive's own breakdown ---
     base = {**lead_q, "assigned_to": exec_id}
@@ -3901,6 +4313,7 @@ async def executive_detail_report(
         },
         "call_log": call_log,
         "total_calls": len(call_log),
+        "unique_numbers_called": unique_numbers_called,
         "total_talk_time_seconds": total_talk_time_seconds,
         "leads_assigned": leads_assigned,
         "leads_worked": leads_worked,
@@ -3959,15 +4372,17 @@ async def reports_daily_calls(
         if user_id:
             q["by_user_id"] = user_id
             
-    cursor = db.call_logs.find(q, {"_id": 0, "by_user_id": 1, "by_user_name": 1, "duration_seconds": 1, "outcome": 1})
+    cursor = db.call_logs.find(q, {"_id": 0, "by_user_id": 1, "by_user_name": 1, "duration_seconds": 1, "outcome": 1, "phone": 1})
     logs = await cursor.to_list(None)
     
     total_calls = len(logs)
+    unique_numbers_called = len({c.get("phone") for c in logs if c.get("phone")})
     total_talk_time_seconds = sum(c.get("duration_seconds") or 0 for c in logs)
     talked_calls = sum(1 for c in logs if (c.get("duration_seconds") or 0) > 0)
     
     response_data = {
         "total_calls": total_calls,
+        "unique_numbers_called": unique_numbers_called,
         "total_talk_time_seconds": total_talk_time_seconds,
         "talked_calls": talked_calls,
         "date_from": date_from,
@@ -3983,7 +4398,9 @@ async def reports_daily_calls(
                 "user_name": e["name"],
                 "total_calls": 0,
                 "total_talk_time_seconds": 0,
-                "talked_calls": 0
+                "talked_calls": 0,
+                "unique_numbers_called": 0,
+                "_phones": set()
             } for e in executives
         }
         
@@ -3997,14 +4414,22 @@ async def reports_daily_calls(
                     "user_name": c.get("by_user_name") or "Unknown Executive",
                     "total_calls": 0,
                     "total_talk_time_seconds": 0,
-                    "talked_calls": 0
+                    "talked_calls": 0,
+                    "unique_numbers_called": 0,
+                    "_phones": set()
                 }
             dur = c.get("duration_seconds") or 0
             exec_map[uid]["total_calls"] += 1
             exec_map[uid]["total_talk_time_seconds"] += dur
             if dur > 0:
                 exec_map[uid]["talked_calls"] += 1
+            phone = c.get("phone")
+            if phone:
+                exec_map[uid]["_phones"].add(phone)
                 
+        for em in exec_map.values():
+            em["unique_numbers_called"] = len(em.pop("_phones"))
+            
         response_data["per_executive"] = list(exec_map.values())
         
     return response_data
@@ -5229,6 +5654,15 @@ async def webhooks_info(admin: dict = Depends(require_admin)):
             "where_to_paste": "IndiaMART Lead Manager → Push API → Webhook URL",
             "auth": "none (public endpoint)",
         },
+        "shopify": {
+            "label": "Shopify (citspray.com) Orders",
+            "url": f"{base}/api/webhooks/shopify",
+            "method": "POST",
+            "where_to_paste": "Shopify Admin → Settings → Notifications → Webhooks → Create webhook (topics: Order creation + Fulfillment creation, format JSON)",
+            "auth": "HMAC via SHOPIFY_WEBHOOK_SECRET env (Shopify shows the signing secret under the webhook list)",
+            "topics": ["orders/create", "fulfillments/create"],
+            "secret_configured": bool(SHOPIFY_WEBHOOK_SECRET),
+        },
         "exportersindia": {
             "label": "ExportersIndia Webhook",
             "url": ei_url,
@@ -5714,6 +6148,333 @@ async def webhook_indiamart_recent(admin: dict = Depends(require_admin), limit: 
     """Admin-only: inspect last N raw IndiaMART webhook payloads (useful for debugging activations)."""
     docs = await db.webhook_payloads.find(
         {"source": "IndiaMART"}, {"_id": 0}
+    ).sort("received_at", -1).to_list(limit)
+    return docs
+
+# ------------- Shopify (citspray.com website) webhooks -------------
+# Orders placed on the Shopify storefront flow into the CRM as source="Website"
+# leads (round-robin assigned so executives can call), and the customer receives
+# WhatsApp UTILITY messages only: order confirmation on orders/create and
+# tracking details on fulfillments/create. No marketing content is sent here.
+
+SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "").strip()
+SHOPIFY_TPL_ORDER_CONFIRM = os.environ.get("SHOPIFY_TPL_ORDER_CONFIRM", "order_confirmation").strip()
+SHOPIFY_TPL_ORDER_SHIPPED = os.environ.get("SHOPIFY_TPL_ORDER_SHIPPED", "order_shipped").strip()
+SHOPIFY_TPL_ABANDONED = os.environ.get("SHOPIFY_TPL_ABANDONED", "abandoned_checkout").strip()
+SHOPIFY_ABANDONED_DELAY_MIN = int(os.environ.get("SHOPIFY_ABANDONED_DELAY_MIN", "60") or 60)
+
+def _shopify_verify_hmac(raw_body: bytes, header_hmac: str) -> bool:
+    if not SHOPIFY_WEBHOOK_SECRET:
+        # Not configured yet — accept but log loudly so setup isn't forgotten.
+        logger.warning("SHOPIFY_WEBHOOK_SECRET not set — accepting Shopify webhook WITHOUT verification")
+        return True
+    if not header_hmac:
+        return False
+    digest = hmac_mod.new(SHOPIFY_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    return hmac_mod.compare_digest(expected, header_hmac.strip())
+
+def _shopify_order_phone(order: dict) -> Optional[str]:
+    for path in (
+        ("shipping_address", "phone"), ("billing_address", "phone"),
+        ("customer", "phone"), ("customer", "default_address", "phone"),
+    ):
+        node: Any = order
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if node:
+            return str(node)
+    return order.get("phone")
+
+def _shopify_order_name(order: dict) -> str:
+    cust = order.get("customer") or {}
+    ship = order.get("shipping_address") or {}
+    name = " ".join(filter(None, [cust.get("first_name"), cust.get("last_name")])).strip()
+    return name or ship.get("name") or "Website Customer"
+
+def _shopify_items_summary(order: dict, max_items: int = 4) -> str:
+    items = order.get("line_items") or []
+    parts = []
+    for li in items[:max_items]:
+        title = li.get("title") or "Item"
+        variant = li.get("variant_title")
+        qty = li.get("quantity") or 1
+        label = f"{title} ({variant})" if variant and variant != "Default Title" else title
+        parts.append(f"{label} ×{qty}")
+    extra = len(items) - max_items
+    if extra > 0:
+        parts.append(f"+{extra} more")
+    return ", ".join(parts)
+
+async def _shopify_send_template_for_lead(lead: dict, tpl_name: str, params: List[str]) -> None:
+    """Send a WA template to the lead, padding/truncating params to the template's
+    actual placeholder count (mirrors the welcome-template send), and log the
+    message into the conversation history."""
+    cfg = await get_wa_config()
+    try:
+        tpl_meta = await _resolve_template_meta(tpl_name, cfg["default_template_lang"])
+    except Exception:
+        tpl_meta = {}
+    required = int(tpl_meta.get("params_required") or 0)
+    body_params: Optional[List[str]] = None
+    if required > 0:
+        padded = [str(p) for p in params if str(p) != ""]
+        filler = padded[0] if padded else (lead.get("customer_name") or "Customer")
+        while len(padded) < required:
+            padded.append(filler)
+        body_params = padded[:required]
+    api_result = await wa_send_template(
+        to_phone=lead["phone"],
+        template_name=tpl_name,
+        lang_code=tpl_meta.get("language") or cfg["default_template_lang"],
+        body_params=body_params,
+    )
+    msg = {
+        "id": str(uuid.uuid4()),
+        "lead_id": lead["id"],
+        "direction": "out",
+        "body": f"[Template: {tpl_name}] sent to {lead['phone']}",
+        "template_name": tpl_name,
+        "status": api_result.get("status", "failed"),
+        "wamid": api_result.get("wamid"),
+        "error": api_result.get("error"),
+        "error_code": api_result.get("code"),
+        "at": iso(now_utc()),
+        "by_user_id": None,
+    }
+    await db.messages.insert_one(msg.copy())
+    if msg["status"] in ("sent", "delivered", "read", "sent_mock"):
+        await db.leads.update_one({"id": lead["id"]}, {"$set": {"has_whatsapp": True, "last_message_at": msg["at"]}})
+    else:
+        logger.warning(f"Shopify WA template '{tpl_name}' failed for lead {lead['id']}: {msg.get('error')}")
+
+async def _shopify_handle_order_created(order: dict) -> dict:
+    order_no = order.get("name") or f"#{order.get('order_number', '')}"
+    phone = _shopify_order_phone(order)
+    name = _shopify_order_name(order)
+    email = (order.get("customer") or {}).get("email") or order.get("email")
+    ship = order.get("shipping_address") or {}
+    total = order.get("total_price") or "0"
+    currency = order.get("currency") or "INR"
+    items_summary = _shopify_items_summary(order)
+    requirement = f"Website order {order_no} · {currency} {total} · {items_summary}"
+    data = {
+        "customer_name": name,
+        "phone": phone,
+        "email": email,
+        "requirement": requirement,
+        "area": ship.get("address1"),
+        "city": ship.get("city"),
+        "state": ship.get("province"),
+        "country": ship.get("country"),
+        "source": "Website",
+        "enquiry_type": "order",
+        "source_data": {
+            "shopify_order_id": order.get("id"),
+            "order_number": order_no,
+            "total_price": total,
+            "currency": currency,
+            "financial_status": order.get("financial_status"),
+            "items": items_summary,
+            "order_status_url": order.get("order_status_url"),
+            "gateway": order.get("gateway") or (order.get("payment_gateway_names") or [None])[0],
+        },
+        "_suppress_auto_welcome": True,
+    }
+    lead = await _create_lead_internal(data, by_user_id=None)
+    await log_activity(None, "website_order", lead["id"], {"order": order_no, "total": f"{currency} {total}"})
+    # WhatsApp UTILITY message: order confirmation ({{1}}=name, {{2}}=order no, {{3}}=total)
+    if phone:
+        try:
+            await _shopify_send_template_for_lead(
+                lead, SHOPIFY_TPL_ORDER_CONFIRM,
+                [name, order_no, f"{currency} {total}"],
+            )
+        except Exception as e:
+            logger.warning(f"Shopify order-confirmation WA failed: {e}")
+    return {"lead_id": lead["id"], "order": order_no}
+
+async def _shopify_handle_fulfillment_created(fulfillment: dict) -> dict:
+    order_no = fulfillment.get("name") or ""
+    if order_no and "." in order_no:
+        order_no = order_no.split(".")[0]
+    dest = fulfillment.get("destination") or {}
+    phone = dest.get("phone")
+    tracking_no = fulfillment.get("tracking_number") or ""
+    tracking_url = fulfillment.get("tracking_url") or ""
+    company = fulfillment.get("tracking_company") or "our courier"
+    lead = None
+    if phone:
+        lead = await _find_lead_by_phone(str(phone))
+    if not lead and fulfillment.get("order_id"):
+        lead = await db.leads.find_one(
+            {"source_data.shopify_order_id": fulfillment["order_id"]},
+            {"_id": 0, "raw_email_html": 0, "raw_email_text": 0},
+        )
+    if not lead or not lead.get("phone"):
+        return {"skipped": "no matching lead/phone", "order": order_no}
+    tracking_bits = " ".join(filter(None, [tracking_no, tracking_url])) or "your order-status page"
+    # WhatsApp UTILITY message: shipped ({{1}}=name, {{2}}=order no, {{3}}=carrier, {{4}}=tracking)
+    try:
+        await _shopify_send_template_for_lead(
+            lead, SHOPIFY_TPL_ORDER_SHIPPED,
+            [lead.get("customer_name") or "Customer", order_no or "your order", company, tracking_bits],
+        )
+    except Exception as e:
+        logger.warning(f"Shopify shipped WA failed: {e}")
+    await log_activity(None, "website_order_shipped", lead["id"], {"order": order_no, "tracking": tracking_no})
+    return {"lead_id": lead["id"], "order": order_no}
+
+async def _shopify_handle_checkout_upsert(checkout: dict) -> dict:
+    """Track a storefront checkout (checkouts/create|update). If it never converts,
+    abandoned_checkout_task() sends a WhatsApp reminder after SHOPIFY_ABANDONED_DELAY_MIN."""
+    token = str(checkout.get("token") or checkout.get("id") or "").strip()
+    if not token:
+        return {"skipped": "no checkout token"}
+    phone = _shopify_order_phone(checkout) or checkout.get("phone")
+    name = _shopify_order_name(checkout)
+    completed = bool(checkout.get("completed_at"))
+    now_iso = iso(now_utc())
+    doc = {
+        "checkout_id": checkout.get("id"),
+        "phone": str(phone) if phone else None,
+        "customer_name": name,
+        "email": checkout.get("email") or (checkout.get("customer") or {}).get("email"),
+        "items": _shopify_items_summary(checkout),
+        "total_price": checkout.get("total_price") or "0",
+        "currency": checkout.get("currency") or "INR",
+        "recovery_url": checkout.get("abandoned_checkout_url") or "",
+        "updated_at": now_iso,
+    }
+    if completed:
+        doc["status"] = "converted"
+    await db.abandoned_checkouts.update_one(
+        {"token": token},
+        {"$set": doc, "$setOnInsert": {"token": token, "created_at": now_iso, "status": "pending", "reminder_sent_at": None}},
+        upsert=True,
+    )
+    if completed:
+        await db.abandoned_checkouts.update_one({"token": token}, {"$set": {"status": "converted"}})
+    return {"checkout": token, "phone_present": bool(phone), "completed": completed}
+
+
+async def _shopify_mark_checkout_converted(order: dict) -> None:
+    """Called from orders/create so a completed purchase never gets an abandoned-cart nudge."""
+    ors = []
+    if order.get("checkout_token"):
+        ors.append({"token": str(order["checkout_token"])})
+    if order.get("checkout_id"):
+        ors.append({"checkout_id": order["checkout_id"]})
+    phone = _shopify_order_phone(order)
+    if phone:
+        ors.append({"phone": str(phone)})
+    if not ors:
+        return
+    await db.abandoned_checkouts.update_many(
+        {"$or": ors, "status": {"$ne": "converted"}},
+        {"$set": {"status": "converted", "converted_at": iso(now_utc())}},
+    )
+
+
+async def abandoned_checkout_task():
+    """Every 10 min: WhatsApp-remind checkouts that stalled > SHOPIFY_ABANDONED_DELAY_MIN ago.
+    One reminder per checkout; each becomes/updates a Website lead so execs can follow up."""
+    cutoff = iso(now_utc() - timedelta(minutes=SHOPIFY_ABANDONED_DELAY_MIN))
+    stale = iso(now_utc() - timedelta(days=3))  # don't dredge up ancient carts
+    cursor = db.abandoned_checkouts.find({
+        "status": "pending",
+        "reminder_sent_at": None,
+        "phone": {"$nin": [None, ""]},
+        "updated_at": {"$lt": cutoff, "$gt": stale},
+    }, {"_id": 0}).limit(20)
+    async for co in cursor:
+        try:
+            # Atomic claim: gunicorn runs one scheduler per worker, so without this
+            # a checkout could be reminded up to N-workers times.
+            claimed = await db.abandoned_checkouts.find_one_and_update(
+                {"token": co["token"], "reminder_sent_at": None},
+                {"$set": {"reminder_sent_at": iso(now_utc()), "status": "reminding"}},
+            )
+            if not claimed:
+                continue
+            lead = await _find_lead_by_phone(co["phone"])
+            if not lead:
+                lead = await _create_lead_internal({
+                    "customer_name": co.get("customer_name") or "Website Visitor",
+                    "phone": co["phone"],
+                    "email": co.get("email"),
+                    "requirement": f"Abandoned checkout · {co.get('currency')} {co.get('total_price')} · {co.get('items')}",
+                    "source": "Website",
+                    "enquiry_type": "abandoned_checkout",
+                    "source_data": {
+                        "checkout_token": co.get("token"),
+                        "recovery_url": co.get("recovery_url"),
+                        "total_price": co.get("total_price"),
+                        "items": co.get("items"),
+                    },
+                    "_suppress_auto_welcome": True,
+                }, by_user_id=None)
+                await log_activity(None, "abandoned_checkout", lead["id"], {"total": f"{co.get('currency')} {co.get('total_price')}"})
+            # {{1}}=name, {{2}}=items, {{3}}=recovery link
+            await _shopify_send_template_for_lead(
+                lead, SHOPIFY_TPL_ABANDONED,
+                [co.get("customer_name") or "there", co.get("items") or "your items", co.get("recovery_url") or "https://www.citspray.com/cart"],
+            )
+            await db.abandoned_checkouts.update_one(
+                {"token": co["token"]},
+                {"$set": {"status": "reminded", "lead_id": lead["id"]}},
+            )
+        except Exception as e:
+            logger.warning(f"abandoned_checkout_task failed for {co.get('token')}: {e}")
+            await db.abandoned_checkouts.update_one(
+                {"token": co["token"]},
+                {"$set": {"status": "error"}},
+            )
+
+
+@api.post("/webhooks/shopify")
+async def webhook_shopify(request: Request):
+    raw = await request.body()
+    header_hmac = request.headers.get("X-Shopify-Hmac-Sha256", "")
+    topic = request.headers.get("X-Shopify-Topic", "")
+    if not _shopify_verify_hmac(raw, header_hmac):
+        raise HTTPException(status_code=401, detail="invalid hmac")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        payload = {}
+    await db.webhook_payloads.insert_one({
+        "id": str(uuid.uuid4()),
+        "source": "Shopify",
+        "topic": topic,
+        "payload": payload,
+        "received_at": iso(now_utc()),
+        "processed": False,
+    })
+    result: dict = {"ok": True, "topic": topic}
+    try:
+        if topic == "orders/create":
+            await _shopify_mark_checkout_converted(payload)
+            result.update(await _shopify_handle_order_created(payload))
+        elif topic in ("checkouts/create", "checkouts/update"):
+            result.update(await _shopify_handle_checkout_upsert(payload))
+        elif topic in ("fulfillments/create", "fulfillments/update"):
+            # Only message on first tracking availability for updates
+            if topic == "fulfillments/create" or payload.get("tracking_number"):
+                result.update(await _shopify_handle_fulfillment_created(payload))
+        else:
+            result["skipped"] = f"unhandled topic {topic}"
+    except Exception as e:
+        logger.exception(f"Shopify webhook processing failed: {e}")
+        result = {"ok": True, "error": "processing_failed"}  # 200 so Shopify doesn't retry-storm
+    return result
+
+@api.get("/webhooks/shopify/_debug/recent")
+async def webhook_shopify_recent(admin: dict = Depends(require_admin), limit: int = 20):
+    docs = await db.webhook_payloads.find(
+        {"source": "Shopify"}, {"_id": 0, "payload.line_items": 0}
     ).sort("received_at", -1).to_list(limit)
     return docs
 
@@ -7190,6 +7951,38 @@ async def webhook_whatsapp(request: Request):
                     )
                     created_msgs += 1
 
+                    # ---- Attendance-aware urgent reassign ----
+                    # Customer messaged, but the assigned exec is on leave / never
+                    # punched in / already punched out → hand the conversation to an
+                    # available exec immediately (office hours only, so assignments
+                    # don't churn every night).
+                    try:
+                        assigned_uid = lead.get("assigned_to")
+                        att_cfg = await get_attendance_config()
+                        if assigned_uid and att_cfg.get("attendance_routing_enabled", True) and await _office_open_now(att_cfg):
+                            owner = await db.users.find_one({"id": assigned_uid, "active": True}, {"_id": 0, "password_hash": 0})
+                            owner_ok = False
+                            if owner:
+                                if not await _is_user_on_leave(assigned_uid):
+                                    owner_ok = await _is_user_available_by_attendance(owner)
+                            if not owner_ok:
+                                new_uid = await _auto_reassign_lead(lead["id"], assigned_uid, "wa_inbound_owner_unavailable")
+                                if new_uid:
+                                    await db.leads.update_one({"id": lead["id"]}, {"$set": {
+                                        "last_reassigned_at": iso(now_utc()),
+                                        "sort_at": iso(now_utc()),
+                                        "wa_reassign_notice": {
+                                            "from_user_id": assigned_uid,
+                                            "from_user_name": (owner or {}).get("name"),
+                                            "to_user_id": new_uid,
+                                            "at": iso(now_utc()),
+                                            "reason": "customer_message_while_owner_away",
+                                        },
+                                    }})
+                                    logger.info(f"WA inbound: lead {lead['id'][:8]} reassigned {assigned_uid} → {new_uid} (owner away)")
+                    except Exception as _e:
+                        logger.warning(f"inbound availability reassign failed: {_e}")
+
                     # ---- Auto-Reply Sequence Trigger ----
                     if not lead.get("auto_reply_sequence_triggered"):
                         # Only consume the first-time token when the sequence is actually live.
@@ -7357,6 +8150,22 @@ async def auto_reassign_task():
         async for lead in cursor2:
             await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_noaction")
 
+        # Stale: leads still status='new' N days (default 3) after their last assignment
+        # → force a fresh round-robin so no enquiry rots in a dead queue.
+        try:
+            att_cfg = await get_attendance_config()
+            stale_days = int(att_cfg.get("stale_new_days") or 3)
+            stale_cutoff = iso(now_utc() - timedelta(days=stale_days))
+            cursor3 = db.leads.find({
+                "assigned_to": {"$ne": None},
+                "status": "new",
+                "last_assignment_at": {"$lt": stale_cutoff},
+            }, {"_id": 0, "id": 1, "assigned_to": 1}).sort("last_assignment_at", 1).limit(20)
+            async for lead in cursor3:
+                await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_stale")
+        except Exception as e:
+            logger.warning(f"stale-new reassign pass failed: {e}")
+
         # Followups: mark missed
         await db.followups.update_many(
             {"status": "pending", "due_at": {"$lt": iso(now_utc() - timedelta(minutes=30))}},
@@ -7366,6 +8175,148 @@ async def auto_reassign_task():
         logger.exception(f"auto_reassign_task failed: {e}")
     finally:
         await _release_reassign_lock()
+
+
+async def attendance_monitor_task():
+    """Every 10 min: raise admin flags for attendance rule breaches.
+    All alerts are deduped per employee+date, so re-runs are harmless."""
+    try:
+        cfg = await get_attendance_config()
+        now = _ist_now()
+        today = now.strftime("%Y-%m-%d")
+        now_m = now.hour * 60 + now.minute
+        office_start_m = _hhmm_to_minutes(cfg["office_start"], 630)
+        late_until_m = _hhmm_to_minutes(cfg["late_grace_until"], 660)
+        half_cutoff_m = _hhmm_to_minutes(cfg["half_day_cutoff"], 900)
+        office_end_m = _hhmm_to_minutes(cfg["office_end"], 1140)
+        full_out_m = office_end_m - int(cfg.get("full_day_out_grace_minutes") or 0)
+        streak_n = int(cfg.get("late_streak_threshold") or 3)
+
+        employees = await db.users.find(
+            {"active": True, "role": {"$ne": "admin"}}, {"_id": 0, "password_hash": 0}).to_list(200)
+        employees = [u for u in employees if u.get("username") not in ("scanner", "test_user")
+                     and (u.get("employee_code") or u.get("role") == "executive")]
+
+        def _mins_of(t):
+            try:
+                return int(t[11:13]) * 60 + int(t[14:16])
+            except Exception:
+                return None
+
+        async def _is_workday(d_str):
+            dt = datetime.strptime(d_str, "%Y-%m-%d")
+            if dt.weekday() == 6:
+                return False
+            hol = await db.holidays.find_one({"date": d_str}, {"_id": 0, "holiday_type": 1})
+            return not (hol and (hol.get("holiday_type") or "full") == "full")
+
+        today_is_workday = await _is_workday(today)
+
+        for u in employees:
+            uid = u["id"]
+            log = await db.attendance_logs.find_one({"user_id": uid, "date": today}, {"_id": 0})
+            in_m = _mins_of((log or {}).get("check_in", {}).get("time") or "")
+            out_m = _mins_of(((log or {}).get("check_out") or {}).get("time") or "")
+
+            if today_is_workday and in_m is not None:
+                # Arrival after the 11:00 grace — no salary cut, but flag it
+                if in_m > late_until_m:
+                    await create_system_alert(
+                        "late_arrival",
+                        f"Late arrival: {u['name']}",
+                        f"{u['name']} punched in at {(log or {}).get('check_in', {}).get('time', '')[11:16]} "
+                        f"(after {cfg['late_grace_until']}) on {today}.",
+                        dedup_key=f"after11:{uid}:{today}",
+                    )
+
+                # Consecutive-late streak (arrivals after office_start on consecutive workdays)
+                streak = 1 if in_m > office_start_m else 0
+                if streak:
+                    d = datetime.strptime(today, "%Y-%m-%d")
+                    back = 0
+                    while streak < streak_n + 3 and back < 10:
+                        back += 1
+                        d_prev = (d - timedelta(days=back)).strftime("%Y-%m-%d")
+                        if not await _is_workday(d_prev):
+                            continue
+                        prev_log = await db.attendance_logs.find_one({"user_id": uid, "date": d_prev}, {"_id": 0})
+                        prev_in = _mins_of((prev_log or {}).get("check_in", {}).get("time") or "")
+                        if prev_in is not None and prev_in > office_start_m:
+                            streak += 1
+                        else:
+                            break
+                    if streak >= streak_n:
+                        await create_system_alert(
+                            "late_streak",
+                            f"Repeated late arrivals: {u['name']}",
+                            f"{u['name']} has arrived after {cfg['office_start']} for {streak} working days in a row "
+                            f"(latest: {today}).",
+                            dedup_key=f"latestreak:{uid}:{today}",
+                        )
+
+            # Early punch-out today (before full-day time, while the office is still open)
+            if today_is_workday and out_m is not None and out_m < full_out_m and now_m < office_end_m:
+                kind = "FULL DAY CUT (left before 3 PM)" if out_m < half_cutoff_m else "half day"
+                await create_system_alert(
+                    "early_punch_out",
+                    f"Early punch-out: {u['name']}",
+                    f"{u['name']} punched out at {((log or {}).get('check_out') or {}).get('time', '')[11:16]} on {today} — "
+                    f"counts as {kind}. No new leads will be assigned to them today.",
+                    dedup_key=f"earlyout:{uid}:{today}",
+                )
+
+            # Yesterday's missing punch-out
+            yday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+            if await _is_workday(yday) and (u.get("joining_date") or "0000") <= yday:
+                ylog = await db.attendance_logs.find_one({"user_id": uid, "date": yday}, {"_id": 0})
+                if ylog and ylog.get("check_in") and not ylog.get("check_out"):
+                    await create_system_alert(
+                        "missing_punch_out",
+                        f"Missing punch-out: {u['name']}",
+                        f"{u['name']} punched in on {yday} but never punched out. "
+                        f"Payroll counts it as a half day until you correct it in the Payroll page.",
+                        dedup_key=f"noout:{uid}:{yday}",
+                    )
+
+            # Salary pay-date reminder: pay date = joining-day anniversary + 8.
+            # Remind the day BEFORE (and again on the day) until marked paid.
+            try:
+                jd = u.get("joining_date")
+                if jd and float(u.get("base_salary") or 0) > 0:
+                    import calendar as _cal
+                    jday = int(jd[8:10])
+                    t = now.date()
+
+                    def _anchor(y, m):
+                        return datetime(y, m, min(jday, _cal.monthrange(y, m)[1])).date()
+
+                    a_cur = _anchor(t.year, t.month)
+                    if a_cur > t:
+                        pm_y, pm_m = (t.year - 1, 12) if t.month == 1 else (t.year, t.month - 1)
+                        a_cur = _anchor(pm_y, pm_m)
+                    pm_y, pm_m = (a_cur.year - 1, 12) if a_cur.month == 1 else (a_cur.year, a_cur.month - 1)
+                    a_prev = _anchor(pm_y, pm_m)
+                    cycle_start = a_prev.strftime("%Y-%m-%d")
+                    cycle_end = (a_cur - timedelta(days=1)).strftime("%Y-%m-%d")
+                    pay_date = a_cur + timedelta(days=8)
+                    delta_days = (pay_date - t).days
+                    if delta_days in (0, 1):
+                        paid = await db.salary_payments.find_one({
+                            "user_id": uid, "period_start": cycle_start,
+                            "period_end": cycle_end, "paid": True}, {"_id": 1})
+                        if not paid:
+                            when = "TOMORROW" if delta_days == 1 else "TODAY"
+                            await create_system_alert(
+                                "salary_due",
+                                f"Salary due {when}: {u['name']}",
+                                f"{u['name']}'s salary for {cycle_start} → {cycle_end} is due on {pay_date} "
+                                f"(joining day + 8). Open Payroll → their Sheet to review, pay, and tick 'Salary Paid'.",
+                                dedup_key=f"salarydue:{uid}:{pay_date}:{when}",
+                            )
+            except Exception as _pe:
+                logger.warning(f"salary reminder failed for {u.get('name')}: {_pe}")
+    except Exception as e:
+        logger.exception(f"attendance_monitor_task failed: {e}")
 
 # ------------- System settings (WhatsApp runtime overrides) -------------
 def _mask_token(t: str) -> str:
@@ -8883,6 +9834,27 @@ async def seed_data():
             logger.info("Seeded data entry user Gayatri")
     except DuplicateKeyError:
         pass
+
+    # Seed Scanner Device User
+    scanner_uname = "scanner"
+    scanner_pwd = "CitSpray1"
+    scanner_name = "Attendance Device Scanner"
+    try:
+        existing_scanner = await db.users.find_one({"username": scanner_uname})
+        if not existing_scanner:
+            await db.users.insert_one({
+                "id": str(uuid.uuid4()),
+                "username": scanner_uname,
+                "name": scanner_name,
+                "password_hash": hash_password(scanner_pwd),
+                "role": "data_entry",
+                "active": True,
+                "scanner_access": True,
+                "created_at": iso(now_utc()),
+            })
+            logger.info("Seeded scanner device user")
+    except DuplicateKeyError:
+        pass
   
 
 
@@ -9104,6 +10076,14 @@ async def on_startup():
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(auto_reassign_task, "interval", minutes=1, id="auto_reassign", max_instances=1, coalesce=True)
     scheduler.add_job(check_due_followups_task, "interval", seconds=10, id="check_due_followups", max_instances=1, coalesce=True)
+    scheduler.add_job(attendance_monitor_task, "interval", minutes=10, id="attendance_monitor", max_instances=1, coalesce=True)
+    scheduler.add_job(abandoned_checkout_task, "interval", minutes=10, id="abandoned_checkout", max_instances=1, coalesce=True)
+    try:
+        await db.attendance_logs.create_index([("user_id", 1), ("date", 1)])
+        await db.leaves.create_index([("user_id", 1), ("start_date", 1)])
+        await db.admin_alerts.create_index([("meta.dedup_key", 1)])
+    except Exception as _e:
+        logger.warning(f"index creation skipped: {_e}")
     logger.info("DEBUG STARTUP: counting gmail_connections...")
     has_gmail_conns = await db.gmail_connections.count_documents({}) > 0
     logger.info(f"DEBUG STARTUP: gmail connections count done (has_gmail_conns={has_gmail_conns}). GMAIL_ENABLED={GMAIL_ENABLED}")
@@ -9442,6 +10422,1035 @@ async def translate_text(body: TranslateRequest, user: dict = Depends(get_curren
     except Exception as e:
         logger.error(f"Translation failed: {e}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
+
+# ------------- Attendance & Payroll Endpoints -------------
+
+@api.get("/holidays")
+async def list_holidays(user: dict = Depends(get_current_user)):
+    hols = await db.holidays.find().to_list(1000)
+    for h in hols:
+        h.pop("_id", None)
+    return hols
+
+@api.post("/holidays")
+async def create_holiday(body: HolidayCreate, admin: dict = Depends(require_admin)):
+    existing = await db.holidays.find_one({"date": body.date})
+    if existing:
+        raise HTTPException(status_code=409, detail="Holiday for this date already exists")
+    if body.holiday_type == "early_off" and not body.early_off_time:
+        raise HTTPException(status_code=400, detail="early_off_time (HH:MM) required for an early-off day")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "date": body.date,
+        "name": body.name,
+        "is_paid": body.is_paid,
+        "holiday_type": body.holiday_type,
+        "early_off_time": body.early_off_time,
+    }
+    await db.holidays.insert_one(doc.copy())
+    return doc
+
+@api.delete("/holidays/{holiday_id}")
+async def delete_holiday(holiday_id: str, admin: dict = Depends(require_admin)):
+    res = await db.holidays.delete_one({"id": holiday_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Holiday not found")
+    return {"ok": True}
+
+@api.get("/attendance/status")
+async def get_attendance_status(user: dict = Depends(get_current_user)):
+    today_ist = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+    log = await db.attendance_logs.find_one({"user_id": user["id"], "date": today_ist}, {"_id": 0})
+    if not log:
+        return {"checked_in": False, "checked_out": False}
+    return {
+        "checked_in": "check_in" in log,
+        "check_in_time": log.get("check_in", {}).get("time") if log else None,
+        "checked_out": "check_out" in log,
+        "check_out_time": log.get("check_out", {}).get("time") if log else None
+    }
+
+class ManualPunchInput(BaseModel):
+    username: str
+    password: str
+
+@api.post("/attendance/punch")
+async def punch_attendance(user: dict = Depends(get_current_user)):
+    today_ist = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+    now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    now_str = now_ist.isoformat()
+    
+    settings_doc = await db.attendance_settings.find_one({"key": "general_settings"}) or {}
+    log = await db.attendance_logs.find_one({"user_id": user["id"], "date": today_ist})
+    
+    if not log:
+        # Punch In
+        log_doc = {
+            "id": str(uuid.uuid4()),
+            "user_id": user["id"],
+            "date": today_ist,
+            "check_in": {
+                "time": now_str,
+                "photo_path": "web_dashboard_punch",
+                "verification_score": 0.0
+            },
+            "status": "present"
+        }
+        
+        shift_start_str = settings_doc.get("shift_start", "09:30")
+        grace_mins = settings_doc.get("grace_period_minutes", 15)
+        try:
+            sh_h, sh_m = map(int, shift_start_str.split(":"))
+            checkin_h, checkin_m = now_ist.hour, now_ist.minute
+            minutes_late = (checkin_h * 60 + checkin_m) - (sh_h * 60 + sh_m)
+            if minutes_late > grace_mins:
+                log_doc["status"] = "late"
+        except Exception:
+            pass
+            
+        await db.attendance_logs.insert_one(log_doc.copy())
+        return {
+            "status": "success",
+            "action": "check_in",
+            "user_name": user["name"],
+            "time": now_str
+        }
+        
+    elif "check_out" not in log:
+        # Punch Out
+        total_hours = 0.0
+        try:
+            in_time = datetime.fromisoformat(log["check_in"]["time"])
+            diff = now_ist - in_time
+            total_hours = round(diff.total_seconds() / 3600.0, 2)
+        except Exception:
+            pass
+            
+        update_fields = {
+            "check_out": {
+                "time": now_str,
+                "photo_path": "web_dashboard_punch",
+                "verification_score": 0.0
+            },
+            "total_hours": total_hours
+        }
+        
+        await db.attendance_logs.update_one({"id": log["id"]}, {"$set": update_fields})
+        return {
+            "status": "success",
+            "action": "check_out",
+            "user_name": user["name"],
+            "time": now_str,
+            "total_hours": total_hours
+        }
+    else:
+        raise HTTPException(status_code=400, detail="Already checked out for today")
+
+@api.post("/attendance/manual-punch")
+async def manual_punch(body: ManualPunchInput):
+    uname = body.username.strip().lower()
+    user = await db.users.find_one({"username": uname})
+    if not user or not verify_password(body.password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not user.get("active", True):
+        raise HTTPException(status_code=403, detail="Account disabled")
+        
+    today_ist = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+    now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    now_str = now_ist.isoformat()
+    
+    settings_doc = await db.attendance_settings.find_one({"key": "general_settings"}) or {}
+    log = await db.attendance_logs.find_one({"user_id": user["id"], "date": today_ist})
+    
+    if not log:
+        # Check in
+        log_doc = {
+            "id": str(uuid.uuid4()),
+            "user_id": user["id"],
+            "date": today_ist,
+            "check_in": {
+                "time": now_str,
+                "photo_path": "manual_punch",
+                "verification_score": 0.0
+            },
+            "status": "present"
+        }
+        
+        shift_start_str = settings_doc.get("shift_start", "09:30")
+        grace_mins = settings_doc.get("grace_period_minutes", 15)
+        try:
+            sh_h, sh_m = map(int, shift_start_str.split(":"))
+            checkin_h, checkin_m = now_ist.hour, now_ist.minute
+            minutes_late = (checkin_h * 60 + checkin_m) - (sh_h * 60 + sh_m)
+            if minutes_late > grace_mins:
+                log_doc["status"] = "late"
+        except Exception:
+            pass
+            
+        await db.attendance_logs.insert_one(log_doc.copy())
+        return {
+            "status": "success",
+            "action": "check_in",
+            "user_name": user["name"],
+            "time": now_str
+        }
+        
+    elif "check_out" not in log:
+        # Check out
+        total_hours = 0.0
+        try:
+            in_time = datetime.fromisoformat(log["check_in"]["time"])
+            diff = now_ist - in_time
+            total_hours = round(diff.total_seconds() / 3600.0, 2)
+        except Exception:
+            pass
+            
+        update_fields = {
+            "check_out": {
+                "time": now_str,
+                "photo_path": "manual_punch",
+                "verification_score": 0.0
+            },
+            "total_hours": total_hours
+        }
+        
+        await db.attendance_logs.update_one({"id": log["id"]}, {"$set": update_fields})
+        return {
+            "status": "success",
+            "action": "check_out",
+            "user_name": user["name"],
+            "time": now_str,
+            "total_hours": total_hours
+        }
+    else:
+        raise HTTPException(status_code=400, detail="Already checked out for today")
+
+
+# ------------- ZKTeco / eSSL ADMS (iClock) Protocol Endpoints -------------
+
+async def _register_device_punch(emp_code: str, time_str: str):
+    user = await db.users.find_one({"employee_code": emp_code, "active": True})
+    if not user:
+        logger.warning(f"Device punch: user with employee_code={emp_code} not found or inactive")
+        return False
+        
+    try:
+        dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        try:
+            dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+        except Exception:
+            dt = datetime.now()
+            
+    punch_date = dt.strftime("%Y-%m-%d")
+    punch_time_str = dt.isoformat()
+    
+    log = await db.attendance_logs.find_one({"user_id": user["id"], "date": punch_date})
+    settings_doc = await db.attendance_settings.find_one({"key": "general_settings"}) or {}
+    
+    if not log:
+        log_doc = {
+            "id": str(uuid.uuid4()),
+            "user_id": user["id"],
+            "date": punch_date,
+            "check_in": {
+                "time": punch_time_str,
+                "photo_path": "fingerprint_device",
+                "verification_score": 0.0
+            },
+            "status": "present"
+        }
+        
+        shift_start_str = settings_doc.get("shift_start", "09:30")
+        grace_mins = settings_doc.get("grace_period_minutes", 15)
+        try:
+            sh_h, sh_m = map(int, shift_start_str.split(":"))
+            checkin_h, checkin_m = dt.hour, dt.minute
+            minutes_late = (checkin_h * 60 + checkin_m) - (sh_h * 60 + sh_m)
+            if minutes_late > grace_mins:
+                log_doc["status"] = "late"
+        except Exception:
+            pass
+            
+        await db.attendance_logs.insert_one(log_doc.copy())
+        logger.info(f"Registered check-in for user {user['name']} via fingerprint device")
+        return True
+        
+    elif "check_out" not in log:
+        total_hours = 0.0
+        try:
+            in_time = datetime.fromisoformat(log["check_in"]["time"])
+            diff = dt - in_time
+            total_hours = round(diff.total_seconds() / 3600.0, 2)
+        except Exception:
+            pass
+            
+        update_fields = {
+            "check_out": {
+                "time": punch_time_str,
+                "photo_path": "fingerprint_device",
+                "verification_score": 0.0
+            },
+            "total_hours": total_hours
+        }
+        
+        await db.attendance_logs.update_one({"id": log["id"]}, {"$set": update_fields})
+        logger.info(f"Registered check-out for user {user['name']} via fingerprint device")
+        return True
+    else:
+        logger.info(f"User {user['name']} already checked out today. Ignoring extra device punch.")
+        return False
+
+@api.get("/iclock/cdata")
+@api.get("/iclock/cdata.aspx")
+async def iclock_get(request: Request, SN: Optional[str] = Query(None)):
+    res_text = (
+        f"GET OPTION FROM: {SN or 'device'}\n"
+        "Stamp=0\n"
+        "OpStamp=0\n"
+        "ErrorDelay=30\n"
+        "Delay=10\n"
+        "TransInterval=1\n"
+        "TransFlag=1111111111\n"
+        "Realtime=1\n"
+        "SessionID=1234567890\n"
+    )
+    return Response(content=res_text, media_type="text/plain")
+
+@api.post("/iclock/cdata")
+@api.post("/iclock/cdata.aspx")
+async def iclock_post(request: Request, table: str = Query(...), SN: str = Query(...)):
+    body = await request.body()
+    content = body.decode('utf-8', errors='ignore')
+    logger.info(f"ADMS Post received: table={table}, SN={SN}, body={content}")
+    
+    if table.upper() == "ATTLOG":
+        lines = content.splitlines()
+        success_count = 0
+        for line in lines:
+            if not line.strip():
+                continue
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                emp_code = parts[0]
+                time_str = parts[1]
+                if len(parts) >= 3:
+                    time_str = parts[1] + " " + parts[2]
+                
+                try:
+                    if await _register_device_punch(emp_code, time_str):
+                        success_count += 1
+                except Exception as ex:
+                    logger.error(f"Failed to register device punch for {emp_code} at {time_str}: {ex}")
+                    
+        return Response(content=f"OK: {success_count}\n", media_type="text/plain")
+        
+    return Response(content="OK\n", media_type="text/plain")
+
+@api.get("/iclock/getrequest")
+@api.get("/iclock/getrequest.aspx")
+async def iclock_getrequest(request: Request, SN: str = Query(...)):
+    return Response(content="OK\n", media_type="text/plain")
+
+@api.post("/iclock/devicecmd")
+@api.post("/iclock/devicecmd.aspx")
+async def iclock_devicecmd(request: Request, SN: str = Query(...)):
+    return Response(content="OK\n", media_type="text/plain")
+
+@api.post("/attendance/register-face")
+async def register_face(body: FaceRegisterInput, admin: dict = Depends(require_admin)):
+    u = await db.users.find_one({"id": body.user_id})
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    await db.users.update_one({"id": body.user_id}, {"$set": {"face_embedding": body.face_embedding}})
+    return {"ok": True, "message": f"Successfully registered face embedding for {u.get('name')}"}
+
+@api.post("/attendance/verify")
+async def verify_attendance(body: FaceVerifyInput, request: Request, scanner_user: dict = Depends(get_current_user)):
+    import numpy as np
+    import base64
+
+    # Verify that the scanner_user is indeed active and has scanner access (or admin)
+    if not (scanner_user.get("scanner_access") or scanner_user.get("role") == "admin"):
+        raise HTTPException(status_code=403, detail="Only scanner devices or admins can perform attendance verification")
+    
+    settings_doc = await db.attendance_settings.find_one({"key": "general_settings"}) or {}
+    if settings_doc.get("enforce_ip_lock") and settings_doc.get("allowed_office_ips"):
+        client_ip = request.client.host
+        if client_ip not in settings_doc["allowed_office_ips"]:
+            raise HTTPException(status_code=403, detail=f"IP {client_ip} not authorized for scanner device")
+            
+    users = await db.users.find({
+        "face_embedding": {"$exists": True, "$ne": None}, 
+        "active": True
+    }, {"_id": 0, "id": 1, "name": 1, "username": 1, "face_embedding": 1}).to_list(1000)
+    
+    if not users:
+        raise HTTPException(status_code=404, detail="No users with registered face embeddings found in database")
+        
+    uploaded_vector = np.array(body.face_embedding)
+    best_user = None
+    min_distance = 999.0
+    
+    for u in users:
+        db_vector = np.array(u["face_embedding"])
+        dist = np.linalg.norm(uploaded_vector - db_vector)
+        if dist < min_distance:
+            min_distance = dist
+            best_user = u
+            
+    match_threshold = settings_doc.get("match_threshold", 0.6)
+    if min_distance > match_threshold:
+        raise HTTPException(status_code=401, detail=f"No matching face found (best score: {round(min_distance, 3)})")
+        
+    today_ist = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+    now_ist = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30))
+    now_str = now_ist.isoformat()
+    
+    photo_path = None
+    if body.photo_base64:
+        try:
+            header, encoded = body.photo_base64.split(",", 1)
+            file_data = base64.b64decode(encoded)
+            filename = f"attendance_{best_user['id']}_{now_ist.strftime('%Y%m%d_%H%M%S')}.jpg"
+            dest_file = UPLOAD_DIR / filename
+            with open(dest_file, "wb") as f:
+                f.write(file_data)
+            photo_path = f"api/uploads/{filename}"
+        except Exception as e:
+            logger.error(f"Failed to save attendance photo: {e}")
+            
+    log = await db.attendance_logs.find_one({"user_id": best_user["id"], "date": today_ist})
+    
+    if not log:
+        log_doc = {
+            "id": str(uuid.uuid4()),
+            "user_id": best_user["id"],
+            "date": today_ist,
+            "check_in": {
+                "time": now_str,
+                "photo_path": photo_path,
+                "verification_score": float(min_distance)
+            },
+            "status": "present"
+        }
+        
+        shift_start_str = settings_doc.get("shift_start", "09:30")
+        grace_mins = settings_doc.get("grace_period_minutes", 15)
+        try:
+            sh_h, sh_m = map(int, shift_start_str.split(":"))
+            checkin_h, checkin_m = now_ist.hour, now_ist.minute
+            minutes_late = (checkin_h * 60 + checkin_m) - (sh_h * 60 + sh_m)
+            if minutes_late > grace_mins:
+                log_doc["status"] = "late"
+        except Exception:
+            pass
+            
+        await db.attendance_logs.insert_one(log_doc.copy())
+        return {
+            "status": "success",
+            "action": "check_in",
+            "user_name": best_user["name"],
+            "time": now_str
+        }
+        
+    elif "check_out" not in log:
+        total_hours = 0.0
+        try:
+            in_time = datetime.fromisoformat(log["check_in"]["time"])
+            diff = now_ist - in_time
+            total_hours = round(diff.total_seconds() / 3600.0, 2)
+        except Exception:
+            pass
+            
+        update_fields = {
+            "check_out": {
+                "time": now_str,
+                "photo_path": photo_path,
+                "verification_score": float(min_distance)
+            },
+            "total_hours": total_hours
+        }
+        
+        await db.attendance_logs.update_one({"id": log["id"]}, {"$set": update_fields})
+        return {
+            "status": "success",
+            "action": "check_out",
+            "user_name": best_user["name"],
+            "time": now_str,
+            "total_hours": total_hours
+        }
+    else:
+        return {
+            "status": "already_completed",
+            "user_name": best_user["name"],
+            "message": "Already checked out for today"
+        }
+
+@api.get("/attendance/settings")
+async def get_attendance_settings_ep(admin: dict = Depends(require_admin)):
+    cfg = await get_attendance_config()
+    users = await db.users.find(
+        {"active": True, "role": {"$ne": "admin"}},
+        {"_id": 0, "id": 1, "name": 1, "username": 1, "role": 1}
+    ).to_list(200)
+    cfg["all_users"] = [u for u in users if u.get("username") not in ("scanner", "test_user")]
+    return cfg
+
+
+@api.put("/attendance/settings")
+async def update_attendance_settings_ep(body: AttendanceSettingsInput, admin: dict = Depends(require_admin)):
+    patch = {k: v for k, v in body.dict().items() if v is not None}
+    if not patch:
+        raise HTTPException(status_code=400, detail="No changes supplied")
+    patch["updated_by"] = admin["id"]
+    patch["updated_at"] = iso(now_utc())
+    await db.attendance_settings.update_one({"key": "general_settings"}, {"$set": patch}, upsert=True)
+    return await get_attendance_config()
+
+
+@api.post("/attendance/edit")
+async def edit_attendance_punch(body: PunchEditInput, admin: dict = Depends(require_admin)):
+    """Admin manual override of punch times for any employee/date.
+    Payroll recalculates automatically since it always reads attendance_logs live."""
+    if not _valid_date_str(body.date):
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    u = await db.users.find_one({"id": body.user_id}, {"_id": 0, "id": 1, "name": 1})
+    if not u:
+        raise HTTPException(status_code=404, detail="user not found")
+    log = await db.attendance_logs.find_one({"user_id": body.user_id, "date": body.date})
+
+    if body.remove:
+        if log:
+            await db.attendance_logs.delete_one({"id": log["id"]})
+            await log_activity(admin["id"], "attendance_punch_removed", None, {"user_id": body.user_id, "date": body.date})
+        return {"ok": True, "removed": True}
+
+    def _mk_time(hhmm: str) -> str:
+        try:
+            h, m = map(int, hhmm.split(":"))
+            return f"{body.date}T{h:02d}:{m:02d}:00"
+        except Exception:
+            raise HTTPException(status_code=400, detail="times must be HH:MM")
+
+    updates: Dict[str, Any] = {}
+    if body.check_in:
+        updates["check_in"] = {"time": _mk_time(body.check_in), "photo_path": "admin_manual_edit", "verification_score": 0.0}
+    if body.clear_check_out:
+        pass  # handled below via $unset
+    elif body.check_out:
+        updates["check_out"] = {"time": _mk_time(body.check_out), "photo_path": "admin_manual_edit", "verification_score": 0.0}
+
+    if not log and not updates.get("check_in"):
+        raise HTTPException(status_code=400, detail="check_in required to create a new day record")
+
+    if not log:
+        doc = {
+            "id": str(uuid.uuid4()),
+            "user_id": body.user_id,
+            "date": body.date,
+            "status": "present",
+            "edited_by": admin["id"],
+            **updates,
+        }
+        await db.attendance_logs.insert_one(doc.copy())
+        log = doc
+    else:
+        ops: Dict[str, Any] = {}
+        if updates:
+            ops["$set"] = {**updates, "edited_by": admin["id"]}
+        if body.clear_check_out:
+            ops.setdefault("$set", {})["edited_by"] = admin["id"]
+            ops["$unset"] = {"check_out": "", "total_hours": ""}
+        if ops:
+            await db.attendance_logs.update_one({"id": log["id"]}, ops)
+        log = await db.attendance_logs.find_one({"user_id": body.user_id, "date": body.date})
+
+    # recompute total_hours + status
+    try:
+        cfg = await get_attendance_config()
+        in_t = (log.get("check_in") or {}).get("time")
+        out_t = (log.get("check_out") or {}).get("time")
+        patch: Dict[str, Any] = {}
+        if in_t:
+            in_mins = int(in_t[11:13]) * 60 + int(in_t[14:16])
+            patch["status"] = "present" if in_mins <= _hhmm_to_minutes(cfg["late_grace_until"], 660) else "late"
+        if in_t and out_t:
+            diff = datetime.fromisoformat(out_t) - datetime.fromisoformat(in_t)
+            patch["total_hours"] = round(diff.total_seconds() / 3600.0, 2)
+        if patch:
+            await db.attendance_logs.update_one({"id": log["id"]}, {"$set": patch})
+    except Exception:
+        pass
+
+    await log_activity(admin["id"], "attendance_punch_edited", None, {"user_id": body.user_id, "date": body.date})
+    final = await db.attendance_logs.find_one({"user_id": body.user_id, "date": body.date}, {"_id": 0})
+    return {"ok": True, "log": final}
+
+
+@api.get("/attendance/today")
+async def attendance_today(admin: dict = Depends(require_admin)):
+    """Live view: every employee's punches + availability for today (IST)."""
+    cfg = await get_attendance_config()
+    today = _ist_now().strftime("%Y-%m-%d")
+    users = await db.users.find(
+        {"active": True, "role": {"$ne": "admin"}},
+        {"_id": 0, "password_hash": 0}
+    ).to_list(200)
+    users = [u for u in users if u.get("username") not in ("scanner", "test_user")
+             and (u.get("employee_code") or u.get("role") == "executive")]
+    office_open = await _office_open_now(cfg)
+    out = []
+    for u in users:
+        log = await db.attendance_logs.find_one({"user_id": u["id"], "date": today}, {"_id": 0})
+        leave = await _is_user_on_leave(u["id"])
+        out.append({
+            "user_id": u["id"],
+            "name": u["name"],
+            "username": u["username"],
+            "role": u.get("role"),
+            "department": u.get("department"),
+            "employee_code": u.get("employee_code"),
+            "check_in": (log or {}).get("check_in", {}).get("time"),
+            "check_out": ((log or {}).get("check_out") or {}).get("time"),
+            "status": (log or {}).get("status"),
+            "on_leave": bool(leave),
+            "available_for_leads": await _is_user_available_by_attendance(u) if u.get("role") == "executive" else None,
+        })
+    return {"date": today, "office_open": office_open, "employees": out}
+
+
+def _pay_date_for_period_end(joining_date_str: str, end_date_str: str) -> Optional[str]:
+    """Salary is paid on the 8th day after the joining-day anniversary:
+    joined on the 10th -> cycle ends the 9th -> paid on the 18th (= end + 9 days)."""
+    try:
+        end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
+        return (end_dt + timedelta(days=9)).strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+@api.get("/payroll/calculate")
+async def calculate_payroll(
+    start_date: str,
+    end_date: str,
+    user_id: Optional[str] = None,
+    admin: dict = Depends(require_admin)
+):
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    if start_dt > end_dt:
+        raise HTTPException(status_code=400, detail="start_date cannot be after end_date")
+
+    cfg = await get_attendance_config()
+    office_start_m = _hhmm_to_minutes(cfg["office_start"], 630)       # 10:30
+    late_until_m = _hhmm_to_minutes(cfg["late_grace_until"], 660)     # 11:00
+    office_end_m = _hhmm_to_minutes(cfg["office_end"], 1140)          # 19:00
+    full_out_m = office_end_m - int(cfg.get("full_day_out_grace_minutes") or 0)
+    half_cutoff_m = _hhmm_to_minutes(cfg["half_day_cutoff"], 900)     # 15:00
+    late_streak_n = int(cfg.get("late_streak_threshold") or 3)
+
+    date_list = [(start_dt + timedelta(days=i)).strftime("%Y-%m-%d")
+                 for i in range((end_dt - start_dt).days + 1)]
+    today_ist = _ist_now().strftime("%Y-%m-%d")
+    # Sunday sandwich-rule looks at the day before the first Sunday and the day
+    # after the last one — widen lookups by 6 days back and 1 day forward.
+    lookback_date = (start_dt - timedelta(days=6)).strftime("%Y-%m-%d")
+    lookahead_date = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Payroll covers every active employee on the machine (any department) + all executives.
+    users_list = await db.users.find(
+        {"active": True, "role": {"$ne": "admin"}},
+        {"_id": 0, "password_hash": 0}
+    ).to_list(200)
+    users_list = [u for u in users_list if u.get("username") not in ("scanner", "test_user")
+                  and (u.get("employee_code") or u.get("role") == "executive")]
+    if user_id:
+        users_list = [u for u in users_list if u["id"] == user_id]
+    users_list.sort(key=lambda u: (u.get("department") or "zz", u.get("name") or ""))
+
+    holidays_list = await db.holidays.find({"date": {"$gte": lookback_date, "$lte": lookahead_date}}).to_list(1000)
+    holidays_map = {h["date"]: h for h in holidays_list}
+
+    def _mins_of(time_iso: Optional[str]) -> Optional[int]:
+        if not time_iso:
+            return None
+        try:
+            return int(time_iso[11:13]) * 60 + int(time_iso[14:16])
+        except Exception:
+            return None
+
+    results = []
+    for u in users_list:
+        uid = u["id"]
+        joining_date_str = u.get("joining_date") or today_ist
+        base_salary = float(u.get("base_salary") or 0.0)
+        daily_rate = base_salary / 31.0  # flat /31 as per company policy
+
+        att_list = await db.attendance_logs.find(
+            {"user_id": uid, "date": {"$gte": lookback_date, "$lte": lookahead_date}}).to_list(1000)
+        att_map = {a["date"]: a for a in att_list}
+
+        leaves_list = await db.leaves.find({
+            "user_id": uid,
+            "cancelled": {"$ne": True},
+            "start_date": {"$lte": end_date},
+            "end_date": {"$gte": start_date},
+        }).to_list(200)
+
+        def leave_on(d_str):
+            for lv in leaves_list:
+                if lv["start_date"] <= d_str <= lv["end_date"]:
+                    return lv
+            return None
+
+        adjs_list = await db.payroll_adjustments.find(
+            {"user_id": uid, "date": {"$gte": lookback_date, "$lte": lookahead_date}}).to_list(1000)
+        adjs_map = {ad["date"]: ad["status"] for ad in adjs_list}
+
+        def worked_credit(d_str: str) -> float:
+            """How much of a working day this date counts for (full=1, half=0.5).
+            Used for Sunday eligibility: a Sunday is paid only when the employee
+            worked >= 5 days in the Mon–Sat before it."""
+            hol = holidays_map.get(d_str)
+            if hol and (hol.get("holiday_type") or "full") == "full":
+                return 1.0  # company holiday shouldn't cost anyone their Sunday
+            adj = adjs_map.get(d_str)
+            if adj and adj != "auto":
+                if adj in ("present", "wfh", "paid"):
+                    return 1.0
+                if adj == "half_day":
+                    return 0.5
+                return 0.0
+            a = att_map.get(d_str)
+            if not a:
+                return 0.0
+            in_t = (a.get("check_in") or {}).get("time")
+            out_t = ((a.get("check_out") or {}).get("time")) if a.get("check_out") else None
+            in_m2, out_m2 = _mins_of(in_t), _mins_of(out_t)
+            if in_m2 is None:
+                return 0.0
+            if out_m2 is None:
+                return 1.0 if d_str == today_ist else 0.5
+            day_full = full_out_m
+            if hol and hol.get("holiday_type") == "early_off" and hol.get("early_off_time"):
+                day_full = min(full_out_m, _hhmm_to_minutes(hol["early_off_time"], office_end_m))
+            if out_m2 >= day_full:
+                return 1.0
+            if out_m2 >= half_cutoff_m:
+                return 0.5
+            return 0.0
+
+        daily_breakdown = []
+        target_earnings = 0.0
+        total_deductions = 0.0
+        counts = {"present": 0.0, "half_day": 0, "leave_approved": 0, "absent_informed": 0,
+                  "absent_uninformed": 0, "holiday": 0, "weekly_off": 0, "sunday_unpaid": 0,
+                  "late": 0, "after_grace": 0, "early_exit": 0, "wfh": 0, "missing_punch_out": 0}
+        flags = []
+        late_streak = 0
+        late_streak_flagged = False
+        sunday_rows = []  # finalized after the loop (quota + sandwich rule)
+
+        for d_str in date_list:
+            dt = datetime.strptime(d_str, "%Y-%m-%d")
+            is_sunday = dt.weekday() == 6
+            hol = holidays_map.get(d_str)
+            is_full_holiday = bool(hol and (hol.get("holiday_type") or "full") == "full")
+            early_off_m = _hhmm_to_minutes(hol["early_off_time"], office_end_m) if (hol and hol.get("holiday_type") == "early_off" and hol.get("early_off_time")) else None
+            day_full_out_m = min(full_out_m, early_off_m) if early_off_m else full_out_m
+
+            day = {"date": d_str, "weekday": dt.strftime("%A"), "status": "absent_uninformed",
+                   "earning": 0.0, "deduction": 0.0, "details": "", "punch_in": None,
+                   "punch_out": None, "work_hours": None, "flags": []}
+
+            log = att_map.get(d_str)
+            in_m = out_m = None
+            if log:
+                in_t = (log.get("check_in") or {}).get("time")
+                out_t = ((log.get("check_out") or {}).get("time")) if log.get("check_out") else None
+                day["punch_in"] = in_t[11:16] if in_t else None
+                day["punch_out"] = out_t[11:16] if out_t else None
+                in_m, out_m = _mins_of(in_t), _mins_of(out_t)
+                if log.get("total_hours") is not None:
+                    day["work_hours"] = log["total_hours"]
+                elif in_m is not None and out_m is not None:
+                    day["work_hours"] = round((out_m - in_m) / 60.0, 2)
+
+            if d_str < joining_date_str:
+                day["status"] = "not_joined"
+                day["details"] = "Not yet joined"
+                daily_breakdown.append(day)
+                continue
+            if d_str > today_ist:
+                day["status"] = "future"
+                day["details"] = ""
+                daily_breakdown.append(day)
+                continue
+
+            target_earnings += daily_rate
+            adj = adjs_map.get(d_str)
+            worked_day = (not is_sunday) and (not is_full_holiday)
+
+            # late tracking happens on worked days regardless of the final status
+            if worked_day and in_m is not None:
+                if in_m > office_start_m:
+                    counts["late"] += 1
+                    late_streak += 1
+                    if late_streak >= late_streak_n and not late_streak_flagged:
+                        flags.append(f"Late {late_streak_n}+ days in a row (after {cfg['office_start']}), last on {d_str}")
+                        late_streak_flagged = True
+                else:
+                    late_streak = 0
+                    late_streak_flagged = False
+                if in_m > late_until_m:
+                    counts["after_grace"] += 1
+                    day["flags"].append(f"Arrived after {cfg['late_grace_until']}")
+            elif worked_day and log is None:
+                late_streak = 0
+                late_streak_flagged = False
+
+            if adj and adj != "auto":
+                if adj == "present":
+                    day.update(status="excused_present", earning=daily_rate, details="Present (Admin Override)")
+                    counts["present"] += 1.0
+                elif adj == "wfh":
+                    day.update(status="wfh", earning=daily_rate, details="Work From Home (Admin)")
+                    counts["wfh"] += 1
+                    counts["present"] += 1.0
+                elif adj == "paid":
+                    day.update(status="paid_leave", earning=daily_rate, details="Paid Leave / Comp-off (Admin)")
+                elif adj == "half_day":
+                    day.update(status="half_day", earning=0.5 * daily_rate, deduction=0.5 * daily_rate,
+                               details="Half Day (Admin Override)")
+                    total_deductions += 0.5 * daily_rate
+                    counts["half_day"] += 1
+                    counts["present"] += 0.5
+                elif adj == "informed":
+                    day.update(status="absent_informed", deduction=daily_rate,
+                               details="Informed Absence (Admin Override, 1 day cut)")
+                    total_deductions += daily_rate
+                    counts["absent_informed"] += 1
+                elif adj == "uninformed":
+                    day.update(status="absent_uninformed", deduction=2.0 * daily_rate,
+                               details="Uninformed Absence (Admin Override, 2 days cut)")
+                    total_deductions += 2.0 * daily_rate
+                    counts["absent_uninformed"] += 1
+                elif adj == "leave":
+                    day.update(status="leave_approved", deduction=daily_rate,
+                               details="Approved Leave (Admin Override, 1 day cut)")
+                    total_deductions += daily_rate
+                    counts["leave_approved"] += 1
+                daily_breakdown.append(day)
+                continue
+
+            if is_sunday:
+                # Provisional — paid/unpaid decided after the loop from the
+                # period-total quota and the sandwich rule.
+                day["status"] = "weekly_off"
+                day["details"] = "Sunday"
+                sunday_rows.append(day)
+            elif is_full_holiday:
+                day.update(status="holiday", earning=daily_rate, details=f"Holiday: {hol.get('name')} (Paid)")
+                counts["holiday"] += 1
+            elif log and in_m is not None:
+                in_s, out_s = day["punch_in"] or "--:--", day["punch_out"] or "--:--"
+                if out_m is None:
+                    if d_str == today_ist:
+                        day.update(status="present", earning=daily_rate,
+                                   details=f"Checked in {in_s} (active)")
+                        counts["present"] += 1.0
+                    else:
+                        day.update(status="missing_punch_out", earning=0.5 * daily_rate,
+                                   deduction=0.5 * daily_rate,
+                                   details=f"No punch-out (In {in_s}) — counted half day, verify")
+                        total_deductions += 0.5 * daily_rate
+                        counts["missing_punch_out"] += 1
+                        counts["present"] += 0.5
+                        day["flags"].append("Missing punch-out")
+                elif out_m >= day_full_out_m:
+                    label = "Present"
+                    if early_off_m and out_m < full_out_m:
+                        label = f"Present (early-off day: {hol.get('name')})"
+                    day.update(status="present", earning=daily_rate, details=f"{label} ({in_s} – {out_s})")
+                    counts["present"] += 1.0
+                elif out_m >= half_cutoff_m:
+                    day.update(status="half_day", earning=0.5 * daily_rate, deduction=0.5 * daily_rate,
+                               details=f"Half Day — left {out_s} before {cfg['office_end']}")
+                    total_deductions += 0.5 * daily_rate
+                    counts["half_day"] += 1
+                    counts["present"] += 0.5
+                else:
+                    day.update(status="early_exit", deduction=daily_rate,
+                               details=f"Left {out_s} before {cfg['half_day_cutoff']} — full day cut")
+                    total_deductions += daily_rate
+                    counts["early_exit"] += 1
+                    day["flags"].append(f"Punched out early at {out_s}")
+            else:
+                lv = leave_on(d_str)
+                lv_status = (lv or {}).get("status") or ("approved" if lv else None)
+                if lv and lv_status == "approved":
+                    day.update(status="leave_approved", deduction=daily_rate,
+                               details=f"Approved Leave (1 day cut){' — ' + lv.get('reason') if lv.get('reason') else ''}")
+                    total_deductions += daily_rate
+                    counts["leave_approved"] += 1
+                elif lv and lv_status == "pending":
+                    day.update(status="absent_uninformed", deduction=2.0 * daily_rate,
+                               details="Absent — leave request PENDING approval (2 days cut until approved)")
+                    total_deductions += 2.0 * daily_rate
+                    counts["absent_uninformed"] += 1
+                    day["flags"].append("Pending leave request")
+                elif d_str == today_ist:
+                    day.update(status="pending_today", details="No punch-in yet today")
+                    target_earnings -= daily_rate  # don't judge today until it's over
+                else:
+                    rej = " (leave was rejected)" if (lv and lv_status == "rejected") else ""
+                    day.update(status="absent_uninformed", deduction=2.0 * daily_rate,
+                               details=f"Uninformed Absence{rej} — 2 days cut")
+                    total_deductions += 2.0 * daily_rate
+                    counts["absent_uninformed"] += 1
+
+            daily_breakdown.append(day)
+
+        # ---- Sunday pay allocation: PERIOD-TOTAL quota + sandwich rule ----
+        # Paid Sundays = floor(total worked days in the period / 5) — 20 worked
+        # days pays 4 Sundays, 15 pays 3, and so on. Independently, a Sunday
+        # with leave/absence on BOTH the day before and after is always unpaid.
+        total_credits = 0.0
+        for d_str in date_list:
+            if d_str < joining_date_str or d_str > today_ist:
+                continue
+            ddt = datetime.strptime(d_str, "%Y-%m-%d")
+            if ddt.weekday() == 6:
+                continue
+            hol2 = holidays_map.get(d_str)
+            if hol2 and (hol2.get("holiday_type") or "full") == "full":
+                total_credits += 1.0  # a company holiday never costs a Sunday
+            else:
+                total_credits += worked_credit(d_str)
+        sunday_quota = int(total_credits // 5.0)
+
+        def _side_absent(x_str: str) -> bool:
+            """True when x_str is a workday the employee did not work at all."""
+            if x_str < joining_date_str or x_str > today_ist:
+                return False  # outside knowable range → don't penalize
+            xd = datetime.strptime(x_str, "%Y-%m-%d")
+            if xd.weekday() == 6:
+                return False
+            xh = holidays_map.get(x_str)
+            if xh and (xh.get("holiday_type") or "full") == "full":
+                return False
+            return worked_credit(x_str) <= 0.0
+
+        for s_day in sunday_rows:
+            sdt = datetime.strptime(s_day["date"], "%Y-%m-%d")
+            prev_str = (sdt - timedelta(days=1)).strftime("%Y-%m-%d")
+            next_str = (sdt + timedelta(days=1)).strftime("%Y-%m-%d")
+            if _side_absent(prev_str) and _side_absent(next_str):
+                s_day.update(status="weekly_off_unpaid", earning=0.0, deduction=daily_rate,
+                             details="Sunday UNPAID — leave/absent on both the day before and the day after")
+                total_deductions += daily_rate
+                counts["sunday_unpaid"] += 1
+            elif sunday_quota > 0:
+                sunday_quota -= 1
+                s_day.update(status="weekly_off", earning=daily_rate,
+                             details=f"Sunday (Paid — {total_credits:g} worked days in period)")
+                counts["weekly_off"] += 1
+            else:
+                s_day.update(status="weekly_off_unpaid", earning=0.0, deduction=daily_rate,
+                             details=f"Sunday UNPAID — only {total_credits:g} worked days in period (5 needed per paid Sunday)")
+                total_deductions += daily_rate
+                counts["sunday_unpaid"] += 1
+
+        if counts["after_grace"] > 0:
+            flags.append(f"Arrived after {cfg['late_grace_until']} on {counts['after_grace']} day(s)")
+        if counts["early_exit"] > 0:
+            flags.append(f"Punched out before {cfg['half_day_cutoff']} on {counts['early_exit']} day(s)")
+        if counts["missing_punch_out"] > 0:
+            flags.append(f"{counts['missing_punch_out']} day(s) missing punch-out — verify manually")
+        if counts["sunday_unpaid"] > 0:
+            flags.append(f"{counts['sunday_unpaid']} unpaid Sunday(s) — quota is 1 paid Sunday per 5 worked days, minus sandwiched Sundays")
+
+        final_salary = max(0.0, target_earnings - total_deductions)
+        payment = await db.salary_payments.find_one(
+            {"user_id": uid, "period_start": start_date, "period_end": end_date}, {"_id": 0})
+        results.append({
+            "payment": payment,
+            "user_id": uid,
+            "name": u["name"],
+            "username": u["username"],
+            "role": u.get("role"),
+            "department": u.get("department"),
+            "employee_code": u.get("employee_code"),
+            "joining_date": joining_date_str,
+            "base_salary": base_salary,
+            "daily_rate": round(daily_rate, 2),
+            "pro_rated_target_salary": round(target_earnings, 2),
+            "total_deductions": round(total_deductions, 2),
+            "final_salary_payout": round(final_salary, 2),
+            "pay_date": _pay_date_for_period_end(joining_date_str, end_date),
+            "counts": counts,
+            "flags": flags,
+            "daily_breakdown": daily_breakdown,
+        })
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "daily_rate_basis": 31,
+        "payroll": results,
+    }
+
+class SalaryPaidInput(BaseModel):
+    user_id: str
+    period_start: str   # YYYY-MM-DD (cycle start)
+    period_end: str     # YYYY-MM-DD (cycle end)
+    paid: bool = True
+    amount: Optional[float] = None
+    note: Optional[str] = ""
+
+
+@api.post("/payroll/mark-paid")
+async def mark_salary_paid(body: SalaryPaidInput, admin: dict = Depends(require_admin)):
+    """Tick/untick that the salary for a pay period was actually handed out.
+    Drives the register 'PAID' badge and silences the pay-date reminders."""
+    if not _valid_date_str(body.period_start) or not _valid_date_str(body.period_end):
+        raise HTTPException(status_code=400, detail="period dates must be YYYY-MM-DD")
+    u = await db.users.find_one({"id": body.user_id}, {"_id": 0, "id": 1, "name": 1})
+    if not u:
+        raise HTTPException(status_code=404, detail="user not found")
+    key = {"user_id": body.user_id, "period_start": body.period_start, "period_end": body.period_end}
+    if body.paid:
+        await db.salary_payments.update_one(key, {"$set": {
+            **key,
+            "paid": True,
+            "amount": body.amount,
+            "note": (body.note or "").strip(),
+            "paid_at": iso(now_utc()),
+            "paid_by": admin["id"],
+        }}, upsert=True)
+    else:
+        await db.salary_payments.delete_one(key)
+    await log_activity(admin["id"], "salary_marked_paid" if body.paid else "salary_unmarked_paid",
+                       None, {**key, "amount": body.amount})
+    doc = await db.salary_payments.find_one(key, {"_id": 0})
+    return {"ok": True, "payment": doc}
+
+
+@api.post("/payroll/adjust")
+async def adjust_payroll(body: PayrollAdjustInput, admin: dict = Depends(require_admin)):
+    if body.status == "auto":
+        await db.payroll_adjustments.delete_one({"user_id": body.user_id, "date": body.date})
+    else:
+        await db.payroll_adjustments.update_one(
+            {"user_id": body.user_id, "date": body.date},
+            {"$set": {"status": body.status, "updated_at": (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).isoformat(), "updated_by": admin["id"]}},
+            upsert=True
+        )
+    return {"ok": True}
 
 # Root ping for api
 @api.get("/")

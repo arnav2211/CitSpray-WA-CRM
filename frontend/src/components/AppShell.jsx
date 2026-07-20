@@ -3,18 +3,18 @@ import Sidebar from "@/components/Sidebar";
 import FollowupAlerts from "@/components/FollowupAlerts";
 import { AlertListener } from "@/components/AlertListener";
 import { Outlet, useLocation, useNavigate, NavLink } from "react-router-dom";
-import { List, House, ChatTeardropDots, Kanban, Phone, PhoneCall } from "@phosphor-icons/react";
+import { List, House, ChatTeardropDots, Kanban, Phone, PhoneCall, XCircle } from "@phosphor-icons/react";
 import { useAuth } from "@/context/AuthContext";
 
 export default function AppShell() {
   const loc = useLocation();
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, isAttendanceLocked, refresh, logout } = useAuth();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const onChat = loc.pathname.startsWith("/chat");
 
   useEffect(() => {
-    if (user && user.role === "data_entry" && loc.pathname !== "/data-entry") {
+    if (user && user.username !== "scanner" && user.role === "data_entry" && loc.pathname !== "/data-entry") {
       navigate("/data-entry", { replace: true });
     }
   }, [user, loc.pathname, navigate]);
@@ -30,6 +30,36 @@ export default function AppShell() {
       return () => { document.body.style.overflow = prev; };
     }
   }, [sidebarOpen]);
+
+  if (isAttendanceLocked) {
+    return (
+      <div className="h-screen w-screen bg-[#0d0f14] text-white flex flex-col items-center justify-center p-6 text-center select-none font-chivo z-50">
+        <div className="bg-[#161a22] border border-white/10 p-8 max-w-md w-full shadow-2xl flex flex-col items-center">
+          <div className="w-16 h-16 rounded-full bg-red-950/50 border border-red-500/30 flex items-center justify-center mb-6">
+            <XCircle size={36} weight="fill" className="text-red-500 animate-pulse" />
+          </div>
+          <h1 className="text-2xl font-black mb-2 tracking-tight">LeadOrbit Access Locked</h1>
+          <p className="text-sm text-gray-400 mb-8 leading-relaxed">
+            Good morning! Access to the CRM is restricted until you clock in. Please stand in front of the **Office Scanner** to log your check-in for today.
+          </p>
+          <div className="w-full space-y-2">
+            <button
+              onClick={() => refresh()}
+              className="w-full bg-[#002FA7] hover:bg-[#002288] text-white font-bold py-2.5 text-xs uppercase tracking-widest transition-all"
+            >
+              I have checked in (Refresh)
+            </button>
+            <button
+              onClick={async () => { await logout(); navigate("/login"); }}
+              className="w-full border border-white/10 hover:border-white/20 text-gray-400 hover:text-white font-bold py-2.5 text-xs uppercase tracking-widest transition-all"
+            >
+              Sign Out
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="h-screen app-shell-viewport flex bg-white overflow-hidden" data-testid="app-shell">
