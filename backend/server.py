@@ -6406,16 +6406,21 @@ def _shopify_items_summary(order: dict, max_items: int = 4) -> str:
         parts.append(f"+{extra} more")
     return ", ".join(parts)
 
-async def _shopify_send_template_for_lead(lead: dict, tpl_name: str, params: List[str]) -> None:
+async def _shopify_send_template_for_lead(lead: dict, tpl_name: str, params: List[str]) -> dict:
     """Send a WA template to the lead, padding/truncating params to the template's
     actual placeholder count (mirrors the welcome-template send), and log the
-    message into the conversation history."""
+    message into the conversation history. Returns the logged message dict so
+    callers can react to failures. When the template isn't in the local
+    whatsapp_templates cache, fall back to the caller-supplied param count —
+    sending zero params for a parameterised template is a guaranteed #132000."""
     cfg = await get_wa_config()
     try:
         tpl_meta = await _resolve_template_meta(tpl_name, cfg["default_template_lang"])
     except Exception:
         tpl_meta = {}
     required = int(tpl_meta.get("params_required") or 0)
+    if required <= 0:
+        required = len([p for p in params if str(p) != ""])
     body_params: Optional[List[str]] = None
     if required > 0:
         padded = [str(p) for p in params if str(p) != ""]
@@ -6447,6 +6452,7 @@ async def _shopify_send_template_for_lead(lead: dict, tpl_name: str, params: Lis
         await db.leads.update_one({"id": lead["id"]}, {"$set": {"has_whatsapp": True, "last_message_at": msg["at"]}})
     else:
         logger.warning(f"Shopify WA template '{tpl_name}' failed for lead {lead['id']}: {msg.get('error')}")
+    return msg
 
 async def _shopify_handle_order_created(order: dict) -> dict:
     order_no = order.get("name") or f"#{order.get('order_number', '')}"
@@ -6550,12 +6556,59 @@ async def _shopify_handle_checkout_upsert(checkout: dict) -> dict:
         doc["status"] = "converted"
     await db.abandoned_checkouts.update_one(
         {"token": token},
-        {"$set": doc, "$setOnInsert": {"token": token, "created_at": now_iso, "status": "pending", "reminder_sent_at": None}},
+        {"$set": doc, "$setOnInsert": {"token": token, "created_at": now_iso, "status": "pending", "reminder_sent_at": None, "send_attempts": 0}},
         upsert=True,
     )
     if completed:
         await db.abandoned_checkouts.update_one({"token": token}, {"$set": {"status": "converted"}})
-    return {"checkout": token, "phone_present": bool(phone), "completed": completed}
+
+    # Surface the checkout in the CRM IMMEDIATELY (don't wait for the reminder task)
+    # so telecallers can see the live cart and call. Reuses an existing lead when the
+    # phone matches; otherwise creates a Website/abandoned_checkout lead.
+    lead_id = None
+    if phone and not completed:
+        try:
+            cart_note = f"Abandoned checkout · {doc['currency']} {doc['total_price']} · {doc['items']}"
+            lead = await _find_lead_by_phone(str(phone))
+            if not lead:
+                lead = await _create_lead_internal({
+                    "customer_name": name or "Website Visitor",
+                    "phone": str(phone),
+                    "email": doc.get("email"),
+                    "requirement": cart_note,
+                    "source": "Website",
+                    "enquiry_type": "abandoned_checkout",
+                    "source_data": {
+                        "checkout_token": token,
+                        "recovery_url": doc.get("recovery_url"),
+                        "total_price": doc.get("total_price"),
+                        "items": doc.get("items"),
+                    },
+                    "_suppress_auto_welcome": True,
+                }, by_user_id=None)
+                await log_activity(None, "abandoned_checkout", lead["id"], {"total": f"{doc['currency']} {doc['total_price']}"})
+            lead_id = lead["id"]
+            # Live cart snapshot on the lead — rendered by the CRM UI and used by
+            # the send-recovery endpoint. Never clobbers the lead's own fields.
+            await db.leads.update_one({"id": lead_id}, {"$set": {"abandoned_cart": {
+                "checkout_token": token,
+                "items": doc.get("items"),
+                "total_price": doc.get("total_price"),
+                "currency": doc.get("currency"),
+                "recovery_url": doc.get("recovery_url"),
+                "updated_at": now_iso,
+                "status": "pending",
+            }}})
+            await db.abandoned_checkouts.update_one({"token": token}, {"$set": {"lead_id": lead_id}})
+        except Exception as e:
+            logger.warning(f"abandoned-checkout lead upsert failed for {token}: {e}")
+    if completed:
+        # reflect conversion on any lead that carries this cart snapshot
+        await db.leads.update_many(
+            {"abandoned_cart.checkout_token": token},
+            {"$set": {"abandoned_cart.status": "converted"}},
+        )
+    return {"checkout": token, "phone_present": bool(phone), "completed": completed, "lead_id": lead_id}
 
 
 async def _shopify_mark_checkout_converted(order: dict) -> None:
@@ -6586,18 +6639,23 @@ async def abandoned_checkout_task():
         "reminder_sent_at": None,
         "phone": {"$nin": [None, ""]},
         "updated_at": {"$lt": cutoff, "$gt": stale},
+        "send_attempts": {"$not": {"$gte": 3}},
     }, {"_id": 0}).limit(20)
     async for co in cursor:
         try:
             # Atomic claim: gunicorn runs one scheduler per worker, so without this
             # a checkout could be reminded up to N-workers times.
             claimed = await db.abandoned_checkouts.find_one_and_update(
-                {"token": co["token"], "reminder_sent_at": None},
-                {"$set": {"reminder_sent_at": iso(now_utc()), "status": "reminding"}},
+                {"token": co["token"], "reminder_sent_at": None, "send_attempts": {"$not": {"$gte": 3}}},
+                {"$set": {"reminder_sent_at": iso(now_utc()), "status": "reminding"}, "$inc": {"send_attempts": 1}},
             )
             if not claimed:
                 continue
-            lead = await _find_lead_by_phone(co["phone"])
+            lead = None
+            if co.get("lead_id"):
+                lead = await db.leads.find_one({"id": co["lead_id"]}, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})
+            if not lead:
+                lead = await _find_lead_by_phone(co["phone"])
             if not lead:
                 lead = await _create_lead_internal({
                     "customer_name": co.get("customer_name") or "Website Visitor",
@@ -6616,19 +6674,26 @@ async def abandoned_checkout_task():
                 }, by_user_id=None)
                 await log_activity(None, "abandoned_checkout", lead["id"], {"total": f"{co.get('currency')} {co.get('total_price')}"})
             # {{1}}=name, {{2}}=items, {{3}}=recovery link
-            await _shopify_send_template_for_lead(
+            msg = await _shopify_send_template_for_lead(
                 lead, SHOPIFY_TPL_ABANDONED,
                 [co.get("customer_name") or "there", co.get("items") or "your items", co.get("recovery_url") or "https://www.citspray.com/cart"],
             )
-            await db.abandoned_checkouts.update_one(
-                {"token": co["token"]},
-                {"$set": {"status": "reminded", "lead_id": lead["id"]}},
-            )
+            if msg.get("status") in ("sent", "delivered", "read", "sent_mock"):
+                await db.abandoned_checkouts.update_one(
+                    {"token": co["token"]},
+                    {"$set": {"status": "reminded", "lead_id": lead["id"]}},
+                )
+            else:
+                # release the claim so the next run retries (up to 3 attempts)
+                await db.abandoned_checkouts.update_one(
+                    {"token": co["token"]},
+                    {"$set": {"status": "pending", "reminder_sent_at": None, "lead_id": lead["id"], "last_send_error": msg.get("error")}},
+                )
         except Exception as e:
             logger.warning(f"abandoned_checkout_task failed for {co.get('token')}: {e}")
             await db.abandoned_checkouts.update_one(
                 {"token": co["token"]},
-                {"$set": {"status": "error"}},
+                {"$set": {"status": "pending", "reminder_sent_at": None, "last_send_error": str(e)[:300]}},
             )
 
 
@@ -6675,6 +6740,39 @@ async def webhook_shopify_recent(admin: dict = Depends(require_admin), limit: in
         {"source": "Shopify"}, {"_id": 0, "payload.line_items": 0}
     ).sort("received_at", -1).to_list(limit)
     return docs
+
+
+@api.post("/leads/{lead_id}/send-recovery")
+async def send_checkout_recovery(lead_id: str, user: dict = Depends(get_current_user)):
+    """Telecaller action: WhatsApp the customer their saved-cart recovery link
+    (approved UTILITY template `abandoned_checkout`). Works for any lead that has
+    an abandoned cart snapshot — either lead.abandoned_cart or a matching
+    abandoned_checkouts doc."""
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if not lead.get("phone"):
+        raise HTTPException(status_code=400, detail="Lead has no phone number")
+    cart = lead.get("abandoned_cart") or {}
+    if not cart:
+        co = await db.abandoned_checkouts.find_one(
+            {"$or": [{"lead_id": lead_id}, {"phone": {"$regex": _normalize_phone(lead["phone"])[-10:] + "$"}}]},
+            {"_id": 0}, sort=[("updated_at", -1)],
+        )
+        if co:
+            cart = {
+                "items": co.get("items"), "total_price": co.get("total_price"),
+                "currency": co.get("currency"), "recovery_url": co.get("recovery_url"),
+            }
+    recovery_url = (cart.get("recovery_url") or "").strip() or "https://www.citspray.com/cart"
+    items = cart.get("items") or "your items"
+    msg = await _shopify_send_template_for_lead(
+        lead, SHOPIFY_TPL_ABANDONED,
+        [lead.get("customer_name") or "there", items, recovery_url],
+    )
+    await log_activity(user.get("id"), "recovery_link_sent", lead_id, {"status": msg.get("status")})
+    ok = msg.get("status") in ("sent", "delivered", "read", "sent_mock")
+    return {"ok": ok, "status": msg.get("status"), "error": msg.get("error"), "recovery_url": recovery_url}
 
 
 # ---------------- ExportersIndia webhook ----------------
@@ -11964,13 +12062,13 @@ async def root():
 
 app.include_router(api)
 
-# Never combine wildcard origins with credentials — default to the known
-# production hosts; override with a comma-separated CORS_ORIGINS in .env.
-_default_origins = "https://crm.mangalamagro.in,http://localhost:3000,http://127.0.0.1:3000"
+# REVERTED to permissive default (2026-07-20): a strict origin list broke real
+# logins ("network error") for origin variants while adding little — the app is
+# same-origin. Set CORS_ORIGINS in .env only with a verified full list.
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=[o.strip() for o in os.environ.get("CORS_ORIGINS", _default_origins).split(",") if o.strip()],
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
