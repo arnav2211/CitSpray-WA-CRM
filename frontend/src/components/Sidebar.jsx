@@ -8,17 +8,20 @@ import { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
 
-const navBase = "flex items-center gap-3 px-4 py-3 md:py-2.5 text-sm border-l-2 border-transparent hover:bg-gray-100 transition-colors";
-const navActive = "bg-white border-l-2 border-[#002FA7] text-gray-900 font-semibold";
+const navBase = "flex items-center gap-3 px-4 py-3 md:py-2.5 text-sm border-l-2 transition-colors";
+const navActive = "bg-white border-[#002FA7] text-gray-900 font-semibold";
+// Amber "attention" state: tints the whole tab while something awaits action
+const navHighlight = "bg-[#FFF4E5] border-[#E67E00] text-[#B85F00] font-semibold hover:bg-[#FFE9CC]";
+const navIdle = "border-transparent text-gray-700 hover:bg-gray-100";
 
-function Item({ to, icon: Icon, children, testId, onNavigate, badge }) {
+function Item({ to, icon: Icon, children, testId, onNavigate, badge, badgeClass = "bg-[#E60000] text-white", highlight = false }) {
   return (
     <NavLink to={to} data-testid={testId} onClick={onNavigate}
-      className={({ isActive }) => `${navBase} ${isActive ? navActive : "text-gray-700"}`}>
+      className={({ isActive }) => `${navBase} ${isActive ? navActive : highlight ? navHighlight : navIdle}`}>
       <Icon size={18} weight="regular" />
       <span className="flex-1">{children}</span>
       {badge > 0 && (
-        <span className="bg-[#E60000] text-white rounded-full px-1.5 text-[10px] font-bold min-w-[18px] text-center" data-testid={`${testId}-badge`}>
+        <span className={`${badgeClass} rounded-full px-1.5 text-[10px] font-bold min-w-[18px] text-center`} data-testid={`${testId}-badge`}>
           {badge > 99 ? "99+" : badge}
         </span>
       )}
@@ -32,6 +35,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
   const isAdmin = user?.role === "admin";
   const [pendingTransfers, setPendingTransfers] = useState(0);
   const [pendingLeaves, setPendingLeaves] = useState(0);
+  const [pendingQA, setPendingQA] = useState(0);
   const [att, setAtt] = useState({ checked_in: false, checked_out: false });
   const [punching, setPunching] = useState(false);
 
@@ -63,6 +67,22 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
     };
     tick();
     const id = setInterval(tick, 15000);
+    return () => { stop = true; clearInterval(id); };
+  }, [user?.id]);
+
+  // Fast-poll the pending Q&A count so the badge feels realtime.
+  // Admins see questions awaiting their answer; executives see their own unanswered questions.
+  useEffect(() => {
+    if (!user || user.role === "data_entry") return;
+    let stop = false;
+    const tick = async () => {
+      try {
+        const { data } = await api.get("/internal-qa/pending-count");
+        if (!stop) setPendingQA(data?.pending || 0);
+      } catch { /* ignore */ }
+    };
+    tick();
+    const id = setInterval(tick, 5000);
     return () => { stop = true; clearInterval(id); };
   }, [user?.id]);
 
@@ -145,7 +165,8 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
               <Item to="/chat" icon={ChatTeardropDots} testId="nav-chat" onNavigate={handleNavigate}>WhatsApp</Item>
               <Item to="/leads" icon={Kanban} testId="nav-leads" onNavigate={handleNavigate}>Leads</Item>
               <Item to="/followups" icon={Bell} testId="nav-followups" onNavigate={handleNavigate}>Follow-ups</Item>
-              <Item to="/qa" icon={ChatTeardropText} testId="nav-qa" onNavigate={handleNavigate}>Internal Q&amp;A</Item>
+              <Item to="/qa" icon={ChatTeardropText} testId="nav-qa" onNavigate={handleNavigate}
+                badge={pendingQA} badgeClass="bg-[#E67E00] text-white" highlight={pendingQA > 0}>Internal Q&amp;A</Item>
               <Item to="/transfer-requests" icon={ArrowsLeftRight} testId="nav-transfer-requests" onNavigate={handleNavigate} badge={pendingTransfers}>Reassign Requests</Item>
               <Item to="/calls" icon={PhoneCall} testId="nav-calls" onNavigate={handleNavigate}>Call Logs</Item>
               <Item to="/reports" icon={PaperPlaneTilt} testId="nav-reports" onNavigate={handleNavigate}>Reports</Item>

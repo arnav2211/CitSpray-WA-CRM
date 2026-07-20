@@ -1356,6 +1356,28 @@ async def internal_qa_threads(
     return rows
 
 
+@api.get("/internal-qa/pending-count")
+async def internal_qa_pending_count(user: dict = Depends(get_current_user)):
+    """Lightweight count of Q&A threads awaiting an answer — a thread is pending when its
+    latest message is from the executive. Admin: all threads; executive: own threads only.
+    Polled by the sidebar badge."""
+    match: Dict[str, Any] = {}
+    if user["role"] == "executive":
+        match["agent_id"] = user["id"]
+    pipeline = [
+        {"$match": match},
+        {"$sort": {"at": 1}},
+        {"$group": {
+            "_id": {"lead_id": "$lead_id", "agent_id": "$agent_id"},
+            "last_from_role": {"$last": "$from_role"},
+        }},
+        {"$match": {"last_from_role": "executive"}},
+        {"$count": "pending"},
+    ]
+    docs = await db.internal_messages.aggregate(pipeline).to_list(1)
+    return {"pending": docs[0]["pending"] if docs else 0}
+
+
 # ------------- Assignment Engine -------------
 async def get_routing_rules() -> dict:
     r = await db.routing_rules.find_one({"key": "default"}, {"_id": 0})
