@@ -113,7 +113,7 @@ function MyLeaves() {
                     {lv.start_date} → {lv.end_date}
                     <span className="ml-2 text-[10px] text-gray-400 font-sans font-semibold uppercase">{daysBetween(lv.start_date, lv.end_date)} day(s)</span>
                   </div>
-                  {lv.reason && <div className="text-xs text-gray-500 mt-0.5 truncate">{lv.reason}</div>}
+                  {lv.reason && <div className="text-xs text-gray-500 mt-0.5 whitespace-pre-wrap break-words">{lv.reason}</div>}
                   {lv.decision_note && <div className="text-[11px] text-gray-400 mt-0.5 italic">Admin: {lv.decision_note}</div>}
                 </div>
                 <span className={chip(lv.status)}><StatusIcon status={lv.status} /> {lv.status}</span>
@@ -239,9 +239,9 @@ function AdminLeaves() {
                     {lv.start_date} → {lv.end_date}
                     <span className="ml-1 text-gray-400">({daysBetween(lv.start_date, lv.end_date)}d)</span>
                   </td>
-                  <td className="px-4 py-2.5 text-xs text-gray-600 max-w-[240px]">
-                    <div className="truncate">{lv.reason || "—"}</div>
-                    {lv.decision_note && <div className="text-[10px] text-gray-400 italic truncate">Note: {lv.decision_note}</div>}
+                  <td className="px-4 py-2.5 text-xs text-gray-600 max-w-[340px]">
+                    <div className="whitespace-pre-wrap break-words">{lv.reason || "—"}</div>
+                    {lv.decision_note && <div className="text-[10px] text-gray-400 italic whitespace-pre-wrap break-words">Note: {lv.decision_note}</div>}
                   </td>
                   <td className="px-4 py-2.5 text-center"><span className={chip(lv.status)}><StatusIcon status={lv.status} /> {lv.status}</span></td>
                   <td className="px-4 py-2.5 text-right space-x-1 whitespace-nowrap">
