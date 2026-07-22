@@ -89,7 +89,8 @@ export default function FollowupAlerts() {
         const { data } = await api.get("/followups", { params: { status: "pending" } });
         if (cancelled) return;
 
-        const followups = data || [];
+        // Reorder nudges are a to-do list, not time-alarms — never ring for them.
+        const followups = (data || []).filter((f) => f.meta?.type !== "reorder");
 
         // If we have an active popup, but it is no longer pending or has been snoozed/dismissed elsewhere, clear it
         if (active) {

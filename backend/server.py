@@ -8636,10 +8636,15 @@ async def auto_reassign_task():
 async def _crm_user_for_oms_telecaller(oms_telecaller_id: Optional[str], oms_telecaller_name: Optional[str]) -> Optional[dict]:
     """Resolve the OMS order's telecaller to the CRM executive who should own the
     reorder follow-up. Priority:
+      0. Admin / Administrator orders → the CRM System Admin (per business rule)
       1. admin-configured user_mappings (oms_user_id → crm_user_id)
       2. name match against an active CRM executive
     Returns the CRM user doc, or None when the telecaller has left the company
     (unmapped + no name match) so the caller can fall back to round-robin."""
+    if (oms_telecaller_name or "").strip().lower() in ("admin", "administrator"):
+        admin = await db.users.find_one({"role": "admin", "active": True}, {"_id": 0, "password_hash": 0})
+        if admin:
+            return admin
     if oms_telecaller_id:
         m = await oms_db.user_mappings.find_one({"oms_user_id": oms_telecaller_id}, {"_id": 0, "crm_user_id": 1})
         if m and m.get("crm_user_id"):
@@ -10587,12 +10592,16 @@ async def check_due_followups_task():
         query = {
             "status": "pending",
             "notified": {"$ne": True},
+            # Reorder nudges are an open-ended to-do list, NOT time-boxed alarms —
+            # never fire the blocking full-screen popup for them (they live on the
+            # Follow-ups page). Firing them made execs spam "Mark Done" to dismiss.
+            "meta.type": {"$ne": "reorder"},
             "$or": [
                 {"due_at": {"$lte": now_iso}},
                 {"snoozed_until": {"$lte": now_iso}}
             ]
         }
-        
+
         due_followups = await db.followups.find(query).to_list(100)
         for fu in due_followups:
             lead = await db.leads.find_one({"id": fu.get("lead_id")}, {"_id": 0, "customer_name": 1, "phone": 1, "active_wa_phone": 1})
