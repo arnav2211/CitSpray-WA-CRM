@@ -1743,7 +1743,10 @@ async def assign_lead(lead_id: str, target_user_id: Optional[str] = None, by_use
     # /leads list can bubble them up alongside brand-new leads.
     prev = await db.leads.find_one({"id": lead_id}, {"_id": 0, "assigned_to": 1, "assignment_history": 1})
     is_reassignment = bool(prev and (prev.get("assigned_to") or (prev.get("assignment_history") or [])))
-    set_ops: Dict[str, Any] = {"assigned_to": chosen_id, "last_assignment_at": iso(now_utc()), "opened_at": None}
+    set_ops: Dict[str, Any] = {"assigned_to": chosen_id, "last_assignment_at": iso(now_utc()), "opened_at": None,
+                               # Tag after-hours (WFH pool) assignments so the morning
+                               # redistribution pass can spread them across everyone.
+                               "assigned_after_hours": not await _office_open_now()}
     if is_reassignment:
         set_ops["last_reassigned_at"] = iso(now_utc())
         set_ops["sort_at"] = set_ops["last_reassigned_at"]
@@ -2594,7 +2597,7 @@ async def get_lead(lead_id: str, user: dict = Depends(get_current_user)):
     # mark opened (only assignee)
     if user["role"] == "executive" and not lead.get("opened_at"):
         await db.leads.update_one(
-            {"id": lead_id}, {"$set": {"opened_at": iso(now_utc()), "last_action_at": iso(now_utc()), "auto_reassign_count": 0}}
+            {"id": lead_id}, {"$set": {"opened_at": iso(now_utc()), "last_action_at": iso(now_utc()), "auto_reassign_count": 0, "assigned_after_hours": False}}
         )
         lead["opened_at"] = iso(now_utc())
         await log_activity(user["id"], "lead_opened", lead_id)
@@ -8349,6 +8352,60 @@ async def webhook_whatsapp(request: Request):
 
 # ------------- Auto-reassignment task -------------
 
+async def _redistribute_after_hours_leads():
+    """Morning spread: leads that landed on the after-hours WFH pool overnight
+    and are still UNTOUCHED (status new, never opened) get divided round-robin
+    across the punched-in executives once the office opens. Waits until at
+    least 3 executives are available (or 45 min past office start) so the
+    first person to punch in doesn't get the whole overnight pile."""
+    cfg = await get_attendance_config()
+    if not await _office_open_now(cfg):
+        return
+    # Anything to move at all? (cheap check before counting attendance)
+    pending = await db.leads.count_documents({
+        "assigned_after_hours": True, "status": "new",
+        "opened_at": None, "assigned_to": {"$ne": None}})
+    if not pending:
+        return
+    execs = await db.users.find(
+        {"role": "executive", "active": True, "username": {"$ne": "test_user"}},
+        {"_id": 0, "password_hash": 0}).to_list(200)
+    available = []
+    for e in execs:
+        if await _is_user_available_by_attendance(e):
+            available.append(e)
+    if not available:
+        return
+    now = _ist_now()
+    mins = now.hour * 60 + now.minute
+    start_m = _hhmm_to_minutes(cfg["office_start"], 630)
+    if len(available) < 3 and mins < start_m + 45:
+        return  # wait for more people to punch in
+    moved = 0
+    cursor = db.leads.find({
+        "assigned_after_hours": True, "status": "new",
+        "opened_at": None, "assigned_to": {"$ne": None},
+    }, {"_id": 0, "id": 1, "assigned_to": 1}).sort("created_at", 1).limit(200)
+    async for lead in cursor:
+        chosen = await pick_next_executive()
+        if not chosen:
+            break
+        now_iso = iso(now_utc())
+        res = await db.leads.find_one_and_update(
+            {"id": lead["id"], "assigned_after_hours": True},
+            {"$set": {"assigned_to": chosen["id"], "assigned_after_hours": False,
+                      "last_assignment_at": now_iso, "last_action_at": now_iso,
+                      "auto_reassign_count": 0},
+             "$push": {"assignment_history": {"user_id": chosen["id"], "at": now_iso, "by": None}}},
+            return_document=False)
+        if res is not None and res.get("assigned_to") != chosen["id"]:
+            await log_activity(None, "wfh_morning_redistribution", lead["id"],
+                               {"from": res.get("assigned_to"), "to": chosen["id"]})
+            moved += 1
+    if moved:
+        logger.info(f"morning redistribution: spread {moved} after-hours leads across {len(available)} available execs")
+
+
 MAX_AUTO_REASSIGN_HOPS = 3
 
 async def _auto_reassign_lead(lead_id: str, current_assigned_to: Optional[str], reason: str,
@@ -8381,6 +8438,7 @@ async def _auto_reassign_lead(lead_id: str, current_assigned_to: Optional[str], 
             "last_reassigned_at": now_iso,
             "sort_at": now_iso,
             "opened_at": None,
+            "assigned_after_hours": not await _office_open_now(),
         },
         "$push": {"assignment_history": entry},
     }
@@ -8449,6 +8507,12 @@ async def auto_reassign_task():
         noaction_mins = int(rules.get("no_action_reassign_minutes") or 60)
         unopened_cutoff = iso(now_utc() - timedelta(minutes=unopened_mins))
         noaction_cutoff = iso(now_utc() - timedelta(minutes=noaction_mins))
+
+        # Morning spread of untouched overnight (WFH-pool) leads
+        try:
+            await _redistribute_after_hours_leads()
+        except Exception as e:
+            logger.warning(f"after-hours redistribution failed: {e}")
 
         # Only portal leads (IndiaMART / JustDial / ExportersIndia) take part in
         # auto-reassignment; hop cap stops the infinite ping-pong that was
