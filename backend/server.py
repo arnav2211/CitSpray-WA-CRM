@@ -8619,7 +8619,7 @@ async def auto_reassign_task():
                     continue
                 now_iso = iso(now_utc())
                 await db.followups.update_one({"id": fu["id"]}, {"$set": {
-                    "executive_id": nxt["id"], "due_at": now_iso,
+                    "executive_id": nxt["id"], "due_at": iso(now_utc() + timedelta(hours=12)),
                     "meta.reorder_assigned_at": now_iso}})
                 await db.leads.update_one({"id": fu["lead_id"]}, {
                     "$set": {"assigned_to": nxt["id"], "last_assignment_at": now_iso, "opened_at": None},
@@ -8749,9 +8749,10 @@ async def reorder_reminder_task():
                 "lead_id": lead["id"],
                 "executive_id": owner["id"],
                 "created_by": None,
-                # Due now (shows immediately). Reorder nudges are NOT time-alarms,
-                # so the 30-min "mark missed" sweep skips meta.type == reorder.
-                "due_at": iso(now_utc()),
+                # Due 12h out (not a minute-alarm). Keeps reorder nudges off the
+                # 90-second alarm-popup window on every frontend version while
+                # still surfacing on the Follow-ups page + /leads reorder chip.
+                "due_at": iso(now_utc() + timedelta(hours=12)),
                 "note": note,
                 "status": "pending",
                 "created_at": iso(now_utc()),

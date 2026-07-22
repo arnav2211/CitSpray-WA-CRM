@@ -171,12 +171,14 @@ function FollowupCard({ f, onOpen, onChat, onDone, onSnooze }) {
               <Package size={10} weight="bold" /> Reorder
             </span>
           )}
-          {!done && (
+          {!done && !isReorder && (
             <span className={`border px-1.5 py-0.5 text-[9px] uppercase tracking-widest font-bold rounded-sm ${u.cls}`}>{u.label}</span>
           )}
         </div>
         <div className="text-xs text-gray-700 mt-1 whitespace-pre-wrap break-words">{f.note || "—"}</div>
-        <div className="text-[10px] text-gray-400 font-mono mt-1">{done ? "Completed" : "Due"} {fmtIST(f.due_at)}</div>
+        <div className="text-[10px] text-gray-400 font-mono mt-1">
+          {done ? `Completed ${fmtIST(f.due_at)}` : isReorder ? "Reorder opportunity — call when you can" : `Due ${fmtIST(f.due_at)}`}
+        </div>
       </div>
       {!done && (
         <div className="flex items-center gap-1 shrink-0 relative">
