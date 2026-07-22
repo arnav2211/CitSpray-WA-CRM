@@ -498,6 +498,7 @@ class FollowupUpdate(BaseModel):
     status: Optional[Literal["pending", "done", "missed"]] = None
     note: Optional[str] = None
     due_at: Optional[str] = None
+    snooze_minutes: Optional[int] = None  # hide + re-surface after N minutes
 
 class WhatsAppSendInput(BaseModel):
     lead_id: str
@@ -507,6 +508,7 @@ class WhatsAppSendInput(BaseModel):
     template_params: Optional[List[str]] = None  # explicit body params; if omitted backend infers
     reply_to_message_id: Optional[str] = None  # local UUID of the message being replied to
     to_all_numbers: Optional[bool] = False  # send the same message to every number on the lead
+    to_phone: Optional[str] = None  # send to this specific number on the lead (number switcher)
 
 class TemplateCreate(BaseModel):
     name: str
@@ -2241,6 +2243,24 @@ async def list_leads(
         {"$project": {"_id": 0, "raw_email_html": 0, "raw_email_text": 0, "_src_tier": 0}},
     ]
     items = await db.leads.aggregate(pipeline).to_list(safe_limit)
+    # Enrich each lead with its earliest OPEN follow-up (pending, not snoozed) so
+    # /leads can flag urgency inline — overdue vs due-soon vs upcoming.
+    lead_id_list = [it["id"] for it in items if it.get("id")]
+    if lead_id_list:
+        now_iso2 = iso(now_utc())
+        fu_map: Dict[str, dict] = {}
+        async for f in db.followups.find(
+            {"lead_id": {"$in": lead_id_list}, "status": "pending",
+             "snoozed_until": {"$not": {"$gt": now_iso2}}},
+            {"_id": 0, "lead_id": 1, "due_at": 1, "note": 1, "meta": 1}).sort("due_at", 1):
+            if f["lead_id"] not in fu_map:  # earliest wins (already sorted)
+                fu_map[f["lead_id"]] = f
+        for it in items:
+            f = fu_map.get(it["id"])
+            if f:
+                it["followup_due_at"] = f.get("due_at")
+                it["followup_note"] = f.get("note")
+                it["followup_type"] = (f.get("meta") or {}).get("type")
     if paginate:
         total = await db.leads.count_documents(query)
         return {"items": items, "total": total, "limit": safe_limit, "offset": safe_offset}
@@ -3418,6 +3438,13 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
             if p and digits and digits not in seen_digits:
                 seen_digits.add(digits)
                 targets.append(p)
+    elif body.to_phone:
+        # Send to the specific number the agent selected in the switcher — must be
+        # one of the lead's own numbers (match on last-10-digit suffix).
+        want = re.sub(r"\D", "", body.to_phone)[-10:]
+        match = next((p for p in [lead.get("phone")] + list(lead.get("phones") or [])
+                      if p and re.sub(r"\D", "", p)[-10:] == want), None)
+        targets = [match or body.to_phone]
     else:
         targets = [lead.get("active_wa_phone") or lead.get("phone")]
     targets = [t for t in targets if t]
@@ -4116,6 +4143,12 @@ async def update_followup(fu_id: str, body: FollowupUpdate, user: dict = Depends
         updates["note"] = body.note
     if body.due_at is not None:
         updates["due_at"] = body.due_at
+    if body.snooze_minutes is not None and body.snooze_minutes > 0:
+        # Keep it pending but hide it (and push its due) until the snooze expires
+        snooze_until = iso(now_utc() + timedelta(minutes=int(body.snooze_minutes)))
+        updates["snoozed_until"] = snooze_until
+        updates["due_at"] = snooze_until
+        updates["status"] = "pending"
     if updates:
         await db.followups.update_one({"id": fu_id}, {"$set": updates})
     fu = await db.followups.find_one({"id": fu_id}, {"_id": 0})
@@ -8564,21 +8597,70 @@ async def auto_reassign_task():
         except Exception as e:
             logger.warning(f"stale-new reassign pass failed: {e}")
 
-        # Followups: mark missed
+        # Followups: mark missed — but NOT reorder nudges (they are open-ended
+        # reminders, not time-boxed alarms).
         await db.followups.update_many(
-            {"status": "pending", "due_at": {"$lt": iso(now_utc() - timedelta(minutes=30))}},
+            {"status": "pending", "due_at": {"$lt": iso(now_utc() - timedelta(minutes=30))},
+             "meta.type": {"$ne": "reorder"}},
             {"$set": {"status": "missed"}},
         )
+
+        # Stale reorder follow-ups: if a reorder nudge is still pending 2 days
+        # after it was assigned (nobody actioned it), reassign the lead + nudge
+        # round-robin so the reorder chance isn't lost on an idle executive.
+        try:
+            reorder_stale = iso(now_utc() - timedelta(days=2))
+            async for fu in db.followups.find({
+                "status": "pending", "meta.type": "reorder",
+                "meta.reorder_assigned_at": {"$lt": reorder_stale},
+            }, {"_id": 0}).limit(20):
+                nxt = await pick_next_executive(exclude_user_id=fu.get("executive_id"))
+                if not nxt or nxt["id"] == fu.get("executive_id"):
+                    continue
+                now_iso = iso(now_utc())
+                await db.followups.update_one({"id": fu["id"]}, {"$set": {
+                    "executive_id": nxt["id"], "due_at": now_iso,
+                    "meta.reorder_assigned_at": now_iso}})
+                await db.leads.update_one({"id": fu["lead_id"]}, {
+                    "$set": {"assigned_to": nxt["id"], "last_assignment_at": now_iso, "opened_at": None},
+                    "$push": {"assignment_history": {"user_id": nxt["id"], "at": now_iso, "by": None, "reason": "reorder_stale_reassign"}}})
+                await log_activity(None, "reorder_stale_reassigned", fu["lead_id"], {"to": nxt["id"]})
+        except Exception as e:
+            logger.warning(f"stale reorder reassign failed: {e}")
     except Exception as e:
         logger.exception(f"auto_reassign_task failed: {e}")
     finally:
         await _release_reassign_lock()
 
 
+async def _crm_user_for_oms_telecaller(oms_telecaller_id: Optional[str], oms_telecaller_name: Optional[str]) -> Optional[dict]:
+    """Resolve the OMS order's telecaller to the CRM executive who should own the
+    reorder follow-up. Priority:
+      1. admin-configured user_mappings (oms_user_id → crm_user_id)
+      2. name match against an active CRM executive
+    Returns the CRM user doc, or None when the telecaller has left the company
+    (unmapped + no name match) so the caller can fall back to round-robin."""
+    if oms_telecaller_id:
+        m = await oms_db.user_mappings.find_one({"oms_user_id": oms_telecaller_id}, {"_id": 0, "crm_user_id": 1})
+        if m and m.get("crm_user_id"):
+            u = await db.users.find_one({"id": m["crm_user_id"], "active": True}, {"_id": 0, "password_hash": 0})
+            if u:
+                return u
+    if oms_telecaller_name:
+        u = await db.users.find_one(
+            {"name": {"$regex": f"^{re.escape(oms_telecaller_name.strip())}$", "$options": "i"},
+             "role": "executive", "active": True}, {"_id": 0, "password_hash": 0})
+        if u:
+            return u
+    return None
+
+
 async def reorder_reminder_task():
     """Daily: find OMS customers whose LAST order is 30+ days old, match them to
-    their CRM lead, and drop a follow-up on the lead owner's queue with the
-    previous order's details so they can pitch a repeat order.
+    their CRM lead, and drop a follow-up with the previous order's details so the
+    right executive can pitch a repeat order. The follow-up (and the lead) go to
+    the executive who took the LAST order (via admin user_mappings); if that
+    telecaller has left the company, it round-robins to anybody.
     One reminder per (customer, last order) — dedup key prevents daily nagging;
     a fresh reminder only fires after the customer places (and then lapses on)
     a NEW order."""
@@ -8614,23 +8696,35 @@ async def reorder_reminder_task():
                     {"_id": 0, "id": 1, "assigned_to": 1, "customer_name": 1})
                 if lead:
                     break
-            owner = None
-            if lead and lead.get("assigned_to"):
-                owner = await db.users.find_one(
-                    {"id": lead["assigned_to"], "active": True}, {"_id": 0, "id": 1})
-            if not owner:
-                # No CRM lead / no live owner — tell the admin instead of dropping it
+            if not lead:
+                # No CRM lead exists for this customer — flag the admin (the OMS
+                # import backfill should normally have created one).
                 if not await db.admin_alerts.find_one({"meta.dedup_key": dedup}, {"_id": 1}):
                     await create_system_alert(
                         "reorder_unrouted",
-                        f"Reorder chance needs an owner: {cust.get('name')}",
+                        f"Reorder chance needs a lead: {cust.get('name')}",
                         f"OMS customer {cust.get('name')} (last order {o.get('order_number')} on "
                         f"{str(o.get('created_at'))[:10]}, ₹{o.get('grand_total')}) hasn't ordered in 30+ days, "
-                        f"but has no CRM lead or no active executive assigned. Assign someone to chase the repeat order.",
+                        f"but has no CRM lead. Add them so the reorder nudge can route.",
                         dedup_key=dedup,
                     )
                     created += 1
                 continue
+            # Route to the executive who took the LAST order (admin mapping);
+            # if that telecaller has left, round-robin to anybody.
+            owner = await _crm_user_for_oms_telecaller(o.get("telecaller_id"), o.get("telecaller_name"))
+            if not owner:
+                owner = await pick_next_executive()
+            if not owner:
+                owner = await db.users.find_one(
+                    {"id": lead.get("assigned_to"), "active": True}, {"_id": 0, "password_hash": 0})
+            if not owner:
+                continue
+            # Point the lead at the reorder owner so all follow-up work lands together
+            if lead.get("assigned_to") != owner["id"]:
+                await db.leads.update_one({"id": lead["id"]}, {
+                    "$set": {"assigned_to": owner["id"], "last_assignment_at": iso(now_utc()), "opened_at": None},
+                    "$push": {"assignment_history": {"user_id": owner["id"], "at": iso(now_utc()), "by": None, "reason": "reorder_owner"}}})
             items = o.get("items") or []
             if not isinstance(items, list):
                 items = []
@@ -8648,17 +8742,21 @@ async def reorder_reminder_task():
             fu = {
                 "id": str(uuid.uuid4()),
                 "lead_id": lead["id"],
-                "executive_id": lead["assigned_to"],
+                "executive_id": owner["id"],
                 "created_by": None,
-                "due_at": iso(now_utc() + timedelta(minutes=30)),
+                # Due now (shows immediately). Reorder nudges are NOT time-alarms,
+                # so the 30-min "mark missed" sweep skips meta.type == reorder.
+                "due_at": iso(now_utc()),
                 "note": note,
                 "status": "pending",
                 "created_at": iso(now_utc()),
                 "completed_at": None,
-                "meta": {"type": "reorder", "dedup_key": dedup, "oms_customer_id": cust_id, "oms_order_id": o["id"]},
+                "meta": {"type": "reorder", "dedup_key": dedup, "oms_customer_id": cust_id,
+                         "oms_order_id": o["id"], "reorder_assigned_at": iso(now_utc())},
             }
             await db.followups.insert_one(fu)
-            await log_activity(None, "reorder_reminder_created", lead["id"], {"customer": cust.get("name"), "order": o.get("order_number")})
+            await log_activity(None, "reorder_reminder_created", lead["id"],
+                               {"customer": cust.get("name"), "order": o.get("order_number"), "to": owner["id"]})
             created += 1
         if created:
             logger.info(f"reorder_reminder_task: created {created} reorder follow-ups")
