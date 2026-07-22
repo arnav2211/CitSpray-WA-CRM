@@ -691,15 +691,23 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   const [aiLoading, setAiLoading] = useState(false);
   const [aiSuggestions, setAiSuggestions] = useState([]);
   const [sendToAll, setSendToAll] = useState(false);
-  // Unique numbers on this lead (primary + extras, deduped on last 10 digits)
-  const uniquePhoneCount = React.useMemo(() => {
+  // Unique numbers on this lead (primary + extras, deduped on last 10 digits),
+  // primary first — drives the header number switcher and the send target.
+  const allNumbers = React.useMemo(() => {
     const seen = new Set();
+    const out = [];
     [conv.phone, ...(conv.phones || [])].filter(Boolean).forEach((p) => {
       const d = String(p).replace(/\D/g, "").slice(-10);
-      if (d) seen.add(d);
+      if (d && !seen.has(d)) { seen.add(d); out.push(p); }
     });
-    return seen.size;
+    return out;
   }, [conv.phone, conv.phones]);
+  const uniquePhoneCount = allNumbers.length;
+  // id → name for showing who sent each outbound WhatsApp message
+  const userMap = React.useMemo(
+    () => Object.fromEntries((execs || []).map((e) => [e.id, e.name])),
+    [execs],
+  );
 
   const askAI = async (intent) => {
     setAiLoading(true);
@@ -1100,6 +1108,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
       const payload = { lead_id: conv.id, body: draft };
       if (replyTo?.id) payload.reply_to_message_id = replyTo.id;
       if (sendToAll) payload.to_all_numbers = true;
+      else if (phoneFilter) payload.to_phone = phoneFilter;  // send to the selected number
       const { data } = await api.post("/whatsapp/send", payload);
       if (data?.multi) {
         toast[data.failed > 0 ? "warning" : "success"](
@@ -1140,6 +1149,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
       };
       if (templateParams !== null) payload.template_params = templateParams;
       if (sendToAll) payload.to_all_numbers = true;
+      else if (phoneFilter) payload.to_phone = phoneFilter;  // send to the selected number
       const { data } = await api.post("/whatsapp/send", payload);
       if (data?.multi) {
         toast[data.failed > 0 ? "warning" : "success"](`Template sent to ${data.sent}/${data.sent + data.failed} numbers`);
@@ -1419,10 +1429,30 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
             </select>
           </div>
           <div className="text-xs text-gray-500 flex items-center gap-3 flex-wrap">
-            {conv.phone && (
-              <a href={`tel:${conv.phone}`} className="font-mono flex items-center gap-1 hover:underline hover:text-blue-600" data-testid="chat-phone-display">
-                <Phone size={11} /> {conv.phone}
-              </a>
+            {allNumbers.length <= 1 ? (
+              conv.phone && (
+                <a href={`tel:${conv.phone}`} className="font-mono flex items-center gap-1 hover:underline hover:text-blue-600" data-testid="chat-phone-display">
+                  <Phone size={11} /> {conv.phone}
+                </a>
+              )
+            ) : (
+              <span className="flex items-center gap-1 flex-wrap" data-testid="chat-number-switcher">
+                <Phone size={11} className="text-gray-400" />
+                <button
+                  onClick={() => setPhoneFilter("")}
+                  className={`font-mono px-1.5 py-0.5 border text-[11px] ${!phoneFilter ? "bg-[#128C7E] border-[#128C7E] text-white" : "border-gray-300 hover:bg-gray-100"}`}
+                  data-testid="chat-number-all"
+                >All</button>
+                {allNumbers.map((p, i) => (
+                  <button
+                    key={p}
+                    onClick={() => setPhoneFilter(p)}
+                    className={`font-mono px-1.5 py-0.5 border text-[11px] ${phoneFilter === p ? "bg-[#128C7E] border-[#128C7E] text-white" : "border-gray-300 hover:bg-gray-100"}`}
+                    title={i === 0 ? "Primary number" : "Additional number"}
+                    data-testid={`chat-number-${i}`}
+                  >{p}{i === 0 ? " ★" : ""}</button>
+                ))}
+              </span>
             )}
             {/* Admin: reassign dropdown ; executive: read-only assignee */}
             {isAdmin ? (
@@ -1533,6 +1563,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                 key={g.dayKey}
                 group={g}
                 allMessages={messages}
+                userMap={userMap}
                 canMessage={canMessage && within24h}
                 currentUserId={user?.id}
                 searchQuery={inChatQuery.trim()}
@@ -2361,7 +2392,7 @@ function InfoRow({ label, children }) {
 // `position: sticky` + `top: 0` makes the separator pin to the top while scrolling
 // through the day's messages — matching WhatsApp's behavior.
 const DayGroup = React.memo(function DayGroup({
-  group, allMessages, canMessage, currentUserId,
+  group, allMessages, userMap, canMessage, currentUserId,
   onReply, onResend, onReact, onAskAdmin, onJumpTo,
   searchQuery, focusedHitId, searchHitsSet,
 }) {
@@ -2387,6 +2418,7 @@ const DayGroup = React.memo(function DayGroup({
           key={m.id}
           m={m}
           allMessages={allMessages}
+          senderName={m.by_user_id ? (userMap?.[m.by_user_id] || null) : "Auto"}
           canMessage={canMessage}
           currentUserId={currentUserId}
           searchQuery={searchQuery}
@@ -2404,7 +2436,7 @@ const DayGroup = React.memo(function DayGroup({
 });
 
 
-function BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmin, onJumpTo, canMessage = true, currentUserId = null, isHighlighted = false, isFocused = false, searchQuery = "" }) {
+function BubbleImpl({ m, allMessages = [], senderName = null, onReply, onResend, onReact, onAskAdmin, onJumpTo, canMessage = true, currentUserId = null, isHighlighted = false, isFocused = false, searchQuery = "" }) {
   const isOut = m.direction === "out";
   const isSystem = m.direction === "system";
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -2535,6 +2567,9 @@ function BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmi
               ↻ Resend
             </button>
           )}
+          {isOut && senderName && (
+            <span className="text-[9px] text-gray-400 uppercase tracking-wider font-bold mr-1" title="Sent by" data-testid={`msg-sender-${m.id}`}>~ {senderName}</span>
+          )}
           <span className="text-[10px] text-gray-500 font-mono" title={fmtSmartLong(m.at)}>{fmtTime12(m.at)}</span>
           {isOut && <span className={`text-[10px] ${tickColor(m.status)}`}>{tickFor(m.status)}</span>}
           {isOut && m.error && <span className="text-[9px] text-[#E60000] uppercase tracking-widest font-bold">{String(m.error).slice(0, 24)}</span>}
@@ -2595,6 +2630,7 @@ function BubbleImpl({ m, allMessages = [], onReply, onResend, onReact, onAskAdmi
 // large histories (#5 perf).
 const Bubble = React.memo(BubbleImpl, (prev, next) => {
   if (prev.m !== next.m) return false;
+  if (prev.senderName !== next.senderName) return false;
   if (prev.isHighlighted !== next.isHighlighted) return false;
   if (prev.isFocused !== next.isFocused) return false;
   if (prev.canMessage !== next.canMessage) return false;

@@ -4,12 +4,33 @@ import { useAuth } from "@/context/AuthContext";
 import { Link, useSearchParams, useNavigate } from "react-router-dom";
 import { StatusBadge, SourceBadge, EnquiryTypeBadge } from "@/components/Badges";
 import { toast } from "sonner";
-import { Kanban, Table, Plus, MagnifyingGlass, FileX, WhatsappLogo, UploadSimple, Star } from "@phosphor-icons/react";
+import { Kanban, Table, Plus, MagnifyingGlass, FileX, WhatsappLogo, UploadSimple, Star, Bell, Package } from "@phosphor-icons/react";
 import LeadDrawer from "@/components/LeadDrawer";
 import { fmtIST } from "@/lib/format";
 
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
 const SOURCES = ["IndiaMART", "ExportersIndia", "Justdial", "Manual", "WhatsApp", "Website"];
+
+// Inline follow-up urgency chip for a lead row: red=overdue, amber=due, blue=upcoming.
+function FollowupChip({ lead }) {
+  if (!lead.followup_due_at) return null;
+  const diffMin = (new Date(lead.followup_due_at).getTime() - Date.now()) / 60000;
+  const isReorder = lead.followup_type === "reorder";
+  let cls, label;
+  if (diffMin < -30) { cls = "bg-[#FDECEC] border-[#E60000] text-[#B00000]"; label = "Overdue"; }
+  else if (diffMin < 60) { cls = "bg-[#FFF4E5] border-[#E67E00] text-[#B85F00]"; label = "Due"; }
+  else { cls = "bg-[#EAF1FF] border-[#002FA7] text-[#002FA7]"; label = "Follow-up"; }
+  return (
+    <span
+      className={`inline-flex items-center gap-0.5 border px-1.5 py-0.5 text-[9px] uppercase tracking-widest font-bold rounded-sm ${cls}`}
+      title={`${isReorder ? "Reorder — " : ""}${lead.followup_note || "Follow-up scheduled"}`}
+      data-testid={`lead-followup-chip-${lead.id}`}
+    >
+      {isReorder ? <Package size={10} weight="bold" /> : <Bell size={10} weight="bold" />}
+      {isReorder ? "Reorder" : label}
+    </span>
+  );
+}
 
 export default function Leads() {
   const { user } = useAuth();
@@ -252,6 +273,7 @@ export default function Leads() {
                         >
                           <Star size={14} weight={l.starred ? "fill" : "regular"} />
                         </button>
+                        <FollowupChip lead={l} />
                       </div>
                       {l.phone && (
                         <div className="text-xs text-gray-500 font-mono mt-0.5 flex items-center gap-1.5">
@@ -330,6 +352,7 @@ export default function Leads() {
                         >
                           <Star size={16} weight={l.starred ? "fill" : "regular"} />
                         </button>
+                        <FollowupChip lead={l} />
                       </div>
                       {l.phone && (
                         <div className="text-xs text-gray-500 font-mono flex items-center gap-1.5">
