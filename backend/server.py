@@ -1833,6 +1833,7 @@ async def auto_send_whatsapp_on_create(lead: dict):
         "lead_id": lead["id"],
         "direction": "out",
         "body": body_preview,
+        "to_phone": lead["phone"],   # required so per-number threads stay separate
         "template_name": tpl_name,
         "status": api_result.get("status", "failed"),
         "wamid": api_result.get("wamid"),
@@ -5177,7 +5178,7 @@ async def list_conversations(
             continue
         out.append({
             **{k: ld.get(k) for k in [
-                "id", "customer_name", "phone", "phones", "email", "requirement",
+                "id", "customer_name", "phone", "phones", "active_wa_phone", "email", "requirement",
                 "area", "city", "state", "source", "source_data", "status",
                 "assigned_to", "contact_link", "created_at", "opened_at", "last_action_at",
                 "has_whatsapp", "notes", "starred",
@@ -6525,6 +6526,7 @@ async def _shopify_send_template_for_lead(lead: dict, tpl_name: str, params: Lis
         "lead_id": lead["id"],
         "direction": "out",
         "body": f"[Template: {tpl_name}] sent to {lead['phone']}",
+        "to_phone": lead["phone"],   # required so per-number threads stay separate
         "template_name": tpl_name,
         "status": api_result.get("status", "failed"),
         "wamid": api_result.get("wamid"),

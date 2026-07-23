@@ -840,13 +840,28 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   // /leads-only concern. The filter here is purely a view-side restriction.
   const [phoneFilter, setPhoneFilter] = useState(initialPhone || "");
 
-  // 24h window follows the SELECTED number — WhatsApp's window belongs to the
-  // number that wrote in, so switching numbers re-evaluates it. Viewing "All"
-  // falls back to the lead-wide flag (open if ANY number is in window).
   const winByPhone = conv.within_24h_by_phone || null;
-  const within24h = (phoneFilter && winByPhone && Object.prototype.hasOwnProperty.call(winByPhone, phoneFilter))
-    ? !!winByPhone[phoneFilter]
-    : !!conv.within_24h;
+
+  // The 24h window is derived from the messages ACTUALLY IN VIEW: the newest
+  // inbound in this thread. With a number selected the thread holds only that
+  // number's messages, so this is exactly that number's window — and it can
+  // never disagree with what the agent is looking at.
+  const within24h = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].direction === "in" && messages[i].at) {
+        const t = new Date(messages[i].at).getTime();
+        if (Number.isFinite(t)) return (Date.now() - t) < 24 * 3600 * 1000;
+      }
+    }
+    if (messages.length === 0) {
+      // thread not loaded yet — trust the server hint
+      if (phoneFilter && winByPhone && Object.prototype.hasOwnProperty.call(winByPhone, phoneFilter)) {
+        return !!winByPhone[phoneFilter];
+      }
+      return !!conv.within_24h;
+    }
+    return false;  // loaded, but this number never wrote in → template only
+  }, [messages, phoneFilter, winByPhone, conv.within_24h]);
 
   const lastConvIdRef = useRef(conv.id);
   const messagesLengthRef = useRef(0);
@@ -856,11 +871,15 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
     messagesLengthRef.current = 0;
   }
 
-  // BUG FIX: the per-number filter belonged to the PREVIOUS lead. Without this
-  // reset, opening another chat kept filtering by a number that lead doesn't
-  // have — so the thread rendered completely empty.
+  // Per-number threads: when a lead has 2+ numbers each number is its OWN
+  // conversation. On opening a lead we select the number that actually talked
+  // most recently (active_wa_phone, else primary) instead of merging them.
+  // Also resets when switching leads — a stale filter used to blank the thread.
   useEffect(() => {
-    setPhoneFilter(initialPhone || "");
+    if (initialPhone) { setPhoneFilter(initialPhone); return; }
+    const nums = [conv.phone, ...(conv.phones || [])].filter(Boolean);
+    setPhoneFilter(nums.length > 1 ? (conv.active_wa_phone || conv.phone || "") : "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conv.id, initialPhone]);
 
   useEffect(() => {
@@ -1795,7 +1814,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                     {translatingInput ? "..." : "Translate"}
                   </button>
                 </div>
-                {uniquePhoneCount > 1 && (
+                {uniquePhoneCount > 1 && !phoneFilter && (
                   <label className={`flex items-center gap-1.5 px-2 py-1.5 border rounded cursor-pointer select-none shrink-0 ${sendToAll ? "bg-[#25D366] border-[#25D366] text-white" : "border-gray-300 bg-white text-gray-600 hover:bg-gray-50"}`}
                     title={`This lead has ${uniquePhoneCount} numbers — when on, every message/template goes to all of them`}
                     data-testid="send-all-numbers-toggle">
