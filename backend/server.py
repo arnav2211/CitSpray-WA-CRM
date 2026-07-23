@@ -11949,7 +11949,21 @@ async def calculate_payroll(
         uid = u["id"]
         joining_date_str = u.get("joining_date") or today_ist
         base_salary = float(u.get("base_salary") or 0.0)
-        daily_rate = base_salary / 31.0  # flat /31 as per company policy
+        # Daily rate = base ÷ WORKING DAYS in this cycle (Mon–Sat, minus full
+        # holidays), counted from the employee's joining date. So a full month of
+        # attendance pays exactly the base salary; Sundays and holidays are paid
+        # rest days already covered by the base (they neither add nor cut pay).
+        working_days = 0
+        for _d in date_list:
+            if _d < joining_date_str:
+                continue
+            if datetime.strptime(_d, "%Y-%m-%d").weekday() == 6:
+                continue  # Sunday
+            _h = holidays_map.get(_d)
+            if _h and (_h.get("holiday_type") or "full") == "full":
+                continue  # full company holiday
+            working_days += 1
+        daily_rate = base_salary / working_days if working_days > 0 else 0.0
 
         att_list = await db.attendance_logs.find(
             {"user_id": uid, "date": {"$gte": lookback_date, "$lte": lookahead_date}}).to_list(1000)
@@ -12052,9 +12066,12 @@ async def calculate_payroll(
                 daily_breakdown.append(day)
                 continue
 
-            target_earnings += daily_rate
             adj = adjs_map.get(d_str)
             worked_day = (not is_sunday) and (not is_full_holiday)
+            # Only working days accrue pay. Sundays & full holidays are paid rest
+            # days already inside the base — they accrue nothing and cut nothing.
+            if worked_day:
+                target_earnings += daily_rate
 
             # late tracking happens on worked days regardless of the final status
             if worked_day and in_m is not None:
@@ -12115,7 +12132,8 @@ async def calculate_payroll(
                 day["details"] = "Sunday"
                 sunday_rows.append(day)
             elif is_full_holiday:
-                day.update(status="holiday", earning=daily_rate, details=f"Holiday: {hol.get('name')} (Paid)")
+                # Paid day off, already covered by the base — no extra earning.
+                day.update(status="holiday", earning=0.0, details=f"Holiday: {hol.get('name')} (Paid off)")
                 counts["holiday"] += 1
             elif log and in_m is not None:
                 in_s, out_s = day["punch_in"] or "--:--", day["punch_out"] or "--:--"
@@ -12206,25 +12224,11 @@ async def calculate_payroll(
                 return False
             return worked_credit(x_str) <= 0.0
 
+        # With salary spread over working days, Sundays are paid weekly-off rest
+        # days already included in the base — they neither add nor cut pay.
         for s_day in sunday_rows:
-            sdt = datetime.strptime(s_day["date"], "%Y-%m-%d")
-            prev_str = (sdt - timedelta(days=1)).strftime("%Y-%m-%d")
-            next_str = (sdt + timedelta(days=1)).strftime("%Y-%m-%d")
-            if _side_absent(prev_str) and _side_absent(next_str):
-                s_day.update(status="weekly_off_unpaid", earning=0.0, deduction=daily_rate,
-                             details="Sunday UNPAID — leave/absent on both the day before and the day after")
-                total_deductions += daily_rate
-                counts["sunday_unpaid"] += 1
-            elif sunday_quota > 0:
-                sunday_quota -= 1
-                s_day.update(status="weekly_off", earning=daily_rate,
-                             details=f"Sunday (Paid — {total_credits:g} worked days in period)")
-                counts["weekly_off"] += 1
-            else:
-                s_day.update(status="weekly_off_unpaid", earning=0.0, deduction=daily_rate,
-                             details=f"Sunday UNPAID — only {total_credits:g} worked days in period (5 needed per paid Sunday)")
-                total_deductions += daily_rate
-                counts["sunday_unpaid"] += 1
+            s_day.update(status="weekly_off", earning=0.0, deduction=0.0, details="Sunday (weekly off)")
+            counts["weekly_off"] += 1
 
         if counts["after_grace"] > 0:
             flags.append(f"Arrived after {cfg['late_grace_until']} on {counts['after_grace']} day(s)")
@@ -12249,6 +12253,7 @@ async def calculate_payroll(
             "joining_date": joining_date_str,
             "base_salary": base_salary,
             "daily_rate": round(daily_rate, 2),
+            "working_days": working_days,
             "pro_rated_target_salary": round(target_earnings, 2),
             "total_deductions": round(total_deductions, 2),
             "final_salary_payout": round(final_salary, 2),
@@ -12261,7 +12266,7 @@ async def calculate_payroll(
     return {
         "start_date": start_date,
         "end_date": end_date,
-        "daily_rate_basis": 31,
+        "daily_rate_basis": "working_days",
         "payroll": results,
     }
 

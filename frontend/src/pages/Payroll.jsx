@@ -312,7 +312,7 @@ function RegisterTab() {
           <div className="hidden print:block px-4 pt-4 pb-2 border-b-2 border-gray-900">
             <div className="font-black text-2xl uppercase">CitSpray — Salary Register</div>
             <div className="text-[10px] font-mono text-gray-600">
-              Generated {new Date().toLocaleString("en-IN")} · Daily rate = Base ÷ 31
+              Generated {new Date().toLocaleString("en-IN")} · Daily rate = Base ÷ working days in cycle
             </div>
           </div>
           <table className="w-full text-sm text-left min-w-[900px]">
@@ -644,7 +644,7 @@ function SalarySheetContent({ p }) {
         <span>
           Present: <b>{c.present}</b> · Half days: <b>{(c.half_day || 0) + (c.missing_punch_out || 0)}</b> ·
           Approved leave: <b>{c.leave_approved || 0}</b> · Uninformed absent: <b>{c.absent_uninformed || 0}</b> ·
-          Sundays paid: <b>{c.weekly_off || 0}</b> · Sundays unpaid: <b>{c.sunday_unpaid || 0}</b> ·
+          Sundays (weekly off): <b>{c.weekly_off || 0}</b> ·
           Late arrivals (after 10:30): <b>{c.late || 0}</b> · Total worked: <b>{totalHours.toFixed(1)}h</b>
         </span>
         {p.payment?.paid && (
@@ -692,11 +692,11 @@ function SalarySheetContent({ p }) {
           <tbody>
             <tr><td className="py-0.5">Monthly base salary</td><td className="text-right">{money(p.base_salary)}</td></tr>
             <tr className="border-b border-gray-400">
-              <td className="py-0.5">Daily rate = {money(p.base_salary)} ÷ 31</td>
+              <td className="py-0.5">Daily rate = {money(p.base_salary)} ÷ {p.working_days ?? "—"} working days</td>
               <td className="text-right">{money(p.daily_rate)} / day</td>
             </tr>
             <tr>
-              <td className="py-0.5">Period gross ({days.filter((d) => d.status !== "pending_today").length} days × {money(p.daily_rate)}; {paidDays} paid)</td>
+              <td className="py-0.5">Earned ({paidDays} working day(s) paid × {money(p.daily_rate)})</td>
               <td className="text-right">{money(p.pro_rated_target_salary)}</td>
             </tr>
             {groups.map(([status, g]) => (
@@ -722,9 +722,9 @@ function SalarySheetContent({ p }) {
         <b>Company rules:</b> Office Mon–Sat 10:30 AM – 7:00 PM. Arrival allowed till 11:00 AM (later arrivals are flagged, no cut).
         Leaving after 3 PM but before 7 PM = half day (½ day cut). Leaving before 3 PM = full day cut.
         Approved leave = 1 day's salary cut per day; absence without approval = 2 days' cut per day.
-        Paid Sundays are earned by total days worked in the period: every 5 worked days pays 1 Sunday
-        (20 days → 4 Sundays, 15 → 3, …). A Sunday with leave/absence on both the day before and after is unpaid.
-        Declared company holidays are fully paid. Daily rate is Base ÷ 31 in every month.
+        Sundays and declared company holidays are paid weekly-off days already included in the base.
+        Daily rate = Base ÷ number of working days (Mon–Sat minus holidays) in the salary cycle, so
+        being present on every working day pays the full base salary.
       </div>
 
       <div className="flex justify-between mt-14 pt-6 text-center text-[10px] font-bold uppercase tracking-widest">
