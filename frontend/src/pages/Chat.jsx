@@ -833,13 +833,20 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   }, []);
 
   const exec = execs.find(e => e.id === conv.assigned_to);
-  const within24h = !!conv.within_24h;
   // Per-phone filter (#3 from /leads parity spec). When deep-linked from /leads
   // with `?phone=…`, this filters the WA history to only the conversations
   // addressed to/from that specific number — never merging across phones.
   // NOTE: /chat itself does NOT alter the lead's active_wa_phone — that's a
   // /leads-only concern. The filter here is purely a view-side restriction.
   const [phoneFilter, setPhoneFilter] = useState(initialPhone || "");
+
+  // 24h window follows the SELECTED number — WhatsApp's window belongs to the
+  // number that wrote in, so switching numbers re-evaluates it. Viewing "All"
+  // falls back to the lead-wide flag (open if ANY number is in window).
+  const winByPhone = conv.within_24h_by_phone || null;
+  const within24h = (phoneFilter && winByPhone && Object.prototype.hasOwnProperty.call(winByPhone, phoneFilter))
+    ? !!winByPhone[phoneFilter]
+    : !!conv.within_24h;
 
   const lastConvIdRef = useRef(conv.id);
   const messagesLengthRef = useRef(0);
@@ -848,6 +855,13 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
     lastConvIdRef.current = conv.id;
     messagesLengthRef.current = 0;
   }
+
+  // BUG FIX: the per-number filter belonged to the PREVIOUS lead. Without this
+  // reset, opening another chat kept filtering by a number that lead doesn't
+  // have — so the thread rendered completely empty.
+  useEffect(() => {
+    setPhoneFilter(initialPhone || "");
+  }, [conv.id, initialPhone]);
 
   useEffect(() => {
     messagesLengthRef.current = messages.length;
@@ -1443,15 +1457,23 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                   className={`font-mono px-1.5 py-0.5 border text-[11px] ${!phoneFilter ? "bg-[#128C7E] border-[#128C7E] text-white" : "border-gray-300 hover:bg-gray-100"}`}
                   data-testid="chat-number-all"
                 >All</button>
-                {allNumbers.map((p, i) => (
-                  <button
-                    key={p}
-                    onClick={() => setPhoneFilter(p)}
-                    className={`font-mono px-1.5 py-0.5 border text-[11px] ${phoneFilter === p ? "bg-[#128C7E] border-[#128C7E] text-white" : "border-gray-300 hover:bg-gray-100"}`}
-                    title={i === 0 ? "Primary number" : "Additional number"}
-                    data-testid={`chat-number-${i}`}
-                  >{p}{i === 0 ? " ★" : ""}</button>
-                ))}
+                {allNumbers.map((p, i) => {
+                  const open = winByPhone ? !!winByPhone[p] : null;
+                  return (
+                    <button
+                      key={p}
+                      onClick={() => setPhoneFilter(p)}
+                      className={`font-mono px-1.5 py-0.5 border text-[11px] flex items-center gap-1 ${phoneFilter === p ? "bg-[#128C7E] border-[#128C7E] text-white" : "border-gray-300 hover:bg-gray-100"}`}
+                      title={`${i === 0 ? "Primary number" : "Additional number"}${open === null ? "" : open ? " · 24h window OPEN (can send free text)" : " · 24h window closed (template only)"}`}
+                      data-testid={`chat-number-${i}`}
+                    >
+                      {open !== null && (
+                        <span className={`w-1.5 h-1.5 rounded-full ${open ? "bg-[#25D366]" : "bg-[#E60000]"}`} />
+                      )}
+                      {p}{i === 0 ? " ★" : ""}
+                    </button>
+                  );
+                })}
               </span>
             )}
             {/* Admin: reassign dropdown ; executive: read-only assignee */}

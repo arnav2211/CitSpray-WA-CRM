@@ -500,6 +500,34 @@ class FollowupUpdate(BaseModel):
     due_at: Optional[str] = None
     snooze_minutes: Optional[int] = None  # hide + re-surface after N minutes
 
+async def _last_inbound_at(lead_id: Optional[str], phone: Optional[str] = None) -> Optional[str]:
+    """Timestamp of the most recent INBOUND WhatsApp message on this lead.
+    When `phone` is given, only messages from that specific customer number
+    count (WhatsApp's 24h window belongs to the number that wrote in)."""
+    if not lead_id:
+        return None
+    q: Dict[str, Any] = {"lead_id": lead_id, "direction": "in"}
+    if phone:
+        pat = phone_match_pattern(phone)
+        if pat:
+            q["from"] = {"$regex": pat}
+    m = await db.messages.find_one(q, {"_id": 0, "at": 1}, sort=[("at", -1)])
+    return (m or {}).get("at")
+
+
+async def _within_24h_for_phone(lead_id: Optional[str], phone: Optional[str]) -> bool:
+    at = await _last_inbound_at(lead_id, phone)
+    if not at:
+        return False
+    try:
+        d = datetime.fromisoformat(str(at).replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return (now_utc() - d) < timedelta(hours=24)
+    except Exception:
+        return False
+
+
 class WhatsAppSendInput(BaseModel):
     lead_id: str
     body: str
@@ -3488,22 +3516,24 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
             )
             send_results.append((tp, r))
     else:
-        # Free-text: enforce WhatsApp's 24-hour customer-care window
-        last_in = lead.get("last_user_message_at")
-        within = False
-        if last_in:
-            try:
-                d = datetime.fromisoformat(last_in.replace("Z", "+00:00"))
-                if d.tzinfo is None:
-                    d = d.replace(tzinfo=timezone.utc)
-                within = (now_utc() - d) < timedelta(hours=24)
-            except Exception:
-                within = False
-        if not within:
+        # Free-text: enforce WhatsApp's 24-hour customer-care window.
+        # Computed from the ACTUAL inbound messages (never the denormalized
+        # lead field, which goes stale on merges / multi-number threads), and
+        # per TARGET NUMBER — the window belongs to the number that wrote in.
+        blocked: List[str] = []
+        for tp in targets:
+            if not await _within_24h_for_phone(body.lead_id, tp):
+                blocked.append(tp)
+        if blocked and len(blocked) == len(targets):
+            nums = ", ".join(blocked)
             raise HTTPException(
                 status_code=400,
-                detail="Outside the 24-hour customer service window — please use a template message",
+                detail=(f"Outside the 24-hour window for {nums} — that number hasn't messaged in the "
+                        f"last 24h. Use a template, or switch to a number that has replied recently."),
             )
+        if blocked:
+            # Some targets are outside their own window — drop just those
+            targets = [t for t in targets if t not in blocked]
         # Resolve reply context: must reference a message on the SAME lead.
         reply_ctx_wamid: Optional[str] = None
         reply_ctx_local_id: Optional[str] = None
@@ -5326,6 +5356,16 @@ async def get_one_conversation(lead_id: str, user: dict = Depends(get_current_us
         except Exception:
             pass
     unreplied = bool(last_in_at and (not last_out_at or last_in_at > last_out_at))
+    # Per-number 24h window: the composer must know WHICH of the lead's numbers
+    # can receive free text (the window belongs to the number that wrote in).
+    win_by_phone: Dict[str, bool] = {}
+    last_in_by_phone: Dict[str, Any] = {}
+    for ph in [lead.get("phone")] + list(lead.get("phones") or []):
+        if not ph:
+            continue
+        at = await _last_inbound_at(lead_id, ph)
+        last_in_by_phone[ph] = at
+        win_by_phone[ph] = await _within_24h_for_phone(lead_id, ph)
     iqa = await db.internal_messages.find_one({"lead_id": lead_id}, {"_id": 0, "qa_status": 1}, sort=[("at", -1)])
     return {
         **{k: lead.get(k) for k in [
@@ -5346,6 +5386,8 @@ async def get_one_conversation(lead_id: str, user: dict = Depends(get_current_us
         "last_in_at": last_in_at,
         "last_out_at": last_out_at,
         "within_24h": within_24h,
+        "within_24h_by_phone": win_by_phone,
+        "last_in_by_phone": last_in_by_phone,
         "unreplied": unreplied,
         "internal_qa_status": (iqa or {}).get("qa_status", "none"),
     }
@@ -6122,6 +6164,14 @@ async def _merge_leads(source_lead: dict, dest_lead: dict, by_user_id: Optional[
     for field in ["requirement", "area", "city", "state", "country"]:
         if not dest_lead.get(field) and source_lead.get(field):
             update_fields[field] = source_lead[field]
+
+    # Carry the newest customer-reply timestamp across — losing it used to close
+    # the 24h window on a merged lead even though the customer had just written.
+    lu = max([x for x in [dest_lead.get("last_user_message_at"), source_lead.get("last_user_message_at")] if x], default=None)
+    if lu:
+        update_fields["last_user_message_at"] = lu
+    if source_lead.get("has_whatsapp"):
+        update_fields["has_whatsapp"] = True
 
     await db.leads.update_one({"id": dest_id}, {"$set": update_fields})
 
@@ -7093,16 +7143,10 @@ class ChatOptionInput(BaseModel):
 
 
 async def _is_within_24h_window(lead: dict) -> bool:
-    last_in = lead.get("last_user_message_at")
-    if not last_in:
-        return False
-    try:
-        d = datetime.fromisoformat(last_in.replace("Z", "+00:00"))
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=timezone.utc)
-        return (now_utc() - d) < timedelta(hours=24)
-    except Exception:
-        return False
+    """24h customer-care window for a lead — computed from real inbound messages
+    (any of the lead's numbers), never the denormalized last_user_message_at,
+    which goes stale after merges and on multi-number threads."""
+    return await _within_24h_for_phone(lead.get("id"), None)
 
 
 async def wa_send_interactive(to_phone: str, interactive_payload: Dict[str, Any], reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
