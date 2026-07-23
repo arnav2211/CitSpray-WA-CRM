@@ -3,7 +3,7 @@ import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
 import {
   Calendar, FileText, Printer, Trash, CheckCircle, Warning, XCircle, Spinner,
-  Clock, Buildings, Gear, UsersThree, CaretDown, CaretUp, Flag, Pencil, Eye, EyeSlash,
+  Clock, Buildings, Gear, UsersThree, CaretDown, CaretUp, Flag, Pencil, Eye, EyeSlash, Receipt,
 } from "@phosphor-icons/react";
 
 /* ---------------- date helpers (pay cycles are joining-day based) ---------------- */
@@ -140,9 +140,10 @@ function RegisterTab() {
   const [loading, setLoading] = useState(false);
   const [rows, setRows] = useState([]);
   const [openUser, setOpenUser] = useState(null);   // expanded row user_id
-  const [printTarget, setPrintTarget] = useState(null); // "register" | "sheet"
+  const [printTarget, setPrintTarget] = useState(null); // "register" | "sheet" | "voucher"
   const [sheetUser, setSheetUser] = useState(null);     // employee for the sheet modal
   const [sheetPrintData, setSheetPrintData] = useState(null);
+  const [voucherData, setVoucherData] = useState(null); // employee row for the A5 voucher
 
   const load = async () => {
     setLoading(true);
@@ -215,9 +216,23 @@ function RegisterTab() {
     } catch (e) { toast.error(errMsg(e)); }
   };
 
+  const clearPunchOut = async (userId, date, name) => {
+    if (!window.confirm(`Remove the punch-OUT for ${name} on ${date}?\n\nUse this when a punch-out was made by mistake — the day goes back to "still in office" and salary recalculates.`)) return;
+    try {
+      await api.post("/attendance/edit", { user_id: userId, date, clear_check_out: true });
+      toast.success("Punch-out removed");
+      load();
+    } catch (e) { toast.error(errMsg(e)); }
+  };
+
   const doPrint = (target) => {
     setPrintTarget(target);
     setTimeout(() => { window.print(); setTimeout(() => setPrintTarget(null), 500); }, 150);
+  };
+
+  const printVoucher = (p) => {
+    setVoucherData(p);
+    doPrint("voucher");
   };
 
   const totals = useMemo(() => ({
@@ -375,12 +390,17 @@ function RegisterTab() {
                         className="text-[10px] uppercase font-bold text-emerald-700 hover:underline inline-flex items-center gap-0.5">
                         <Printer size={13} /> Sheet
                       </button>
+                      <button onClick={() => printVoucher(p)} title="Print A5 salary voucher for the employee to sign"
+                        className="ml-2 text-[10px] uppercase font-bold text-[#7C3AED] hover:underline inline-flex items-center gap-0.5"
+                        data-testid={`voucher-btn-${p.user_id}`}>
+                        <Receipt size={13} /> Voucher
+                      </button>
                     </td>
                   </tr>
                   {openUser === p.user_id && (
                     <tr className="print:hidden">
                       <td colSpan={14} className="bg-gray-50/80 px-4 py-4 border-t border-gray-200">
-                        <DayGrid p={p} onOverride={override} onEditPunch={editPunch} />
+                        <DayGrid p={p} onOverride={override} onEditPunch={editPunch} onClearPunchOut={clearPunchOut} />
                       </td>
                     </tr>
                   )}
@@ -412,16 +432,21 @@ function RegisterTab() {
           userMeta={sheetUser}
           onClose={() => setSheetUser(null)}
           onPrint={(data) => { setSheetPrintData(data); doPrint("sheet"); }}
+          onVoucher={(data) => printVoucher(data)}
+          onOverride={override}
+          onEditPunch={editPunch}
+          onClearPunchOut={clearPunchOut}
         />
       )}
       {printTarget === "sheet" && sheetPrintData && <PrintSheet p={sheetPrintData} />}
+      {printTarget === "voucher" && voucherData && <SalaryVoucher p={voucherData} />}
 
-      <PrintStyles />
+      <PrintStyles a5={printTarget === "voucher"} />
     </div>
   );
 }
 
-function DayGrid({ p, onOverride, onEditPunch }) {
+function DayGrid({ p, onOverride, onEditPunch, onClearPunchOut }) {
   const money = useMoney();
   const [editDay, setEditDay] = useState(null);
   const [inVal, setInVal] = useState("");
@@ -476,10 +501,19 @@ function DayGrid({ p, onOverride, onEditPunch }) {
                 ) : (
                   <>
                     <span>In {day.punch_in || "--:--"} · Out {day.punch_out || "--:--"}{day.work_hours != null ? ` · ${day.work_hours}h` : ""}</span>
-                    {editable && (
-                      <button title="Edit punch times" onClick={() => { setEditDay(day.date); setInVal(day.punch_in || ""); setOutVal(day.punch_out || ""); }}
-                        className="text-gray-300 hover:text-[#002FA7]"><Pencil size={12} /></button>
-                    )}
+                    <span className="flex items-center gap-1">
+                      {day.punch_out && onClearPunchOut && (
+                        <button title="Remove this punch-out (done by mistake)"
+                          onClick={() => onClearPunchOut(p.user_id, day.date, p.name)}
+                          className="text-gray-300 hover:text-[#E60000]" data-testid={`clear-out-${day.date}`}>
+                          <XCircle size={13} weight="bold" />
+                        </button>
+                      )}
+                      {editable && (
+                        <button title="Edit punch times" onClick={() => { setEditDay(day.date); setInVal(day.punch_in || ""); setOutVal(day.punch_out || ""); }}
+                          className="text-gray-300 hover:text-[#002FA7]"><Pencil size={12} /></button>
+                      )}
+                    </span>
                   </>
                 )}
               </div>
@@ -706,12 +740,111 @@ function PrintSheet({ p }) {
   return <div className="hidden print:block"><SalarySheetContent p={p} /></div>;
 }
 
+/* ---- Amount in words (Indian numbering: lakh / crore) ---- */
+const ONES = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
+  "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
+const TENS = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+function twoDigits(n) {
+  if (n < 20) return ONES[n];
+  return `${TENS[Math.floor(n / 10)]}${n % 10 ? " " + ONES[n % 10] : ""}`;
+}
+function amountInWords(num) {
+  let n = Math.floor(Math.abs(Number(num) || 0));
+  if (n === 0) return "Zero Rupees Only";
+  const parts = [];
+  const crore = Math.floor(n / 10000000); n %= 10000000;
+  const lakh = Math.floor(n / 100000); n %= 100000;
+  const thousand = Math.floor(n / 1000); n %= 1000;
+  const hundred = Math.floor(n / 100); n %= 100;
+  if (crore) parts.push(`${twoDigits(crore)} Crore`);
+  if (lakh) parts.push(`${twoDigits(lakh)} Lakh`);
+  if (thousand) parts.push(`${twoDigits(thousand)} Thousand`);
+  if (hundred) parts.push(`${ONES[hundred]} Hundred`);
+  if (n) parts.push(twoDigits(n));
+  return `${parts.join(" ")} Rupees Only`;
+}
+
+/* ---- A5 salary voucher: employee signs to confirm they received the salary ---- */
+function SalaryVoucher({ p }) {
+  const c = p.counts || {};
+  const paidOn = p.payment?.paid_at ? String(p.payment.paid_at).slice(0, 10) : "____________";
+  return (
+    <div className="hidden print:block voucher-page bg-white text-black" data-testid="salary-voucher">
+      <div className="border-2 border-black p-4" style={{ minHeight: "180mm" }}>
+        <div className="text-center border-b-2 border-black pb-2 mb-3">
+          <div className="font-black text-lg uppercase tracking-wide">CitSpray / Mangalam Agro</div>
+          <div className="text-[11px] uppercase tracking-widest font-bold mt-0.5">Salary Payment Voucher</div>
+        </div>
+
+        <table className="w-full text-[12px] mb-3">
+          <tbody>
+            <tr>
+              <td className="py-1 font-bold w-[38%]">Voucher No.</td>
+              <td className="py-1 font-mono">SAL/{(p.employee_code || p.user_id || "").toString().slice(-6)}/{String(p.period_end || "").replace(/-/g, "").slice(0, 6)}</td>
+            </tr>
+            <tr><td className="py-1 font-bold">Employee Name</td><td className="py-1 font-bold">{p.name}</td></tr>
+            <tr>
+              <td className="py-1 font-bold">Designation / Dept</td>
+              <td className="py-1">{p.department || p.role || "—"}{p.employee_code ? ` · ID ${p.employee_code}` : ""}</td>
+            </tr>
+            <tr><td className="py-1 font-bold">Salary Period</td><td className="py-1 font-mono">{p.period_start} to {p.period_end}</td></tr>
+            <tr><td className="py-1 font-bold">Payment Date</td><td className="py-1 font-mono">{paidOn}</td></tr>
+          </tbody>
+        </table>
+
+        <table className="w-full text-[12px] border-collapse border border-black mb-3">
+          <tbody>
+            <tr className="border-b border-black">
+              <td className="py-1.5 px-2 border-r border-black">Monthly base salary</td>
+              <td className="py-1.5 px-2 text-right font-mono">{inr(p.base_salary)}</td>
+            </tr>
+            <tr className="border-b border-black">
+              <td className="py-1.5 px-2 border-r border-black">
+                Present {c.present || 0} · Half {(c.half_day || 0) + (c.missing_punch_out || 0)} · Leave {c.leave_approved || 0} · Absent {c.absent_uninformed || 0}
+              </td>
+              <td className="py-1.5 px-2 text-right font-mono">{inr(p.pro_rated_target_salary)}</td>
+            </tr>
+            <tr className="border-b border-black">
+              <td className="py-1.5 px-2 border-r border-black">Less: deductions</td>
+              <td className="py-1.5 px-2 text-right font-mono">-{inr(p.total_deductions)}</td>
+            </tr>
+            <tr className="bg-gray-100">
+              <td className="py-2 px-2 border-r border-black font-black uppercase">Net amount paid</td>
+              <td className="py-2 px-2 text-right font-mono font-black text-base">{inr(p.final_salary_payout)}</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div className="text-[11px] mb-4">
+          <span className="font-bold">Amount in words: </span>
+          <span className="italic">{amountInWords(p.final_salary_payout)}</span>
+        </div>
+
+        <div className="text-[10px] leading-relaxed border border-black p-2 mb-6">
+          I, <b>{p.name}</b>, acknowledge that I have received the above amount of
+          <b> {inr(p.final_salary_payout)}</b> as full and final salary for the period
+          <b> {p.period_start} to {p.period_end}</b>, and I have no further claim for this period.
+        </div>
+
+        <div className="flex justify-between gap-6 mt-12 text-center text-[10px] font-bold uppercase tracking-widest">
+          <div className="w-1/2 border-t border-black pt-1">Employee Signature<br /><span className="font-normal normal-case tracking-normal">({p.name})</span></div>
+          <div className="w-1/2 border-t border-black pt-1">Authorised Signatory</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* On-screen modal for the admin: employee's own joining-date cycle + print */
-function EmployeeSheetModal({ userMeta, onClose, onPrint }) {
+function EmployeeSheetModal({ userMeta, onClose, onPrint, onVoucher, onOverride, onEditPunch, onClearPunchOut }) {
   const [offset, setOffset] = useState(-1);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refresh, setRefresh] = useState(0);
+  // Local salary visibility for this sheet only (independent of the page-level eye)
+  const [showMoney, setShowMoney] = useState(false);
+  const [editDays, setEditDays] = useState(false);
+  const bump = () => setRefresh((r) => r + 1);
 
   useEffect(() => {
     let stop = false;
@@ -755,7 +888,7 @@ function EmployeeSheetModal({ userMeta, onClose, onPrint }) {
         className="bg-white w-full max-w-4xl max-h-[92vh] flex flex-col border border-gray-900">
         <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-gray-200 bg-gray-50">
           <div className="font-chivo font-black text-sm uppercase">{userMeta.name} — Salary Sheet</div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap justify-end">
             <select value={offset} onChange={(e) => setOffset(Number(e.target.value))}
               className="border border-gray-300 px-2 py-1.5 text-xs bg-white">
               <option value={0}>Current (running) cycle</option>
@@ -763,9 +896,26 @@ function EmployeeSheetModal({ userMeta, onClose, onPrint }) {
               <option value={-2}>2 cycles back</option>
               <option value={-3}>3 cycles back</option>
             </select>
+            <button onClick={() => setShowMoney((v) => !v)} data-testid="sheet-money-toggle"
+              title={showMoney ? "Hide salary amounts" : "Show salary amounts"}
+              className={`px-2.5 py-1.5 text-[10px] uppercase tracking-widest font-bold border flex items-center gap-1 ${showMoney ? "bg-[#E67E00] border-[#E67E00] text-white" : "border-gray-300 text-gray-600"}`}>
+              {showMoney ? <Eye size={14} weight="bold" /> : <EyeSlash size={14} weight="bold" />}
+              {showMoney ? "Salary shown" : "Salary hidden"}
+            </button>
+            <button onClick={() => setEditDays((v) => !v)} data-testid="sheet-edit-toggle"
+              title="Edit attendance days without leaving this sheet"
+              className={`px-2.5 py-1.5 text-[10px] uppercase tracking-widest font-bold border flex items-center gap-1 ${editDays ? "bg-[#002FA7] border-[#002FA7] text-white" : "border-gray-300 text-gray-600"}`}>
+              <Pencil size={13} weight="bold" /> {editDays ? "Editing" : "Edit days"}
+            </button>
             <button onClick={togglePaid} disabled={!data}
               className={`px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50 ${data?.payment?.paid ? "bg-emerald-600 text-white" : "border border-gray-300 text-gray-600 hover:border-emerald-600 hover:text-emerald-700"}`}>
               {data?.payment?.paid ? "✓ Salary Paid" : "Mark Salary Paid"}
+            </button>
+            <button onClick={() => data && onVoucher && onVoucher(data)} disabled={!data}
+              title="Print A5 voucher for the employee to sign on receiving salary"
+              className="bg-[#7C3AED] hover:bg-[#6D28D9] text-white px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 disabled:opacity-50"
+              data-testid="sheet-voucher-btn">
+              <Receipt size={14} /> Voucher
             </button>
             <button onClick={() => data && onPrint(data)} disabled={!data}
               className="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 disabled:opacity-50">
@@ -778,7 +928,22 @@ function EmployeeSheetModal({ userMeta, onClose, onPrint }) {
           {loading ? (
             <div className="py-14 text-center"><Spinner size={26} className="animate-spin inline text-[#002FA7]" /></div>
           ) : data ? (
-            <SalarySheetContent p={data} />
+            <HideMoneyContext.Provider value={!showMoney}>
+              {editDays && (
+                <div className="mb-5 border border-[#002FA7] bg-[#F5F8FF] p-3">
+                  <div className="text-[10px] uppercase tracking-widest font-bold text-[#002FA7] mb-2">
+                    Edit attendance — changes recalculate this sheet instantly
+                  </div>
+                  <DayGrid
+                    p={data}
+                    onOverride={async (uid, date, status) => { await onOverride?.(uid, date, status); bump(); }}
+                    onEditPunch={async (uid, date, ci, co) => { await onEditPunch?.(uid, date, ci, co); bump(); }}
+                    onClearPunchOut={async (uid, date, nm) => { await onClearPunchOut?.(uid, date, nm); bump(); }}
+                  />
+                </div>
+              )}
+              <SalarySheetContent p={data} />
+            </HideMoneyContext.Provider>
           ) : (
             <div className="py-10 text-center text-sm text-gray-400">No data for this cycle</div>
           )}
@@ -802,6 +967,15 @@ function TodayTab() {
     const id = setInterval(load, 30000);
     return () => clearInterval(id);
   }, []);
+
+  const clearOutToday = async (e) => {
+    if (!window.confirm(`Remove ${e.name}'s punch-OUT for today (${data.date})?\n\nUse this when they punched out by mistake — they go back to "In Office" and start receiving leads again.`)) return;
+    try {
+      await api.post("/attendance/edit", { user_id: e.user_id, date: data.date, clear_check_out: true });
+      toast.success(`${e.name} is back to In Office`);
+      load();
+    } catch (err) { toast.error(errMsg(err)); }
+  };
 
   if (!data) return <div className="py-14 text-center"><Spinner size={28} className="animate-spin inline text-[#002FA7]" /></div>;
   return (
@@ -830,7 +1004,17 @@ function TodayTab() {
                 </td>
                 <td className="px-4 py-2.5 text-xs text-gray-500 capitalize">{e.department || e.role}</td>
                 <td className="px-4 py-2.5 font-mono text-xs">{e.check_in ? e.check_in.slice(11, 16) : "—"}</td>
-                <td className="px-4 py-2.5 font-mono text-xs">{e.check_out ? e.check_out.slice(11, 16) : "—"}</td>
+                <td className="px-4 py-2.5 font-mono text-xs">
+                  {e.check_out ? (
+                    <span className="flex items-center gap-1.5">
+                      {e.check_out.slice(11, 16)}
+                      <button onClick={() => clearOutToday(e)} title="Punched out by mistake? Remove this punch-out"
+                        className="text-gray-300 hover:text-[#E60000]" data-testid={`today-clear-out-${e.user_id}`}>
+                        <XCircle size={14} weight="bold" />
+                      </button>
+                    </span>
+                  ) : "—"}
+                </td>
                 <td className="px-4 py-2.5 text-center">
                   {e.on_leave ? <span className="px-2 py-0.5 bg-blue-50 text-blue-700 border border-blue-200 text-[10px] font-bold uppercase rounded-sm">On Leave</span>
                     : e.check_out ? <span className="px-2 py-0.5 bg-gray-100 text-gray-500 border border-gray-200 text-[10px] font-bold uppercase rounded-sm">Punched Out</span>
@@ -1046,7 +1230,7 @@ function SettingsTab() {
   );
 }
 
-function PrintStyles() {
+function PrintStyles({ a5 = false }) {
   return (
     <style>{`
       @media print {
@@ -1056,6 +1240,15 @@ function PrintStyles() {
         .border { border-color: #ddd !important; }
         .shadow-sm, .shadow-lg { box-shadow: none !important; }
       }
+      ${a5 ? `
+      /* Salary voucher prints on A5 — everything else is hidden */
+      @page { size: A5 portrait; margin: 8mm; }
+      @media print {
+        body * { visibility: hidden !important; }
+        .voucher-page, .voucher-page * { visibility: visible !important; }
+        .voucher-page { position: absolute; left: 0; top: 0; width: 100%; }
+        .voucher-page .border-2, .voucher-page .border { border-color: #000 !important; }
+      }` : `@page { size: A4; margin: 10mm; }`}
     `}</style>
   );
 }
