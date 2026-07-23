@@ -623,8 +623,12 @@ async def get_current_user(request: Request) -> dict:
                     "leave_end": leave.get("end_date"),
                 },
             )
-        # Attendance lockout enforcement (completely disabled as requested)
-        pass
+        # Attendance gate: an executive who is not punched in (or has punched
+        # out) is logged straight back out — 401 so the frontend interceptor
+        # clears the token and returns them to the login screen.
+        blocked = await _attendance_login_allowed(user)
+        if blocked:
+            raise HTTPException(status_code=401, detail=blocked)
     user.pop("password_hash", None)
     return user
 
@@ -683,6 +687,10 @@ async def login(body: LoginInput, response: Response, request: Request):
                     "leave_end": leave.get("end_date"),
                 },
             )
+        # Must be punched in at the office to log in at all
+        blocked = await _attendance_login_allowed(user)
+        if blocked:
+            raise HTTPException(status_code=403, detail=blocked)
     token = create_access_token(user["id"], user["username"], user["role"], user.get("token_version", 0))
     response.set_cookie(
         key="access_token", value=token, httponly=True,
@@ -1553,6 +1561,7 @@ ATTENDANCE_DEFAULTS = {
     "wfh_pool_user_ids": [],             # execs allowed to receive leads outside office hours (WFH)
     "wfh_afterhours_enabled": True,
     "attendance_routing_enabled": True,  # master switch: gate lead assignment on punch-in status
+    "attendance_login_lock": True,       # executives can only use the CRM while punched in
 }
 
 
@@ -1622,6 +1631,37 @@ async def _is_user_available_by_attendance(user: dict) -> bool:
     if not cfg.get("wfh_afterhours_enabled", True):
         return False
     return user["id"] in (cfg.get("wfh_pool_user_ids") or [])
+
+
+async def _attendance_login_allowed(user: dict) -> Optional[dict]:
+    """CRM access gate: executives may only use the CRM while they are actually
+    punched IN at the office. Returns None when access is allowed, else a dict
+    describing why it is blocked.
+
+    Never blocks: admins, data-entry/scanner accounts, users with
+    bypass_attendance, and the configured WFH pool (they work from home, so
+    the fingerprint device can't see them).
+    Turn the whole gate off with attendance_login_lock=false in settings.
+    """
+    if user.get("role") != "executive":
+        return None
+    if user.get("bypass_attendance"):
+        return None
+    cfg = await get_attendance_config()
+    if not cfg.get("attendance_login_lock", True):
+        return None
+    if user["id"] in (cfg.get("wfh_pool_user_ids") or []):
+        return None
+    today = _ist_now().strftime("%Y-%m-%d")
+    log = await db.attendance_logs.find_one(
+        {"user_id": user["id"], "date": today}, {"_id": 0, "check_in": 1, "check_out": 1})
+    if not log or not log.get("check_in"):
+        return {"code": "attendance_required",
+                "message": "You have not punched in today. Scan your finger at the office device to use the CRM."}
+    if log.get("check_out"):
+        return {"code": "attendance_required",
+                "message": "You have punched out for the day. The CRM is locked until your next punch-in."}
+    return None
 
 
 async def create_system_alert(alert_type: str, title: str, message: str, dedup_key: Optional[str] = None):

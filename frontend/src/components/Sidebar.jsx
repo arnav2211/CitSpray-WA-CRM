@@ -36,8 +36,6 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
   const [pendingTransfers, setPendingTransfers] = useState(0);
   const [pendingLeaves, setPendingLeaves] = useState(0);
   const [pendingQA, setPendingQA] = useState(0);
-  const [att, setAtt] = useState({ checked_in: false, checked_out: false });
-  const [punching, setPunching] = useState(false);
 
   // Admin: poll pending leave-request count for the sidebar badge
   useEffect(() => {
@@ -85,34 +83,6 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
     const id = setInterval(tick, 5000);
     return () => { stop = true; clearInterval(id); };
   }, [user?.id]);
-
-  // Load and poll attendance status for executives
-  const loadAttStatus = async () => {
-    if (!user) return;
-    try {
-      const { data } = await api.get("/attendance/status");
-      setAtt(data);
-    } catch { /* ignore */ }
-  };
-
-  useEffect(() => {
-    loadAttStatus();
-    const id = setInterval(loadAttStatus, 20000); // poll every 20s
-    return () => clearInterval(id);
-  }, [user?.id]);
-
-  const handlePunch = async () => {
-    setPunching(true);
-    try {
-      const { data } = await api.post("/attendance/punch");
-      toast.success(data.action === "check_in" ? "Clocked In Successfully!" : "Clocked Out Successfully!");
-      loadAttStatus();
-    } catch (e) {
-      toast.error(errMsg(e));
-    } finally {
-      setPunching(false);
-    }
-  };
 
   // When a nav item is clicked on mobile, close the drawer
   const handleNavigate = () => { if (mobileOpen && onClose) onClose(); };
@@ -210,31 +180,9 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
             <span className="kbd">{user?.role}</span> · @{user?.username}
           </div>
 
-          {/* Punch In / Punch Out Button for Executive */}
-          {user?.role === "executive" && (
-            <div className="mt-3 border border-gray-200 p-2 bg-white rounded-sm">
-              <div className="flex items-center justify-between mb-1.5">
-                <span className="text-[9px] uppercase font-bold text-gray-400">Attendance</span>
-                <span className="flex items-center gap-1 text-[10px] font-bold">
-                  <span className={`w-2 h-2 rounded-full ${att.checked_out ? "bg-gray-400" : att.checked_in ? "bg-[#008A00]" : "bg-[#E60000]"}`}></span>
-                  {att.checked_out ? "Clocked Out" : att.checked_in ? "Clocked In" : "Not Clocked In"}
-                </span>
-              </div>
-              {user.bypass_attendance ? (
-                <div className="text-[9px] font-bold text-gray-500 uppercase text-center py-1">Bypass Active (WFH)</div>
-              ) : !att.checked_in ? (
-                <button
-                  onClick={handlePunch}
-                  disabled={punching}
-                  className="w-full py-1.5 text-[10px] uppercase tracking-wider font-black text-white bg-[#008A00] hover:bg-[#007000]"
-                >
-                  {punching ? "Processing…" : "Punch In"}
-                </button>
-              ) : (
-                <div className="text-[9px] font-bold text-[#008A00] uppercase text-center py-1">Shift In Progress</div>
-              )}
-            </div>
-          )}
+          {/* Clock-in from the CRM was removed — attendance is recorded only at
+              the office fingerprint device, and being punched in is what grants
+              CRM access in the first place. */}
 
           <button
             className="mt-3 w-full flex items-center justify-center gap-2 border border-gray-300 py-2 text-xs uppercase tracking-wider font-bold hover:bg-gray-100"

@@ -43,9 +43,12 @@ export function AuthProvider({ children }) {
         if (status === 401 && localStorage.getItem("token")) {
           if (!leaveNoticeRef.current) {
             leaveNoticeRef.current = true;
-            if (code === "user_on_leave") {
-              const msg = (typeof detail === "object" && detail?.message) || "You are on leave — access disabled.";
-              toast.error(msg);
+            if (code === "user_on_leave" || code === "attendance_required") {
+              const msg = (typeof detail === "object" && detail?.message)
+                || (code === "attendance_required"
+                  ? "Punch in at the office device to use the CRM."
+                  : "You are on leave — access disabled.");
+              toast.error(msg, { duration: 8000 });
             } else {
               toast.error("Session expired — please log in again.");
             }
@@ -77,8 +80,9 @@ export function AuthProvider({ children }) {
     } catch (e) {
       const detail = e?.response?.data?.detail;
       const code = typeof detail === "object" ? detail?.code : null;
-      if (code === "user_on_leave") {
-        const msg = (typeof detail === "object" && detail?.message) || "You are on leave — access disabled.";
+      if (code === "user_on_leave" || code === "attendance_required") {
+        const msg = (typeof detail === "object" && detail?.message)
+          || "Punch in at the office device before logging in.";
         setError(msg);
       } else {
         setError(errMsg(e, "Login failed"));
