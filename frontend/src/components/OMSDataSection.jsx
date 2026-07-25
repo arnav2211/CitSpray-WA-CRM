@@ -49,7 +49,13 @@ export default function OMSDataSection({ leadId }) {
 
   const { orders = [], pis = [], oms_base_url = "https://oms.mangalamagro.in" } = omsData;
 
+  // Every OMS share button messages the CUSTOMER immediately. Confirm first so a
+  // stray tap can't fire an order update (esp. on old orders shown here).
+  const confirmSend = (what, order) =>
+    window.confirm(`Send ${what} for order ${order.order_number} (${order.status?.toUpperCase?.() || ""}) to the customer on WhatsApp now?`);
+
   const handleShareOrderDetails = async (order) => {
+    if (!confirmSend("this order-status update", order)) return;
     setSharingId(`order-details-${order.id}`);
     try {
       const itemsText = order.items
@@ -94,6 +100,7 @@ export default function OMSDataSection({ leadId }) {
       toast.error("No packed box images available for this order!");
       return;
     }
+    if (!confirmSend("the packed-box image(s)", order)) return;
 
     setSharingId(`packed-images-${order.id}`);
     try {
@@ -129,6 +136,7 @@ export default function OMSDataSection({ leadId }) {
       toast.error("No dispatch slip images available for this order!");
       return;
     }
+    if (!confirmSend("the dispatch slip", order)) return;
 
     setSharingId(`dispatch-slip-${order.id}`);
     try {
@@ -167,6 +175,7 @@ export default function OMSDataSection({ leadId }) {
       toast.error("No tax invoice available for this order!");
       return;
     }
+    if (!confirmSend("the tax invoice", order)) return;
 
     setSharingId(`tax-invoice-${order.id}`);
     try {
@@ -194,6 +203,7 @@ export default function OMSDataSection({ leadId }) {
   };
 
   const handleSharePiDetails = async (pi) => {
+    if (!window.confirm(`Send PI ${pi.pi_number} PDF to the customer on WhatsApp now?`)) return;
     setSharingId(`pi-details-${pi.id}`);
     try {
       await api.post("/whatsapp/send-pi-pdf", {
