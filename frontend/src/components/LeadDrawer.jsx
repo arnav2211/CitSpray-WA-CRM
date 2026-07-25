@@ -53,6 +53,7 @@ export default function LeadDrawer({ leadId, onClose }) {
   const [aliasDraft, setAliasDraft] = useState("");
   const [editingReq, setEditingReq] = useState(false);
   const [reqDraft, setReqDraft] = useState("");
+  const [sendingRecovery, setSendingRecovery] = useState(false);
   // Call form
   const [callOutcome, setCallOutcome] = useState("");
   const [callPhone, setCallPhone] = useState("");
@@ -94,8 +95,11 @@ export default function LeadDrawer({ leadId, onClose }) {
           api.get("/quick-replies"),
         ]);
         setExecs(U.filter((u) => u.role === "executive" || u.role === "admin"));
-        // Match /chat: only show APPROVED templates (or local non-Meta-synced)
-        setTpl(T.filter((t) => !t.status || t.status === "APPROVED" || !t.synced_from_meta));
+        // Match /chat: only the manual reply templates. The order_* / cod /
+        // abandoned_checkout templates are system-automated — never manual.
+        const MANUAL_TEMPLATES = new Set(["reply_all", "reply_to_all"]);
+        setTpl(T.filter((t) => MANUAL_TEMPLATES.has((t.name || "").toLowerCase())
+          && (!t.status || t.status === "APPROVED" || !t.synced_from_meta)));
         setQuickReplies(Q || []);
       } catch { /* empty */ }
     })();
@@ -195,6 +199,16 @@ export default function LeadDrawer({ leadId, onClose }) {
       .filter(Boolean);
     await update({ customer_name: nameDraft.trim() || lead.customer_name, aliases });
     setEditingName(false);
+  };
+
+  const sendRecoveryLink = async () => {
+    setSendingRecovery(true);
+    try {
+      const { data } = await api.post(`/leads/${activeLeadId}/send-recovery`);
+      if (data.ok) toast.success("Checkout link sent on WhatsApp");
+      else toast.error(`Send failed: ${data.error || data.status}`);
+    } catch (e) { toast.error(errMsg(e, "Couldn't send checkout link")); }
+    setSendingRecovery(false);
   };
 
   const saveRequirement = async () => {
@@ -502,6 +516,51 @@ export default function LeadDrawer({ leadId, onClose }) {
                 <div className="border border-gray-200 p-3 text-sm bg-gray-50 whitespace-pre-wrap" data-testid="requirement-display">{lead.requirement || "—"}</div>
               )}
             </section>
+
+            {lead.abandoned_cart && (
+              <section data-testid="abandoned-cart-section">
+                <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2 flex items-center justify-between">
+                  <span>🛒 Abandoned Cart {lead.abandoned_cart.status === "converted" ? "· CONVERTED ✅" : "· NOT COMPLETED"}</span>
+                  <span className="text-gray-400 normal-case tracking-normal font-normal">{(lead.abandoned_cart.updated_at || "").slice(0, 16).replace("T", " ")}</span>
+                </div>
+                <div className={`border p-3 text-sm space-y-2 ${lead.abandoned_cart.status === "converted" ? "border-green-300 bg-green-50" : "border-amber-300 bg-amber-50"}`}>
+                  <div className="whitespace-pre-wrap" data-testid="abandoned-cart-items">{lead.abandoned_cart.items || "—"}</div>
+                  <div className="font-bold" data-testid="abandoned-cart-total">Cart value: {lead.abandoned_cart.currency || "INR"} {lead.abandoned_cart.total_price}</div>
+                  {lead.abandoned_cart.status !== "converted" && (
+                    <div className="flex flex-wrap gap-2 pt-1">
+                      <button
+                        onClick={sendRecoveryLink}
+                        disabled={sendingRecovery}
+                        className="bg-[#25D366] text-white px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50"
+                        data-testid="send-recovery-btn"
+                      >
+                        {sendingRecovery ? "Sending…" : "Send checkout link on WhatsApp"}
+                      </button>
+                      {lead.abandoned_cart.recovery_url && (
+                        <>
+                          <a
+                            href={lead.abandoned_cart.recovery_url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="border border-gray-900 px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-900 hover:text-white"
+                            data-testid="open-recovery-link"
+                          >
+                            Open cart link
+                          </a>
+                          <button
+                            onClick={() => { navigator.clipboard.writeText(lead.abandoned_cart.recovery_url); toast.success("Link copied"); }}
+                            className="border border-gray-300 px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold"
+                            data-testid="copy-recovery-link"
+                          >
+                            Copy link
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </section>
+            )}
 
             {(lead.gst_no || lead.enquiry_type) && (
               <section data-testid="general-details-section">
