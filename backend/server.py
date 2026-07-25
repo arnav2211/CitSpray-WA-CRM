@@ -128,6 +128,24 @@ def phone_match_pattern(query: str) -> Optional[str]:
 
 _TPL_PLACEHOLDER_RX = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 
+def render_template_text(body_text: Optional[str], params: Optional[List[str]]) -> str:
+    """Fill a WhatsApp template body's {{1}}, {{2}}… (and named) placeholders with
+    the params actually sent, so the chat can show the REAL message text instead
+    of a bare '[Template: name]'. Positional params map by order; unknown/missing
+    placeholders are left as-is."""
+    if not body_text:
+        return ""
+    plist = list(params or [])
+
+    def _sub(m):
+        key = (m.group(1) or "").strip()
+        if key.isdigit():
+            idx = int(key) - 1
+            if 0 <= idx < len(plist):
+                return str(plist[idx])
+        return m.group(0)  # leave named/out-of-range placeholders untouched
+    return _TPL_PLACEHOLDER_RX.sub(_sub, body_text)
+
 def count_template_placeholders(body_text: Optional[str]) -> int:
     """Return the number of distinct placeholders ({{1}}, {{2}}, …, or {{name}}) in a
     WhatsApp template body. Used to decide whether to include `components` and to
@@ -1867,7 +1885,7 @@ async def auto_send_whatsapp_on_create(lead: dict):
         lang_code=tpl_meta.get("language") or cfg["default_template_lang"],
         body_params=body_params,
     )
-    body_preview = f"[Template: {tpl_name}] sent to {lead['phone']}"
+    body_preview = render_template_text(tpl_meta.get("body"), body_params) or f"[Template: {tpl_name}]"
     msg = {
         "id": str(uuid.uuid4()),
         "lead_id": lead["id"],
@@ -3547,6 +3565,9 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
                         detail=f"Incorrect number of template parameters: template '{body.template_name}' requires {params_required}, got {len(provided)}",
                     )
                 params_to_send = provided
+        # Render the ACTUAL message text (placeholders filled) so the chat shows
+        # what the customer received, not just "[Template: name]".
+        rendered_template_body = render_template_text(tpl_meta.get("body"), params_to_send) or body.body
         send_results: List[tuple] = []
         for tp in targets:
             r = await wa_send_template(
@@ -3604,7 +3625,9 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
             "id": str(uuid.uuid4()),
             "lead_id": body.lead_id,
             "direction": "out",
-            "body": body.body,
+            # Templates: store the rendered text so the bubble shows the real
+            # message; free text: the typed body.
+            "body": rendered_template_body if body.template_name else body.body,
             "to_phone": tp,
             "template_name": body.template_name,
             "status": api_result.get("status", "failed"),
@@ -6565,7 +6588,7 @@ async def _shopify_send_template_for_lead(lead: dict, tpl_name: str, params: Lis
         "id": str(uuid.uuid4()),
         "lead_id": lead["id"],
         "direction": "out",
-        "body": f"[Template: {tpl_name}] sent to {lead['phone']}",
+        "body": render_template_text(tpl_meta.get("body"), body_params) or f"[Template: {tpl_name}]",
         "to_phone": lead["phone"],   # required so per-number threads stay separate
         "template_name": tpl_name,
         "status": api_result.get("status", "failed"),
