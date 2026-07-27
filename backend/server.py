@@ -6605,6 +6605,209 @@ async def _shopify_send_template_for_lead(lead: dict, tpl_name: str, params: Lis
         logger.warning(f"Shopify WA template '{tpl_name}' failed for lead {lead['id']}: {msg.get('error')}")
     return msg
 
+# ── OMS website-order push (re-applied 2026-07-27; keep in sync with GitHub repo) ──
+OMS_WEBSITE_USERNAME = os.environ.get("OMS_WEBSITE_USERNAME", "website").strip()
+OMS_WEBSITE_DISPLAY_NAME = os.environ.get("OMS_WEBSITE_DISPLAY_NAME", "Website").strip()
+OMS_GST_RATE = float(os.environ.get("OMS_GST_RATE", "18"))
+
+
+def _oms_mint_token(oms_user_id: str, hours: int = 1) -> str:
+    """OMS accepts a JWT signed with OMS_JWT_SECRET (same pattern as the PI-PDF fetch)."""
+    secret = os.environ.get("OMS_JWT_SECRET", "9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c")
+    return jwt.encode(
+        {"user_id": oms_user_id, "exp": datetime.now(timezone.utc) + timedelta(hours=hours)},
+        secret, algorithm="HS256",
+    )
+
+
+async def _oms_website_user() -> Optional[dict]:
+    """The OMS user that website orders are booked under (shows as the executive)."""
+    u = await oms_db.users.find_one({"username": OMS_WEBSITE_USERNAME}, {"_id": 0})
+    if u:
+        return u
+    return await oms_db.users.find_one({"name": OMS_WEBSITE_DISPLAY_NAME}, {"_id": 0})
+
+
+async def _oms_api(method: str, path: str, token: str, payload: Optional[dict] = None) -> tuple:
+    """Call the OMS API (internal first, public URL as fallback). Returns (ok, data)."""
+    headers = {"Authorization": f"Bearer {token}"}
+    last_err = None
+    for base in ("http://127.0.0.1:8000", OMS_BASE_URL):
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as hc:
+                r = await hc.request(method, f"{base}{path}", headers=headers, json=payload)
+            if r.status_code in (200, 201):
+                return True, r.json()
+            last_err = f"{r.status_code}: {r.text[:200]}"
+        except Exception as e:
+            last_err = str(e)
+    logger.error(f"OMS API {method} {path} failed: {last_err}")
+    return False, last_err
+
+
+def _oms_ex_gst(amount_incl: float) -> float:
+    """Website prices include GST — strip it so OMS can recompute tax cleanly."""
+    return round(float(amount_incl) / (1 + OMS_GST_RATE / 100.0), 2)
+
+
+def _oms_build_lines(order: dict) -> dict:
+    """Turn a Shopify order into OMS items + any COD/handling charge.
+    The residual (total - items - shipping) is whatever extra was charged at
+    checkout (the COD fee), so it works no matter how Shopify represents it."""
+    items, items_incl = [], 0.0
+    for li in (order.get("line_items") or []):
+        qty = int(li.get("quantity") or 1)
+        unit_incl = float(li.get("price") or 0)
+        disc = float(li.get("total_discount") or 0)
+        line_incl = max(unit_incl * qty - disc, 0.0)
+        items_incl += line_incl
+        per_unit_ex = _oms_ex_gst(line_incl / qty) if qty else 0.0
+        items.append({
+            "product_name": li.get("title") or li.get("name") or "Item",
+            "qty": qty,
+            "unit": (li.get("variant_title") or "").strip(),
+            "rate": per_unit_ex,
+            "amount": round(per_unit_ex * qty, 2),
+            "gst_rate": OMS_GST_RATE,
+            "description": f"SKU {li.get('sku')}" if li.get("sku") else "",
+        })
+    shipping_incl = 0.0
+    for sl in (order.get("shipping_lines") or []):
+        shipping_incl += float(sl.get("price") or 0)
+    total_incl = float(order.get("total_price") or 0)
+    residual = round(total_incl - items_incl - shipping_incl, 2)
+    charges = []
+    if residual >= 0.5:  # COD / handling fee charged at checkout
+        charges.append({
+            "name": "COD Charges",
+            "amount": _oms_ex_gst(residual),
+            "gst_percent": int(OMS_GST_RATE),
+        })
+    return {
+        "items": items,
+        "additional_charges": charges,
+        "shipping_charge": _oms_ex_gst(shipping_incl) if shipping_incl else 0,
+        "total_incl": total_incl,
+        "cod_fee_incl": residual if residual >= 0.5 else 0,
+    }
+
+
+async def _oms_create_address(cust_id: str, token: str, src: dict, name: str, phone: str) -> str:
+    """Create one OMS address from a Shopify address dict; '' when PIN invalid."""
+    if not src:
+        return ""
+    addr_line = " ".join(filter(None, [src.get("address1"), src.get("address2")])).strip()
+    pincode = re.sub(r"\D", "", str(src.get("zip") or ""))[:6]
+    if len(pincode) != 6:
+        logger.warning("OMS address skipped for %s: invalid pincode %r", name, src.get("zip"))
+        return ""
+    ok, addr = await _oms_api("POST", f"/api/customers/{cust_id}/addresses", token, {
+        "address_line": addr_line or "-",
+        "city": src.get("city") or "",
+        "state": src.get("province") or "",
+        "pincode": pincode,
+        "country": src.get("country") or "India",
+        "contact_person": name,
+        "contact_number": phone,
+    })
+    if not ok or not isinstance(addr, dict):
+        return ""
+    return addr.get("id", "")
+
+
+def _oms_same_address(a: dict, b: dict) -> bool:
+    keys = ("address1", "address2", "city", "province", "zip")
+    return all((a or {}).get(k) == (b or {}).get(k) for k in keys)
+
+
+async def _oms_customer_and_address(order: dict, token: str, lead: dict) -> tuple:
+    """Reuse/create the OMS customer, then create shipping AND billing addresses
+    (single record when identical). Returns (customer, shipping_id, billing_id)."""
+    ship = order.get("shipping_address") or order.get("billing_address") or {}
+    bill = order.get("billing_address") or ship
+    name = _shopify_order_name(order)
+    phone = _shopify_order_phone(order) or lead.get("phone") or ""
+    digits = re.sub(r"\D", "", str(phone))[-10:] if phone else ""
+    cust = None
+    if digits:
+        cust = await oms_db.customers.find_one(
+            {"phone_numbers": {"$regex": digits + "$"}}, {"_id": 0}
+        )
+    if not cust:
+        ok, data = await _oms_api("POST", "/api/customers", token, {
+            "name": name,
+            "phone_numbers": [digits or str(phone)],
+            "email": (order.get("customer") or {}).get("email") or order.get("email") or "",
+            "gst_no": (order.get("note_attributes") and next(
+                (a.get("value") for a in order["note_attributes"] if a.get("name") == "GSTIN"), "")) or "",
+        })
+        if not ok:
+            return None, "", ""
+        cust = data
+    contact = digits or str(phone)
+    ship_id = await _oms_create_address(cust["id"], token, ship, name, contact)
+    if _oms_same_address(ship, bill):
+        bill_id = ship_id
+    else:
+        bill_id = await _oms_create_address(cust["id"], token, bill, name, contact)
+    return cust, ship_id, bill_id
+
+
+async def _oms_push_order(lead: dict, order: dict, paid: bool) -> dict:
+    """Create the order in OMS under the Website executive. Idempotent per lead."""
+    if lead.get("oms_order_id"):
+        return {"skipped": "already synced", "oms_order_number": lead.get("oms_order_number")}
+    wuser = await _oms_website_user()
+    if not wuser:
+        logger.error("OMS push skipped: no OMS user named '%s'", OMS_WEBSITE_USERNAME)
+        return {"error": "no website user in OMS"}
+    token = _oms_mint_token(wuser["id"])
+    cust, ship_addr_id, bill_addr_id = await _oms_customer_and_address(order, token, lead)
+    if not cust:
+        return {"error": "customer create failed"}
+    lines = _oms_build_lines(order)
+    order_no = order.get("name") or f"#{order.get('order_number', '')}"
+    paid_note = "PREPAID (paid online)" if paid else "COD - confirmed by customer"
+    payload = {
+        "customer_id": cust["id"],
+        "purpose": "Website order",
+        "items": lines["items"],
+        "gst_applicable": True,
+        "shipping_method": "courier",
+        "shipping_charge": lines["shipping_charge"],
+        "additional_charges": lines["additional_charges"],
+        "remark": f"Auto-synced from citspray.com {order_no} · {paid_note} · Customer paid INR {lines['total_incl']:.2f}",
+        "payment_status": "full" if paid else "unpaid",
+        "amount_paid": lines["total_incl"] if paid else 0,
+        "mode_of_payment": "Online" if paid else "COD",
+        "payment_mode_details": (order.get("gateway") or "") if paid else "Cash on Delivery",
+        "billing_address_id": bill_addr_id or ship_addr_id or "",
+        "shipping_address_id": ship_addr_id or bill_addr_id or "",
+    }
+    ok, data = await _oms_api("POST", "/api/orders", token, payload)
+    if not ok:
+        return {"error": str(data)[:300]}
+    await db.leads.update_one({"id": lead["id"]}, {"$set": {
+        "oms_order_id": data.get("id"),
+        "oms_order_number": data.get("order_number"),
+        "oms_synced_at": iso(now_utc()),
+    }})
+    await log_activity(None, "oms_order_created", lead["id"], {
+        "oms_order_number": data.get("order_number"), "shopify_order": order_no, "paid": paid,
+    })
+    logger.info(f"OMS order {data.get('order_number')} created for {order_no} (paid={paid})")
+    return {"oms_order_number": data.get("order_number"), "oms_order_id": data.get("id")}
+
+
+async def _oms_push_from_lead(lead: dict) -> dict:
+    """Push using the Shopify payload stashed on the lead (used on COD confirmation)."""
+    snap = (lead.get("source_data") or {}).get("oms_payload")
+    if not snap:
+        return {"error": "no stored order payload on lead"}
+    return await _oms_push_order(lead, snap, paid=False)
+
+
+
 async def _shopify_handle_order_created(order: dict) -> dict:
     order_no = order.get("name") or f"#{order.get('order_number', '')}"
     phone = _shopify_order_phone(order)
@@ -6638,8 +6841,23 @@ async def _shopify_handle_order_created(order: dict) -> dict:
         },
         "_suppress_auto_welcome": True,
     }
+    data["source_data"]["oms_payload"] = {
+        "name": order_no, "order_number": order.get("order_number"),
+        "total_price": total, "gateway": data["source_data"]["gateway"],
+        "line_items": order.get("line_items") or [], "shipping_lines": order.get("shipping_lines") or [],
+        "shipping_address": order.get("shipping_address") or {}, "billing_address": order.get("billing_address") or {},
+        "customer": order.get("customer") or {}, "email": email, "note_attributes": order.get("note_attributes") or [],
+    }
     lead = await _create_lead_internal(data, by_user_id=None)
     await log_activity(None, "website_order", lead["id"], {"order": order_no, "total": f"{currency} {total}"})
+    # Prepaid orders enter OMS immediately, marked paid (executive = Website)
+    try:
+        if (order.get("financial_status") or "").lower() in ("paid", "partially_refunded"):
+            res = await _oms_push_order(lead, order, paid=True)
+            if res.get("error"):
+                logger.warning(f"OMS prepaid push error for {order_no}: {res['error']}")
+    except Exception as e:
+        logger.warning(f"OMS prepaid push crashed for {order_no}: {e}")
     # WhatsApp UTILITY message: order confirmation ({{1}}=name, {{2}}=order no, {{3}}=total)
     if phone:
         try:
