@@ -9097,6 +9097,102 @@ async def reorder_reminder_task():
         logger.exception(f"reorder_reminder_task failed: {e}")
 
 
+# ── WhatsApp win-back: customer-facing reorder nudge for consumables ──
+# Off until WINBACK_ENABLED=1 in the environment AND the template named by
+# WINBACK_TPL exists (approved) in the WhatsApp account. Suggested template
+# (2 body params): "Hi {{1}}! Running low on {{2}}? Most customers reorder
+# around now. Reply here or order at citspray.com — free shipping, COD available."
+WINBACK_ENABLED = os.environ.get("WINBACK_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+WINBACK_TPL = os.environ.get("WINBACK_TPL", "winback_reorder").strip()
+WINBACK_MIN_DAYS = int(os.environ.get("WINBACK_MIN_DAYS", "30") or 30)
+WINBACK_MAX_DAYS = int(os.environ.get("WINBACK_MAX_DAYS", "60") or 60)
+WINBACK_DAILY_CAP = int(os.environ.get("WINBACK_DAILY_CAP", "25") or 25)
+WINBACK_CONSUMABLE_WORDS = ("oil", "hydrosol", "attar", "fragrance")
+
+
+def _winback_is_consumable(order: dict) -> bool:
+    """Only nudge for refillable products (oils/hydrosols) — a diffuser is a
+    one-time hardware buy, so 'running low?' makes no sense for it."""
+    for i in (order.get("items") or []):
+        name = str((i or {}).get("product_name") or "").lower()
+        if any(w in name for w in WINBACK_CONSUMABLE_WORDS):
+            return True
+    return False
+
+
+async def winback_whatsapp_task():
+    """Daily: WhatsApp customers whose LAST consumable order is WINBACK_MIN_DAYS–
+    WINBACK_MAX_DAYS old with a 'running low? reorder' template. Complements
+    reorder_reminder_task (which nudges the executive internally) by nudging the
+    customer directly. One send per (customer, last order) — a fresh nudge only
+    fires after they place (and lapse on) a NEW order. Capped per day."""
+    if not WINBACK_ENABLED:
+        return
+    try:
+        lo = iso(now_utc() - timedelta(days=WINBACK_MAX_DAYS))
+        hi = iso(now_utc() - timedelta(days=WINBACK_MIN_DAYS))
+        sent = 0
+        pipeline = [
+            {"$sort": {"created_at": -1}},
+            {"$group": {"_id": "$customer_id", "last": {"$first": "$$ROOT"}}},
+            {"$match": {"last.created_at": {"$gte": lo, "$lt": hi}}},
+        ]
+        async for doc in oms_db.orders.aggregate(pipeline):
+            if sent >= WINBACK_DAILY_CAP:
+                break
+            o = doc.get("last") or {}
+            cust_id = doc.get("_id")
+            if not cust_id or not o.get("id") or not _winback_is_consumable(o):
+                continue
+            dedup = f"winback:{cust_id}:{o['id']}"
+            # Atomic claim: gunicorn runs one scheduler per worker, so without
+            # this upsert two workers could message the same customer twice.
+            claim = await db.winback_sends.update_one(
+                {"dedup_key": dedup},
+                {"$setOnInsert": {
+                    "id": str(uuid.uuid4()), "dedup_key": dedup,
+                    "oms_customer_id": cust_id, "oms_order_id": o["id"],
+                    "template": WINBACK_TPL, "status": "claimed", "at": iso(now_utc()),
+                }},
+                upsert=True,
+            )
+            if not claim.upserted_id:
+                continue
+            cust = await oms_db.customers.find_one({"id": cust_id}, {"_id": 0})
+            if not cust:
+                continue
+            # Match OMS customer → CRM lead by any phone number (suffix match)
+            lead = None
+            for pn in (cust.get("phone_numbers") or []):
+                pat = phone_match_pattern(pn or "")
+                if not pat:
+                    continue
+                lead = await db.leads.find_one(
+                    {"$or": [{"phone": {"$regex": pat}}, {"phones": {"$regex": pat}}]}, {"_id": 0})
+                if lead:
+                    break
+            if not lead or not lead.get("phone"):
+                await db.winback_sends.update_one({"dedup_key": dedup}, {"$set": {"status": "no_lead"}})
+                continue
+            items = o.get("items") or []
+            first_product = next(
+                (i.get("product_name") for i in items if isinstance(i, dict) and i.get("product_name")),
+                None) or "your CitSpray order"
+            first_name = (cust.get("name") or lead.get("customer_name") or "there").split()[0]
+            msg = await _shopify_send_template_for_lead(lead, WINBACK_TPL, [first_name, first_product])
+            await db.winback_sends.update_one(
+                {"dedup_key": dedup},
+                {"$set": {"lead_id": lead["id"], "status": msg.get("status"), "wamid": msg.get("wamid")}})
+            if msg.get("status") in ("sent", "delivered", "read", "sent_mock"):
+                sent += 1
+                await log_activity(None, "winback_sent", lead["id"],
+                                   {"customer": cust.get("name"), "order": o.get("order_number")})
+        if sent:
+            logger.info(f"winback_whatsapp_task: sent {sent} win-back messages")
+    except Exception as e:
+        logger.exception(f"winback_whatsapp_task failed: {e}")
+
+
 async def attendance_monitor_task():
     """Every 10 min: raise admin flags for attendance rule breaches.
     All alerts are deduped per employee+date, so re-runs are harmless."""
@@ -11015,10 +11111,14 @@ async def on_startup():
     scheduler.add_job(attendance_monitor_task, "interval", minutes=10, id="attendance_monitor", max_instances=1, coalesce=True)
     scheduler.add_job(reorder_reminder_task, "cron", hour=10, minute=45, timezone="Asia/Kolkata", id="reorder_reminder", max_instances=1, coalesce=True)
     scheduler.add_job(abandoned_checkout_task, "interval", minutes=10, id="abandoned_checkout", max_instances=1, coalesce=True)
+    # 11:15 IST — after reorder_reminder_task (10:45) so the executive nudge and
+    # the customer WhatsApp land the same morning. No-op until WINBACK_ENABLED=1.
+    scheduler.add_job(winback_whatsapp_task, "cron", hour=11, minute=15, timezone="Asia/Kolkata", id="winback_whatsapp", max_instances=1, coalesce=True)
     try:
         await db.attendance_logs.create_index([("user_id", 1), ("date", 1)])
         await db.leaves.create_index([("user_id", 1), ("start_date", 1)])
         await db.admin_alerts.create_index([("meta.dedup_key", 1)])
+        await db.winback_sends.create_index([("dedup_key", 1)], unique=True)
     except Exception as _e:
         logger.warning(f"index creation skipped: {_e}")
     logger.info("DEBUG STARTUP: counting gmail_connections...")
