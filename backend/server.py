@@ -9291,6 +9291,161 @@ async def meta_capi_task():
         logger.exception(f"meta_capi_task failed: {e}")
 
 
+# ── Shopify welcome-popup leads: Shopify emails the contact form to the owner's
+# inbox, so these high-intent leads (they asked for the discount code) never
+# reached the CRM and nobody called or WhatsApped them. Poll IMAP and ingest.
+POPUP_LEADS_ENABLED = os.environ.get("POPUP_LEADS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+POPUP_IMAP_HOST = os.environ.get("POPUP_IMAP_HOST", "imap.hostinger.com").strip()
+POPUP_IMAP_PORT = int(os.environ.get("POPUP_IMAP_PORT", "993") or 993)
+POPUP_IMAP_USER = os.environ.get("POPUP_IMAP_USER", "").strip()
+POPUP_IMAP_PASSWORD = os.environ.get("POPUP_IMAP_PASSWORD", "")
+POPUP_FROM_ADDR = os.environ.get("POPUP_FROM_ADDR", "mailer@shopify.com").strip()
+POPUP_LOOKBACK_DAYS = int(os.environ.get("POPUP_LOOKBACK_DAYS", "3") or 3)
+# Shopify puts this placeholder in the Email field when the popup only collected
+# a phone number — it is our own address, never the visitor's, so never store it.
+POPUP_PLACEHOLDER_EMAIL = os.environ.get("POPUP_PLACEHOLDER_EMAIL", "welcome-popup-lead@citspray.com").strip().lower()
+
+
+def _popup_field(text: str, label: str) -> Optional[str]:
+    """Shopify contact-form emails render as 'Label:\\n<value>' blocks."""
+    m = re.search(rf"^{re.escape(label)}\s*:\s*\r?\n\s*(.+)$", text or "", re.MULTILINE)
+    if not m:
+        m = re.search(rf"{re.escape(label)}\s*:\s*(.+)", text or "")
+    return m.group(1).strip() if m else None
+
+
+def _popup_clean_phone(raw: str) -> Optional[str]:
+    """Visitors type '77039 02186', '+919820722119', '9884670848' — normalise all."""
+    if not raw:
+        return None
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) > 10 and digits.startswith("91"):
+        digits = digits[2:]
+    if len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    return digits if len(digits) == 10 else (re.sub(r"\D", "", raw) or None)
+
+
+async def shopify_popup_leads_task():
+    """Every 10 min: pull Shopify contact-form/welcome-popup emails out of the
+    owner's inbox and create CRM leads so they enter the normal call/WhatsApp
+    flow. Dedup is by email Message-Id (plus _create_lead_internal's own
+    phone-based dedup). Read-only on the mailbox — messages are never flagged
+    or moved, so the owner's inbox is untouched."""
+    if not POPUP_LEADS_ENABLED or not POPUP_IMAP_USER or not POPUP_IMAP_PASSWORD:
+        return
+    import imaplib
+    import email as _email
+    from email.header import decode_header as _decode_header
+    from email.utils import parsedate_to_datetime
+
+    def _fetch():
+        out = []
+        M = imaplib.IMAP4_SSL(POPUP_IMAP_HOST, POPUP_IMAP_PORT, timeout=30)
+        try:
+            M.login(POPUP_IMAP_USER, POPUP_IMAP_PASSWORD)
+            M.select("INBOX", readonly=True)  # readonly → never alters seen flags
+            since = (now_utc() - timedelta(days=POPUP_LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+            status, data = M.search(None, "FROM", POPUP_FROM_ADDR, "SINCE", since)
+            if status == "OK":
+                for mid in (data[0].split() or [])[-100:]:
+                    st, md = M.fetch(mid, "(RFC822)")
+                    if st == "OK" and md and md[0]:
+                        out.append(md[0][1])
+        finally:
+            try:
+                M.logout()
+            except Exception:
+                pass
+        return out
+
+    try:
+        raws = await asyncio.get_event_loop().run_in_executor(None, _fetch)
+    except Exception as e:
+        logger.exception(f"shopify_popup_leads_task: IMAP fetch failed: {e}")
+        return
+
+    created = 0
+    for raw in raws:
+        try:
+            msg = _email.message_from_bytes(raw)
+            msg_id = (msg.get("Message-ID") or msg.get("Message-Id") or "").strip().strip("<>")
+            if not msg_id:
+                continue
+            if await db.email_logs.find_one({"gmail_id": msg_id}, {"_id": 1}):
+                continue
+
+            text = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain" and "attachment" not in str(part.get("Content-Disposition")):
+                        p = part.get_payload(decode=True)
+                        if p:
+                            text = p.decode(part.get_content_charset() or "utf-8", errors="replace")
+                            break
+            else:
+                p = msg.get_payload(decode=True)
+                if p:
+                    text = p.decode(msg.get_content_charset() or "utf-8", errors="replace")
+
+            phone = _popup_clean_phone(_popup_field(text, "Phone Number") or "")
+            if not phone:
+                continue  # not a lead-bearing contact-form mail
+
+            raw_email_field = (_popup_field(text, "Email") or "").strip()
+            visitor_email = None
+            if raw_email_field and raw_email_field.lower() != POPUP_PLACEHOLDER_EMAIL and "@" in raw_email_field:
+                visitor_email = raw_email_field
+
+            body_note = (_popup_field(text, "Body") or "").strip()
+            is_popup = "welcome popup" in (body_note or "").lower()
+
+            subject = ""
+            try:
+                for part, enc in _decode_header(msg.get("Subject") or ""):
+                    subject += part.decode(enc or "utf-8", errors="replace") if isinstance(part, bytes) else str(part)
+            except Exception:
+                subject = msg.get("Subject") or ""
+
+            created_override = None
+            try:
+                created_override = iso(parsedate_to_datetime(msg.get("Date")).astimezone(timezone.utc))
+            except Exception:
+                pass
+
+            data = {
+                "customer_name": "Website Popup Lead" if is_popup else "Website Enquiry",
+                "phone": phone,
+                "email": visitor_email,
+                "requirement": body_note or "Requested first-order discount code via website popup.",
+                "country": _popup_field(text, "Country Code"),
+                "source": "Website Popup" if is_popup else "Website Contact Form",
+                "source_data": {"subject": subject, "message_id": msg_id, "from": POPUP_FROM_ADDR},
+                "raw_email_text": text,
+                "_created_at_override": created_override,
+            }
+            lead = await _create_lead_internal(data, by_user_id=None)
+            await db.email_logs.insert_one({
+                "id": str(uuid.uuid4()),
+                "from": POPUP_FROM_ADDR,
+                "subject": subject,
+                "raw_text": text,
+                "received_at": iso(now_utc()),
+                "processed": True,
+                "lead_id": lead["id"],
+                "gmail_id": msg_id,
+                "gmail_slot": "shopify_popup",
+                "gmail_account_email": POPUP_IMAP_USER,
+            })
+            created += 1
+            await log_activity(None, "popup_lead_ingested", lead["id"], {"phone": phone, "subject": subject})
+        except Exception as e:
+            logger.exception(f"shopify_popup_leads_task: message failed: {e}")
+
+    if created:
+        logger.info(f"shopify_popup_leads_task: ingested {created} website popup leads")
+
+
 async def attendance_monitor_task():
     """Every 10 min: raise admin flags for attendance rule breaches.
     All alerts are deduped per employee+date, so re-runs are harmless."""
@@ -11213,6 +11368,7 @@ async def on_startup():
     # the customer WhatsApp land the same morning. No-op until WINBACK_ENABLED=1.
     scheduler.add_job(winback_whatsapp_task, "cron", hour=11, minute=15, timezone="Asia/Kolkata", id="winback_whatsapp", max_instances=1, coalesce=True)
     scheduler.add_job(meta_capi_task, "interval", minutes=30, id="meta_capi", max_instances=1, coalesce=True)
+    scheduler.add_job(shopify_popup_leads_task, "interval", minutes=10, id="shopify_popup_leads", max_instances=1, coalesce=True)
     try:
         await db.attendance_logs.create_index([("user_id", 1), ("date", 1)])
         await db.leaves.create_index([("user_id", 1), ("start_date", 1)])
