@@ -9301,6 +9301,14 @@ POPUP_IMAP_USER = os.environ.get("POPUP_IMAP_USER", "").strip()
 POPUP_IMAP_PASSWORD = os.environ.get("POPUP_IMAP_PASSWORD", "")
 POPUP_FROM_ADDR = os.environ.get("POPUP_FROM_ADDR", "mailer@shopify.com").strip()
 POPUP_LOOKBACK_DAYS = int(os.environ.get("POPUP_LOOKBACK_DAYS", "3") or 3)
+# Retail-toned UTILITY acknowledgement sent instead of the generic B2B `reply_all`
+# ("quotation, specifications"), which reads wrong to a consumer who just asked
+# for the first-order code. Deliberately contains NO code/discount/offer/shop
+# link — any of those would make it a MARKETING template under Meta's rules and
+# risk the WABA quality rating that order_confirmation / cod_verification rely on.
+# The code itself is already shown on-screen by sections/cs-welcome-offer.liquid.
+# Falls back to the normal auto-welcome until this template exists + is approved.
+POPUP_ACK_TEMPLATE = os.environ.get("POPUP_ACK_TEMPLATE", "website_enquiry_ack").strip()
 # Shopify puts this placeholder in the Email field when the popup only collected
 # a phone number — it is our own address, never the visitor's, so never store it.
 POPUP_PLACEHOLDER_EMAIL = os.environ.get("POPUP_PLACEHOLDER_EMAIL", "welcome-popup-lead@citspray.com").strip().lower()
@@ -9413,6 +9421,15 @@ async def shopify_popup_leads_task():
             except Exception:
                 pass
 
+            # Is this a brand-new contact, or someone already in the CRM from
+            # IndiaMART/Justdial/WhatsApp? _create_lead_internal dedups by phone
+            # and returns the existing lead — we must not re-greet those people.
+            pat = phone_match_pattern(phone)
+            pre_existing = None
+            if pat:
+                pre_existing = await db.leads.find_one(
+                    {"$or": [{"phone": {"$regex": pat}}, {"phones": {"$regex": pat}}]}, {"_id": 1})
+
             data = {
                 "customer_name": "Website Popup Lead" if is_popup else "Website Enquiry",
                 "phone": phone,
@@ -9422,9 +9439,26 @@ async def shopify_popup_leads_task():
                 "source": "Website Popup" if is_popup else "Website Contact Form",
                 "source_data": {"subject": subject, "message_id": msg_id, "from": POPUP_FROM_ADDR},
                 "raw_email_text": text,
+                # Suppress the generic B2B welcome; we send our own below.
+                "_suppress_auto_welcome": True,
                 "_created_at_override": created_override,
             }
             lead = await _create_lead_internal(data, by_user_id=None)
+
+            if not pre_existing:
+                acked = False
+                if POPUP_ACK_TEMPLATE:
+                    try:
+                        ack = await _shopify_send_template_for_lead(lead, POPUP_ACK_TEMPLATE, [])
+                        acked = ack.get("status") in ("sent", "delivered", "read", "sent_mock")
+                    except Exception as e:
+                        logger.warning(f"popup ack template '{POPUP_ACK_TEMPLATE}' failed: {e}")
+                if not acked:
+                    # Template not created/approved yet — never leave a lead silent.
+                    try:
+                        await auto_send_whatsapp_on_create(lead)
+                    except Exception as e:
+                        logger.warning(f"popup fallback welcome failed: {e}")
             await db.email_logs.insert_one({
                 "id": str(uuid.uuid4()),
                 "from": POPUP_FROM_ADDR,
