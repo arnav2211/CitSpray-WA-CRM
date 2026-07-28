@@ -9193,6 +9193,104 @@ async def winback_whatsapp_task():
         logger.exception(f"winback_whatsapp_task failed: {e}")
 
 
+# ── Meta Conversions API: report offline/WhatsApp orders the pixel can't see ──
+# The Shopify pixel+CAPI already covers website orders; everything booked by a
+# telecaller or over WhatsApp is invisible to the ads algorithm without this.
+META_CAPI_ENABLED = os.environ.get("META_CAPI_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+META_PIXEL_ID = os.environ.get("META_PIXEL_ID", "1841198606790703").strip()
+META_CAPI_TOKEN = os.environ.get("META_CAPI_TOKEN", "").strip()  # blank → reuse the WhatsApp system-user token
+META_CAPI_LOOKBACK_DAYS = int(os.environ.get("META_CAPI_LOOKBACK_DAYS", "6") or 6)  # CAPI rejects events >7 days old
+
+
+def _capi_sha256(v: str) -> str:
+    return hashlib.sha256(v.strip().lower().encode("utf-8")).hexdigest()
+
+
+def _capi_norm_phone(p: str) -> Optional[str]:
+    """Meta wants digits-only with country code: 10-digit Indian → 91XXXXXXXXXX."""
+    digits = re.sub(r"\D", "", p or "")
+    if len(digits) == 10:
+        digits = "91" + digits
+    return digits if len(digits) >= 11 else None
+
+
+async def meta_capi_task():
+    """Every 30 min: push OMS orders that did NOT come from the website to the
+    Meta pixel as server-side Purchase events (action_source=chat), matched by
+    hashed phone. Website orders are skipped — Shopify already reports those —
+    so nothing is double-counted. One event per order via atomic claim."""
+    if not META_CAPI_ENABLED or not META_PIXEL_ID:
+        return
+    token = META_CAPI_TOKEN or (await get_wa_config()).get("access_token") or ""
+    if not token:
+        return
+    try:
+        website_user = await _oms_website_user()
+        website_id = (website_user or {}).get("id")
+        cutoff = iso(now_utc() - timedelta(days=META_CAPI_LOOKBACK_DAYS))
+        sent = 0
+        async for o in oms_db.orders.find({"created_at": {"$gte": cutoff}}, {"_id": 0}).sort("created_at", 1):
+            if not o.get("id"):
+                continue
+            if website_id and o.get("telecaller_id") == website_id:
+                continue  # website order — the Shopify pixel already reported it
+            dedup = f"capi:{o['id']}"
+            claim = await db.meta_capi_sends.update_one(
+                {"dedup_key": dedup},
+                {"$setOnInsert": {"dedup_key": dedup, "oms_order_id": o["id"],
+                                  "status": "claimed", "at": iso(now_utc())}},
+                upsert=True)
+            if not claim.upserted_id:
+                continue
+            cust = await oms_db.customers.find_one({"id": o.get("customer_id")}, {"_id": 0}) or {}
+            phones = [p for p in (_capi_norm_phone(pn) for pn in (cust.get("phone_numbers") or [])) if p]
+            user_data = {"external_id": [_capi_sha256(str(o.get("customer_id") or o["id"]))],
+                         "country": [_capi_sha256("in")]}
+            if phones:
+                user_data["ph"] = [_capi_sha256(p) for p in phones[:3]]
+            cust_name = (cust.get("name") or "").strip()
+            if cust_name:
+                user_data["fn"] = [_capi_sha256(cust_name.split()[0])]
+            try:
+                ts = int(datetime.fromisoformat(str(o["created_at"]).replace("Z", "+00:00")).timestamp())
+            except Exception:
+                ts = int(now_utc().timestamp())
+            event = {
+                "event_name": "Purchase",
+                "event_time": ts,
+                "event_id": f"oms-{o['id']}",
+                "action_source": "chat",
+                "user_data": user_data,
+                "custom_data": {"currency": "INR", "value": float(o.get("grand_total") or 0),
+                                "order_id": str(o.get("order_number") or o["id"])},
+            }
+            ok, err, network_fail = False, None, False
+            try:
+                async with httpx.AsyncClient(timeout=20.0) as hc:
+                    r = await hc.post(f"https://graph.facebook.com/v21.0/{META_PIXEL_ID}/events",
+                                      json={"data": [event], "access_token": token})
+                ok = r.status_code == 200 and bool(r.json().get("events_received"))
+                if not ok:
+                    err = r.text[:300]
+            except Exception as e:
+                err, network_fail = str(e), True
+            if network_fail:
+                # transient — release the claim so the next run retries
+                await db.meta_capi_sends.delete_one({"dedup_key": dedup})
+            else:
+                await db.meta_capi_sends.update_one(
+                    {"dedup_key": dedup},
+                    {"$set": {"status": "sent" if ok else "failed", "error": err,
+                              "value": float(o.get("grand_total") or 0),
+                              "order_number": o.get("order_number")}})
+            if ok:
+                sent += 1
+        if sent:
+            logger.info(f"meta_capi_task: reported {sent} offline orders to Meta CAPI")
+    except Exception as e:
+        logger.exception(f"meta_capi_task failed: {e}")
+
+
 async def attendance_monitor_task():
     """Every 10 min: raise admin flags for attendance rule breaches.
     All alerts are deduped per employee+date, so re-runs are harmless."""
@@ -11114,11 +11212,13 @@ async def on_startup():
     # 11:15 IST — after reorder_reminder_task (10:45) so the executive nudge and
     # the customer WhatsApp land the same morning. No-op until WINBACK_ENABLED=1.
     scheduler.add_job(winback_whatsapp_task, "cron", hour=11, minute=15, timezone="Asia/Kolkata", id="winback_whatsapp", max_instances=1, coalesce=True)
+    scheduler.add_job(meta_capi_task, "interval", minutes=30, id="meta_capi", max_instances=1, coalesce=True)
     try:
         await db.attendance_logs.create_index([("user_id", 1), ("date", 1)])
         await db.leaves.create_index([("user_id", 1), ("start_date", 1)])
         await db.admin_alerts.create_index([("meta.dedup_key", 1)])
         await db.winback_sends.create_index([("dedup_key", 1)], unique=True)
+        await db.meta_capi_sends.create_index([("dedup_key", 1)], unique=True)
     except Exception as _e:
         logger.warning(f"index creation skipped: {_e}")
     logger.info("DEBUG STARTUP: counting gmail_connections...")
