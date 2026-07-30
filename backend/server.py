@@ -6521,6 +6521,7 @@ async def webhook_indiamart_recent(admin: dict = Depends(require_admin), limit: 
 SHOPIFY_WEBHOOK_SECRET = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "").strip()
 SHOPIFY_TPL_ORDER_CONFIRM = os.environ.get("SHOPIFY_TPL_ORDER_CONFIRM", "order_confirmation").strip()
 SHOPIFY_TPL_ORDER_SHIPPED = os.environ.get("SHOPIFY_TPL_ORDER_SHIPPED", "order_shipped").strip()
+SHOPIFY_TPL_ORDER_DELIVERED = os.environ.get("SHOPIFY_TPL_ORDER_DELIVERED", "order_delivered").strip()
 SHOPIFY_TPL_ABANDONED = os.environ.get("SHOPIFY_TPL_ABANDONED", "abandoned_checkout").strip()
 SHOPIFY_ABANDONED_DELAY_MIN = int(os.environ.get("SHOPIFY_ABANDONED_DELAY_MIN", "60") or 60)
 
@@ -6882,15 +6883,33 @@ async def _shopify_handle_order_created(order: dict) -> dict:
             logger.warning(f"Shopify order-confirmation WA failed: {e}")
     return {"lead_id": lead["id"], "order": order_no}
 
-async def _shopify_handle_fulfillment_created(fulfillment: dict) -> dict:
+async def _fulfillment_template_already_sent(lead_id: str, tpl_name: str, order_no: str) -> bool:
+    """True if we already sent this fulfillment template for this order — so status
+    webhooks that re-fire (in_transit, out_for_delivery, delivered all carry the same
+    tracking number) don't spam the customer with duplicate 'shipped'/'delivered' notes."""
+    q: Dict[str, Any] = {
+        "lead_id": lead_id,
+        "template_name": tpl_name,
+        "status": {"$in": ["sent", "delivered", "read", "sent_mock"]},
+    }
+    if order_no:
+        q["body"] = {"$regex": re.escape(order_no)}
+    return (await db.messages.count_documents(q)) > 0
+
+
+async def _shopify_handle_fulfillment(fulfillment: dict, topic: str) -> dict:
+    """Shopify fulfillment webhook. `fulfillments/create` (and the first update that
+    carries tracking) sends the 'shipped' note ONCE. A `fulfillments/update` whose
+    shipment_status is 'delivered' sends the 'delivered' note ONCE. Every other
+    interim status (confirmed / in_transit / out_for_delivery / …) sends nothing —
+    previously each of those re-sent 'shipped', and the delivered update even told
+    the customer the parcel was still 'on its way'."""
     order_no = fulfillment.get("name") or ""
     if order_no and "." in order_no:
         order_no = order_no.split(".")[0]
+    ship_status = (fulfillment.get("shipment_status") or "").lower()
     dest = fulfillment.get("destination") or {}
     phone = dest.get("phone")
-    tracking_no = fulfillment.get("tracking_number") or ""
-    tracking_url = fulfillment.get("tracking_url") or ""
-    company = fulfillment.get("tracking_company") or "our courier"
     lead = None
     if phone:
         lead = await _find_lead_by_phone(str(phone))
@@ -6901,17 +6920,44 @@ async def _shopify_handle_fulfillment_created(fulfillment: dict) -> dict:
         )
     if not lead or not lead.get("phone"):
         return {"skipped": "no matching lead/phone", "order": order_no}
-    tracking_bits = " ".join(filter(None, [tracking_no, tracking_url])) or "your order-status page"
-    # WhatsApp UTILITY message: shipped ({{1}}=name, {{2}}=order no, {{3}}=carrier, {{4}}=tracking)
-    try:
-        await _shopify_send_template_for_lead(
-            lead, SHOPIFY_TPL_ORDER_SHIPPED,
-            [lead.get("customer_name") or "Customer", order_no or "your order", company, tracking_bits],
-        )
-    except Exception as e:
-        logger.warning(f"Shopify shipped WA failed: {e}")
-    await log_activity(None, "website_order_shipped", lead["id"], {"order": order_no, "tracking": tracking_no})
-    return {"lead_id": lead["id"], "order": order_no}
+
+    name = lead.get("customer_name") or "Customer"
+
+    # DELIVERED — the parcel is in the customer's hands. Send the delivered note, once.
+    if ship_status == "delivered":
+        if await _fulfillment_template_already_sent(lead["id"], SHOPIFY_TPL_ORDER_DELIVERED, order_no):
+            return {"skipped": "delivered already sent", "order": order_no}
+        # order_delivered params: {{1}}=name, {{2}}=order no
+        try:
+            await _shopify_send_template_for_lead(
+                lead, SHOPIFY_TPL_ORDER_DELIVERED, [name, order_no or "your order"],
+            )
+        except Exception as e:
+            logger.warning(f"Shopify delivered WA failed: {e}")
+        await log_activity(None, "website_order_delivered", lead["id"], {"order": order_no})
+        return {"lead_id": lead["id"], "order": order_no, "sent": "delivered"}
+
+    # SHIPPED — first time we learn the order left the warehouse (create, or the first
+    # update that carries a tracking number). Interim status updates fall through silently.
+    tracking_no = fulfillment.get("tracking_number") or ""
+    if topic == "fulfillments/create" or tracking_no:
+        if await _fulfillment_template_already_sent(lead["id"], SHOPIFY_TPL_ORDER_SHIPPED, order_no):
+            return {"skipped": "shipped already sent", "order": order_no}
+        tracking_url = fulfillment.get("tracking_url") or ""
+        company = fulfillment.get("tracking_company") or "our courier"
+        tracking_bits = " ".join(filter(None, [tracking_no, tracking_url])) or "your order-status page"
+        # order_shipped params: {{1}}=name, {{2}}=order no, {{3}}=carrier, {{4}}=tracking
+        try:
+            await _shopify_send_template_for_lead(
+                lead, SHOPIFY_TPL_ORDER_SHIPPED,
+                [name, order_no or "your order", company, tracking_bits],
+            )
+        except Exception as e:
+            logger.warning(f"Shopify shipped WA failed: {e}")
+        await log_activity(None, "website_order_shipped", lead["id"], {"order": order_no, "tracking": tracking_no})
+        return {"lead_id": lead["id"], "order": order_no, "sent": "shipped"}
+
+    return {"skipped": f"no message for status '{ship_status or 'n/a'}'", "order": order_no}
 
 async def _shopify_handle_checkout_upsert(checkout: dict) -> dict:
     """Track a storefront checkout (checkouts/create|update). If it never converts,
@@ -7106,9 +7152,8 @@ async def webhook_shopify(request: Request):
         elif topic in ("checkouts/create", "checkouts/update"):
             result.update(await _shopify_handle_checkout_upsert(payload))
         elif topic in ("fulfillments/create", "fulfillments/update"):
-            # Only message on first tracking availability for updates
-            if topic == "fulfillments/create" or payload.get("tracking_number"):
-                result.update(await _shopify_handle_fulfillment_created(payload))
+            # Handler decides: shipped once, delivered once, interim statuses silent.
+            result.update(await _shopify_handle_fulfillment(payload, topic))
         else:
             result["skipped"] = f"unhandled topic {topic}"
     except Exception as e:
