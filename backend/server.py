@@ -12749,6 +12749,18 @@ async def calculate_payroll(
             adj = adjs_map.get(d_str)
             worked_day = (not is_sunday) and (not is_full_holiday)
 
+            # A declared full-day company holiday is PAID for everyone and overrides
+            # any stale per-user adjustment (e.g. an "informed absence" left over from
+            # before the holiday was declared, when nobody punched in) — nobody is
+            # marked absent on a holiday. Sundays still honour admin overrides, so
+            # they remain in the chain below.
+            if is_full_holiday:
+                day.update(status="holiday", earning=daily_rate,
+                           details=f"Holiday: {hol.get('name')} (Paid)")
+                counts["holiday"] += 1
+                daily_breakdown.append(day)
+                continue
+
             # late tracking happens on worked days regardless of the final status
             if worked_day and in_m is not None:
                 if in_m > office_start_m:
@@ -12807,9 +12819,6 @@ async def calculate_payroll(
                 day["status"] = "weekly_off"
                 day["details"] = "Sunday"
                 sunday_rows.append(day)
-            elif is_full_holiday:
-                day.update(status="holiday", earning=daily_rate, details=f"Holiday: {hol.get('name')} (Paid)")
-                counts["holiday"] += 1
             elif log and in_m is not None:
                 in_s, out_s = day["punch_in"] or "--:--", day["punch_out"] or "--:--"
                 if out_m is None:
