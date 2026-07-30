@@ -90,6 +90,19 @@ def _normalize_phone(p: Optional[str]) -> str:
     return re.sub(r"\D+", "", p)
 
 
+def _wa_recipient(p: Optional[str]) -> str:
+    """Recipient number for the WhatsApp Cloud API — MUST carry a country code.
+    Leads are stored in the bare 10-digit Indian national form (e.g. '6265802309').
+    Sending that as-is lets Meta mis-read the leading digits as a foreign country
+    code (e.g. '62...' -> Indonesia) and bounce it as 'Message undeliverable', so any
+    10-digit number gets India's '91' prepended here. Numbers that already include a
+    country code (11-13 digits) are passed through unchanged."""
+    d = re.sub(r"\D+", "", p or "")
+    if len(d) == 10:
+        return "91" + d
+    return d
+
+
 def normalize_phone_display(p: Optional[str]) -> str:
     """Canonical storage / display format for phone numbers.
     Indian numbers (+91XXXXXXXXXX, 91XXXXXXXXXX, 091XXXXXXXXXX, 0XXXXXXXXXX, XXXXXXXXXX)
@@ -202,7 +215,7 @@ async def wa_send_text(to_phone: str, body: str, reply_to_wamid: Optional[str] =
     cfg = await get_wa_config()
     if not cfg["enabled"]:
         return {"mock": True, "status": "sent_mock", "wamid": None}
-    to = _normalize_phone(to_phone)
+    to = _wa_recipient(to_phone)
     if not to:
         return {"error": "no_phone", "status": "failed"}
     url = f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['phone_number_id']}/messages"
@@ -254,7 +267,7 @@ async def wa_send_template(to_phone: str, template_name: str, lang_code: Optiona
     cfg = await get_wa_config()
     if not cfg["enabled"]:
         return {"mock": True, "status": "sent_mock", "wamid": None}
-    to = _normalize_phone(to_phone)
+    to = _wa_recipient(to_phone)
     if not to:
         return {"error": "no_phone", "status": "failed"}
     url = f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['phone_number_id']}/messages"
@@ -7486,7 +7499,7 @@ async def _wa_send_typed(to_phone: str, payload_extra: Dict[str, Any], reply_to_
     cfg = await get_wa_config()
     if not cfg["enabled"]:
         return {"mock": True, "status": "sent_mock", "wamid": None}
-    to = _normalize_phone(to_phone)
+    to = _wa_recipient(to_phone)
     if not to:
         return {"error": "no_phone", "status": "failed"}
     url = f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['phone_number_id']}/messages"
