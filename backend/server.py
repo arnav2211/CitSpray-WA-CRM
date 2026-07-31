@@ -8671,16 +8671,22 @@ async def webhook_whatsapp(request: Request):
                         msg_doc["msg_type"] = "contacts"
                         msg_doc["contacts"] = m.get("contacts") or []
                     await db.messages.insert_one(msg_doc.copy())
-                    await db.leads.update_one(
-                        {"id": lead["id"]},
-                        {"$set": {
-                            "last_action_at": iso(now_utc()),
-                            "last_user_message_at": iso(now_utc()),
-                            "last_message_at": msg_doc["at"],
-                            "has_whatsapp": True,
-                            f"wa_status_map.{(_normalize_phone(from_phone or '')[-10:] or 'unk')}": True,
-                        }},
-                    )
+                    lead_set = {
+                        "last_action_at": iso(now_utc()),
+                        "last_user_message_at": iso(now_utc()),
+                        "last_message_at": msg_doc["at"],
+                        "has_whatsapp": True,
+                        f"wa_status_map.{(_normalize_phone(from_phone or '')[-10:] or 'unk')}": True,
+                    }
+                    # Route replies back to the number the customer actually messaged
+                    # from. A lead can carry several numbers, and only the one that just
+                    # messaged has an open 24h window — without this, a reply to a
+                    # multi-number lead can hit a different number and bounce with Meta
+                    # error 131047 ("Re-engagement message").
+                    _active_num = normalize_phone_display(from_phone or "")
+                    if _active_num:
+                        lead_set["active_wa_phone"] = _active_num
+                    await db.leads.update_one({"id": lead["id"]}, {"$set": lead_set})
                     created_msgs += 1
 
                     # ---- Attendance-aware urgent reassign ----
