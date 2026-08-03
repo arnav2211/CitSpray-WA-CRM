@@ -6672,7 +6672,12 @@ def _oms_build_lines(order: dict) -> dict:
     for li in (order.get("line_items") or []):
         qty = int(li.get("quantity") or 1)
         unit_incl = float(li.get("price") or 0)
+        # `total_discount` only covers line-level discounts. Order-level discount
+        # CODES (WELCOME10, AZADI...) land in `discount_allocations` instead —
+        # missing those billed COD customers the FULL price at the door.
         disc = float(li.get("total_discount") or 0)
+        disc += sum(float(d.get("amount") or 0)
+                    for d in (li.get("discount_allocations") or []))
         line_incl = max(unit_incl * qty - disc, 0.0)
         items_incl += line_incl
         per_unit_ex = _oms_ex_gst(line_incl / qty) if qty else 0.0
