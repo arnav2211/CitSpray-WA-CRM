@@ -6821,6 +6821,70 @@ async def _oms_push_from_lead(lead: dict) -> dict:
     return await _oms_push_order(lead, snap, paid=False)
 
 
+# ── COD confirmation ──────────────────────────────────────────────────────
+# Prepaid orders go straight to OMS. COD must NOT — an unverified COD order
+# that gets dispatched is an RTO waiting to happen. So the customer gets the
+# `cod_verification` template (Confirm Order / Cancel Order quick replies) and
+# the order only enters OMS once they tap Confirm.
+SHOPIFY_TPL_COD = os.environ.get("SHOPIFY_TPL_COD", "cod_verification").strip()
+
+
+def _shopify_is_cod(order: dict) -> bool:
+    gateways = " ".join(order.get("payment_gateway_names") or []).lower()
+    gw = str(order.get("gateway") or "").lower()
+    blob = f"{gateways} {gw}"
+    if "cash on delivery" in blob or "cod" in blob:
+        return True
+    # No gateway named but money not captured -> treat as COD rather than
+    # silently skipping verification.
+    return (order.get("financial_status") or "").lower() in ("pending", "unpaid") and not blob.strip()
+
+
+async def _handle_cod_button_reply(lead: dict, body_text: str) -> None:
+    """Customer tapped Confirm/Cancel on the cod_verification template."""
+    t = (body_text or "").lower()
+    confirmed = "confirm order" in t
+    cancelled = "cancel order" in t
+    if not (confirmed or cancelled):
+        return
+
+    fresh = await db.leads.find_one({"id": lead["id"]}, {"_id": 0}) or lead
+    if (fresh.get("cod_status") or "") != "pending":
+        return  # not awaiting confirmation (or already handled) — ignore
+
+    order_no = ((fresh.get("source_data") or {}).get("order_number")) or ""
+
+    if cancelled:
+        await db.leads.update_one({"id": fresh["id"]}, {"$set": {
+            "cod_status": "cancelled", "cod_responded_at": iso(now_utc())}})
+        await log_activity(None, "cod_cancelled", fresh["id"], {"order": order_no})
+        try:
+            await create_system_alert(
+                "cod_cancelled", f"COD order {order_no} cancelled by customer",
+                f"{fresh.get('customer_name')} ({fresh.get('phone')}) tapped Cancel on {order_no}. "
+                f"Do not dispatch.", dedup_key=f"cod_cancel:{fresh['id']}:{order_no}")
+        except Exception as e:
+            logger.warning(f"cod cancel alert failed: {e}")
+        return
+
+    # Confirmed → book it into OMS
+    await db.leads.update_one({"id": fresh["id"]}, {"$set": {
+        "cod_status": "confirmed", "cod_responded_at": iso(now_utc())}})
+    await log_activity(None, "cod_confirmed", fresh["id"], {"order": order_no})
+    try:
+        res = await _oms_push_from_lead(fresh)
+        if res.get("error"):
+            logger.warning(f"OMS COD push failed for {order_no}: {res['error']}")
+            await create_system_alert(
+                "cod_oms_failed", f"COD {order_no} confirmed but OMS push failed",
+                f"{fresh.get('customer_name')} confirmed {order_no} but it did not reach OMS: "
+                f"{res['error']}. Create it manually.", dedup_key=f"cod_oms_fail:{fresh['id']}")
+        else:
+            logger.info(f"COD {order_no} confirmed -> OMS {res.get('oms_order_number')}")
+    except Exception as e:
+        logger.exception(f"OMS COD push crashed for {order_no}: {e}")
+
+
 
 async def _shopify_handle_order_created(order: dict) -> dict:
     order_no = order.get("name") or f"#{order.get('order_number', '')}"
@@ -6872,16 +6936,30 @@ async def _shopify_handle_order_created(order: dict) -> dict:
                 logger.warning(f"OMS prepaid push error for {order_no}: {res['error']}")
     except Exception as e:
         logger.warning(f"OMS prepaid push crashed for {order_no}: {e}")
-    # WhatsApp UTILITY message: order confirmation ({{1}}=name, {{2}}=order no, {{3}}=total)
+    # WhatsApp UTILITY message ({{1}}=name, {{2}}=order no, {{3}}=total).
+    # COD gets `cod_verification` (Confirm/Cancel buttons) — it must be verified
+    # before dispatch; prepaid gets the plain `order_confirmation`.
+    is_cod = _shopify_is_cod(order)
     if phone:
+        tpl = SHOPIFY_TPL_COD if is_cod else SHOPIFY_TPL_ORDER_CONFIRM
         try:
-            await _shopify_send_template_for_lead(
-                lead, SHOPIFY_TPL_ORDER_CONFIRM,
-                [name, order_no, f"{currency} {total}"],
+            msg = await _shopify_send_template_for_lead(
+                lead, tpl, [name, order_no, f"{currency} {total}"],
             )
+            sent = msg.get("status") in ("sent", "delivered", "read", "sent_mock")
+            if is_cod and not sent:
+                # Never leave a COD order silent — fall back to the plain
+                # confirmation so the customer at least hears from us.
+                logger.warning(f"COD template failed for {order_no}: {msg.get('error')}")
+                await _shopify_send_template_for_lead(
+                    lead, SHOPIFY_TPL_ORDER_CONFIRM, [name, order_no, f"{currency} {total}"])
         except Exception as e:
-            logger.warning(f"Shopify order-confirmation WA failed: {e}")
-    return {"lead_id": lead["id"], "order": order_no}
+            logger.warning(f"Shopify order WA failed ({tpl}): {e}")
+    if is_cod:
+        await db.leads.update_one({"id": lead["id"]}, {"$set": {
+            "cod_status": "pending", "cod_asked_at": iso(now_utc())}})
+        await log_activity(None, "cod_verification_sent", lead["id"], {"order": order_no})
+    return {"lead_id": lead["id"], "order": order_no, "cod": is_cod}
 
 async def _fulfillment_template_already_sent(lead_id: str, tpl_name: str, order_no: str) -> bool:
     """True if we already sent this fulfillment template for this order — so status
@@ -8688,6 +8766,14 @@ async def webhook_whatsapp(request: Request):
                         lead_set["active_wa_phone"] = _active_num
                     await db.leads.update_one({"id": lead["id"]}, {"$set": lead_set})
                     created_msgs += 1
+
+                    # COD verification: customer tapped Confirm / Cancel on the
+                    # cod_verification template. Confirm books it into OMS.
+                    if msg_type == "button":
+                        try:
+                            await _handle_cod_button_reply(lead, body_text)
+                        except Exception as _e:
+                            logger.exception(f"COD button handling failed: {_e}")
 
                     # ---- Attendance-aware urgent reassign ----
                     # Customer messaged, but the assigned exec is on leave / never
