@@ -5,7 +5,7 @@ import { useSearchParams } from "react-router-dom";
 import { ArrowSquareOut, Plug, ArrowsClockwise, X, EnvelopeSimple, CheckCircle, Warning, Eye, EyeSlash } from "@phosphor-icons/react";
 import { fmtIST } from "@/lib/format";
 
-const SLOT_LABELS = { primary: "Primary", secondary: "Secondary" };
+const SLOT_LABELS = { primary: "Primary", secondary: "Secondary", fragvansh: "Fragvansh Inbox" };
 
 export default function Integrations() {
   const [params, setParams] = useSearchParams();
@@ -77,7 +77,11 @@ export default function Integrations() {
     finally { setSlotBusy("all", false); }
   };
 
+  // The backend returns only the ACTIVE company's slots (CitSpray: primary +
+  // secondary; Fragvansh: its own inbox slot) — render whatever came back.
   const slots = status?.slots || {};
+  const slotKeys = Object.keys(slots);
+  const anyConnected = slotKeys.some((s) => slots[s]?.connected);
 
   return (
     <div className="p-4 md:p-8 space-y-6">
@@ -86,7 +90,7 @@ export default function Integrations() {
           <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Sources</div>
           <h1 className="font-chivo font-black text-2xl md:text-4xl">Integrations</h1>
         </div>
-        {status?.enabled && (slots.primary?.connected || slots.secondary?.connected) && (
+        {status?.enabled && anyConnected && (
           <button onClick={syncAll} disabled={!!busy.all}
             className="border border-gray-900 px-3 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-900 hover:text-white flex items-center gap-2 disabled:opacity-50"
             data-testid="gmail-sync-all-btn">
@@ -122,8 +126,8 @@ export default function Integrations() {
         )}
 
         {status?.enabled && (
-          <div className="grid md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-gray-200">
-            {["primary", "secondary"].map((slot) => (
+          <div className={`grid ${slotKeys.length > 1 ? "md:grid-cols-2" : ""} divide-y md:divide-y-0 md:divide-x divide-gray-200`}>
+            {(slotKeys.length ? slotKeys : ["primary", "secondary"]).map((slot) => (
               <SlotPanel
                 key={slot}
                 slot={slot}

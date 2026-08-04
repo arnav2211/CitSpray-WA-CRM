@@ -1423,15 +1423,22 @@ async def internal_qa_threads(
     status: Optional[str] = None,     # 'pending' | 'answered' | None
     agent_id: Optional[str] = None,   # admin-only filter
     q: Optional[str] = None,          # free-text search on customer name / lead requirement
+    x_company: Optional[str] = Header(None, alias="X-Company"),
 ):
     """List all internal Q&A threads visible to the caller, one row per (lead_id, agent_id).
     Each row reports: asked_by, replied_by, first/last question timestamps, last admin reply
-    timestamp, overall status (pending/answered/new), unread count, and lead preview info."""
+    timestamp, overall status (pending/answered/new), unread count, and lead preview info.
+    Admin view is scoped to the active company (a thread belongs to its agent's company)."""
     match: Dict[str, Any] = {}
     if user["role"] == "executive":
         match["agent_id"] = user["id"]
     elif agent_id:
         match["agent_id"] = agent_id
+    else:
+        company = _resolve_company(user, x_company)
+        co_agent_ids = [u["id"] async for u in db.users.find(
+            {"$or": [{"role": "admin"}, {"$and": [company_filter(company)]}]}, {"_id": 0, "id": 1})]
+        match["agent_id"] = {"$in": co_agent_ids}
 
     pipeline = [
         {"$match": match} if match else {"$match": {}},
@@ -1538,13 +1545,19 @@ async def internal_qa_threads(
 
 
 @api.get("/internal-qa/pending-count")
-async def internal_qa_pending_count(user: dict = Depends(get_current_user)):
+async def internal_qa_pending_count(user: dict = Depends(get_current_user),
+                                    x_company: Optional[str] = Header(None, alias="X-Company")):
     """Lightweight count of Q&A threads awaiting an answer — a thread is pending when its
-    latest message is from the executive. Admin: all threads; executive: own threads only.
+    latest message is from the executive. Admin: active company's threads; executive: own only.
     Polled by the sidebar badge."""
     match: Dict[str, Any] = {}
     if user["role"] == "executive":
         match["agent_id"] = user["id"]
+    else:
+        company = _resolve_company(user, x_company)
+        co_agent_ids = [u["id"] async for u in db.users.find(
+            {"$or": [{"role": "admin"}, {"$and": [company_filter(company)]}]}, {"_id": 0, "id": 1})]
+        match["agent_id"] = {"$in": co_agent_ids}
     pipeline = [
         {"$match": match},
         {"$sort": {"at": 1}},
@@ -1560,10 +1573,18 @@ async def internal_qa_pending_count(user: dict = Depends(get_current_user)):
 
 
 # ------------- Assignment Engine -------------
-async def get_routing_rules() -> dict:
-    r = await db.routing_rules.find_one({"key": "default"}, {"_id": 0})
-    if not r:
-        r = {
+async def get_routing_rules(company: Optional[str] = None) -> dict:
+    """Per-company routing settings. CitSpray keeps the legacy "default" doc.
+    A company's doc is seeded ON FIRST READ as a COPY of CitSpray's current
+    settings (per spec) — after that the two are fully independent."""
+    key = _scoped_key("default", company)
+    r = await db.routing_rules.find_one({"key": key}, {"_id": 0})
+    # The doc may pre-exist holding only the round-robin pointer
+    # (last_assigned_username) — that doesn't count as "settings present".
+    if r and "round_robin_enabled" in r:
+        return r
+    if key == "default":
+        seed = {
             "key": "default",
             "round_robin_enabled": True,
             "unopened_reassign_minutes": int(os.environ.get("AUTO_REASSIGN_UNOPENED_MINUTES", "15")),
@@ -1572,8 +1593,14 @@ async def get_routing_rules() -> dict:
             "auto_whatsapp_on_create": True,
             "last_assigned_index": -1,
         }
-        await db.routing_rules.insert_one(r.copy())
-    return r
+    else:
+        base = await get_routing_rules(DEFAULT_COMPANY)
+        seed = {k: v for k, v in base.items()
+                if k not in ("key", "last_assigned_username", "last_assigned_index")}
+        seed["key"] = key
+        seed["last_assigned_index"] = -1
+    await db.routing_rules.update_one({"key": key}, {"$set": seed}, upsert=True)
+    return await db.routing_rules.find_one({"key": key}, {"_id": 0})
 
 def _exec_in_working_hours(exec_user: dict, at: datetime) -> bool:
     wh = exec_user.get("working_hours") or []
@@ -1839,8 +1866,8 @@ async def _pick_buyleads_executive(source: str, company: Optional[str] = None) -
 
 
 async def pick_next_executive(exclude_user_id: Optional[str] = None, company: Optional[str] = None) -> Optional[dict]:
-    rules = await get_routing_rules()
     comp = normalize_company(company)
+    rules = await get_routing_rules(comp)
     execs = await db.users.find(
         {"role": "executive", "active": True, "username": {"$ne": "test_user"},
          **company_filter(comp)}, {"_id": 0, "password_hash": 0}
@@ -1943,7 +1970,7 @@ async def assign_lead(lead_id: str, target_user_id: Optional[str] = None, by_use
     return chosen_id
 
 async def auto_send_whatsapp_on_create(lead: dict):
-    rules = await get_routing_rules()
+    rules = await get_routing_rules(lead.get("company"))
     if not rules.get("auto_whatsapp_on_create", True):
         return
     if not lead.get("phone"):
@@ -3658,13 +3685,21 @@ async def list_all_calls(
     start: Optional[str] = None,
     end: Optional[str] = None,
     limit: int = 500,
+    x_company: Optional[str] = Header(None, alias="X-Company"),
 ):
-    """Cross-lead call log feed. Executives only see their own calls."""
+    """Cross-lead call log feed. Executives only see their own calls; the admin
+    view is scoped to the active company's callers (calls belong to the exec
+    who made them, and each exec belongs to one company)."""
     query: Dict[str, Any] = {}
     if user["role"] == "executive":
         query["by_user_id"] = user["id"]
     elif by_user_id:
         query["by_user_id"] = by_user_id
+    else:
+        company = _resolve_company(user, x_company)
+        co_user_ids = [u["id"] async for u in db.users.find(
+            {"$or": [{"role": "admin"}, {"$and": [company_filter(company)]}]}, {"_id": 0, "id": 1})]
+        query["by_user_id"] = {"$in": co_user_ids}
     if outcome:
         if outcome not in CALL_OUTCOMES:
             raise HTTPException(status_code=400, detail=f"Invalid outcome. Must be one of {CALL_OUTCOMES}")
@@ -4530,16 +4565,20 @@ async def update_followup(fu_id: str, body: FollowupUpdate, user: dict = Depends
 
 # ------------- Routing rules -------------
 @api.get("/routing-rules")
-async def get_rules(user: dict = Depends(get_current_user)):
-    return await get_routing_rules()
+async def get_rules(user: dict = Depends(get_current_user),
+                    x_company: Optional[str] = Header(None, alias="X-Company")):
+    return await get_routing_rules(_resolve_company(user, x_company))
 
 @api.put("/routing-rules")
-async def update_rules(body: RoutingRulesUpdate, admin: dict = Depends(require_admin)):
-    await get_routing_rules()
+async def update_rules(body: RoutingRulesUpdate, admin: dict = Depends(require_admin),
+                       x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(admin, x_company)
+    key = _scoped_key("default", company)
+    await get_routing_rules(company)  # ensures the (seeded) doc exists first
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if updates:
-        await db.routing_rules.update_one({"key": "default"}, {"$set": updates}, upsert=True)
-    r = await db.routing_rules.find_one({"key": "default"}, {"_id": 0})
+        await db.routing_rules.update_one({"key": key}, {"$set": updates}, upsert=True)
+    r = await db.routing_rules.find_one({"key": key}, {"_id": 0})
     return r
 
 # ------------- Reports -------------
@@ -5139,15 +5178,19 @@ class PaymentQRGenerate(BaseModel):
     amount: int  # whole rupees only
 
 
-async def _get_payment_qr_settings() -> Dict[str, Any]:
-    doc = await db.system_settings.find_one({"key": "payment_qr"}, {"_id": 0})
-    if not doc:
+async def _get_payment_qr_settings(company: Optional[str] = None) -> Dict[str, Any]:
+    """Per-company payment accounts. CitSpray keeps the legacy 'payment_qr' key
+    (and its Mangalam Agro defaults); Fragvansh starts EMPTY — its own bank
+    accounts get entered in /payment-settings under the Fragvansh switcher."""
+    key = _scoped_key("payment_qr", company)
+    doc = await db.system_settings.find_one({"key": key}, {"_id": 0})
+    if not doc and key == "payment_qr":
         seed = {"key": "payment_qr", **DEFAULT_PAYMENT_QR, "seeded_at": iso(now_utc())}
         await db.system_settings.insert_one(seed.copy())
         doc = seed
     return {
-        "gst": list(doc.get("gst") or []),
-        "no_gst": list(doc.get("no_gst") or []),
+        "gst": list((doc or {}).get("gst") or []),
+        "no_gst": list((doc or {}).get("no_gst") or []),
     }
 
 
@@ -5196,16 +5239,21 @@ def _format_payment_caption(account: Dict[str, Any], amount: int, qr_type: str) 
 
 
 @api.get("/settings/payment-qr")
-async def get_payment_qr_settings(user: dict = Depends(get_current_user)):
-    """Return both GST and Without-GST account lists. Visible to executives so
-    they can pick which account to send; only admins can mutate."""
-    return await _get_payment_qr_settings()
+async def get_payment_qr_settings(user: dict = Depends(get_current_user),
+                                  x_company: Optional[str] = Header(None, alias="X-Company")):
+    """Return both GST and Without-GST account lists for the active company.
+    Visible to executives so they can pick which account to send; only admins
+    can mutate."""
+    return await _get_payment_qr_settings(_resolve_company(user, x_company))
 
 
 @api.put("/settings/payment-qr")
-async def update_payment_qr_settings(body: PaymentQRSettings, admin: dict = Depends(require_admin)):
-    """Replace the entire GST + Without-GST account lists. Each account gets a
-    UUID id assigned if not present."""
+async def update_payment_qr_settings(body: PaymentQRSettings, admin: dict = Depends(require_admin),
+                                     x_company: Optional[str] = Header(None, alias="X-Company")):
+    """Replace the entire GST + Without-GST account lists (per company). Each
+    account gets a UUID id assigned if not present."""
+    company = _resolve_company(admin, x_company)
+    key = _scoped_key("payment_qr", company)
     def normalise(accts: List[PaymentQRAccount]) -> List[Dict[str, Any]]:
         out = []
         for a in accts:
@@ -5214,26 +5262,27 @@ async def update_payment_qr_settings(body: PaymentQRSettings, admin: dict = Depe
             out.append(d)
         return out
     payload = {
-        "key": "payment_qr",
+        "key": key,
         "gst": normalise(body.gst),
         "no_gst": normalise(body.no_gst),
         "updated_by": admin["id"],
         "updated_at": iso(now_utc()),
     }
-    await db.system_settings.update_one({"key": "payment_qr"}, {"$set": payload}, upsert=True)
-    await log_activity(admin["id"], "payment_qr_settings_updated", None, {"gst": len(payload["gst"]), "no_gst": len(payload["no_gst"])})
-    return await _get_payment_qr_settings()
+    await db.system_settings.update_one({"key": key}, {"$set": payload}, upsert=True)
+    await log_activity(admin["id"], "payment_qr_settings_updated", None, {"company": company, "gst": len(payload["gst"]), "no_gst": len(payload["no_gst"])})
+    return await _get_payment_qr_settings(company)
 
 
 @api.post("/payment-qr/generate")
-async def generate_payment_qr(body: PaymentQRGenerate, request: Request, user: dict = Depends(get_current_user)):
+async def generate_payment_qr(body: PaymentQRGenerate, request: Request, user: dict = Depends(get_current_user),
+                              x_company: Optional[str] = Header(None, alias="X-Company")):
     """Render a fresh PNG QR code for the requested {type, account_id, amount}.
     Returns the public media URL + the formatted caption + the UPI URL.
     The caller (frontend chat composer) then fires `/whatsapp/send-media`
     with image=<media_url> and caption=<caption>."""
     if body.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be a positive whole rupee value")
-    settings = await _get_payment_qr_settings()
+    settings = await _get_payment_qr_settings(_resolve_company(user, x_company))
     bucket = settings.get(body.type) or []
     account = next((a for a in bucket if a.get("id") == body.account_id), None)
     if not account:
@@ -5809,6 +5858,8 @@ async def transfer_request(body: TransferRequestInput, user: dict = Depends(get_
         raise HTTPException(status_code=404, detail="Lead not found")
     doc = {
         "id": str(uuid.uuid4()),
+        # A reassign request belongs to the lead's company book.
+        "company": normalize_company(lead.get("company")),
         "lead_id": body.lead_id,
         "from_user_id": user["id"],
         "from_user_name": user["name"],
@@ -5823,8 +5874,9 @@ async def transfer_request(body: TransferRequestInput, user: dict = Depends(get_
 
 
 @api.get("/inbox/transfer-requests")
-async def list_transfer_requests(user: dict = Depends(get_current_user), status: str = "pending"):
-    query: Dict[str, Any] = {"status": status}
+async def list_transfer_requests(user: dict = Depends(get_current_user), status: str = "pending",
+                                 x_company: Optional[str] = Header(None, alias="X-Company")):
+    query: Dict[str, Any] = {"status": status, "$and": [company_filter(_resolve_company(user, x_company))]}
     if user["role"] == "executive":
         query["from_user_id"] = user["id"]
     docs = await db.transfer_requests.find(query, {"_id": 0}).sort("created_at", -1).to_list(200)
@@ -5855,26 +5907,31 @@ async def reject_transfer(req_id: str, admin: dict = Depends(require_admin)):
     return {"ok": True}
 
 
-# Quick Replies
+# Quick Replies (per company — each company writes its own canned messages)
 @api.get("/quick-replies")
-async def list_quick_replies(user: dict = Depends(get_current_user)):
+async def list_quick_replies(user: dict = Depends(get_current_user),
+                             x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(user, x_company)
     # Sort by admin-defined sort_order asc (NULLS last via fallback to a high
     # default), then by title for stable ordering of unordered legacy rows.
-    items = await db.quick_replies.find({}, {"_id": 0}).to_list(500)
+    items = await db.quick_replies.find({"$and": [company_filter(company)]}, {"_id": 0}).to_list(500)
     items.sort(key=lambda q: (q.get("sort_order") if isinstance(q.get("sort_order"), (int, float)) else 99999, (q.get("title") or "").lower()))
     return items
 
 
 @api.post("/quick-replies")
-async def create_quick_reply(body: QuickReplyInput, admin: dict = Depends(require_admin)):
+async def create_quick_reply(body: QuickReplyInput, admin: dict = Depends(require_admin),
+                             x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(admin, x_company)
     if body.media_url and body.media_type not in ("image", "video", "document", "audio"):
         raise HTTPException(status_code=400, detail="media_type must be image|video|document|audio when media_url is set")
     # Append new replies at the end of the order so admin sees them last —
     # they can drag/sort up later if needed.
-    last = await db.quick_replies.find({}, {"_id": 0, "sort_order": 1}).sort("sort_order", -1).limit(1).to_list(1)
+    last = await db.quick_replies.find({"$and": [company_filter(company)]}, {"_id": 0, "sort_order": 1}).sort("sort_order", -1).limit(1).to_list(1)
     next_order = (int(last[0].get("sort_order")) + 1) if (last and isinstance(last[0].get("sort_order"), (int, float))) else 1
     doc = {
         "id": str(uuid.uuid4()),
+        "company": company,
         "title": body.title.strip(),
         "text": (body.text or "").strip(),
         "media_url": body.media_url or None,
@@ -8372,7 +8429,10 @@ async def handle_flow_inbound(from_phone: str, interactive: Dict[str, Any], lead
     phone_key = _normalize_phone(from_phone or "")[-10:]
     session = await db.chat_sessions.find_one({"phone_key": phone_key}, {"_id": 0}) if phone_key else None
     if not session or not session.get("current_node_id"):
-        flow = await db.chat_flows.find_one({"is_active": True}, {"_id": 0})
+        # The active flow is per company — a Fragvansh customer gets the
+        # Fragvansh bot, never CitSpray's.
+        flow = await db.chat_flows.find_one(
+            {"is_active": True, "$and": [company_filter((lead or {}).get("company"))]}, {"_id": 0})
         if not flow:
             return {"status": "no_active_flow"}
         start_node = await db.chat_nodes.find_one({"flow_id": flow["id"], "is_start_node": True}, {"_id": 0})
@@ -8517,16 +8577,19 @@ class ImportTemplateInput(BaseModel):
 
 
 @api.post("/chatflows/import-template")
-async def import_chatflow_template(body: ImportTemplateInput, admin: dict = Depends(require_admin)):
+async def import_chatflow_template(body: ImportTemplateInput, admin: dict = Depends(require_admin),
+                                   x_company: Optional[str] = Header(None, alias="X-Company")):
     """Materialise a built-in template into real DB docs (flow + nodes + options)."""
+    company = _resolve_company(admin, x_company)
     template = next((t for t in FLOW_TEMPLATES if t["id"] == body.template_id), None)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
     if body.is_active:
-        await db.chat_flows.update_many({"is_active": True}, {"$set": {"is_active": False}})
+        await db.chat_flows.update_many({"is_active": True, "$and": [company_filter(company)]}, {"$set": {"is_active": False}})
     flow_id = str(uuid.uuid4())
     await db.chat_flows.insert_one({
         "id": flow_id,
+        "company": company,
         "name": body.name or template["name"],
         "description": template.get("description", ""),
         "is_active": body.is_active,
@@ -8582,16 +8645,22 @@ async def import_chatflow_template(body: ImportTemplateInput, admin: dict = Depe
 
 
 @api.get("/chatflows")
-async def list_chatflows(admin: dict = Depends(require_admin)):
-    return await db.chat_flows.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+async def list_chatflows(admin: dict = Depends(require_admin),
+                         x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(admin, x_company)
+    return await db.chat_flows.find({"$and": [company_filter(company)]}, {"_id": 0}).sort("created_at", -1).to_list(200)
 
 
 @api.post("/chatflows")
-async def create_chatflow(body: ChatFlowInput, admin: dict = Depends(require_admin)):
+async def create_chatflow(body: ChatFlowInput, admin: dict = Depends(require_admin),
+                          x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(admin, x_company)
     if body.is_active:
-        await db.chat_flows.update_many({"is_active": True}, {"$set": {"is_active": False}})
+        # Only ONE active flow per company; the other company's active flow stays.
+        await db.chat_flows.update_many({"is_active": True, "$and": [company_filter(company)]}, {"$set": {"is_active": False}})
     doc = {
         "id": str(uuid.uuid4()),
+        "company": company,
         "name": body.name,
         "description": body.description,
         "is_active": body.is_active,
@@ -8629,7 +8698,12 @@ async def update_chatflow(flow_id: str, body: ChatFlowUpdate, admin: dict = Depe
         upd["description"] = body.description
     if body.is_active is not None:
         if body.is_active:
-            await db.chat_flows.update_many({"id": {"$ne": flow_id}, "is_active": True}, {"$set": {"is_active": False}})
+            # Deactivate only THIS company's other flows — companies run
+            # independent bots on their own WhatsApp numbers.
+            await db.chat_flows.update_many(
+                {"id": {"$ne": flow_id}, "is_active": True,
+                 "$and": [company_filter(flow.get("company"))]},
+                {"$set": {"is_active": False}})
         upd["is_active"] = body.is_active
     await db.chat_flows.update_one({"id": flow_id}, {"$set": upd})
     return await db.chat_flows.find_one({"id": flow_id}, {"_id": 0})
@@ -9480,14 +9554,6 @@ async def auto_reassign_task():
         logger.debug("auto_reassign_task: lock held by another worker — skipping")
         return
     try:
-        rules = await get_routing_rules()
-        if not rules.get("round_robin_enabled", True):
-            return
-        unopened_mins = int(rules.get("unopened_reassign_minutes") or 15)
-        noaction_mins = int(rules.get("no_action_reassign_minutes") or 60)
-        unopened_cutoff = iso(now_utc() - timedelta(minutes=unopened_mins))
-        noaction_cutoff = iso(now_utc() - timedelta(minutes=noaction_mins))
-
         # Morning spread of untouched overnight (WFH-pool) leads
         try:
             await _redistribute_after_hours_leads()
@@ -9501,48 +9567,61 @@ async def auto_reassign_task():
         under_cap = {"$or": [{"auto_reassign_count": {"$exists": False}},
                              {"auto_reassign_count": {"$lt": MAX_AUTO_REASSIGN_HOPS}}]}
 
-        # Unopened: assigned but not opened within X minutes (oldest first so a
-        # backlog never starves the oldest leads)
-        cursor = db.leads.find({
-            "assigned_to": {"$ne": None},
-            "opened_at": None,
-            "status": "new",
-            "source": rr_source,
-            "last_assignment_at": {"$lt": unopened_cutoff},
-            **under_cap,
-        }, {"_id": 0, "id": 1, "assigned_to": 1}).sort("last_assignment_at", 1).limit(20)
-        async for lead in cursor:
-            await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_unopened")
+        # Each company runs on its OWN routing rules (timings / on-off switch are
+        # independent), touching only its own leads.
+        for _co in COMPANIES:
+            rules = await get_routing_rules(_co)
+            if not rules.get("round_robin_enabled", True):
+                continue
+            unopened_mins = int(rules.get("unopened_reassign_minutes") or 15)
+            noaction_mins = int(rules.get("no_action_reassign_minutes") or 60)
+            unopened_cutoff = iso(now_utc() - timedelta(minutes=unopened_mins))
+            noaction_cutoff = iso(now_utc() - timedelta(minutes=noaction_mins))
+            co_clause = company_filter(_co)
 
-        # No action: opened but no activity within Y minutes (still status='new')
-        cursor2 = db.leads.find({
-            "assigned_to": {"$ne": None},
-            "status": "new",
-            "source": rr_source,
-            "last_action_at": {"$lt": noaction_cutoff},
-            "opened_at": {"$ne": None},
-            **under_cap,
-        }, {"_id": 0, "id": 1, "assigned_to": 1}).sort("last_action_at", 1).limit(20)
-        async for lead in cursor2:
-            await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_noaction")
+            # Unopened: assigned but not opened within X minutes (oldest first so a
+            # backlog never starves the oldest leads)
+            cursor = db.leads.find({
+                "assigned_to": {"$ne": None},
+                "opened_at": None,
+                "status": "new",
+                "source": rr_source,
+                "last_assignment_at": {"$lt": unopened_cutoff},
+                "$and": [co_clause, under_cap],
+            }, {"_id": 0, "id": 1, "assigned_to": 1}).sort("last_assignment_at", 1).limit(20)
+            async for lead in cursor:
+                await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_unopened")
 
-        # Stale: leads still status='new' N days (default 3) after their last assignment
-        # → force a fresh round-robin so no enquiry rots in a dead queue. This pass
-        # RESETS the hop counter, giving capped leads a fresh chance every N days.
-        try:
-            att_cfg = await get_attendance_config()
-            stale_days = int(att_cfg.get("stale_new_days") or 3)
-            stale_cutoff = iso(now_utc() - timedelta(days=stale_days))
-            cursor3 = db.leads.find({
+            # No action: opened but no activity within Y minutes (still status='new')
+            cursor2 = db.leads.find({
                 "assigned_to": {"$ne": None},
                 "status": "new",
                 "source": rr_source,
-                "last_assignment_at": {"$lt": stale_cutoff},
-            }, {"_id": 0, "id": 1, "assigned_to": 1}).sort("last_assignment_at", 1).limit(20)
-            async for lead in cursor3:
-                await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_stale", reset_hop_count=True)
-        except Exception as e:
-            logger.warning(f"stale-new reassign pass failed: {e}")
+                "last_action_at": {"$lt": noaction_cutoff},
+                "opened_at": {"$ne": None},
+                "$and": [co_clause, under_cap],
+            }, {"_id": 0, "id": 1, "assigned_to": 1}).sort("last_action_at", 1).limit(20)
+            async for lead in cursor2:
+                await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_noaction")
+
+            # Stale: leads still status='new' N days (default 3) after their last assignment
+            # → force a fresh round-robin so no enquiry rots in a dead queue. This pass
+            # RESETS the hop counter, giving capped leads a fresh chance every N days.
+            try:
+                att_cfg = await get_attendance_config()
+                stale_days = int(att_cfg.get("stale_new_days") or 3)
+                stale_cutoff = iso(now_utc() - timedelta(days=stale_days))
+                cursor3 = db.leads.find({
+                    "assigned_to": {"$ne": None},
+                    "status": "new",
+                    "source": rr_source,
+                    "last_assignment_at": {"$lt": stale_cutoff},
+                    "$and": [co_clause],
+                }, {"_id": 0, "id": 1, "assigned_to": 1}).sort("last_assignment_at", 1).limit(20)
+                async for lead in cursor3:
+                    await _auto_reassign_lead(lead["id"], lead.get("assigned_to"), "auto_reassigned_stale", reset_hop_count=True)
+            except Exception as e:
+                logger.warning(f"stale-new reassign pass failed ({_co}): {e}")
 
         # Followups: mark missed — but NOT reorder nudges (they are open-ended
         # reminders, not time-boxed alarms).
@@ -10984,14 +11063,19 @@ async def update_gmail_poll_settings(body: GmailPollSettingsInput, admin: dict =
 
 
 @api.get("/integrations/gmail/status")
-async def gmail_status(user: dict = Depends(get_current_user), slot: Optional[str] = None):
-    """Returns status for one slot (if `slot` is supplied) or BOTH slots otherwise.
+async def gmail_status(user: dict = Depends(get_current_user), slot: Optional[str] = None,
+                       x_company: Optional[str] = Header(None, alias="X-Company")):
+    """Returns status for one slot (if `slot` is supplied) or every slot belonging
+    to the ACTIVE COMPANY otherwise (CitSpray: primary+secondary; Fragvansh: its
+    own 'fragvansh' inbox slot).
     Back-compat: legacy key='default' docs are migrated to 'primary' on first read."""
     await _ensure_gmail_migrated()
     secs = await _get_gmail_poll_seconds()
     oauth_enabled = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI)
-    
+
     if slot is None:
+        company = _resolve_company(user, x_company)
+        visible_slots = [s for s in GMAIL_SLOTS if GMAIL_SLOT_COMPANY.get(s, DEFAULT_COMPANY) == company]
         out = {
             "enabled": True,
             "oauth_enabled": oauth_enabled,
@@ -11001,7 +11085,7 @@ async def gmail_status(user: dict = Depends(get_current_user), slot: Optional[st
             "poll_interval_minutes": max(1, secs // 60),
             "query": GMAIL_QUERY
         }
-        for s in GMAIL_SLOTS:
+        for s in visible_slots:
             cfg = await db.gmail_connections.find_one({"key": s}, {"_id": 0, "access_token": 0, "refresh_token": 0, "imap_password": 0})
             last_poll = await db.gmail_polls.find_one({"key": f"last:{s}"}, {"_id": 0})
             out["slots"][s] = {
@@ -12055,7 +12139,8 @@ async def on_startup():
     # Multi-company backfill — idempotent, cheap after the first run: every doc
     # created before the company dimension existed belongs to CitSpray.
     try:
-        for _coll in (db.leads, db.users, db.whatsapp_templates):
+        for _coll in (db.leads, db.users, db.whatsapp_templates,
+                      db.quick_replies, db.chat_flows, db.transfer_requests):
             res = await _coll.update_many({"company": {"$exists": False}}, {"$set": {"company": DEFAULT_COMPANY}})
             if res.modified_count:
                 logger.info(f"company backfill: stamped {res.modified_count} docs in {_coll.name}")
