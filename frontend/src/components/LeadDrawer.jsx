@@ -99,7 +99,7 @@ export default function LeadDrawer({ leadId, onClose }) {
         setExecs(U.filter((u) => u.role === "executive" || u.role === "admin"));
         // Match /chat: only the manual reply templates. The order_* / cod /
         // abandoned_checkout templates are system-automated — never manual.
-        const MANUAL_TEMPLATES = new Set(["reply_all", "reply_to_all", "reply_to_all_fv"]);
+        const MANUAL_TEMPLATES = new Set(["reply_all", "reply_to_all", "fv_reply_all"]);
         setTpl(T.filter((t) => MANUAL_TEMPLATES.has((t.name || "").toLowerCase())
           && (!t.status || t.status === "APPROVED" || !t.synced_from_meta)));
         setQuickReplies(Q || []);
