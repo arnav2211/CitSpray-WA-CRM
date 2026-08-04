@@ -7073,11 +7073,17 @@ def _oms_ex_gst(amount_incl: float) -> float:
     return round(float(amount_incl) / (1 + OMS_GST_RATE / 100.0), 2)
 
 
+def _oms_discount_label(order: dict) -> str:
+    codes = [str(d.get("code") or "").strip()
+             for d in (order.get("discount_codes") or []) if d.get("code")]
+    return "Discount ({})".format(", ".join(codes)) if codes else "Discount"
+
+
 def _oms_build_lines(order: dict) -> dict:
     """Turn a Shopify order into OMS items + any COD/handling charge.
     The residual (total - items - shipping) is whatever extra was charged at
     checkout (the COD fee), so it works no matter how Shopify represents it."""
-    items, items_incl = [], 0.0
+    items, items_incl, discount_incl = [], 0.0, 0.0
     for li in (order.get("line_items") or []):
         qty = int(li.get("quantity") or 1)
         unit_incl = float(li.get("price") or 0)
@@ -7087,9 +7093,13 @@ def _oms_build_lines(order: dict) -> dict:
         disc = float(li.get("total_discount") or 0)
         disc += sum(float(d.get("amount") or 0)
                     for d in (li.get("discount_allocations") or []))
-        line_incl = max(unit_incl * qty - disc, 0.0)
+        # Lines carry their FULL price. The discount is sent to OMS as its
+        # own order-level field, so the invoice shows real rates plus a
+        # discount row instead of silently-reduced per-unit rates.
+        line_incl = unit_incl * qty
         items_incl += line_incl
-        per_unit_ex = _oms_ex_gst(line_incl / qty) if qty else 0.0
+        discount_incl += min(disc, line_incl)
+        per_unit_ex = _oms_ex_gst(unit_incl)
         items.append({
             "product_name": li.get("title") or li.get("name") or "Item",
             "qty": qty,
@@ -7103,7 +7113,7 @@ def _oms_build_lines(order: dict) -> dict:
     for sl in (order.get("shipping_lines") or []):
         shipping_incl += float(sl.get("price") or 0)
     total_incl = float(order.get("total_price") or 0)
-    residual = round(total_incl - items_incl - shipping_incl, 2)
+    residual = round(total_incl - (items_incl - discount_incl) - shipping_incl, 2)
     charges = []
     if residual >= 0.5:  # COD / handling fee charged at checkout
         charges.append({
@@ -7117,6 +7127,9 @@ def _oms_build_lines(order: dict) -> dict:
         "shipping_charge": _oms_ex_gst(shipping_incl) if shipping_incl else 0,
         "total_incl": total_incl,
         "cod_fee_incl": residual if residual >= 0.5 else 0,
+        "discount": _oms_ex_gst(discount_incl) if discount_incl > 0 else 0,
+        "discount_incl": round(discount_incl, 2),
+        "discount_label": _oms_discount_label(order),
     }
 
 
@@ -7204,6 +7217,8 @@ async def _oms_push_order(lead: dict, order: dict, paid: bool) -> dict:
         "shipping_method": "courier",
         "shipping_charge": lines["shipping_charge"],
         "additional_charges": lines["additional_charges"],
+        "discount": lines["discount"],
+        "discount_label": lines["discount_label"],
         "remark": f"Auto-synced from citspray.com {order_no} · {paid_note} · Customer paid INR {lines['total_incl']:.2f}",
         "payment_status": "full" if paid else "unpaid",
         "amount_paid": lines["total_incl"] if paid else 0,
