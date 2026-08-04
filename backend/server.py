@@ -134,9 +134,10 @@ async def get_wa_config(company: Optional[str] = None) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for k, v in _WA_ENV_DEFAULTS.items():
         override = (doc.get(k) or "").strip() if isinstance(doc.get(k), str) else doc.get(k)
+        # Non-CitSpray companies get NO default welcome template — nothing sends
+        # automatically until an admin explicitly configures one in Settings.
         env_default = v if c == DEFAULT_COMPANY else ("v22.0" if k == "api_version" else
                                                       "en_US" if k == "default_template_lang" else
-                                                      "hello_world" if k == "default_template" else
                                                       "leadorbit_meta_verify" if k == "verify_token" else "")
         out[k] = override if override else env_default
     out["company"] = c
@@ -1018,9 +1019,13 @@ async def set_user_receiver_numbers(user_id: str, body: ReceiverNumbersInput, ad
 
 
 @api.get("/settings/receiver-routing")
-async def get_receiver_routing(admin: dict = Depends(require_admin)):
-    """Return the receiver-number → user mapping for the admin Call Routing UI."""
-    users = await db.users.find({"active": True}, {"_id": 0, "password_hash": 0}).sort("name", 1).to_list(500)
+async def get_receiver_routing(admin: dict = Depends(require_admin),
+                               x_company: Optional[str] = Header(None, alias="X-Company")):
+    """Return the receiver-number → user mapping for the admin Call Routing UI —
+    only the active company's people (each company routes calls to its own team)."""
+    company = _resolve_company(admin, x_company)
+    users = await db.users.find({"active": True, "$and": [company_filter(company)]},
+                                {"_id": 0, "password_hash": 0}).sort("name", 1).to_list(500)
     rows = []
     for u in users:
         rows.append({
@@ -1037,40 +1042,48 @@ async def get_receiver_routing(admin: dict = Depends(require_admin)):
 BUYLEADS_SOURCES = ("IndiaMART", "ExportersIndia")
 
 @api.get("/settings/buyleads-routing")
-async def get_buyleads_routing(admin: dict = Depends(require_admin)):
-    """Return the per-source buyleads routing config + eligible executives for the UI."""
+async def get_buyleads_routing(admin: dict = Depends(require_admin),
+                               x_company: Optional[str] = Header(None, alias="X-Company")):
+    """Return the per-source buyleads routing config + eligible executives for the UI.
+    Per company: each company has its own config docs and its own exec pool."""
+    company = _resolve_company(admin, x_company)
     out = []
     for src in BUYLEADS_SOURCES:
-        cfg = await _get_buyleads_routing(src)
+        cfg = await _get_buyleads_routing(_scoped_key(src, company))
+        cfg["source"] = src  # UI keys off the plain source name
         out.append(cfg)
-    # Include active executives so UI can render the multi-select
+    # Include this company's active executives so UI can render the multi-select
     execs = await db.users.find(
-        {"role": "executive", "active": True},
+        {"role": "executive", "active": True, "$and": [company_filter(company)]},
         {"_id": 0, "password_hash": 0},
     ).sort("name", 1).to_list(500)
     return {"configs": out, "executives": execs}
 
 
 @api.put("/settings/buyleads-routing/{source}")
-async def update_buyleads_routing(source: str, body: BuyleadsRoutingInput, admin: dict = Depends(require_admin)):
+async def update_buyleads_routing(source: str, body: BuyleadsRoutingInput, admin: dict = Depends(require_admin),
+                                  x_company: Optional[str] = Header(None, alias="X-Company")):
     if source not in BUYLEADS_SOURCES:
         raise HTTPException(status_code=400, detail=f"source must be one of {list(BUYLEADS_SOURCES)}")
-    patch: Dict[str, Any] = {"source": source, "updated_at": iso(now_utc()), "updated_by": admin["id"]}
+    company = _resolve_company(admin, x_company)
+    src_key = _scoped_key(source, company)
+    patch: Dict[str, Any] = {"source": src_key, "updated_at": iso(now_utc()), "updated_by": admin["id"]}
     if body.mode is not None:
         if body.mode not in ("all", "selected"):
             raise HTTPException(status_code=400, detail="mode must be 'all' or 'selected'")
         patch["mode"] = body.mode
     if body.agent_ids is not None:
-        # Validate agents exist and are executives
+        # Validate agents exist, are executives, and belong to this company
         valid_ids: List[str] = []
         for uid in body.agent_ids:
-            u = await db.users.find_one({"id": uid, "role": "executive"}, {"_id": 0, "id": 1})
+            u = await db.users.find_one({"id": uid, "role": "executive", "$and": [company_filter(company)]}, {"_id": 0, "id": 1})
             if u:
                 valid_ids.append(uid)
         patch["agent_ids"] = valid_ids
-    await db.buyleads_routing.update_one({"source": source}, {"$set": patch}, upsert=True)
-    await log_activity(admin["id"], "buyleads_routing_updated", None, {"source": source, "mode": patch.get("mode"), "count": len(patch.get("agent_ids", []) or [])})
-    cfg = await _get_buyleads_routing(source)
+    await db.buyleads_routing.update_one({"source": src_key}, {"$set": patch}, upsert=True)
+    await log_activity(admin["id"], "buyleads_routing_updated", None, {"source": src_key, "mode": patch.get("mode"), "count": len(patch.get("agent_ids", []) or [])})
+    cfg = await _get_buyleads_routing(src_key)
+    cfg["source"] = source
     return cfg
 
 
@@ -1995,6 +2008,8 @@ async def auto_send_whatsapp_on_create(lead: dict):
     lead_company = normalize_company(lead.get("company"))
     cfg = await get_wa_config(lead_company)
     tpl_name = cfg["default_template"]
+    if not tpl_name:
+        return  # no welcome template configured for this company — send nothing
     tpl_meta = await _resolve_template_meta(tpl_name, cfg["default_template_lang"], company=lead_company)
     params_required = int(tpl_meta.get("params_required") or 0)
     # Only send body params if the template actually has placeholders.
@@ -10599,10 +10614,11 @@ class LeadEmailInput(BaseModel):
     email: str
 
 
-async def _get_email_smtp_config() -> Dict[str, Any]:
-    """Returns the effective SMTP config — DB overrides over defaults. Password
-    returned in clear-text only for internal sender use; admin endpoints mask it."""
-    doc = await db.system_settings.find_one({"key": "email_smtp"}, {"_id": 0}) or {}
+async def _get_email_smtp_config(company: Optional[str] = None) -> Dict[str, Any]:
+    """Returns the effective SMTP config for a company — DB overrides over defaults.
+    CitSpray keeps the legacy 'email_smtp' key; Fragvansh has its own account.
+    Password returned in clear-text only for internal sender use; admin endpoints mask it."""
+    doc = await db.system_settings.find_one({"key": _scoped_key("email_smtp", company)}, {"_id": 0}) or {}
     return {
         "host": doc.get("host") or EMAIL_DEFAULT_HOST,
         "port": int(doc.get("port") or EMAIL_DEFAULT_PORT),
@@ -10614,8 +10630,8 @@ async def _get_email_smtp_config() -> Dict[str, Any]:
     }
 
 
-async def _get_email_template() -> Dict[str, Any]:
-    doc = await db.system_settings.find_one({"key": "email_template"}, {"_id": 0}) or {}
+async def _get_email_template(company: Optional[str] = None) -> Dict[str, Any]:
+    doc = await db.system_settings.find_one({"key": _scoped_key("email_template", company)}, {"_id": 0}) or {}
     return {
         "subject": doc.get("subject") or "",
         "body": doc.get("body") or "",
@@ -10765,7 +10781,10 @@ async def auto_send_email_to_address(lead: Dict[str, Any], address: str, trigger
     addr = (address or "").strip()
     if not _is_valid_email(addr):
         return None
-    cfg = await _get_email_smtp_config()
+    # Company-specific mailbox + template — a Fragvansh lead must never get the
+    # CitSpray mail (and each company can be enabled/disabled independently).
+    _mail_co = normalize_company(lead.get("company"))
+    cfg = await _get_email_smtp_config(_mail_co)
     if not cfg.get("enabled"):
         return None
     if not (cfg.get("host") and cfg.get("email") and cfg.get("password")):
@@ -10777,7 +10796,7 @@ async def auto_send_email_to_address(lead: Dict[str, Any], address: str, trigger
     norm = addr.lower()
     if norm in {a.lower() for a in already}:
         return {"ok": True, "skipped": "already_sent"}
-    tpl = await _get_email_template()
+    tpl = await _get_email_template(_mail_co)
     subject = _render_email_var(tpl.get("subject") or "", lead, addr)
     body = _render_email_var(tpl.get("body") or "", lead, addr)
     if not subject and not body:
@@ -10814,8 +10833,9 @@ async def auto_send_email_on_create(lead: Dict[str, Any]) -> None:
 
 
 @api.get("/settings/email")
-async def get_email_settings(admin: dict = Depends(require_admin)):
-    cfg = await _get_email_smtp_config()
+async def get_email_settings(admin: dict = Depends(require_admin),
+                             x_company: Optional[str] = Header(None, alias="X-Company")):
+    cfg = await _get_email_smtp_config(_resolve_company(admin, x_company))
     return {
         "host": cfg["host"],
         "port": cfg["port"],
@@ -10829,7 +10849,9 @@ async def get_email_settings(admin: dict = Depends(require_admin)):
 
 
 @api.put("/settings/email")
-async def update_email_settings(body: EmailSettingsInput, admin: dict = Depends(require_admin)):
+async def update_email_settings(body: EmailSettingsInput, admin: dict = Depends(require_admin),
+                                x_company: Optional[str] = Header(None, alias="X-Company")):
+    _mail_key = _scoped_key("email_smtp", _resolve_company(admin, x_company))
     patch: Dict[str, Any] = {}
     unset: Dict[str, Any] = {}
     for f in _EMAIL_EDITABLE_FIELDS:
@@ -10854,22 +10876,26 @@ async def update_email_settings(body: EmailSettingsInput, admin: dict = Depends(
         raise HTTPException(status_code=400, detail="No changes supplied")
     update_ops: Dict[str, Any] = {}
     if patch:
-        update_ops["$set"] = {"key": "email_smtp", **patch, "updated_by": admin["id"], "updated_at": iso(now_utc())}
+        update_ops["$set"] = {"key": _mail_key, **patch, "updated_by": admin["id"], "updated_at": iso(now_utc())}
     if unset:
         update_ops["$unset"] = unset
-        update_ops.setdefault("$set", {}).update({"key": "email_smtp", "updated_by": admin["id"], "updated_at": iso(now_utc())})
-    await db.system_settings.update_one({"key": "email_smtp"}, update_ops, upsert=True)
-    await log_activity(admin["id"], "email_settings_updated", None, {"changed": list(patch.keys()), "cleared": list(unset.keys())})
-    return await get_email_settings(admin=admin)
+        update_ops.setdefault("$set", {}).update({"key": _mail_key, "updated_by": admin["id"], "updated_at": iso(now_utc())})
+    await db.system_settings.update_one({"key": _mail_key}, update_ops, upsert=True)
+    await log_activity(admin["id"], "email_settings_updated", None, {"key": _mail_key, "changed": list(patch.keys()), "cleared": list(unset.keys())})
+    return await get_email_settings(admin=admin, x_company=x_company)
 
 
 @api.get("/settings/email-template")
-async def get_email_template(admin: dict = Depends(require_admin)):
-    return await _get_email_template()
+async def get_email_template(admin: dict = Depends(require_admin),
+                             x_company: Optional[str] = Header(None, alias="X-Company")):
+    return await _get_email_template(_resolve_company(admin, x_company))
 
 
 @api.put("/settings/email-template")
-async def update_email_template(body: EmailTemplateInput, admin: dict = Depends(require_admin)):
+async def update_email_template(body: EmailTemplateInput, admin: dict = Depends(require_admin),
+                                x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(admin, x_company)
+    _tpl_key = _scoped_key("email_template", company)
     patch: Dict[str, Any] = {}
     if body.subject is not None:
         patch["subject"] = body.subject
@@ -10880,21 +10906,23 @@ async def update_email_template(body: EmailTemplateInput, admin: dict = Depends(
     if not patch:
         raise HTTPException(status_code=400, detail="No changes supplied")
     await db.system_settings.update_one(
-        {"key": "email_template"},
-        {"$set": {"key": "email_template", **patch, "updated_by": admin["id"], "updated_at": iso(now_utc())}},
+        {"key": _tpl_key},
+        {"$set": {"key": _tpl_key, **patch, "updated_by": admin["id"], "updated_at": iso(now_utc())}},
         upsert=True,
     )
-    return await _get_email_template()
+    return await _get_email_template(company)
 
 
 @api.post("/settings/email/test-send")
-async def email_test_send(body: EmailTestSendInput, admin: dict = Depends(require_admin)):
+async def email_test_send(body: EmailTestSendInput, admin: dict = Depends(require_admin),
+                          x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(admin, x_company)
     if not _is_valid_email(body.to):
         raise HTTPException(status_code=400, detail="Invalid recipient email")
-    cfg = await _get_email_smtp_config()
+    cfg = await _get_email_smtp_config(company)
     if not (cfg.get("host") and cfg.get("email") and cfg.get("password")):
         raise HTTPException(status_code=400, detail="SMTP not fully configured (host/email/password required)")
-    tpl = await _get_email_template()
+    tpl = await _get_email_template(company)
     fake_lead = {"customer_name": "Test User", "requirement": "Sample requirement", "phone": "+91XXXXXXXXXX", "email": body.to, "source": "Test"}
     subject = _render_email_var(body.subject or tpl.get("subject") or "Test email from CRM", fake_lead, body.to)
     body_text = _render_email_var(body.body or tpl.get("body") or "This is a test email.", fake_lead, body.to)
