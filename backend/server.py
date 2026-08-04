@@ -9365,7 +9365,7 @@ async def _handle_wa_webhook(request: Request, company: str):
                         # the feature being set up — if disabled, the next inbound message
                         # from the same customer will still be eligible to trigger it.
                         _seq_check = await db.system_settings.find_one(
-                            {"key": "auto_reply_sequence"},
+                            {"key": _scoped_key("auto_reply_sequence", company)},
                             {"_id": 0, "is_active": 1, "quick_reply_ids": 1}
                         )
                         if _seq_check and _seq_check.get("is_active") and _seq_check.get("quick_reply_ids"):
@@ -10420,19 +10420,23 @@ class AutoSequenceInput(BaseModel):
 
 
 @api.get("/settings/auto-sequence")
-async def get_auto_sequence(admin: dict = Depends(require_admin)):
-    doc = await db.system_settings.find_one({"key": "auto_reply_sequence"}, {"_id": 0})
+async def get_auto_sequence(admin: dict = Depends(require_admin),
+                            x_company: Optional[str] = Header(None, alias="X-Company")):
+    key = _scoped_key("auto_reply_sequence", _resolve_company(admin, x_company))
+    doc = await db.system_settings.find_one({"key": key}, {"_id": 0})
     if not doc:
         return {"is_active": False, "quick_reply_ids": []}
     return {"is_active": doc.get("is_active", False), "quick_reply_ids": doc.get("quick_reply_ids", [])}
 
 
 @api.put("/settings/auto-sequence")
-async def update_auto_sequence(body: AutoSequenceInput, admin: dict = Depends(require_admin)):
+async def update_auto_sequence(body: AutoSequenceInput, admin: dict = Depends(require_admin),
+                               x_company: Optional[str] = Header(None, alias="X-Company")):
+    key = _scoped_key("auto_reply_sequence", _resolve_company(admin, x_company))
     await db.system_settings.update_one(
-        {"key": "auto_reply_sequence"},
+        {"key": key},
         {"$set": {
-            "key": "auto_reply_sequence",
+            "key": key,
             "is_active": body.is_active,
             "quick_reply_ids": body.quick_reply_ids,
             "updated_by": admin["id"],
@@ -10447,11 +10451,13 @@ async def _trigger_auto_sequence(lead_id: str, target_phone: str):
     try:
         # Give Meta/Webhook a brief moment to finish updating before firing out
         await asyncio.sleep(1)
-        doc = await db.system_settings.find_one({"key": "auto_reply_sequence"}, {"_id": 0})
-        if not doc or not doc.get("is_active") or not doc.get("quick_reply_ids"):
-            return
         _seq_lead = await db.leads.find_one({"id": lead_id}, {"_id": 0, "company": 1})
         _seq_co = normalize_company((_seq_lead or {}).get("company"))
+        # Each company runs its OWN welcome sequence — a Fragvansh customer must
+        # never receive the CitSpray catalogue (and vice versa).
+        doc = await db.system_settings.find_one({"key": _scoped_key("auto_reply_sequence", _seq_co)}, {"_id": 0})
+        if not doc or not doc.get("is_active") or not doc.get("quick_reply_ids"):
+            return
 
         for qr_id in doc["quick_reply_ids"]:
             api_result = {}
