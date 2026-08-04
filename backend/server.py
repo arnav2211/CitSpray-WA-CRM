@@ -1886,6 +1886,13 @@ async def pick_next_executive(exclude_user_id: Optional[str] = None, company: Op
         {"role": "executive", "active": True, "username": {"$ne": "test_user"},
          **company_filter(comp)}, {"_id": 0, "password_hash": 0}
     ).to_list(500)
+
+    # Single-executive company (e.g. Fragvansh with only Prachi): assign to them
+    # unconditionally — attendance / working hours / leave filters would only
+    # strand leads as unassigned when there is nobody else to route to anyway.
+    # The rule dissolves by itself the moment a second executive is added.
+    if comp != DEFAULT_COMPANY and len(execs) == 1 and execs[0]["id"] != exclude_user_id:
+        return execs[0]
     
     # Filter by attendance (punched in or bypass)
     after_attendance = []

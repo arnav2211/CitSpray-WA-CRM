@@ -13,6 +13,8 @@ import {
 import { fmtIST, fmtISTTime, fmtSmartShort, fmtSmartLong, fmtTime12, fmtDaySeparator, istDayKey } from "@/lib/format";
 import { StatusBadge, SourceBadge } from "@/components/Badges";
 import OMSDataSection from "@/components/OMSDataSection";
+import TagsEditor from "@/components/TagsEditor";
+import { useCompany } from "@/context/CompanyContext";
 
 const POLL_MS = 4000;
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
@@ -659,6 +661,7 @@ function MessageHitRow({ hit, query, onClick }) {
 // ---------------- Chat thread ----------------
 function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initialAgentId, initialPhone, jumpToMessageId, onJumpConsumed, onToggleStar }) {
   const isAdmin = user.role === "admin";
+  const { isFragvansh } = useCompany();
   const canMessage = isAdmin || conv.assigned_to === user.id;
   const [messages, setMessages] = useState([]);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -1939,6 +1942,17 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
               <InfoRow label="Requirement">
                 <div className="text-xs text-gray-700 whitespace-pre-wrap">{conv.requirement || "—"}</div>
               </InfoRow>
+              {isFragvansh && (
+                <InfoRow label="Labels">
+                  <TagsEditor
+                    tags={conv.tags || []}
+                    canEdit={canMessage}
+                    onSave={(tags) => api.patch(`/leads/${conv.id}`, { tags })
+                      .then(() => onChanged?.())
+                      .catch((e) => toast.error(errMsg(e)))}
+                  />
+                </InfoRow>
+              )}
               {(conv.city || conv.area || conv.state) && (
                 <InfoRow label="Location">
                   <div className="text-xs text-gray-700">{[conv.area, conv.city, conv.state].filter(Boolean).join(", ")}</div>

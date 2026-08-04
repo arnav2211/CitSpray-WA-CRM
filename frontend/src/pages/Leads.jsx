@@ -350,7 +350,6 @@ export default function Leads() {
                     <SourceBadge source={l.source} />
                     <EnquiryTypeBadge lead={l} />
                     <AlsoInBadge lead={l} />
-                    {isFragvansh && (l.tags || []).map((t) => <TagBadge key={t} tag={t} />)}
                     <span className="text-[10px] uppercase tracking-widest text-gray-400 font-bold ml-auto">
                       {execMap[l.assigned_to]?.name || "Unassigned"}
                     </span>
@@ -406,11 +405,6 @@ export default function Leads() {
                         <FollowupChip lead={l} />
                         <AlsoInBadge lead={l} />
                       </div>
-                      {isFragvansh && (l.tags || []).length > 0 && (
-                        <div className="flex items-center gap-1 flex-wrap mt-0.5">
-                          {(l.tags || []).map((t) => <TagBadge key={t} tag={t} />)}
-                        </div>
-                      )}
                       {l.phone && (
                         <div className="text-xs text-gray-500 font-mono flex items-center gap-1.5">
                           <span>{l.phone}</span>
