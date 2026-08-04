@@ -13,6 +13,13 @@ api.interceptors.request.use((config) => {
     config.headers = config.headers || {};
     config.headers.Authorization = `Bearer ${token}`;
   }
+  // Multi-company scope: the admin's switcher persists here; the backend pins
+  // non-admin users to their own company regardless of this header.
+  const company = localStorage.getItem("active_company");
+  if (company) {
+    config.headers = config.headers || {};
+    config.headers["X-Company"] = company;
+  }
   return config;
 });
 

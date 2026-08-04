@@ -59,7 +59,12 @@ export default function UsersPage() {
                 <div className="font-semibold truncate">{u.name}</div>
                 <div className="text-xs font-mono text-gray-500">@{u.username}</div>
               </div>
-              <span className="kbd shrink-0">{u.role}</span>
+              <div className="flex flex-col items-end gap-1 shrink-0">
+                <span className="kbd">{u.role}</span>
+                <span className={`text-[9px] uppercase tracking-widest font-bold ${u.company === "fragvansh" ? "text-[#7C3AED]" : "text-[#002FA7]"}`}>
+                  {u.company === "fragvansh" ? "Fragvansh" : "CitSpray"}
+                </span>
+              </div>
             </div>
             <div className="text-xs text-gray-600 mt-2">
               {(u.working_hours || []).length === 0 ? "Always available" :
@@ -88,6 +93,7 @@ export default function UsersPage() {
               <th className="text-left px-4 py-3">Name</th>
               <th className="text-left px-4 py-3">Username</th>
               <th className="text-left px-4 py-3">Role</th>
+              <th className="text-left px-4 py-3">Company</th>
               <th className="text-left px-4 py-3">Working Hours</th>
               <th className="text-left px-4 py-3">Status</th>
               <th></th>
@@ -99,6 +105,12 @@ export default function UsersPage() {
                 <td className="px-4 py-3 font-semibold">{u.name}</td>
                 <td className="px-4 py-3 font-mono text-xs">@{u.username}</td>
                 <td className="px-4 py-3"><span className="kbd">{u.role}</span></td>
+                <td className="px-4 py-3">
+                  <span className={`text-[10px] uppercase tracking-widest font-bold ${u.company === "fragvansh" ? "text-[#7C3AED]" : "text-[#002FA7]"}`}
+                    data-testid={`user-company-${u.username}`}>
+                    {u.company === "fragvansh" ? "Fragvansh" : "CitSpray"}
+                  </span>
+                </td>
                 <td className="px-4 py-3 text-xs text-gray-600">
                   {(u.working_hours || []).length === 0 ? "Always available" :
                     u.working_hours.map((w, i) => <span key={i} className="inline-block mr-2">{WEEK[w.weekday]} {w.start}-{w.end}</span>)}
@@ -148,6 +160,7 @@ function UserModal({ user, onClose, onSaved }) {
     bypass_attendance: user?.bypass_attendance ?? false,
     employee_code: user?.employee_code || "",
     department: user?.department || "",
+    company: user?.company || "citspray",
   });
   const [loading, setLoading] = useState(false);
 
@@ -169,7 +182,8 @@ function UserModal({ user, onClose, onSaved }) {
           base_salary: Number(f.base_salary),
           bypass_attendance: f.bypass_attendance,
           employee_code: f.employee_code || null,
-          department: f.department || null
+          department: f.department || null,
+          company: f.company
         };
         if (f.password) body.password = f.password;
         await api.patch(`/users/${user.id}`, body);
@@ -205,6 +219,13 @@ function UserModal({ user, onClose, onSaved }) {
                 <option value="data_entry">data entry</option>
                 <option value="admin">admin</option>
               </select>
+            </Field>
+            <Field label="Company">
+              <select value={f.company} onChange={(e) => setF({ ...f, company: e.target.value })} className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="user-company-select">
+                <option value="citspray">CitSpray</option>
+                <option value="fragvansh">Fragvansh</option>
+              </select>
+              <div className="text-[10px] text-gray-400 mt-1">Executives only see and receive this company's leads. Admins see both via the sidebar switcher.</div>
             </Field>
 
             {f.role !== "admin" && (

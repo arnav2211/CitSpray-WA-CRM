@@ -2271,7 +2271,7 @@ function ContactSendModal({ onClose, onSend, sending, lead }) {
       <form onClick={(e) => e.stopPropagation()} onSubmit={submit} className="w-full max-w-md bg-white border border-gray-900 p-6 space-y-3" data-testid="send-contact-modal">
         <h3 className="font-chivo font-black text-xl">Send Contact Card</h3>
         <input required placeholder="Name" value={name} onChange={(e) => setName(e.target.value)} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="contact-name" />
-        <input required placeholder="Phone (+91…)" value={phone} onChange={(e) => setPhone(e.target.value)} className="w-full border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="contact-phone" />
+        <input required placeholder="Phone with country code (+91…, +52…, +1…)" value={phone} onChange={(e) => setPhone(e.target.value)} className="w-full border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="contact-phone" />
         <input placeholder="Email (optional)" type="email" value={email} onChange={(e) => setEmail(e.target.value)} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="contact-email" />
         <input placeholder="Organization (optional)" value={organization} onChange={(e) => setOrganization(e.target.value)} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="contact-org" />
         <div className="flex justify-end gap-2">

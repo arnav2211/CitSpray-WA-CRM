@@ -26,6 +26,7 @@ export function SourceBadge({ source }) {
     Manual: "border-gray-500 text-gray-700",
     WhatsApp: "border-[#008A00] text-[#008A00]",
     Website: "border-[#1E3A2A] text-[#1E3A2A]",
+    Export: "border-[#B8860B] text-[#8B6508]",
   };
   const cls = map[source] || "border-gray-300 text-gray-600";
   return (
@@ -56,6 +57,41 @@ const FREE_TYPE_COLORS = {
   inquiry: "bg-[#F0F9FF] text-[#0891B2]",
   catalog: "bg-[#ECFDF5] text-[#008A00]",
 };
+
+// Lead tag/label chip (Fragvansh labels feature)
+export function TagBadge({ tag, onRemove }) {
+  if (!tag) return null;
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest border border-[#7C3AED] text-[#7C3AED] bg-[#F5F3FF]"
+      data-testid={`tag-badge-${tag}`}>
+      {tag}
+      {onRemove && (
+        <button onClick={onRemove} className="hover:text-[#4C1D95] leading-none" title={`Remove tag ${tag}`}
+          data-testid={`tag-remove-${tag}`}>×</button>
+      )}
+    </span>
+  );
+}
+
+// "Also in <other company>" note — the same phone exists on the other company's
+// book. Informational only; the leads stay fully independent.
+const COMPANY_LABELS = { citspray: "CitSpray", fragvansh: "Fragvansh" };
+export function AlsoInBadge({ lead }) {
+  const others = (lead?.also_in || []).filter((c) => COMPANY_LABELS[c]);
+  if (!others.length) return null;
+  return (
+    <>
+      {others.map((c) => (
+        <span key={c}
+          className="inline-flex items-center px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest border border-dashed border-amber-500 text-amber-700 bg-amber-50"
+          title={`This customer also exists in ${COMPANY_LABELS[c]}`}
+          data-testid={`also-in-badge-${c}`}>
+          also in {COMPANY_LABELS[c]}
+        </span>
+      ))}
+    </>
+  );
+}
 
 export function EnquiryTypeBadge({ lead }) {
   if (!lead) return null;

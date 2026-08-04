@@ -24,7 +24,7 @@ import jwt
 import httpx
 from bs4 import BeautifulSoup
 import pandas as pd
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Query, UploadFile, File, Form, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Query, UploadFile, File, Form, BackgroundTasks, WebSocket, WebSocketDisconnect, Header
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
@@ -53,6 +53,49 @@ if JWT_SECRET == "devsecret":
         "JWT_SECRET is not set — running with the default dev secret. "
         "Every auth token is forgeable. Set JWT_SECRET in backend/.env immediately.")
 
+# ------------- Companies -------------
+# The CRM hosts more than one company. Every lead and user carries a `company`
+# key; docs created before multi-company were backfilled to "citspray".
+# Admins pick the active company via the X-Company header (frontend switcher);
+# non-admin users are locked to their own user.company.
+COMPANIES = {"citspray": "CitSpray", "fragvansh": "Fragvansh"}
+DEFAULT_COMPANY = "citspray"
+
+
+def normalize_company(value: Optional[str]) -> str:
+    v = (value or "").strip().lower()
+    return v if v in COMPANIES else DEFAULT_COMPANY
+
+
+def other_company(company: str) -> str:
+    return "fragvansh" if normalize_company(company) == "citspray" else "citspray"
+
+
+def _resolve_company(user: Optional[dict], x_company: Optional[str]) -> str:
+    """Company scope for a request: admins follow the X-Company header switcher;
+    everyone else is pinned to the company on their user record."""
+    if user and user.get("role") != "admin":
+        return normalize_company(user.get("company"))
+    return normalize_company(x_company)
+
+
+def company_filter(company: Optional[str]) -> Dict[str, Any]:
+    """Mongo clause matching docs of one company. Docs are backfilled with
+    company="citspray", but a missing field still safely counts as CitSpray so a
+    partially-run backfill can never hide legacy data."""
+    c = normalize_company(company)
+    if c == DEFAULT_COMPANY:
+        return {"$or": [{"company": DEFAULT_COMPANY}, {"company": {"$exists": False}}]}
+    return {"company": c}
+
+
+def _scoped_key(base: str, company: Optional[str]) -> str:
+    """Per-company variant of a settings/routing key. CitSpray keeps the legacy
+    bare key so existing config keeps working untouched."""
+    c = normalize_company(company)
+    return base if c == DEFAULT_COMPANY else f"{base}:{c}"
+
+
 # ------------- WhatsApp Cloud API config -------------
 # Fallback defaults come from .env; the effective config can be overridden at
 # runtime by writing to the `system_settings` collection (key="whatsapp") via
@@ -73,13 +116,29 @@ _WA_ENV_DEFAULTS = {
 
 _WA_EDITABLE_FIELDS = list(_WA_ENV_DEFAULTS.keys())
 
-async def get_wa_config() -> Dict[str, Any]:
-    """Effective WhatsApp config = DB overrides > env defaults."""
-    doc = await db.system_settings.find_one({"key": "whatsapp"}, {"_id": 0}) or {}
+def _wa_settings_key(company: Optional[str]) -> str:
+    """system_settings key for a company's WhatsApp config. CitSpray keeps the
+    legacy key "whatsapp" so nothing existing moves; other companies get
+    "whatsapp_<company>"."""
+    c = normalize_company(company)
+    return "whatsapp" if c == DEFAULT_COMPANY else f"whatsapp_{c}"
+
+
+async def get_wa_config(company: Optional[str] = None) -> Dict[str, Any]:
+    """Effective WhatsApp config for a company = DB overrides > env defaults.
+    Env defaults only ever apply to CitSpray (the original single-company setup);
+    Fragvansh is configured purely from Settings."""
+    c = normalize_company(company)
+    doc = await db.system_settings.find_one({"key": _wa_settings_key(c)}, {"_id": 0}) or {}
     out: Dict[str, Any] = {}
     for k, v in _WA_ENV_DEFAULTS.items():
         override = (doc.get(k) or "").strip() if isinstance(doc.get(k), str) else doc.get(k)
-        out[k] = override if override else v
+        env_default = v if c == DEFAULT_COMPANY else ("v22.0" if k == "api_version" else
+                                                      "en_US" if k == "default_template_lang" else
+                                                      "hello_world" if k == "default_template" else
+                                                      "leadorbit_meta_verify" if k == "verify_token" else "")
+        out[k] = override if override else env_default
+    out["company"] = c
     out["enabled"] = bool(out["access_token"] and out["phone_number_id"])
     return out
 
@@ -185,13 +244,13 @@ def count_template_placeholders(body_text: Optional[str]) -> int:
     return max(pos_max, len(named))
 
 
-async def _resolve_template_meta(template_name: str, lang_code: Optional[str] = None) -> Dict[str, Any]:
+async def _resolve_template_meta(template_name: str, lang_code: Optional[str] = None, company: Optional[str] = None) -> Dict[str, Any]:
     """Look up an approved template doc by name (and optionally language) and return
     {body, language, params_required}. Falls back to {} when not found locally — caller
     can then send without components (Meta will reject if it actually has params)."""
     if not template_name:
         return {}
-    query: Dict[str, Any] = {"name": template_name}
+    query: Dict[str, Any] = {"name": template_name, "company": normalize_company(company)}
     doc = None
     if lang_code:
         doc = await db.whatsapp_templates.find_one({**query, "language": lang_code}, {"_id": 0})
@@ -211,8 +270,8 @@ async def _resolve_template_meta(template_name: str, lang_code: Optional[str] = 
     }
 
 
-async def wa_send_text(to_phone: str, body: str, reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
-    cfg = await get_wa_config()
+async def wa_send_text(to_phone: str, body: str, reply_to_wamid: Optional[str] = None, company: Optional[str] = None) -> Dict[str, Any]:
+    cfg = await get_wa_config(company)
     if not cfg["enabled"]:
         return {"mock": True, "status": "sent_mock", "wamid": None}
     to = _wa_recipient(to_phone)
@@ -263,8 +322,8 @@ async def wa_send_text(to_phone: str, body: str, reply_to_wamid: Optional[str] =
     return {"status": "sent", "wamid": wamid, "raw": data}
 
 
-async def wa_send_template(to_phone: str, template_name: str, lang_code: Optional[str] = None, body_params: Optional[List[str]] = None) -> Dict[str, Any]:
-    cfg = await get_wa_config()
+async def wa_send_template(to_phone: str, template_name: str, lang_code: Optional[str] = None, body_params: Optional[List[str]] = None, company: Optional[str] = None) -> Dict[str, Any]:
+    cfg = await get_wa_config(company)
     if not cfg["enabled"]:
         return {"mock": True, "status": "sent_mock", "wamid": None}
     to = _wa_recipient(to_phone)
@@ -372,6 +431,7 @@ class UserOut(BaseModel):
     base_salary: float = 0.0
     bypass_attendance: bool = False
     employee_code: Optional[str] = None
+    company: str = "citspray"
 
 class UserCreate(BaseModel):
     username: str
@@ -386,6 +446,7 @@ class UserCreate(BaseModel):
     bypass_attendance: bool = False
     employee_code: Optional[str] = None
     department: Optional[str] = None
+    company: Literal["citspray", "fragvansh"] = "citspray"
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
@@ -399,6 +460,7 @@ class UserUpdate(BaseModel):
     bypass_attendance: Optional[bool] = None
     employee_code: Optional[str] = None
     department: Optional[str] = None
+    company: Optional[Literal["citspray", "fragvansh"]] = None
 
 class HolidayCreate(BaseModel):
     date: str  # YYYY-MM-DD
@@ -482,6 +544,7 @@ class LeadUpdate(BaseModel):
     active_wa_phone: Optional[str] = None
     starred: Optional[bool] = None
     gst_no: Optional[str] = None
+    tags: Optional[List[str]] = None
 
 
 CALL_OUTCOMES = ("connected", "no_response", "rejected", "not_reachable", "busy", "invalid", "initiated")
@@ -778,6 +841,7 @@ async def create_user(body: UserCreate, admin: dict = Depends(require_admin)):
         "bypass_attendance": body.bypass_attendance or False,
         "employee_code": body.employee_code,
         "department": body.department,
+        "company": normalize_company(body.company),
     }
     await db.users.insert_one(doc.copy())
     return strip_mongo(doc)
@@ -792,6 +856,8 @@ async def update_user(user_id: str, body: UserUpdate, admin: dict = Depends(requ
         v = getattr(body, f)
         if v is not None:
             updates[f] = v
+    if body.company is not None:
+        updates["company"] = normalize_company(body.company)
     if body.receiver_numbers is not None:
         rx = _normalize_receiver_list(body.receiver_numbers)
         await _ensure_receiver_unique(rx, exclude_user_id=user_id)
@@ -1735,18 +1801,25 @@ async def create_system_alert(alert_type: str, title: str, message: str, dedup_k
         logger.warning(f"create_system_alert failed: {e}")
 
 
-async def _pick_buyleads_executive(source: str) -> Optional[dict]:
+async def _pick_buyleads_executive(source: str, company: Optional[str] = None) -> Optional[dict]:
     """Round-robin across the allow-listed agents for a given buyleads source.
     Respects leave status and `active` flag. Falls back to `pick_next_executive` if
-    the config is mode='all' or no eligible agent remains."""
-    cfg = await _get_buyleads_routing(source)
+    the config is mode='all' or no eligible agent remains.
+    Config + pointer are per company: CitSpray keeps the legacy source key,
+    Fragvansh uses '<source>:fragvansh'."""
+    src_key = _scoped_key(source, company)
+    cfg = await _get_buyleads_routing(src_key)
     if cfg["mode"] != "selected" or not cfg["agent_ids"]:
         return None
-    # Filter by active + not-on-leave
+    # Filter by active + not-on-leave; an allow-listed agent must also belong to
+    # this company (protects against stale config after a user is moved).
+    comp = normalize_company(company)
     eligible: List[dict] = []
     for uid in cfg["agent_ids"]:
         u = await db.users.find_one({"id": uid, "role": "executive", "active": True}, {"_id": 0, "password_hash": 0})
         if not u:
+            continue
+        if normalize_company(u.get("company")) != comp:
             continue
         if await _is_user_on_leave(uid):
             continue
@@ -1758,17 +1831,19 @@ async def _pick_buyleads_executive(source: str) -> Optional[dict]:
     eligible.sort(key=lambda e: e["username"])
     # Round-robin on a stored username pointer per source (robust to the
     # eligible set changing between calls — see pick_next_executive).
-    ptr_doc = await db.buyleads_routing.find_one({"source": source}, {"_id": 0, "last_assigned_username": 1})
+    ptr_doc = await db.buyleads_routing.find_one({"source": src_key}, {"_id": 0, "last_assigned_username": 1})
     last_uname = (ptr_doc or {}).get("last_assigned_username") or ""
     chosen = next((e for e in eligible if e["username"] > last_uname), eligible[0])
-    await db.buyleads_routing.update_one({"source": source}, {"$set": {"last_assigned_username": chosen["username"]}}, upsert=True)
+    await db.buyleads_routing.update_one({"source": src_key}, {"$set": {"last_assigned_username": chosen["username"]}}, upsert=True)
     return chosen
 
 
-async def pick_next_executive(exclude_user_id: Optional[str] = None) -> Optional[dict]:
+async def pick_next_executive(exclude_user_id: Optional[str] = None, company: Optional[str] = None) -> Optional[dict]:
     rules = await get_routing_rules()
+    comp = normalize_company(company)
     execs = await db.users.find(
-        {"role": "executive", "active": True, "username": {"$ne": "test_user"}}, {"_id": 0, "password_hash": 0}
+        {"role": "executive", "active": True, "username": {"$ne": "test_user"},
+         **company_filter(comp)}, {"_id": 0, "password_hash": 0}
     ).to_list(500)
     
     # Filter by attendance (punched in or bypass)
@@ -1809,11 +1884,18 @@ async def pick_next_executive(exclude_user_id: Optional[str] = None) -> Optional
     # eligible set changes constantly (attendance, leave, working hours), so an
     # index into it skips/double-serves people. "First username after the last
     # assigned one" stays fair no matter how the set changes.
+    # The pointer is per company (each company rotates its own exec pool);
+    # CitSpray keeps the legacy "default" doc.
     eligible.sort(key=lambda e: e["username"])
-    last_uname = (rules.get("last_assigned_username") or "")
+    ptr_key = _scoped_key("default", comp)
+    if ptr_key == "default":
+        last_uname = (rules.get("last_assigned_username") or "")
+    else:
+        ptr_doc = await db.routing_rules.find_one({"key": ptr_key}, {"_id": 0, "last_assigned_username": 1})
+        last_uname = ((ptr_doc or {}).get("last_assigned_username") or "")
     chosen = next((e for e in eligible if e["username"] > last_uname), eligible[0])
     await db.routing_rules.update_one(
-        {"key": "default"}, {"$set": {"last_assigned_username": chosen["username"]}}, upsert=True
+        {"key": ptr_key}, {"$set": {"last_assigned_username": chosen["username"]}}, upsert=True
     )
     return chosen
 
@@ -1834,7 +1916,9 @@ async def assign_lead(lead_id: str, target_user_id: Optional[str] = None, by_use
             raise HTTPException(status_code=400, detail="Target executive not found/active")
         chosen_id = target_user_id
     else:
-        chosen = await pick_next_executive()
+        # Auto-pick rotates within the lead's own company pool.
+        lead_doc = await db.leads.find_one({"id": lead_id}, {"_id": 0, "company": 1})
+        chosen = await pick_next_executive(company=(lead_doc or {}).get("company"))
         if not chosen:
             return None
         chosen_id = chosen["id"]
@@ -1880,9 +1964,10 @@ async def auto_send_whatsapp_on_create(lead: dict):
             return
     except Exception as e:
         logger.warning(f"auto-send smart-skip check failed; proceeding with send: {e}")
-    cfg = await get_wa_config()
+    lead_company = normalize_company(lead.get("company"))
+    cfg = await get_wa_config(lead_company)
     tpl_name = cfg["default_template"]
-    tpl_meta = await _resolve_template_meta(tpl_name, cfg["default_template_lang"])
+    tpl_meta = await _resolve_template_meta(tpl_name, cfg["default_template_lang"], company=lead_company)
     params_required = int(tpl_meta.get("params_required") or 0)
     # Only send body params if the template actually has placeholders.
     body_params: Optional[List[str]] = None
@@ -1897,6 +1982,7 @@ async def auto_send_whatsapp_on_create(lead: dict):
         template_name=tpl_name,
         lang_code=tpl_meta.get("language") or cfg["default_template_lang"],
         body_params=body_params,
+        company=lead_company,
     )
     body_preview = render_template_text(tpl_meta.get("body"), body_params) or f"[Template: {tpl_name}]"
     msg = {
@@ -1922,19 +2008,53 @@ def _lead_dedup_hash(name: str, ts: Optional[str], extra: str = "") -> str:
     raw = f"{(name or '').strip().lower()}|{ts or ''}|{extra}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-async def _find_lead_by_phone(phone: str, exclude_id: Optional[str] = None) -> Optional[dict]:
+
+def _normalize_tags(tags: Any) -> List[str]:
+    """Lead tags/labels: trimmed, lowercased, deduped, order-preserving.
+    Accepts a list or a comma-separated string; anything else -> []."""
+    if isinstance(tags, str):
+        tags = tags.split(",")
+    if not isinstance(tags, list):
+        return []
+    out: List[str] = []
+    for t in tags:
+        v = str(t or "").strip().lower()[:60]
+        if v and v not in out:
+            out.append(v)
+    return out[:30]
+
+
+async def _mark_also_in(lead: dict, company: str) -> None:
+    """If this lead's phone also exists in the other company, stamp `also_in`
+    on BOTH leads (display-only note — never merges or dedups across companies)."""
+    phone = lead.get("phone")
+    if not phone:
+        return
+    other = other_company(company)
+    counterpart = await _find_lead_by_phone(phone, company=other)
+    if not counterpart:
+        return
+    await db.leads.update_one({"id": lead["id"]}, {"$addToSet": {"also_in": other}})
+    await db.leads.update_one({"id": counterpart["id"]}, {"$addToSet": {"also_in": company}})
+
+async def _find_lead_by_phone(phone: str, exclude_id: Optional[str] = None, company: Optional[str] = None) -> Optional[dict]:
     """Find an existing lead whose primary phone OR any extra phones suffix-match the
     given input. Indian numbers match on the last-10-digit national form; international
-    numbers match on full digit string."""
+    numbers match on full digit string.
+    Scoped to ONE company — the same customer may exist independently in both
+    companies (deliberately no cross-company dedup)."""
     if not phone:
         return None
     pattern = phone_match_pattern(phone)
     if not pattern:
         return None
-    query: Dict[str, Any] = {"$or": [
-        {"phone": {"$regex": pattern}},
-        {"phones": {"$regex": pattern}},
-    ]}
+    query: Dict[str, Any] = {
+        "company": normalize_company(company),
+        "$or": [
+            {"phone": {"$regex": pattern}},
+            {"phones": {"$regex": pattern}},
+        ],
+    }
     if exclude_id:
         query["id"] = {"$ne": exclude_id}
     return await db.leads.find_one(query, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})
@@ -2053,15 +2173,17 @@ async def _handle_repeat_enquiry(existing: dict, new_data: dict) -> None:
         })
         return
 
-    # Assignee is on leave / inactive / unassigned → pick a fresh eligible executive.
+    # Assignee is on leave / inactive / unassigned → pick a fresh eligible executive
+    # from the lead's own company pool.
+    lead_company = normalize_company(existing.get("company"))
     target_uid: Optional[str] = None
     try:
         if _is_buylead({**new_data, "source": new_source}):
-            chosen_bl = await _pick_buyleads_executive(new_source)
+            chosen_bl = await _pick_buyleads_executive(new_source, company=lead_company)
             if chosen_bl:
                 target_uid = chosen_bl["id"]
         if not target_uid:
-            chosen = await pick_next_executive(exclude_user_id=current_uid)
+            chosen = await pick_next_executive(exclude_user_id=current_uid, company=lead_company)
             if chosen:
                 target_uid = chosen["id"]
     except Exception as e:
@@ -2089,7 +2211,51 @@ async def _handle_repeat_enquiry(existing: dict, new_data: dict) -> None:
         })
 
 
+# ---- Export leads (international) --------------------------------------------
+# Calling-code → country map for the markets the export push targets; used to
+# auto-fill lead.country so the Leads page can filter by market. Longest-prefix
+# match wins (971 before 97, etc.).
+_EXPORT_CC_COUNTRY = {
+    "1": "USA/Canada", "52": "Mexico", "55": "Brazil", "57": "Colombia",
+    "971": "UAE", "966": "Saudi Arabia", "968": "Oman", "974": "Qatar",
+    "965": "Kuwait", "973": "Bahrain", "20": "Egypt", "90": "Turkey",
+    "234": "Nigeria", "233": "Ghana", "254": "Kenya", "255": "Tanzania",
+    "27": "South Africa", "84": "Vietnam", "62": "Indonesia", "94": "Sri Lanka",
+    "880": "Bangladesh", "44": "UK", "49": "Germany", "34": "Spain", "33": "France",
+}
+
+
+def _lead_is_international(data: dict) -> bool:
+    """True when the lead's primary phone is stored in the international '+<cc>…'
+    form. normalize_phone_display keeps Indian numbers as bare 10 digits, so a
+    leading '+' reliably means a non-Indian number."""
+    return (data.get("phone") or "").startswith("+")
+
+
+def _country_from_intl_phone(phone: str) -> Optional[str]:
+    d = re.sub(r"\D+", "", phone or "")
+    for cc in sorted(_EXPORT_CC_COUNTRY, key=len, reverse=True):
+        if d.startswith(cc):
+            return _EXPORT_CC_COUNTRY[cc]
+    return None
+
+
+async def _export_owner_uid() -> Optional[str]:
+    """Export leads always go to the export owner, never the telecaller pool
+    (staff don't handle English/international accounts). A users doc flagged
+    export_owner=true wins; otherwise the first active admin."""
+    u = await db.users.find_one({"export_owner": True, "active": True}, {"_id": 0, "id": 1})
+    if not u:
+        u = await db.users.find_one({"role": "admin", "active": True}, {"_id": 0, "id": 1})
+    return (u or {}).get("id")
+
+
 async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) -> dict:
+    # Which company this lead belongs to — every dedup lookup, assignment pool and
+    # WhatsApp send below is scoped to it. Callers set data["company"]; anything
+    # that doesn't is the original CitSpray pipeline.
+    company = normalize_company(data.get("company"))
+    data["company"] = company
     # Normalize phones to canonical storage format BEFORE dedup so all downstream
     # comparisons are consistent.
     if data.get("phone"):
@@ -2108,6 +2274,26 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
             unique.append(p)
         data["phones"] = unique
 
+    # ---- Export routing: international phone OR source 'Export' ----
+    # These leads must never enter the telecaller round-robin, and never get the
+    # domestic auto-welcome (unsolicited WA to a foreign number is a policy /
+    # quality-rating risk on the business number). Runs before dedup so repeat
+    # foreign enquiries keep the same treatment.
+    _is_export_lead = (data.get("source") == "Export") or _lead_is_international(data)
+    if _is_export_lead:
+        data["_suppress_auto_welcome"] = True
+        if not data.get("country") and _lead_is_international(data):
+            _cc_country = _country_from_intl_phone(data.get("phone") or "")
+            if _cc_country:
+                data["country"] = _cc_country
+        if not data.get("assigned_to"):
+            try:
+                _owner_uid = await _export_owner_uid()
+                if _owner_uid:
+                    data["assigned_to"] = _owner_uid
+            except Exception as e:
+                logger.warning(f"export owner lookup failed: {e}")
+
     # Phone-based dedup (cross-source). If a lead with this number already exists,
     # we return it so callers can decide whether to surface or 409. On a repeat
     # enquiry we ALSO:
@@ -2117,7 +2303,7 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
     #  - bump last_action_at so the conversation resurfaces in the inbox
     #  - log an activity entry so admins can see the repeat
     if data.get("phone"):
-        existing_by_phone = await _find_lead_by_phone(data["phone"])
+        existing_by_phone = await _find_lead_by_phone(data["phone"], company=company)
         if existing_by_phone:
             try:
                 await _handle_repeat_enquiry(existing_by_phone, data)
@@ -2127,10 +2313,11 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
             refreshed = await db.leads.find_one({"id": existing_by_phone["id"]}, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})
             return refreshed or existing_by_phone
 
-    # Legacy hash dedup (kept for IndiaMART unique-id style payloads)
+    # Legacy hash dedup (kept for IndiaMART unique-id style payloads) — scoped to
+    # this company; the same enquiry may legitimately exist in the other one.
     dhash = data.get("dedup_hash")
     if dhash:
-        existing = await db.leads.find_one({"dedup_hash": dhash}, {"_id": 0})
+        existing = await db.leads.find_one({"dedup_hash": dhash, "company": company}, {"_id": 0})
         if existing:
             return existing
     # Build initial enquiry
@@ -2156,6 +2343,9 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
 
     lead = {
         "id": str(uuid.uuid4()),
+        "company": company,
+        "tags": _normalize_tags(data.get("tags")),
+        "also_in": [],  # other company keys where this phone also exists (display-only)
         "customer_name": data.get("customer_name", "Unknown"),
         "phone": data.get("phone"),
         "phones": data.get("phones") or [],
@@ -2204,6 +2394,14 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
                     return refreshed or existing
         raise
 
+    # Cross-company presence marker: the same phone existing in the OTHER company
+    # is NOT a duplicate (each company runs its own pipeline) but both leads get a
+    # small "also in <company>" note for the team's awareness.
+    try:
+        await _mark_also_in(lead, company)
+    except Exception as e:
+        logger.warning(f"also-in marking failed: {e}")
+
     # auto-assign if no explicit assignee. Every live source goes through the
     # round-robin so no lead ever sits unassigned; only Excel-backlog uploads
     # stay out of the rotation (they are old leads distributed manually).
@@ -2215,7 +2413,7 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
             # pick_next_executive() when mode=all or no eligible selected agent.
             target_uid: Optional[str] = None
             if _is_buylead(data):
-                chosen_bl = await _pick_buyleads_executive(lead["source"])
+                chosen_bl = await _pick_buyleads_executive(lead["source"], company=company)
                 if chosen_bl:
                     target_uid = chosen_bl["id"]
             await assign_lead(lead["id"], target_user_id=target_uid, by_user_id=by_user_id)
@@ -2260,6 +2458,8 @@ async def list_leads(
     offset: int = 0,
     paginate: bool = False,
     starred: Optional[bool] = None,
+    tags: Optional[str] = None,  # comma-separated; matches leads carrying ANY of them
+    x_company: Optional[str] = Header(None, alias="X-Company"),
 ):
     """List leads with optional filters. Backwards-compatible:
     - Default returns a bare array (existing callers unchanged).
@@ -2267,7 +2467,9 @@ async def list_leads(
       so the UI can render page controls.
     - Pass `date_from=YYYY-MM-DD` and/or `date_to=YYYY-MM-DD` (IST, inclusive) to
       narrow by created_at."""
-    query: Dict[str, Any] = {}
+    company = _resolve_company(user, x_company)
+    # company clause lives in $and so it can never collide with the free-text $or
+    query: Dict[str, Any] = {"$and": [company_filter(company)]}
     if user["role"] == "data_entry":
         raise HTTPException(status_code=403, detail="Access denied")
     elif user["role"] == "executive":
@@ -2275,6 +2477,10 @@ async def list_leads(
     else:
         if assigned_to:
             query["assigned_to"] = assigned_to
+    if tags:
+        tag_list = _normalize_tags(tags)
+        if tag_list:
+            query["tags"] = {"$in": tag_list}
     if status:
         query["status"] = status
     if starred:
@@ -2365,6 +2571,26 @@ async def list_leads(
         total = await db.leads.count_documents(query)
         return {"items": items, "total": total, "limit": safe_limit, "offset": safe_offset}
     return items
+
+
+@api.get("/leads/tags")
+async def list_lead_tags(
+    user: dict = Depends(get_current_user),
+    x_company: Optional[str] = Header(None, alias="X-Company"),
+):
+    """Distinct tags in the active company, with usage counts — feeds the tag
+    filter and the tag-editor suggestions."""
+    company = _resolve_company(user, x_company)
+    pipeline = [
+        {"$match": {"$and": [company_filter(company)], "tags": {"$exists": True, "$ne": []}}},
+        {"$unwind": "$tags"},
+        {"$group": {"_id": "$tags", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1, "_id": 1}},
+        {"$limit": 200},
+    ]
+    rows = await db.leads.aggregate(pipeline).to_list(200)
+    return [{"tag": r["_id"], "count": r["count"]} for r in rows]
+
 
 @api.get("/leads/upload-template")
 async def download_upload_template(user: dict = Depends(get_current_user)):
@@ -2656,17 +2882,20 @@ async def get_upload_status(upload_id: str, user: dict = Depends(get_current_use
     return status
 
 @api.post("/leads")
-async def create_lead(body: LeadCreate, user: dict = Depends(get_current_user)):
+async def create_lead(body: LeadCreate, user: dict = Depends(get_current_user),
+                      x_company: Optional[str] = Header(None, alias="X-Company")):
     """Create a new lead — but enforce per-phone duplicate prevention.
     - If the phone already belongs to a lead owned by the same user (or no one), return it.
     - Admin: always returns the existing lead so they can open it.
     - Executive whose phone matches a lead owned by ANOTHER executive: 409 with structured
       payload so the UI can offer a 'Request reassignment' flow."""
     data = body.model_dump()
+    company = _resolve_company(user, x_company)
+    data["company"] = company
     if data.get("phone"):
         canonical = normalize_phone_display(data["phone"])
         if canonical:
-            existing = await _find_lead_by_phone(canonical)
+            existing = await _find_lead_by_phone(canonical, company=company)
             if existing:
                 owner_id = existing.get("assigned_to")
                 if user["role"] == "admin" or not owner_id or owner_id == user["id"]:
@@ -2739,6 +2968,8 @@ async def update_lead(lead_id: str, body: LeadUpdate, user: dict = Depends(get_c
         v = getattr(body, f)
         if v is not None:
             updates[f] = v
+    if body.tags is not None:
+        updates["tags"] = _normalize_tags(body.tags)
     if body.requirement is not None:
         updates["requirement_updated_at"] = iso(now_utc())
     if body.assigned_to is not None and user["role"] == "admin":
@@ -2831,8 +3062,10 @@ async def add_phone(lead_id: str, body: PhoneInput, user: dict = Depends(get_cur
                 "existing_lead_id": lead_id,
             },
         )
-    # Cross-lead dedup: if a phone already lives on another lead, merge this lead into it
-    other = await _find_lead_by_phone(new_phone, exclude_id=lead_id)
+    # Cross-lead dedup (same company only): if a phone already lives on another
+    # lead of THIS company, merge this lead into it.
+    lead_company = normalize_company(lead.get("company"))
+    other = await _find_lead_by_phone(new_phone, exclude_id=lead_id, company=lead_company)
     if other:
         merged_lead = await _merge_leads(source_lead=lead, dest_lead=other, by_user_id=user["id"])
         return {
@@ -2849,6 +3082,11 @@ async def add_phone(lead_id: str, body: PhoneInput, user: dict = Depends(get_cur
         update["phones"] = existing_phones
     await db.leads.update_one({"id": lead_id}, {"$set": update})
     await log_activity(user["id"], "phone_added", lead_id, {"phone": new_phone})
+    # The new number may exist on the OTHER company's books — flag both sides.
+    try:
+        await _mark_also_in({**lead, "phone": new_phone}, lead_company)
+    except Exception as e:
+        logger.warning(f"also-in marking on phone-add failed: {e}")
     updated = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     # Justdial leads often arrive without a mobile number — when the agent later
     # adds one manually, fire the welcome template so the customer gets contacted
@@ -3553,9 +3791,10 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
     target_phone = targets[0]
 
     # If a template_name is given, send as template; else send freeform text.
+    _lead_company = normalize_company(lead.get("company"))
     if body.template_name:
-        cfg = await get_wa_config()
-        tpl_meta = await _resolve_template_meta(body.template_name, body.template_lang or cfg["default_template_lang"])
+        cfg = await get_wa_config(_lead_company)
+        tpl_meta = await _resolve_template_meta(body.template_name, body.template_lang or cfg["default_template_lang"], company=_lead_company)
         params_required = int(tpl_meta.get("params_required") or 0)
         # Resolve params: caller-supplied wins; else default-substitute when needed.
         provided = list(body.template_params) if body.template_params is not None else None
@@ -3588,6 +3827,7 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
                 template_name=body.template_name,
                 lang_code=tpl_meta.get("language") or body.template_lang or cfg["default_template_lang"],
                 body_params=params_to_send,
+                company=_lead_company,
             )
             send_results.append((tp, r))
     else:
@@ -3627,7 +3867,7 @@ async def whatsapp_send(body: WhatsAppSendInput, user: dict = Depends(get_curren
         for i, tp in enumerate(targets):
             # Reply context only applies to the first (active) number — the quoted
             # message lives in that number's conversation.
-            r = await wa_send_text(to_phone=tp, body=body.body, reply_to_wamid=reply_ctx_wamid if i == 0 else None)
+            r = await wa_send_text(to_phone=tp, body=body.body, reply_to_wamid=reply_ctx_wamid if i == 0 else None, company=_lead_company)
             send_results.append((tp, r))
 
     msgs_out: List[dict] = []
@@ -3740,6 +3980,10 @@ async def _assert_chat_permitted(user: dict, lead_id: str) -> dict:
         raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
+    # Staff belong to exactly one company; they can never chat with the other
+    # company's customers (admin is exempt — they operate across both).
+    if user["role"] != "admin" and normalize_company(user.get("company")) != normalize_company(lead.get("company")):
+        raise HTTPException(status_code=403, detail="Lead belongs to a different company")
     target_phone = lead.get("active_wa_phone") or lead.get("phone")
     if not target_phone:
         raise HTTPException(status_code=400, detail="Lead has no phone number")
@@ -3811,14 +4055,15 @@ async def whatsapp_send_media(body: WASendMedia, user: dict = Depends(get_curren
     (use POST /chatflows/upload-media first if uploading a local file)."""
     ctx = await _assert_chat_permitted(user, body.lead_id)
     target_phone = ctx["target_phone"]
+    _co = normalize_company(ctx["lead"].get("company"))
     reply_ctx = await _resolve_reply_context(body.lead_id, body.reply_to_message_id)
     if body.media_type == "audio":
-        api_result = await wa_send_audio(to_phone=target_phone, url=body.media_url, reply_to_wamid=reply_ctx["wamid"])
+        api_result = await wa_send_audio(to_phone=target_phone, url=body.media_url, reply_to_wamid=reply_ctx["wamid"], company=_co)
         preview = "[voice note]"
     else:
         api_result = await wa_send_media(
             to_phone=target_phone, media_type=body.media_type, url=body.media_url,
-            caption=body.caption, filename=body.filename, reply_to_wamid=reply_ctx["wamid"],
+            caption=body.caption, filename=body.filename, reply_to_wamid=reply_ctx["wamid"], company=_co,
         )
         if body.media_type == "image":
             preview = f"[image] {body.caption or ''}".rstrip()
@@ -3941,6 +4186,7 @@ async def whatsapp_send_location(body: WASendLocation, user: dict = Depends(get_
     api_result = await wa_send_location(
         to_phone=target_phone, latitude=body.latitude, longitude=body.longitude,
         name=body.name, address=body.address, reply_to_wamid=reply_ctx["wamid"],
+        company=normalize_company(ctx["lead"].get("company")),
     )
     preview = f"[location] {body.name or ''} ({body.latitude:.4f}, {body.longitude:.4f})".strip()
     extra = {"msg_type": "location", "location": {
@@ -3970,7 +4216,8 @@ async def whatsapp_send_contact(body: WASendContact, user: dict = Depends(get_cu
         contact_payload["emails"] = [{"email": e.email, "type": (e.type or "WORK").upper()} for e in body.emails]
     if body.organization:
         contact_payload["org"] = {"company": body.organization}
-    api_result = await wa_send_contacts(to_phone=target_phone, contacts=[contact_payload], reply_to_wamid=reply_ctx["wamid"])
+    api_result = await wa_send_contacts(to_phone=target_phone, contacts=[contact_payload], reply_to_wamid=reply_ctx["wamid"],
+                                        company=normalize_company(ctx["lead"].get("company")))
     phones_str = ", ".join(p.phone for p in body.phones)
     preview = f"[contact] {body.name} · {phones_str}"
     extra = {"msg_type": "contacts", "contacts": [contact_payload]}
@@ -4002,7 +4249,8 @@ async def whatsapp_react(body: ReactInput, user: dict = Depends(get_current_user
         raise HTTPException(status_code=400, detail="Target message has no WhatsApp id (mock?) — cannot react")
     ctx = await _assert_chat_permitted(user, target["lead_id"])
     to_phone = ctx["target_phone"]
-    api_result = await wa_send_reaction(to_phone=to_phone, message_wamid=target_wamid, emoji=body.emoji or "")
+    api_result = await wa_send_reaction(to_phone=to_phone, message_wamid=target_wamid, emoji=body.emoji or "",
+                                        company=normalize_company(ctx["lead"].get("company")))
     if api_result.get("status") == "failed":
         raise HTTPException(status_code=400, detail=api_result.get("error") or "Reaction send failed")
     # Upsert reaction on the target message: one per (direction=out, user_id)
@@ -4033,21 +4281,22 @@ async def whatsapp_resend(body: ResendInput, user: dict = Depends(get_current_us
         raise HTTPException(status_code=400, detail=f"Only failed messages can be resent (current status: {src.get('status')})")
     ctx = await _assert_chat_permitted(user, src["lead_id"])
     target_phone = ctx["target_phone"]
+    _co = normalize_company(ctx["lead"].get("company"))
     reply_to_wamid = src.get("reply_to_wamid")
     if src.get("media_type") in ("image", "video", "document"):
         api_result = await wa_send_media(target_phone, src["media_type"], src.get("media_url"),
                                          caption=src.get("caption"), filename=src.get("filename"),
-                                         reply_to_wamid=reply_to_wamid)
+                                         reply_to_wamid=reply_to_wamid, company=_co)
     elif src.get("media_type") == "audio":
-        api_result = await wa_send_audio(target_phone, src.get("media_url"), reply_to_wamid=reply_to_wamid)
+        api_result = await wa_send_audio(target_phone, src.get("media_url"), reply_to_wamid=reply_to_wamid, company=_co)
     elif src.get("msg_type") == "location":
         loc = src.get("location") or {}
         api_result = await wa_send_location(target_phone, loc.get("latitude"), loc.get("longitude"),
-                                             loc.get("name"), loc.get("address"), reply_to_wamid=reply_to_wamid)
+                                             loc.get("name"), loc.get("address"), reply_to_wamid=reply_to_wamid, company=_co)
     elif src.get("msg_type") == "contacts":
-        api_result = await wa_send_contacts(target_phone, src.get("contacts") or [], reply_to_wamid=reply_to_wamid)
+        api_result = await wa_send_contacts(target_phone, src.get("contacts") or [], reply_to_wamid=reply_to_wamid, company=_co)
     else:
-        api_result = await wa_send_text(target_phone, src.get("body") or "", reply_to_wamid=reply_to_wamid)
+        api_result = await wa_send_text(target_phone, src.get("body") or "", reply_to_wamid=reply_to_wamid, company=_co)
     await db.messages.update_one({"id": src["id"]}, {"$set": {
         "status": api_result.get("status", "failed"),
         "wamid": api_result.get("wamid"),
@@ -4064,17 +4313,22 @@ async def whatsapp_resend(body: ResendInput, user: dict = Depends(get_current_us
 
 
 @api.get("/whatsapp/templates")
-async def list_templates(user: dict = Depends(get_current_user)):
-    return await db.whatsapp_templates.find({}, {"_id": 0}).sort("name", 1).to_list(200)
+async def list_templates(user: dict = Depends(get_current_user),
+                         x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(user, x_company)
+    return await db.whatsapp_templates.find({"$and": [company_filter(company)]}, {"_id": 0}).sort("name", 1).to_list(200)
 
 @api.post("/whatsapp/templates")
-async def create_template(body: TemplateCreate, admin: dict = Depends(require_admin)):
-    existing = await db.whatsapp_templates.find_one({"name": body.name})
+async def create_template(body: TemplateCreate, admin: dict = Depends(require_admin),
+                          x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(admin, x_company)
+    existing = await db.whatsapp_templates.find_one({"name": body.name, "$and": [company_filter(company)]})
     if existing:
         raise HTTPException(status_code=409, detail="Template name exists")
     doc = {
         "id": str(uuid.uuid4()),
         "name": body.name,
+        "company": company,
         "category": body.category,
         "body": body.body,
         "params_required": count_template_placeholders(body.body),
@@ -4091,12 +4345,14 @@ async def delete_template(tpl_id: str, admin: dict = Depends(require_admin)):
 
 # ------------- WhatsApp Cloud API status & template sync -------------
 @api.get("/whatsapp/status")
-async def whatsapp_status(user: dict = Depends(get_current_user)):
-    cfg = await get_wa_config()
+async def whatsapp_status(user: dict = Depends(get_current_user),
+                          x_company: Optional[str] = Header(None, alias="X-Company")):
+    cfg = await get_wa_config(_resolve_company(user, x_company))
     if not cfg["enabled"]:
         return {"enabled": False, "reason": "WhatsApp access_token or phone_number_id not configured"}
     out: Dict[str, Any] = {
         "enabled": True,
+        "company": cfg["company"],
         "phone_number_id": cfg["phone_number_id"],
         "waba_id": cfg["waba_id"],
         "api_version": cfg["api_version"],
@@ -4121,8 +4377,10 @@ async def whatsapp_status(user: dict = Depends(get_current_user)):
 
 
 @api.post("/whatsapp/templates/sync")
-async def sync_templates(admin: dict = Depends(require_admin)):
-    cfg = await get_wa_config()
+async def sync_templates(admin: dict = Depends(require_admin),
+                         x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(admin, x_company)
+    cfg = await get_wa_config(company)
     if not (cfg["enabled"] and cfg["waba_id"]):
         raise HTTPException(status_code=400, detail="WhatsApp not configured (need access_token + phone_number_id + waba_id)")
     async with httpx.AsyncClient(timeout=20.0) as cli:
@@ -4150,6 +4408,7 @@ async def sync_templates(admin: dict = Depends(require_admin)):
         doc = {
             "id": str(uuid.uuid4()),
             "name": t.get("name"),
+            "company": company,
             "category": (t.get("category") or "utility").lower(),
             "language": t.get("language"),
             "status": t.get("status"),
@@ -4158,11 +4417,12 @@ async def sync_templates(admin: dict = Depends(require_admin)):
             "synced_from_meta": True,
             "synced_at": iso(now_utc()),
         }
-        # upsert by name+language (Meta uniqueness key)
-        existing = await db.whatsapp_templates.find_one({"name": doc["name"], "language": doc["language"]}, {"_id": 0})
+        # upsert by name+language+company (each company syncs its own WABA)
+        upsert_key = {"name": doc["name"], "language": doc["language"], "$and": [company_filter(company)]}
+        existing = await db.whatsapp_templates.find_one(upsert_key, {"_id": 0})
         if existing:
             await db.whatsapp_templates.update_one(
-                {"name": doc["name"], "language": doc["language"]},
+                upsert_key,
                 {"$set": {k: v for k, v in doc.items() if k != "id"}},
             )
         else:
@@ -4177,7 +4437,9 @@ async def list_followups(
     scope: str = "mine",
     status: Optional[str] = None,
     lead_id: Optional[str] = None,
+    x_company: Optional[str] = Header(None, alias="X-Company"),
 ):
+    company = _resolve_company(user, x_company)
     query: Dict[str, Any] = {}
     if user["role"] == "data_entry":
         raise HTTPException(status_code=403, detail="Access denied")
@@ -4192,17 +4454,22 @@ async def list_followups(
     query["snoozed_until"] = {"$not": {"$gt": now_iso}}
     fu = await db.followups.find(query, {"_id": 0}).sort("due_at", 1).to_list(500)
     # Enrich each follow-up with the parent lead's customer_name + phone (so the
-    # alarm UI doesn't need a second roundtrip).
+    # alarm UI doesn't need a second roundtrip) — and drop follow-ups whose lead
+    # belongs to the other company (the admin switcher scopes this page too).
     lead_ids = list({f.get("lead_id") for f in fu if f.get("lead_id")})
     name_map: Dict[str, Dict[str, Any]] = {}
     if lead_ids:
-        async for ld in db.leads.find({"id": {"$in": lead_ids}}, {"_id": 0, "id": 1, "customer_name": 1, "phone": 1, "active_wa_phone": 1}):
+        async for ld in db.leads.find({"id": {"$in": lead_ids}}, {"_id": 0, "id": 1, "customer_name": 1, "phone": 1, "active_wa_phone": 1, "company": 1}):
             name_map[ld["id"]] = ld
+    out = []
     for f in fu:
         ld = name_map.get(f.get("lead_id") or "") or {}
+        if ld and normalize_company(ld.get("company")) != company:
+            continue
         f["lead_customer_name"] = ld.get("customer_name")
         f["lead_phone"] = ld.get("active_wa_phone") or ld.get("phone")
-    return fu
+        out.append(f)
+    return out
 
 @api.post("/followups")
 async def create_followup(body: FollowupCreate, user: dict = Depends(get_current_user)):
@@ -4297,15 +4564,17 @@ async def reports_overview(
     admin: dict = Depends(require_admin),
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    x_company: Optional[str] = Header(None, alias="X-Company"),
 ):
     """Optional `date_from`/`date_to` (YYYY-MM-DD, IST, inclusive) narrow lead-creation,
     call-log, message and followup counters to that window. Omitting both = all-time.
     Conversion rate, source/status breakdown and the timeseries also respect the window."""
+    company = _resolve_company(admin, x_company)
     try:
         date_range = _parse_ist_range(date_from, date_to)
     except ValueError:
         raise HTTPException(status_code=400, detail="date_from / date_to must be YYYY-MM-DD")
-    lead_q: Dict[str, Any] = {}
+    lead_q: Dict[str, Any] = {"$and": [company_filter(company)]}
     msg_q: Dict[str, Any] = {}
     call_q: Dict[str, Any] = {}
     fup_q: Dict[str, Any] = {}
@@ -4327,8 +4596,8 @@ async def reports_overview(
     # missed = pending followups past due_at (always cross-window — pending reflects current state)
     now_iso = iso(now_utc())
     missed_followups = await db.followups.count_documents({"status": "pending", "due_at": {"$lt": now_iso}})
-    # per executive
-    execs = await db.users.find({"role": "executive"}, {"_id": 0, "password_hash": 0}).to_list(500)
+    # per executive (only this company's execs)
+    execs = await db.users.find({"role": "executive", **company_filter(company)}, {"_id": 0, "password_hash": 0}).to_list(500)
     per_exec = []
     # Pre-aggregate calls (windowed) by user × outcome
     call_pipeline = [
@@ -4732,10 +5001,11 @@ async def reports_daily_calls(
 
 
 @api.get("/leads/phone-map")
-async def get_leads_phone_map(user: dict = Depends(get_current_user)):
+async def get_leads_phone_map(user: dict = Depends(get_current_user),
+                              x_company: Optional[str] = Header(None, alias="X-Company")):
     if user["role"] == "data_entry":
         raise HTTPException(status_code=403, detail="Access denied")
-    q = {}
+    q: Dict[str, Any] = {"$and": [company_filter(_resolve_company(user, x_company))]}
     if user["role"] == "executive":
         q["assigned_to"] = user["id"]
         
@@ -4755,18 +5025,21 @@ async def get_leads_phone_map(user: dict = Depends(get_current_user)):
 
 
 @api.post("/leads/get-or-create")
-async def get_or_create_lead(body: PhoneInput, user: dict = Depends(get_current_user)):
+async def get_or_create_lead(body: PhoneInput, user: dict = Depends(get_current_user),
+                             x_company: Optional[str] = Header(None, alias="X-Company")):
     if user["role"] == "data_entry":
         raise HTTPException(status_code=403, detail="Access denied")
     norm = normalize_phone_display(body.phone)
     if not norm:
         raise HTTPException(status_code=400, detail="Invalid phone number")
-        
-    lead = await _find_lead_by_phone(norm)
+
+    company = _resolve_company(user, x_company)
+    lead = await _find_lead_by_phone(norm, company=company)
     if not lead:
         lead_id = str(uuid.uuid4())
         lead_doc = {
             "id": lead_id,
+            "company": company,
             "phone": norm,
             "customer_name": f"New Call Lead {norm}",
             "status": "new",
@@ -5039,6 +5312,7 @@ async def list_conversations(
     limit: int = 50,
     offset: int = 0,
     starred: Optional[bool] = None,
+    x_company: Optional[str] = Header(None, alias="X-Company"),
 ):
     """Returns a list of leads optimized for the chat inbox: each row carries last_msg preview,
     unread count, last_user_message_at and within_24h flag.
@@ -5053,7 +5327,7 @@ async def list_conversations(
     empty or noticeably short."""
     limit = max(1, min(int(limit or 50), 200))
     offset = max(0, int(offset or 0))
-    query: Dict[str, Any] = {}
+    query: Dict[str, Any] = {"$and": [company_filter(_resolve_company(user, x_company))]}
     if user["role"] == "data_entry":
         raise HTTPException(status_code=403, detail="Access denied")
     elif user["role"] == "executive":
@@ -5671,10 +5945,15 @@ DEFAULT_EI_PULL_URL = "https://members.exportersindia.com/api-inquiry-detail.php
 DEFAULT_EI_INTERVAL = 60  # seconds
 
 
-async def _get_exportersindia_pull_cfg() -> Dict[str, Any]:
+def _ei_pull_key(company: Optional[str] = None) -> str:
+    """Per-company settings key for the EI pull config (CitSpray keeps the legacy key)."""
+    return _scoped_key("exportersindia_pull", company)
+
+
+async def _get_exportersindia_pull_cfg(company: Optional[str] = None) -> Dict[str, Any]:
     """Current pull-API config: api_key, email, interval_seconds, enabled, pull_url,
     last_pulled_at (last attempt), last_success_at (last successful run)."""
-    doc = await db.system_settings.find_one({"key": "exportersindia_pull"}, {"_id": 0}) or {}
+    doc = await db.system_settings.find_one({"key": _ei_pull_key(company)}, {"_id": 0}) or {}
     return {
         "api_key": (doc.get("api_key") or "").strip(),
         "email": (doc.get("email") or "").strip(),
@@ -5689,11 +5968,14 @@ async def _get_exportersindia_pull_cfg() -> Dict[str, Any]:
     }
 
 
-async def _pull_exportersindia_once(force_date_from: Optional[str] = None) -> Dict[str, Any]:
-    """Run a single pull of ExportersIndia enquiries. Uses `last_success_at` (or today)
-    as `date_from` so we don't re-download old leads each tick. Dedup by inq_id / phone
-    is already handled downstream by `_handle_exportersindia_payload`."""
-    cfg = await _get_exportersindia_pull_cfg()
+async def _pull_exportersindia_once(force_date_from: Optional[str] = None, company: Optional[str] = None) -> Dict[str, Any]:
+    """Run a single pull of ExportersIndia enquiries for one company's EI account.
+    Uses `last_success_at` (or today) as `date_from` so we don't re-download old
+    leads each tick. Dedup by inq_id / phone is already handled downstream by
+    `_handle_exportersindia_payload`."""
+    company = normalize_company(company)
+    _ei_key = _ei_pull_key(company)
+    cfg = await _get_exportersindia_pull_cfg(company)
     api_key = cfg["api_key"]
     email = cfg["email"]
     pull_url = cfg["pull_url"]
@@ -5721,8 +6003,8 @@ async def _pull_exportersindia_once(force_date_from: Optional[str] = None) -> Di
         if r.status_code >= 400:
             err = f"HTTP {r.status_code}: {r.text[:300]}"
             await db.system_settings.update_one(
-                {"key": "exportersindia_pull"},
-                {"$set": {"last_pulled_at": started_at, "last_error": err, "last_date_from": date_from, "key": "exportersindia_pull"}},
+                {"key": _ei_key},
+                {"$set": {"last_pulled_at": started_at, "last_error": err, "last_date_from": date_from, "key": _ei_key}},
                 upsert=True,
             )
             return {"ok": False, "error": err, "date_from": date_from}
@@ -5733,19 +6015,19 @@ async def _pull_exportersindia_once(force_date_from: Optional[str] = None) -> Di
     except Exception as e:
         err = str(e)
         await db.system_settings.update_one(
-            {"key": "exportersindia_pull"},
-            {"$set": {"last_pulled_at": started_at, "last_error": err, "last_date_from": date_from, "key": "exportersindia_pull"}},
+            {"key": _ei_key},
+            {"$set": {"last_pulled_at": started_at, "last_error": err, "last_date_from": date_from, "key": _ei_key}},
             upsert=True,
         )
         return {"ok": False, "error": err, "date_from": date_from}
 
     # Ingest via the same parser as the push path
-    result = await _handle_exportersindia_payload(payload, identifier="pull")
+    result = await _handle_exportersindia_payload(payload, identifier="pull", company=company)
     finished_at = iso(now_utc())
     await db.system_settings.update_one(
-        {"key": "exportersindia_pull"},
+        {"key": _ei_key},
         {"$set": {
-            "key": "exportersindia_pull",
+            "key": _ei_key,
             "last_pulled_at": started_at,
             "last_success_at": finished_at,
             "last_error": None,
@@ -5757,12 +6039,12 @@ async def _pull_exportersindia_once(force_date_from: Optional[str] = None) -> Di
     return {"ok": True, "date_from": date_from, **result}
 
 
-async def _acquire_ei_lock() -> bool:
+async def _acquire_ei_lock(company: Optional[str] = None) -> bool:
     now = datetime.now(timezone.utc)
     # Gunicorn worker lock: Only let one worker run the pull task in this interval
     res = await db.system_settings.find_one_and_update(
         {
-            "key": "exportersindia_pull",
+            "key": _ei_pull_key(company),
             "$or": [
                 {"lock_acquired_at": None},
                 {"lock_acquired_at": {"$lt": now - timedelta(minutes=4)}}
@@ -5773,37 +6055,39 @@ async def _acquire_ei_lock() -> bool:
     )
     return bool(res)
 
-async def _release_ei_lock():
+async def _release_ei_lock(company: Optional[str] = None):
     await db.system_settings.update_one(
-        {"key": "exportersindia_pull"},
+        {"key": _ei_pull_key(company)},
         {"$set": {"lock_acquired_at": None}}
     )
 
 
 async def exportersindia_pull_task():
-    """APScheduler tick. Reads current config (so admins can enable/change interval at
-    runtime without restart); reschedules itself when interval changes."""
-    try:
-        cfg = await _get_exportersindia_pull_cfg()
-        if not cfg["enabled"]:
-            return
-        if not cfg["api_key"] or not cfg["email"]:
-            return
-        
-        if not await _acquire_ei_lock():
-            logger.info("ExportersIndia pull task: Lock already held by another worker - skipping")
-            return
-            
+    """APScheduler tick. Runs every company's configured EI pull (each company has
+    its own ExportersIndia account/config). Reads current config on each tick so
+    admins can enable/change interval at runtime without restart."""
+    for _company in COMPANIES:
         try:
-            res = await _pull_exportersindia_once()
-            if not res.get("ok"):
-                logger.warning(f"EI pull failed: {res.get('error')}")
-            else:
-                logger.info(f"EI pull ok date_from={res.get('date_from')} created={len(res.get('created') or [])}")
-        finally:
-            await _release_ei_lock()
-    except Exception as e:
-        logger.exception(f"EI pull task crashed: {e}")
+            cfg = await _get_exportersindia_pull_cfg(_company)
+            if not cfg["enabled"]:
+                continue
+            if not cfg["api_key"] or not cfg["email"]:
+                continue
+
+            if not await _acquire_ei_lock(_company):
+                logger.info(f"ExportersIndia pull task ({_company}): Lock already held by another worker - skipping")
+                continue
+
+            try:
+                res = await _pull_exportersindia_once(company=_company)
+                if not res.get("ok"):
+                    logger.warning(f"EI pull failed ({_company}): {res.get('error')}")
+                else:
+                    logger.info(f"EI pull ok ({_company}) date_from={res.get('date_from')} created={len(res.get('created') or [])}")
+            finally:
+                await _release_ei_lock(_company)
+        except Exception as e:
+            logger.exception(f"EI pull task crashed ({_company}): {e}")
 
 
 
@@ -5834,8 +6118,9 @@ class ExportersIndiaPullInput(BaseModel):
 
 
 @api.get("/settings/exportersindia-pull")
-async def get_exportersindia_pull(admin: dict = Depends(require_admin)):
-    cfg = await _get_exportersindia_pull_cfg()
+async def get_exportersindia_pull(admin: dict = Depends(require_admin),
+                                  x_company: Optional[str] = Header(None, alias="X-Company")):
+    cfg = await _get_exportersindia_pull_cfg(_resolve_company(admin, x_company))
     total = cfg["interval_seconds"]
     return {
         "api_key_masked": _mask_token(cfg["api_key"]) if cfg["api_key"] else "",
@@ -5856,8 +6141,11 @@ async def get_exportersindia_pull(admin: dict = Depends(require_admin)):
 
 
 @api.put("/settings/exportersindia-pull")
-async def update_exportersindia_pull(body: ExportersIndiaPullInput, admin: dict = Depends(require_admin)):
-    updates: Dict[str, Any] = {"key": "exportersindia_pull", "updated_by": admin["id"], "updated_at": iso(now_utc())}
+async def update_exportersindia_pull(body: ExportersIndiaPullInput, admin: dict = Depends(require_admin),
+                                     x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(admin, x_company)
+    _ei_key = _ei_pull_key(company)
+    updates: Dict[str, Any] = {"key": _ei_key, "updated_by": admin["id"], "updated_at": iso(now_utc())}
     unsets: Dict[str, str] = {}
     if body.api_key is not None:
         if body.api_key.strip():
@@ -5881,13 +6169,21 @@ async def update_exportersindia_pull(body: ExportersIndiaPullInput, admin: dict 
     op: Dict[str, Any] = {"$set": updates}
     if unsets:
         op["$unset"] = unsets
-    await db.system_settings.update_one({"key": "exportersindia_pull"}, op, upsert=True)
-    await log_activity(admin["id"], "exportersindia_pull_updated", None, {k: (v if k != "api_key" else "***") for k, v in updates.items()})
+    await db.system_settings.update_one({"key": _ei_key}, op, upsert=True)
+    await log_activity(admin["id"], "exportersindia_pull_updated", None, {"company": company, **{k: (v if k != "api_key" else "***") for k, v in updates.items()}})
 
-    # Reschedule the job so interval/enabled changes take effect immediately
-    cfg = await _get_exportersindia_pull_cfg()
-    if cfg["enabled"]:
-        await _reschedule_exportersindia_pull(cfg["interval_seconds"])
+    # Reschedule the job so interval/enabled changes take effect immediately.
+    # The single job serves BOTH companies (it loops over them), so it must stay
+    # alive if EITHER company still has the pull enabled.
+    any_enabled = False
+    fastest = None
+    for _c in COMPANIES:
+        _cfg = await _get_exportersindia_pull_cfg(_c)
+        if _cfg["enabled"]:
+            any_enabled = True
+            fastest = _cfg["interval_seconds"] if fastest is None else min(fastest, _cfg["interval_seconds"])
+    if any_enabled:
+        await _reschedule_exportersindia_pull(fastest or DEFAULT_EI_INTERVAL)
     else:
         global scheduler
         if scheduler:
@@ -5896,16 +6192,18 @@ async def update_exportersindia_pull(body: ExportersIndiaPullInput, admin: dict 
             except Exception:
                 pass
 
-    return await get_exportersindia_pull(admin)
+    return await get_exportersindia_pull(admin, x_company)
 
 
 @api.post("/settings/exportersindia-pull/run-now")
-async def run_exportersindia_pull_now(admin: dict = Depends(require_admin), date_from: Optional[str] = Query(None)):
+async def run_exportersindia_pull_now(admin: dict = Depends(require_admin), date_from: Optional[str] = Query(None),
+                                      x_company: Optional[str] = Header(None, alias="X-Company")):
     """Manual trigger for an immediate pull (for admins to backfill or test)."""
-    cfg = await _get_exportersindia_pull_cfg()
+    company = _resolve_company(admin, x_company)
+    cfg = await _get_exportersindia_pull_cfg(company)
     if not cfg["api_key"] or not cfg["email"]:
         raise HTTPException(status_code=400, detail="api_key and email must be configured before running a pull")
-    return await _pull_exportersindia_once(force_date_from=date_from)
+    return await _pull_exportersindia_once(force_date_from=date_from, company=company)
 
 
 class ExportersIndiaSettingsInput(BaseModel):
@@ -5952,16 +6250,25 @@ async def update_exportersindia_settings(body: ExportersIndiaSettingsInput, requ
 
 
 @api.get("/settings/webhooks-info")
-async def webhooks_info(admin: dict = Depends(require_admin)):
+async def webhooks_info(admin: dict = Depends(require_admin),
+                        x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(admin, x_company)
+    is_frag = company == "fragvansh"
     base = (FRONTEND_BASE_URL or os.environ.get("FRONTEND_BASE_URL") or "").rstrip("/")
-    cfg = await get_wa_config()
+    cfg = await get_wa_config(company)
     ei_key = await _get_exportersindia_api_key()
-    ei_url = f"{base}/api/webhooks/exportersindia"
+    # Fragvansh accounts must push to the company-suffixed URLs so their leads
+    # land on the Fragvansh book.
+    im_url = f"{base}/api/webhooks/indiamart/fragvansh" if is_frag else f"{base}/api/webhooks/indiamart"
+    ei_url = f"{base}/api/webhooks/exportersindia/fragvansh" if is_frag else f"{base}/api/webhooks/exportersindia"
+    wa_url = f"{base}/api/webhooks/whatsapp/fragvansh" if is_frag else f"{base}/api/webhooks/whatsapp"
     ei_full_url = f"{ei_url}?key={ei_key}" if ei_key else ei_url
-    return {
+    gmaps_key = await _get_or_create_gmaps_key() if is_frag else ""
+    out: Dict[str, Any] = {
+        "company": company,
         "indiamart": {
-            "label": "IndiaMART Push API",
-            "url": f"{base}/api/webhooks/indiamart",
+            "label": f"IndiaMART Push API ({COMPANIES[company]})",
+            "url": im_url,
             "method": "POST",
             "where_to_paste": "IndiaMART Lead Manager → Push API → Webhook URL",
             "auth": "none (public endpoint)",
@@ -5993,15 +6300,15 @@ async def webhooks_info(admin: dict = Depends(require_admin)):
             },
         },
         "whatsapp": {
-            "label": "WhatsApp Cloud API",
-            "url": f"{base}/api/webhooks/whatsapp",
+            "label": f"WhatsApp Cloud API ({COMPANIES[company]})",
+            "url": wa_url,
             "method": "POST",
             "verify_token": cfg["verify_token"],
             "where_to_paste": "Meta App Dashboard → WhatsApp → Configuration → Webhooks → Callback URL + Verify Token",
             "subscribe_fields": ["messages"],
         },
         "gmail": {
-            "label": "Gmail OAuth callback",
+            "label": "Gmail OAuth callback" + (" (connect the Fragvansh Justdial inbox on the 'fragvansh' slot)" if is_frag else ""),
             "url": GOOGLE_REDIRECT_URI or f"{base}/api/integrations/gmail/auth/callback",
             "method": "GET",
             "where_to_paste": "Google Cloud Console → APIs & Services → Credentials → OAuth client → Authorized redirect URIs",
@@ -6013,6 +6320,19 @@ async def webhooks_info(admin: dict = Depends(require_admin)):
             "where_to_paste": "Optional — direct POST endpoint for raw email payloads (Gmail OAuth poll is the primary path).",
         },
     }
+    if is_frag:
+        # Google Maps scraper feed (Fragvansh only) — the Colab notebook posts here.
+        out["gmaps"] = {
+            "label": "Google Maps scraper ingest (Fragvansh)",
+            "url": f"{base}/api/ingest/gmaps",
+            "method": "POST",
+            "auth": "X-Ingest-Key header (shown below; regenerate by clearing system_settings.gmaps_ingest)",
+            "ingest_key": gmaps_key,
+            "where_to_paste": "Colab notebook 'GoogleMapsScraper_Fragvansh_CRM.ipynb' → CRM_INGEST_KEY field",
+        }
+        # Shopify is CitSpray-only commerce — hide it from the Fragvansh view.
+        out.pop("shopify", None)
+    return out
 
 
 # ------------- Justdial email parser -------------
@@ -6317,6 +6637,90 @@ async def _find_lead_by_justdial_link(url: Optional[str]) -> Optional[dict]:
 
 
 
+# ------------- Google Maps scraper ingest (Fragvansh) -------------
+async def _get_or_create_gmaps_key() -> str:
+    """Static ingest key for the Colab scraper. Auto-generated once, shown in
+    Settings → Integration URLs (Fragvansh view)."""
+    doc = await db.system_settings.find_one({"key": "gmaps_ingest"}, {"_id": 0}) or {}
+    key = (doc.get("api_key") or "").strip()
+    if not key:
+        key = uuid.uuid4().hex
+        await db.system_settings.update_one(
+            {"key": "gmaps_ingest"},
+            {"$set": {"key": "gmaps_ingest", "api_key": key, "created_at": iso(now_utc())}},
+            upsert=True,
+        )
+    return key
+
+
+class GmapsIngestInput(BaseModel):
+    # One record or a batch; each record is the scraper's row dict
+    # (keyword, name, phone, address, category, website, rating, ...).
+    records: List[Dict[str, Any]]
+
+
+@api.post("/ingest/gmaps")
+async def ingest_gmaps(body: GmapsIngestInput, request: Request):
+    """Google Maps scraper feed → Fragvansh leads, streamed live from the Colab
+    notebook (or batch-imported from a CSV). Per record:
+    - no usable phone → skipped (telecallers need a dial target)
+    - phone already in Fragvansh → duplicate (the new keyword is added as a tag)
+    - else create: source='Google Maps', requirement=keyword, tags=[keyword],
+      round-robin auto-assigned to a Fragvansh executive by _create_lead_internal.
+    Never touches the CitSpray book. Auth: X-Ingest-Key header (or ?key=)."""
+    supplied = (request.headers.get("X-Ingest-Key") or request.query_params.get("key") or "").strip()
+    expected = await _get_or_create_gmaps_key()
+    if not supplied or supplied != expected:
+        raise HTTPException(status_code=403, detail="Invalid or missing ingest key")
+
+    created_ids: List[str] = []
+    duplicates = 0
+    skipped_no_phone = 0
+    for rec in body.records[:500]:
+        if not isinstance(rec, dict):
+            continue
+        phone_raw = str(rec.get("phone") or "").strip()
+        norm = normalize_phone_display(phone_raw)
+        digits = _normalize_phone(norm)
+        if not norm or len(digits) < 10:
+            skipped_no_phone += 1
+            continue
+        keyword = str(rec.get("keyword") or "").strip()
+        tags = _normalize_tags([keyword] if keyword else [])
+        existing = await _find_lead_by_phone(norm, company="fragvansh")
+        if existing:
+            duplicates += 1
+            if tags:
+                await db.leads.update_one({"id": existing["id"]}, {"$addToSet": {"tags": {"$each": tags}}})
+            continue
+        name = str(rec.get("name") or "").strip() or f"GMaps {norm}"
+        data = {
+            "company": "fragvansh",
+            "customer_name": name,
+            "phone": norm,
+            "requirement": keyword or (rec.get("category") or "Google Maps lead"),
+            "area": str(rec.get("address") or "").strip() or None,
+            "source": "Google Maps",
+            "tags": tags,
+            "source_data": {k: rec.get(k) for k in
+                            ("keyword", "category", "website", "rating", "reviews", "hours", "plus_code", "maps_url")
+                            if rec.get(k)},
+            "dedup_hash": _lead_dedup_hash(name, None, norm),
+            # Scraped numbers must never get the WhatsApp welcome blast — the
+            # telecaller makes first contact by phone.
+            "_suppress_auto_welcome": True,
+        }
+        lead = await _create_lead_internal(data, by_user_id=None)
+        created_ids.append(lead["id"])
+    return {
+        "ok": True,
+        "created": len(created_ids),
+        "duplicates": duplicates,
+        "skipped_no_phone": skipped_no_phone,
+        "lead_ids": created_ids,
+    }
+
+
 @api.post("/ingest/justdial")
 async def ingest_justdial(body: JustdialIngestInput):
     """Public endpoint that accepts a Justdial email payload.
@@ -6391,11 +6795,15 @@ async def ingest_justdial(body: JustdialIngestInput):
 
 # ------------- IndiaMART webhook -------------
 async def _handle_indiamart_payload(payload: Any, identifier: Optional[str] = None) -> dict:
+    # The webhook URL's {identifier} names the CRM company this IndiaMART account
+    # belongs to: /webhooks/indiamart/fragvansh -> Fragvansh. Unknown/absent -> CitSpray.
+    crm_company = normalize_company(identifier)
     # store raw
     raw = {
         "id": str(uuid.uuid4()),
         "source": "IndiaMART",
         "identifier": identifier,
+        "company": crm_company,
         "payload": payload,
         "received_at": iso(now_utc()),
         "processed": False,
@@ -6441,6 +6849,7 @@ async def _handle_indiamart_payload(payload: Any, identifier: Optional[str] = No
         )
         dhash = _lead_dedup_hash(name, query_time, unique_id or (phone or ""))
         data = {
+            "company": crm_company,
             "customer_name": name,
             "phone": phone,
             "email": email,
@@ -7287,14 +7696,18 @@ async def send_checkout_recovery(lead_id: str, user: dict = Depends(get_current_
 
 # ---------------- ExportersIndia webhook ----------------
 
-async def _handle_exportersindia_payload(payload: Any, identifier: Optional[str] = None) -> dict:
+async def _handle_exportersindia_payload(payload: Any, identifier: Optional[str] = None, company: Optional[str] = None) -> dict:
     """Parse and ingest lead enquiries pushed by ExportersIndia. Accepts either a single
     enquiry object or a list/wrapper array. Fields mirror IndiaMART semantically — we
-    preserve `inq_type` in `enquiry_type` on the lead so the UI can show the same badge."""
+    preserve `inq_type` in `enquiry_type` on the lead so the UI can show the same badge.
+    `company` (or a company-named {identifier} in the webhook URL) routes the enquiry to
+    that company's book; default CitSpray."""
+    crm_company = normalize_company(company or identifier)
     raw = {
         "id": str(uuid.uuid4()),
         "source": "ExportersIndia",
         "identifier": identifier,
+        "company": crm_company,
         "payload": payload,
         "received_at": iso(now_utc()),
         "processed": False,
@@ -7355,18 +7768,18 @@ async def _handle_exportersindia_payload(payload: Any, identifier: Optional[str]
         enq_date = e.get("enq_date") or e.get("ENQ_DATE") or iso(now_utc())
         dhash = _lead_dedup_hash(name, enq_date, str(inq_id) if inq_id else (phone or ""))
 
-        # Do not pull the lead if it's already in the database
+        # Do not pull the lead if it's already in the database (this company only)
         existing = None
         if dhash:
-            existing = await db.leads.find_one({"dedup_hash": dhash}, {"_id": 0, "id": 1})
+            existing = await db.leads.find_one({"dedup_hash": dhash, "$and": [company_filter(crm_company)]}, {"_id": 0, "id": 1})
         if not existing and phone:
             norm_phone = normalize_phone_display(phone)
             if norm_phone:
-                existing = await _find_lead_by_phone(norm_phone)
+                existing = await _find_lead_by_phone(norm_phone, company=crm_company)
         if not existing and email and email.strip():
-            existing = await db.leads.find_one({"email": email.strip()}, {"_id": 0, "id": 1})
+            existing = await db.leads.find_one({"email": email.strip(), "$and": [company_filter(crm_company)]}, {"_id": 0, "id": 1})
             if not existing:
-                existing = await db.leads.find_one({"emails": email.strip()}, {"_id": 0, "id": 1})
+                existing = await db.leads.find_one({"emails": email.strip(), "$and": [company_filter(crm_company)]}, {"_id": 0, "id": 1})
 
         if existing:
             logger.info(f"ExportersIndia Ingest: Lead already exists (ID={existing['id']}) - skipping.")
@@ -7374,6 +7787,7 @@ async def _handle_exportersindia_payload(payload: Any, identifier: Optional[str]
             continue
 
         data = {
+            "company": crm_company,
             "customer_name": name,
             "phone": phone,
             "email": email,
@@ -7502,9 +7916,8 @@ async def webhook_whatsapp_simulate(body: WhatsAppSimulateInput, admin: dict = D
     return {"ok": True, "result": res, "simulated_from": _normalize_phone(body.from_phone)}
 
 # ------------- WhatsApp webhook (Meta Cloud API) -------------
-@api.get("/webhooks/whatsapp")
-async def whatsapp_verify(request: Request):
-    cfg = await get_wa_config()
+async def _whatsapp_verify_impl(request: Request, company: str):
+    cfg = await get_wa_config(company)
     params = request.query_params
     mode = params.get("hub.mode")
     token = params.get("hub.verify_token")
@@ -7512,6 +7925,17 @@ async def whatsapp_verify(request: Request):
     if mode == "subscribe" and token == cfg["verify_token"] and challenge:
         return Response(content=challenge, media_type="text/plain")
     raise HTTPException(status_code=403, detail="Verify token mismatch")
+
+
+@api.get("/webhooks/whatsapp")
+async def whatsapp_verify(request: Request):
+    return await _whatsapp_verify_impl(request, DEFAULT_COMPANY)
+
+
+@api.get("/webhooks/whatsapp/fragvansh")
+async def whatsapp_verify_fragvansh(request: Request):
+    """Webhook verification for the Fragvansh Meta app (separate WA Business account)."""
+    return await _whatsapp_verify_impl(request, "fragvansh")
 
 
 async def _find_lead_by_phone_legacy(phone_digits: str) -> Optional[dict]:
@@ -7573,13 +7997,13 @@ async def _is_within_24h_window(lead: dict) -> bool:
     return await _within_24h_for_phone(lead.get("id"), None)
 
 
-async def wa_send_interactive(to_phone: str, interactive_payload: Dict[str, Any], reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
+async def wa_send_interactive(to_phone: str, interactive_payload: Dict[str, Any], reply_to_wamid: Optional[str] = None, company: Optional[str] = None) -> Dict[str, Any]:
     """Send a WA interactive message (button / list) using the existing WA abstraction.
     cfg['api_version'] is read dynamically — never hardcoded."""
-    return await _wa_send_typed(to_phone, {"type": "interactive", "interactive": interactive_payload}, reply_to_wamid=reply_to_wamid)
+    return await _wa_send_typed(to_phone, {"type": "interactive", "interactive": interactive_payload}, reply_to_wamid=reply_to_wamid, company=company)
 
 
-async def wa_send_media(to_phone: str, media_type: str, url: str, caption: Optional[str] = None, filename: Optional[str] = None, reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
+async def wa_send_media(to_phone: str, media_type: str, url: str, caption: Optional[str] = None, filename: Optional[str] = None, reply_to_wamid: Optional[str] = None, company: Optional[str] = None) -> Dict[str, Any]:
     """Send an image, video, or document message via the existing WA abstraction.
     `media_type` is one of 'image','video','document'. `url` must be public HTTPS.
     Caption supported on image/video; filename on document."""
@@ -7590,41 +8014,41 @@ async def wa_send_media(to_phone: str, media_type: str, url: str, caption: Optio
         media_block["caption"] = caption
     if filename and media_type == "document":
         media_block["filename"] = filename
-    return await _wa_send_typed(to_phone, {"type": media_type, media_type: media_block}, reply_to_wamid=reply_to_wamid)
+    return await _wa_send_typed(to_phone, {"type": media_type, media_type: media_block}, reply_to_wamid=reply_to_wamid, company=company)
 
 
-async def wa_send_audio(to_phone: str, url: str, reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
+async def wa_send_audio(to_phone: str, url: str, reply_to_wamid: Optional[str] = None, company: Optional[str] = None) -> Dict[str, Any]:
     """Send an audio/voice note. WA Cloud API does not accept caption/filename for audio."""
-    return await _wa_send_typed(to_phone, {"type": "audio", "audio": {"link": url}}, reply_to_wamid=reply_to_wamid)
+    return await _wa_send_typed(to_phone, {"type": "audio", "audio": {"link": url}}, reply_to_wamid=reply_to_wamid, company=company)
 
 
-async def wa_send_location(to_phone: str, latitude: float, longitude: float, name: Optional[str] = None, address: Optional[str] = None, reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
+async def wa_send_location(to_phone: str, latitude: float, longitude: float, name: Optional[str] = None, address: Optional[str] = None, reply_to_wamid: Optional[str] = None, company: Optional[str] = None) -> Dict[str, Any]:
     loc: Dict[str, Any] = {"latitude": float(latitude), "longitude": float(longitude)}
     if name:
         loc["name"] = name
     if address:
         loc["address"] = address
-    return await _wa_send_typed(to_phone, {"type": "location", "location": loc}, reply_to_wamid=reply_to_wamid)
+    return await _wa_send_typed(to_phone, {"type": "location", "location": loc}, reply_to_wamid=reply_to_wamid, company=company)
 
 
-async def wa_send_contacts(to_phone: str, contacts: List[Dict[str, Any]], reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
+async def wa_send_contacts(to_phone: str, contacts: List[Dict[str, Any]], reply_to_wamid: Optional[str] = None, company: Optional[str] = None) -> Dict[str, Any]:
     """Send one or more contact cards. Each contact must include a `name.formatted_name` and at least one phone."""
-    return await _wa_send_typed(to_phone, {"type": "contacts", "contacts": contacts}, reply_to_wamid=reply_to_wamid)
+    return await _wa_send_typed(to_phone, {"type": "contacts", "contacts": contacts}, reply_to_wamid=reply_to_wamid, company=company)
 
 
-async def wa_send_reaction(to_phone: str, message_wamid: str, emoji: str) -> Dict[str, Any]:
+async def wa_send_reaction(to_phone: str, message_wamid: str, emoji: str, company: Optional[str] = None) -> Dict[str, Any]:
     """Send or remove a WhatsApp reaction. Passing emoji='' (empty string) removes the reaction.
     Per WA Cloud API, reactions don't support context / quoted replies — it's its own message type."""
     return await _wa_send_typed(to_phone, {
         "type": "reaction",
         "reaction": {"message_id": message_wamid, "emoji": emoji or ""},
-    })
+    }, company=company)
 
 
-async def _wa_send_typed(to_phone: str, payload_extra: Dict[str, Any], reply_to_wamid: Optional[str] = None) -> Dict[str, Any]:
+async def _wa_send_typed(to_phone: str, payload_extra: Dict[str, Any], reply_to_wamid: Optional[str] = None, company: Optional[str] = None) -> Dict[str, Any]:
     """Shared transport for non-text WhatsApp messages. Keeps version, auth, error shape
     identical to the other wa_send_* helpers."""
-    cfg = await get_wa_config()
+    cfg = await get_wa_config(company)
     if not cfg["enabled"]:
         return {"mock": True, "status": "sent_mock", "wamid": None}
     to = _wa_recipient(to_phone)
@@ -7687,12 +8111,12 @@ def _ext_for_mime(mime: Optional[str], fallback: str = "") -> str:
     return ext or (fallback or ".bin")
 
 
-async def _download_wa_media(media_id: str, mime_hint: Optional[str] = None, request: Optional[Request] = None) -> Optional[Dict[str, Any]]:
+async def _download_wa_media(media_id: str, mime_hint: Optional[str] = None, request: Optional[Request] = None, company: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Fetch an inbound WhatsApp media blob from Meta and store it locally so the
     chat UI can render it. Returns {stored_name, url, mime} on success, None on failure.
     Two-step flow per Meta docs: (1) GET /{media_id} → {"url": ...}, (2) GET that URL
     with the same Bearer token → bytes."""
-    cfg = await get_wa_config()
+    cfg = await get_wa_config(company)
     if not cfg.get("enabled"):
         return None
     token = cfg.get("access_token")
@@ -7807,6 +8231,8 @@ async def send_flow_message(to_phone: str, node_id: str, lead: Optional[dict] = 
         return {"error": "node_not_found"}
     if not lead:
         lead = await _find_lead_by_phone(to_phone)
+    # Flow replies go out on the business number of the lead's company.
+    _flow_co = normalize_company((lead or {}).get("company"))
     options: List[Dict[str, Any]] = []
     if node["message_type"] in ("button", "list", "carousel"):
         options = await db.chat_options.find({"node_id": node_id}, {"_id": 0}).sort("position", 1).to_list(50)
@@ -7816,7 +8242,7 @@ async def send_flow_message(to_phone: str, node_id: str, lead: Optional[dict] = 
     msg_body_preview = content.get("body") or f"[flow:{node['message_type']}]"
     mtype = node["message_type"]
     if mtype == "text":
-        api_result = await wa_send_text(to_phone=to_phone, body=msg_body_preview)
+        api_result = await wa_send_text(to_phone=to_phone, body=msg_body_preview, company=_flow_co)
     elif mtype in ("image", "video", "document"):
         url = (content.get("media_url") or "").strip()
         if not url:
@@ -7827,6 +8253,7 @@ async def send_flow_message(to_phone: str, node_id: str, lead: Optional[dict] = 
             url=url,
             caption=content.get("caption") or None,
             filename=content.get("filename") or None,
+            company=_flow_co,
         )
         if mtype == "image":
             msg_body_preview = f"[image] {content.get('caption','')}".strip()
@@ -7849,9 +8276,9 @@ async def send_flow_message(to_phone: str, node_id: str, lead: Optional[dict] = 
             # Preserve the caption exactly — join non-empty parts with a newline, no outer strip.
             cap = "\n".join([p for p in cap_parts if p]) or None
             if img_url:
-                last_result = await wa_send_media(to_phone=to_phone, media_type="image", url=img_url, caption=cap)
+                last_result = await wa_send_media(to_phone=to_phone, media_type="image", url=img_url, caption=cap, company=_flow_co)
             elif cap:
-                last_result = await wa_send_text(to_phone=to_phone, body=cap)
+                last_result = await wa_send_text(to_phone=to_phone, body=cap, company=_flow_co)
         # Build the final button prompt from chat_options (same mechanism as 'button' nodes).
         # The UI ensures each card has a corresponding option row so that `next_node_id` works.
         if options:
@@ -7861,7 +8288,7 @@ async def send_flow_message(to_phone: str, node_id: str, lead: Optional[dict] = 
             }
             try:
                 interactive = _build_interactive_payload(temp_node, options[:3])
-                last_result = await wa_send_interactive(to_phone=to_phone, interactive_payload=interactive)
+                last_result = await wa_send_interactive(to_phone=to_phone, interactive_payload=interactive, company=_flow_co)
             except ValueError as e:
                 return {"error": str(e)}
         api_result = last_result
@@ -7871,7 +8298,7 @@ async def send_flow_message(to_phone: str, node_id: str, lead: Optional[dict] = 
             interactive = _build_interactive_payload(node, options)
         except ValueError as e:
             return {"error": str(e)}
-        api_result = await wa_send_interactive(to_phone=to_phone, interactive_payload=interactive)
+        api_result = await wa_send_interactive(to_phone=to_phone, interactive_payload=interactive, company=_flow_co)
     if lead:
         msg_doc = {
             "id": str(uuid.uuid4()),
@@ -8532,13 +8959,30 @@ async def list_chat_sessions(admin: dict = Depends(require_admin), limit: int = 
 
 @api.post("/webhooks/whatsapp")
 async def webhook_whatsapp(request: Request):
-    """Receive incoming WhatsApp messages and delivery status updates from Meta."""
-    body_bytes = await request.body()
+    """CitSpray WhatsApp webhook (legacy URL — already registered with Meta)."""
+    return await _handle_wa_webhook(request, DEFAULT_COMPANY)
+
+
+@api.post("/webhooks/whatsapp/fragvansh")
+async def webhook_whatsapp_fragvansh(request: Request):
+    """Fragvansh WhatsApp webhook — its own Meta app/account posts here."""
+    return await _handle_wa_webhook(request, "fragvansh")
+
+
+async def _handle_wa_webhook(request: Request, company: str):
+    """Receive incoming WhatsApp messages and delivery status updates from Meta.
+    `company` = which company's business number this webhook belongs to; every
+    lead lookup / auto-create below stays inside that company."""
+    company = normalize_company(company)
+    try:
+        body_bytes = await request.body()
+    except Exception:
+        body_bytes = b""  # simulator fake-request has no body(); payload comes from .json()
     # Verify Meta's HMAC signature when an app secret is configured. Reject a
     # PRESENT-but-wrong signature outright; tolerate a missing header only so a
     # misconfigured secret can't silently kill all inbound WhatsApp.
     try:
-        cfg_sig = await get_wa_config()
+        cfg_sig = await get_wa_config(company)
         app_secret = (cfg_sig.get("app_secret") or "").strip()
         sig_header = request.headers.get("x-hub-signature-256", "")
         if app_secret and sig_header:
@@ -8551,12 +8995,13 @@ async def webhook_whatsapp(request: Request):
     except Exception as e:
         logger.warning(f"WhatsApp webhook signature check failed open: {e}")
     try:
-        payload = json.loads(body_bytes.decode("utf-8"))
+        payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else (await request.json())
     except Exception:
         payload = {}
     raw = {
         "id": str(uuid.uuid4()),
         "source": "WhatsApp",
+        "company": company,
         "payload": payload,
         "received_at": iso(now_utc()),
         "processed": False,
@@ -8642,7 +9087,7 @@ async def webhook_whatsapp(request: Request):
                         rx = m.get("reaction") or {}
                         target_wamid = rx.get("message_id")
                         emoji = (rx.get("emoji") or "").strip()
-                        target_lead = await _find_lead_by_phone(from_phone or "")
+                        target_lead = await _find_lead_by_phone(from_phone or "", company=company)
                         if target_wamid and target_lead:
                             target_msg = await db.messages.find_one(
                                 {"wamid": target_wamid, "lead_id": target_lead["id"]},
@@ -8669,7 +9114,7 @@ async def webhook_whatsapp(request: Request):
                     else:
                         body_text = f"[{msg_type}]"
 
-                    lead = await _find_lead_by_phone(from_phone or "")
+                    lead = await _find_lead_by_phone(from_phone or "", company=company)
                     if not lead:
                         # Auto-create a lead so we don't lose the inbound enquiry
                         sender_name = ""
@@ -8678,6 +9123,7 @@ async def webhook_whatsapp(request: Request):
                         except Exception:
                             pass
                         data = {
+                            "company": company,
                             "customer_name": sender_name or f"WhatsApp +{from_phone}",
                             "phone": from_phone,
                             "requirement": body_text[:200],
@@ -8728,7 +9174,7 @@ async def webhook_whatsapp(request: Request):
                         # so the chat UI can render the actual image/video/document/audio.
                         if inbound_media_id:
                             try:
-                                dl = await _download_wa_media(inbound_media_id, mime_hint=inbound_mime, request=request)
+                                dl = await _download_wa_media(inbound_media_id, mime_hint=inbound_mime, request=request, company=company)
                                 if dl and dl.get("url"):
                                     msg_doc["media_url"] = dl["url"]
                                     msg_doc["media_stored_name"] = dl.get("stored_name")
@@ -8788,7 +9234,10 @@ async def webhook_whatsapp(request: Request):
                     try:
                         assigned_uid = lead.get("assigned_to")
                         att_cfg = await get_attendance_config()
-                        if assigned_uid and att_cfg.get("attendance_routing_enabled", True) and await _office_open_now(att_cfg):
+                        # Export / international leads are pinned to the export
+                        # owner — never churn them to the domestic exec pool.
+                        _is_export_conv = (lead.get("source") == "Export") or ((lead.get("phone") or "").startswith("+"))
+                        if assigned_uid and not _is_export_conv and att_cfg.get("attendance_routing_enabled", True) and await _office_open_now(att_cfg):
                             owner = await db.users.find_one({"id": assigned_uid, "active": True}, {"_id": 0, "password_hash": 0})
                             owner_ok = False
                             if owner:
@@ -8900,9 +9349,9 @@ async def _redistribute_after_hours_leads():
     cursor = db.leads.find({
         "assigned_after_hours": True, "status": "new",
         "opened_at": None, "assigned_to": {"$ne": None},
-    }, {"_id": 0, "id": 1, "assigned_to": 1}).sort("created_at", 1).limit(200)
+    }, {"_id": 0, "id": 1, "assigned_to": 1, "company": 1}).sort("created_at", 1).limit(200)
     async for lead in cursor:
-        chosen = await pick_next_executive()
+        chosen = await pick_next_executive(company=lead.get("company"))
         if not chosen:
             break
         now_iso = iso(now_utc())
@@ -8937,7 +9386,8 @@ async def _auto_reassign_lead(lead_id: str, current_assigned_to: Optional[str], 
     - Conditional findOneAndUpdate (optimistic lock): if two workers race on
       the same lead, only the first write succeeds.
     """
-    chosen = await pick_next_executive(exclude_user_id=current_assigned_to)
+    _ld = await db.leads.find_one({"id": lead_id}, {"_id": 0, "company": 1})
+    chosen = await pick_next_executive(exclude_user_id=current_assigned_to, company=(_ld or {}).get("company"))
     if not chosen:
         return None
     chosen_id = chosen["id"]
@@ -9096,7 +9546,8 @@ async def auto_reassign_task():
                 "status": "pending", "meta.type": "reorder",
                 "meta.reorder_assigned_at": {"$lt": reorder_stale},
             }, {"_id": 0}).limit(20):
-                nxt = await pick_next_executive(exclude_user_id=fu.get("executive_id"))
+                _fld = await db.leads.find_one({"id": fu.get("lead_id")}, {"_id": 0, "company": 1})
+                nxt = await pick_next_executive(exclude_user_id=fu.get("executive_id"), company=(_fld or {}).get("company"))
                 if not nxt or nxt["id"] == fu.get("executive_id"):
                     continue
                 now_iso = iso(now_utc())
@@ -9793,11 +10244,14 @@ class WhatsAppSettingsInput(BaseModel):
     default_template_lang: Optional[str] = None
 
 @api.get("/settings/whatsapp")
-async def get_whatsapp_settings(admin: dict = Depends(require_admin)):
+async def get_whatsapp_settings(admin: dict = Depends(require_admin),
+                                x_company: Optional[str] = Header(None, alias="X-Company")):
     """Returns effective WhatsApp config (access_token masked) + env defaults and DB overrides
-    so the admin UI can show what's coming from where."""
-    effective = await get_wa_config()
-    db_doc = await db.system_settings.find_one({"key": "whatsapp"}, {"_id": 0}) or {}
+    so the admin UI can show what's coming from where. X-Company selects which
+    company's config is read (CitSpray = legacy key, Fragvansh = its own)."""
+    company = _resolve_company(admin, x_company)
+    effective = await get_wa_config(company)
+    db_doc = await db.system_settings.find_one({"key": _wa_settings_key(company)}, {"_id": 0}) or {}
     # Mask any token fields before returning
     safe_effective = dict(effective)
     safe_effective["access_token_masked"] = _mask_token(effective.get("access_token") or "")
@@ -9817,13 +10271,18 @@ async def get_whatsapp_settings(admin: dict = Depends(require_admin)):
         "overrides": safe_overrides,
         "env_defaults": env_defaults,
         "editable_fields": _WA_EDITABLE_FIELDS,
+        "company": company,
     }
 
 
 @api.put("/settings/whatsapp")
-async def update_whatsapp_settings(body: WhatsAppSettingsInput, admin: dict = Depends(require_admin)):
-    """Update WhatsApp runtime overrides. Empty string clears an override so the .env default
-    takes back over. Any field not provided in the request is left untouched."""
+async def update_whatsapp_settings(body: WhatsAppSettingsInput, admin: dict = Depends(require_admin),
+                                   x_company: Optional[str] = Header(None, alias="X-Company")):
+    """Update WhatsApp runtime overrides for the X-Company company. Empty string clears
+    an override so the .env default takes back over (CitSpray only — Fragvansh has no
+    env defaults). Any field not provided in the request is left untouched."""
+    company = _resolve_company(admin, x_company)
+    settings_key = _wa_settings_key(company)
     patch: Dict[str, Any] = {}
     unset: Dict[str, Any] = {}
     for f in _WA_EDITABLE_FIELDS:
@@ -9840,16 +10299,16 @@ async def update_whatsapp_settings(body: WhatsAppSettingsInput, admin: dict = De
         raise HTTPException(status_code=400, detail="No changes supplied")
     update_ops: Dict[str, Any] = {}
     if patch:
-        update_ops["$set"] = {"key": "whatsapp", **patch, "updated_by": admin["id"], "updated_at": iso(now_utc())}
+        update_ops["$set"] = {"key": settings_key, **patch, "updated_by": admin["id"], "updated_at": iso(now_utc())}
     if unset:
         update_ops["$unset"] = unset
-        update_ops.setdefault("$set", {}).update({"updated_by": admin["id"], "updated_at": iso(now_utc()), "key": "whatsapp"})
-    await db.system_settings.update_one({"key": "whatsapp"}, update_ops, upsert=True)
-    await log_activity(admin["id"], "whatsapp_settings_updated", None, {"changed": list(patch.keys()), "cleared": list(unset.keys())})
+        update_ops.setdefault("$set", {}).update({"updated_by": admin["id"], "updated_at": iso(now_utc()), "key": settings_key})
+    await db.system_settings.update_one({"key": settings_key}, update_ops, upsert=True)
+    await log_activity(admin["id"], "whatsapp_settings_updated", None, {"company": company, "changed": list(patch.keys()), "cleared": list(unset.keys())})
     # return fresh effective config
-    effective = await get_wa_config()
+    effective = await get_wa_config(company)
     safe = {k: (_mask_token(v) if k in ("access_token", "app_secret") and isinstance(v, str) else v) for k, v in effective.items()}
-    return {"ok": True, "effective": safe}
+    return {"ok": True, "effective": safe, "company": company}
 
 
 # ------------- WhatsApp Auto-Sequence -------------
@@ -9889,7 +10348,9 @@ async def _trigger_auto_sequence(lead_id: str, target_phone: str):
         doc = await db.system_settings.find_one({"key": "auto_reply_sequence"}, {"_id": 0})
         if not doc or not doc.get("is_active") or not doc.get("quick_reply_ids"):
             return
-        
+        _seq_lead = await db.leads.find_one({"id": lead_id}, {"_id": 0, "company": 1})
+        _seq_co = normalize_company((_seq_lead or {}).get("company"))
+
         for qr_id in doc["quick_reply_ids"]:
             api_result = {}
             body_val = ""
@@ -9901,7 +10362,7 @@ async def _trigger_auto_sequence(lead_id: str, target_phone: str):
                 if not custom_text:
                     await asyncio.sleep(1.5)
                     continue
-                api_result = await wa_send_text(to_phone=target_phone, body=custom_text)
+                api_result = await wa_send_text(to_phone=target_phone, body=custom_text, company=_seq_co)
                 body_val = custom_text
 
             else:
@@ -9915,12 +10376,14 @@ async def _trigger_auto_sequence(lead_id: str, target_phone: str):
                             media_type=qr.get("media_type") or "document",
                             url=qr["media_url"],
                             caption=qr.get("caption") or qr.get("text"),
-                            filename=qr.get("media_filename")
+                            filename=qr.get("media_filename"),
+                            company=_seq_co,
                         )
                     else:
                         api_result = await wa_send_text(
                             to_phone=target_phone,
-                            body=qr.get("text") or ""
+                            body=qr.get("text") or "",
+                            company=_seq_co,
                         )
                     body_val = qr.get("text") or ""
                     if qr.get("media_url"):
@@ -9936,7 +10399,7 @@ async def _trigger_auto_sequence(lead_id: str, target_phone: str):
                         await asyncio.sleep(1.5)
                         continue
 
-                    wa_cfg = await get_wa_config()
+                    wa_cfg = await get_wa_config(_seq_co)
                     params_required = int(tpl.get("params_required") or 0)
                     params_to_send = None
                     if params_required > 0:
@@ -9948,7 +10411,8 @@ async def _trigger_auto_sequence(lead_id: str, target_phone: str):
                         to_phone=target_phone,
                         template_name=tpl["name"],
                         lang_code=tpl.get("language") or wa_cfg["default_template_lang"],
-                        body_params=params_to_send
+                        body_params=params_to_send,
+                        company=_seq_co,
                     )
 
                     body_val = tpl.get("body") or f"[Template: {tpl['name']}]"
@@ -10414,7 +10878,11 @@ GMAIL_POLL_DEFAULT_SECONDS = max(10, int(os.environ.get("GMAIL_POLL_INTERVAL_SEC
 GMAIL_POLL_MINUTES = max(1, int(os.environ.get("GMAIL_POLL_INTERVAL_MINUTES", "1")))  # legacy fallback
 GMAIL_QUERY = os.environ.get("GMAIL_JUSTDIAL_QUERY", "from:instantemail@justdial.com is:unread newer_than:2d")
 GMAIL_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI)
-GMAIL_SLOTS = ("primary", "secondary")
+GMAIL_SLOTS = ("primary", "secondary", "fragvansh")
+
+# Which company each Justdial inbox slot feeds. primary/secondary are the
+# original CitSpray inboxes; the fragvansh slot is that company's JD account.
+GMAIL_SLOT_COMPANY = {"primary": "citspray", "secondary": "citspray", "fragvansh": "fragvansh"}
 
 
 def _normalize_gmail_slot(slot: Optional[str]) -> str:
@@ -10916,6 +11384,7 @@ async def _imap_poll_one_slot(slot: str, cfg: dict, summary: dict) -> dict:
                             pass
                             
                 data = {
+                    "company": GMAIL_SLOT_COMPANY.get(slot, DEFAULT_COMPANY),
                     "customer_name": name,
                     "requirement": parsed.get("requirement"),
                     "area": parsed.get("area"),
@@ -11167,6 +11636,7 @@ async def _gmail_poll_one_slot(slot: str) -> dict:
                             except Exception:
                                 pass
                     data = {
+                        "company": GMAIL_SLOT_COMPANY.get(slot, DEFAULT_COMPANY),
                         "customer_name": name,
                         "requirement": parsed.get("requirement"),
                         "area": parsed.get("area"),
@@ -11564,8 +12034,18 @@ async def on_startup():
         await db.admin_alerts.create_index([("meta.dedup_key", 1)])
         await db.winback_sends.create_index([("dedup_key", 1)], unique=True)
         await db.meta_capi_sends.create_index([("dedup_key", 1)], unique=True)
+        await db.leads.create_index([("company", 1), ("created_at", -1)])
     except Exception as _e:
         logger.warning(f"index creation skipped: {_e}")
+    # Multi-company backfill — idempotent, cheap after the first run: every doc
+    # created before the company dimension existed belongs to CitSpray.
+    try:
+        for _coll in (db.leads, db.users, db.whatsapp_templates):
+            res = await _coll.update_many({"company": {"$exists": False}}, {"$set": {"company": DEFAULT_COMPANY}})
+            if res.modified_count:
+                logger.info(f"company backfill: stamped {res.modified_count} docs in {_coll.name}")
+    except Exception as _e:
+        logger.warning(f"company backfill skipped: {_e}")
     logger.info("DEBUG STARTUP: counting gmail_connections...")
     has_gmail_conns = await db.gmail_connections.count_documents({}) > 0
     logger.info(f"DEBUG STARTUP: gmail connections count done (has_gmail_conns={has_gmail_conns}). GMAIL_ENABLED={GMAIL_ENABLED}")
@@ -11578,18 +12058,24 @@ async def on_startup():
             id="gmail_poll", max_instances=1, coalesce=True,
         )
         logger.info(f"Gmail/IMAP poll scheduled every {gmail_secs}s")
-    # ExportersIndia pull — only schedule if admin has enabled it
+    # ExportersIndia pull — one job serves every company; schedule if ANY company
+    # has it enabled, ticking at the fastest configured interval.
     try:
-        logger.info("DEBUG STARTUP: getting exportersindia pull cfg...")
-        ei_cfg = await _get_exportersindia_pull_cfg()
-        logger.info(f"DEBUG STARTUP: exportersindia pull cfg={ei_cfg}")
-        if ei_cfg.get("enabled") and ei_cfg.get("api_key") and ei_cfg.get("email"):
+        _ei_enabled = False
+        _ei_fastest: Optional[int] = None
+        for _c in COMPANIES:
+            ei_cfg = await _get_exportersindia_pull_cfg(_c)
+            if ei_cfg.get("enabled") and ei_cfg.get("api_key") and ei_cfg.get("email"):
+                _ei_enabled = True
+                iv = int(ei_cfg.get("interval_seconds") or DEFAULT_EI_INTERVAL)
+                _ei_fastest = iv if _ei_fastest is None else min(_ei_fastest, iv)
+        if _ei_enabled:
             scheduler.add_job(
                 exportersindia_pull_task, "interval",
-                seconds=max(10, int(ei_cfg.get("interval_seconds") or DEFAULT_EI_INTERVAL)),
+                seconds=max(10, int(_ei_fastest or DEFAULT_EI_INTERVAL)),
                 id="exportersindia_pull", max_instances=1, coalesce=True,
             )
-            logger.info(f"ExportersIndia pull enabled every {ei_cfg['interval_seconds']}s")
+            logger.info(f"ExportersIndia pull enabled every {_ei_fastest}s")
     except Exception as e:
         logger.warning(f"Could not schedule ExportersIndia pull: {e}")
     logger.info("DEBUG STARTUP: starting scheduler...")

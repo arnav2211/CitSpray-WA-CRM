@@ -3,6 +3,7 @@ import "@/App.css";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { Toaster } from "sonner";
 import { AuthProvider } from "@/context/AuthContext";
+import { CompanyProvider } from "@/context/CompanyContext";
 import { ProtectedRoute, AdminOnly, ExecutiveOrAdminOnly } from "@/components/ProtectedRoute";
 import AppShell from "@/components/AppShell";
 import Login from "@/pages/Login";
@@ -34,6 +35,7 @@ export default function App() {
   return (
     <div className="App">
       <AuthProvider>
+        <CompanyProvider>
         <BrowserRouter>
           <Toaster position="top-right" richColors closeButton />
           <Routes>
@@ -67,6 +69,7 @@ export default function App() {
             <Route path="*" element={<Navigate to="/dashboard" replace />} />
           </Routes>
         </BrowserRouter>
+        </CompanyProvider>
       </AuthProvider>
     </div>
   );

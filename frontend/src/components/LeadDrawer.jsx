@@ -3,7 +3,8 @@ import { useNavigate } from "react-router-dom";
 import { api, errMsg } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { toast } from "sonner";
-import { StatusBadge, SourceBadge, QueryTypeBadge } from "@/components/Badges";
+import { StatusBadge, SourceBadge, QueryTypeBadge, TagBadge, AlsoInBadge } from "@/components/Badges";
+import { useCompany } from "@/context/CompanyContext";
 import { X, Phone, EnvelopeSimple, MapPin, ArrowSquareOut, PaperPlaneRight, Clock, CalendarBlank, NotePencil, Plus, Trash, Info, PhoneCall, WhatsappLogo, Star, PencilSimple, Check, Lightning, MagnifyingGlass, GitMerge } from "@phosphor-icons/react";
 import { fmtIST, fmtISTTime, fmtTime12, fmtSmartLong, fmtDaySeparator, istDayKey, queryTypeInfo } from "@/lib/format";
 import OMSDataSection from "@/components/OMSDataSection";
@@ -30,6 +31,7 @@ const OUTCOME_COLOR = {
 
 export default function LeadDrawer({ leadId, onClose }) {
   const { user } = useAuth();
+  const { isFragvansh } = useCompany();
   const nav = useNavigate();
   const [activeLeadId, setActiveLeadId] = useState(leadId);
   const [lead, setLead] = useState(null);
@@ -357,6 +359,7 @@ export default function LeadDrawer({ leadId, onClose }) {
               <SourceBadge source={lead.source} />
               <QueryTypeBadge code={lead.source_data?.QUERY_TYPE} />
               <StatusBadge status={lead.status} />
+              <AlsoInBadge lead={lead} />
               <button
                 onClick={toggleStar}
                 className={`inline-flex items-center justify-center p-1 rounded-full hover:bg-gray-100 transition-colors ${
@@ -560,6 +563,10 @@ export default function LeadDrawer({ leadId, onClose }) {
                   )}
                 </div>
               </section>
+            )}
+
+            {isFragvansh && (
+              <TagsSection lead={lead} canEdit={canEdit} onSave={(tags) => update({ tags })} />
             )}
 
             {(lead.gst_no || lead.enquiry_type) && (
@@ -1417,5 +1424,56 @@ function MergeDialog({ destLead, onClose, onMerged }) {
         </div>
       </div>
     </div>
+  );
+}
+
+// ---- Tags / labels editor (Fragvansh) ----
+// Chips + inline add box, saved via the standard PATCH /leads path. Tags are
+// normalized (lowercase, deduped) server-side; used to sort customers by what
+// they want (e.g. "phenyl", a specific product).
+function TagsSection({ lead, canEdit, onSave }) {
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState("");
+  const tags = lead.tags || [];
+
+  const commit = () => {
+    const v = draft.trim().toLowerCase();
+    setDraft("");
+    setAdding(false);
+    if (!v || tags.includes(v)) return;
+    onSave([...tags, v]);
+  };
+
+  return (
+    <section data-testid="lead-tags-section">
+      <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2">Labels / Tags</div>
+      <div className="border border-gray-200 bg-white p-3 flex items-center gap-1.5 flex-wrap">
+        {tags.length === 0 && !adding && (
+          <span className="text-xs text-gray-400">No labels yet{canEdit ? " — add one to sort this customer by requirement." : "."}</span>
+        )}
+        {tags.map((t) => (
+          <TagBadge key={t} tag={t} onRemove={canEdit ? () => onSave(tags.filter((x) => x !== t)) : undefined} />
+        ))}
+        {canEdit && (adding ? (
+          <input
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") { e.preventDefault(); commit(); }
+              if (e.key === "Escape") { setAdding(false); setDraft(""); }
+            }}
+            onBlur={commit}
+            placeholder="e.g. phenyl"
+            className="border border-[#7C3AED] px-2 py-0.5 text-xs outline-none w-32"
+            data-testid="tag-add-input"
+          />
+        ) : (
+          <button onClick={() => setAdding(true)}
+            className="text-[10px] uppercase tracking-widest font-bold text-[#7C3AED] hover:underline"
+            data-testid="tag-add-btn">+ Add label</button>
+        ))}
+      </div>
+    </section>
   );
 }

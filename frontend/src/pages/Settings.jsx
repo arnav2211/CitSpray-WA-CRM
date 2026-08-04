@@ -3,6 +3,7 @@ import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
 import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck, Copy, Link as LinkIcon, Phone, Plus, Trash, Lightning, Users as UsersIcon, Calendar, X, EnvelopeSimple, Paperclip, PaperPlaneTilt } from "@phosphor-icons/react";
 import { fmtIST } from "@/lib/format";
+import { useCompany } from "@/context/CompanyContext";
 
 const FIELDS = [
   { k: "access_token",          label: "Access Token",              secret: true,  hint: "Permanent System User token with whatsapp_business_messaging + whatsapp_business_management scopes." },
@@ -14,6 +15,23 @@ const FIELDS = [
   { k: "default_template",      label: "Default Welcome Template",  hint: "Template name used for the first-touch message when a new lead is created. Must be APPROVED in Meta." },
   { k: "default_template_lang", label: "Default Template Language", hint: "Language code registered on the template, e.g. en_US, en, hi." },
 ];
+
+// Every panel below reads/writes config for the ACTIVE company (X-Company header
+// is attached by lib/api.js). This banner makes that unmistakable so the admin
+// never pastes Fragvansh credentials into the CitSpray config or vice-versa.
+function CompanyScopeBanner() {
+  const { companyLabel, isFragvansh } = useCompany();
+  return (
+    <div className={`border px-4 py-3 flex items-center gap-2 ${isFragvansh ? "border-[#7C3AED] bg-[#F5F3FF]" : "border-[#002FA7] bg-[#EAF1FF]"}`}
+      data-testid="settings-company-banner">
+      <ShieldCheck size={16} className={isFragvansh ? "text-[#7C3AED]" : "text-[#002FA7]"} />
+      <span className="text-sm">
+        Configuring: <b>{companyLabel}</b>
+        <span className="text-xs text-gray-500 ml-2">WhatsApp, ExportersIndia and webhook URLs below apply to this company only — switch companies in the sidebar to configure the other.</span>
+      </span>
+    </div>
+  );
+}
 
 export default function Settings() {
   const [cfg, setCfg] = useState(null);
@@ -96,6 +114,8 @@ export default function Settings() {
         <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Admin</div>
         <h1 className="font-chivo font-black text-2xl md:text-4xl">Settings</h1>
       </div>
+
+      <CompanyScopeBanner />
 
       {hooks && <WebhooksPanel hooks={hooks} />}
 
@@ -197,6 +217,7 @@ function WebhooksPanel({ hooks }) {
     { ...hooks.whatsapp,             key: "whatsapp" },
     { ...hooks.indiamart,            key: "indiamart" },
     { ...hooks.exportersindia,       key: "exportersindia" },
+    { ...hooks.gmaps,                key: "gmaps" },
     { ...hooks.gmail,                key: "gmail" },
     { ...hooks.justdial_manual_ingest, key: "justdial" },
   ].filter((x) => x && (x.url || x.label));
@@ -243,6 +264,17 @@ function WebhooksPanel({ hooks }) {
                   <code className="flex-1 font-mono text-xs bg-gray-50 border border-gray-200 px-3 py-2 break-all" data-testid={`hook-verify-${it.key}`}>{it.verify_token}</code>
                 </div>
                 <button onClick={() => copy(it.verify_token, "Verify token")} className="border border-gray-900 px-3 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-900 hover:text-white flex items-center gap-1">
+                  <Copy size={12} /> Copy
+                </button>
+              </div>
+            )}
+            {it.ingest_key && (
+              <div className="mt-2 flex gap-2 items-stretch">
+                <div className="flex-1 flex">
+                  <span className="bg-gray-100 border border-gray-200 border-r-0 px-2 py-2 text-[10px] uppercase tracking-widest text-gray-500 font-bold">Ingest key</span>
+                  <code className="flex-1 font-mono text-xs bg-gray-50 border border-gray-200 px-3 py-2 break-all" data-testid={`hook-ingest-key-${it.key}`}>{it.ingest_key}</code>
+                </div>
+                <button onClick={() => copy(it.ingest_key, "Ingest key")} className="border border-gray-900 px-3 py-2 text-[10px] uppercase tracking-widest font-bold hover:bg-gray-900 hover:text-white flex items-center gap-1">
                   <Copy size={12} /> Copy
                 </button>
               </div>

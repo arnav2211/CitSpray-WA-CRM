@@ -7,6 +7,7 @@ import {
 import { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
+import { useCompany, COMPANIES } from "@/context/CompanyContext";
 
 const navBase = "flex items-center gap-3 px-4 py-3 md:py-2.5 text-sm border-l-2 transition-colors";
 const navActive = "bg-white border-[#002FA7] text-gray-900 font-semibold";
@@ -31,6 +32,7 @@ function Item({ to, icon: Icon, children, testId, onNavigate, badge, badgeClass 
 
 export default function Sidebar({ mobileOpen = false, onClose }) {
   const { user, logout } = useAuth();
+  const { company, companyLabel, canSwitch, setCompany } = useCompany();
   const nav = useNavigate();
   const isAdmin = user?.role === "admin";
   const [pendingTransfers, setPendingTransfers] = useState(0);
@@ -125,6 +127,30 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
           >
             <X size={18} />
           </button>
+        </div>
+
+        {/* Company scope — admins switch, everyone else sees their company */}
+        <div className="px-5 py-2.5 border-b border-gray-200" data-testid="company-switcher">
+          {canSwitch ? (
+            <div className="flex gap-1">
+              {Object.entries(COMPANIES).map(([key, label]) => (
+                <button key={key} onClick={() => key !== company && setCompany(key)}
+                  data-testid={`company-${key}`}
+                  className={`flex-1 px-2 py-1.5 text-[10px] uppercase tracking-widest font-bold border transition-colors ${
+                    company === key
+                      ? (key === "fragvansh"
+                          ? "bg-[#7C3AED] text-white border-[#7C3AED]"
+                          : "bg-[#002FA7] text-white border-[#002FA7]")
+                      : "border-gray-300 text-gray-500 hover:bg-gray-100"}`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className={`text-[10px] uppercase tracking-widest font-bold ${company === "fragvansh" ? "text-[#7C3AED]" : "text-[#002FA7]"}`}>
+              {companyLabel}
+            </div>
+          )}
         </div>
 
         <nav className="flex-1 py-3 space-y-0.5 overflow-y-auto">

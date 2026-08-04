@@ -1,15 +1,16 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
+import { useCompany } from "@/context/CompanyContext";
 import { Link, useSearchParams, useNavigate } from "react-router-dom";
-import { StatusBadge, SourceBadge, EnquiryTypeBadge } from "@/components/Badges";
+import { StatusBadge, SourceBadge, EnquiryTypeBadge, TagBadge, AlsoInBadge } from "@/components/Badges";
 import { toast } from "sonner";
-import { Kanban, Table, Plus, MagnifyingGlass, FileX, WhatsappLogo, UploadSimple, Star, Bell, Package } from "@phosphor-icons/react";
+import { Kanban, Table, Plus, MagnifyingGlass, FileX, WhatsappLogo, UploadSimple, Star, Bell, Package, MapPin } from "@phosphor-icons/react";
 import LeadDrawer from "@/components/LeadDrawer";
 import { fmtIST } from "@/lib/format";
 
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
-const SOURCES = ["IndiaMART", "ExportersIndia", "Justdial", "Manual", "WhatsApp", "Website"];
+const SOURCES = ["IndiaMART", "ExportersIndia", "Justdial", "Manual", "WhatsApp", "Website", "Export", "Google Maps"];
 
 // Inline follow-up urgency chip for a lead row: red=overdue, amber=due, blue=upcoming.
 function FollowupChip({ lead }) {
@@ -34,6 +35,7 @@ function FollowupChip({ lead }) {
 
 export default function Leads() {
   const { user } = useAuth();
+  const { isFragvansh } = useCompany();
   const nav = useNavigate();
   const [params, setParams] = useSearchParams();
   const [leads, setLeads] = useState([]);
@@ -47,6 +49,10 @@ export default function Leads() {
   const [dateFrom, setDateFrom] = useState(params.get("date_from") || "");
   const [dateTo, setDateTo] = useState(params.get("date_to") || "");
   const [starredFilter, setStarredFilter] = useState(params.get("starred") === "true");
+  // Tag filter (Fragvansh labels): multi-select, match-any
+  const [tagFilter, setTagFilter] = useState((params.get("tags") || "").split(",").filter(Boolean));
+  const [allTags, setAllTags] = useState([]);
+  const [gmapsImporting, setGmapsImporting] = useState(false);
   const [openId, setOpenId] = useState(params.get("lead") || null);
   const [creating, setCreating] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -70,6 +76,7 @@ export default function Leads() {
           date_from: dateFrom || undefined,
           date_to: dateTo || undefined,
           starred: starredFilter ? true : undefined,
+          tags: tagFilter.length ? tagFilter.join(",") : undefined,
           paginate: true,
           limit: pageSize,
           offset: (page - 1) * pageSize,
@@ -108,11 +115,22 @@ export default function Leads() {
     })();
   }, []);
 
+  // Fragvansh: distinct tags for the filter chips
+  useEffect(() => {
+    if (!isFragvansh) return;
+    (async () => {
+      try {
+        const { data } = await api.get("/leads/tags");
+        setAllTags(data || []);
+      } catch { /* empty */ }
+    })();
+  }, [isFragvansh]);
+
   // Reset to first page whenever a filter changes (so we never end up on an
   // empty page after narrowing the result set).
-  useEffect(() => { setPage(1); }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, q, pageSize, starredFilter]);
+  useEffect(() => { setPage(1); }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, q, pageSize, starredFilter, tagFilter]);
 
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, page, pageSize, starredFilter]);
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, page, pageSize, starredFilter, tagFilter]);
   useEffect(() => {
     const t = setTimeout(() => load(), 300);
     return () => clearTimeout(t);
@@ -130,11 +148,12 @@ export default function Leads() {
     if (dateFrom) p.date_from = dateFrom;
     if (dateTo) p.date_to = dateTo;
     if (starredFilter) p.starred = "true";
+    if (tagFilter.length) p.tags = tagFilter.join(",");
     if (openId) p.lead = openId;
     if (page > 1) p.page = String(page);
     if (pageSize !== 25) p.size = String(pageSize);
     setParams(p, { replace: true });
-  }, [view, q, statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, starredFilter, openId, page, pageSize, setParams]);
+  }, [view, q, statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, starredFilter, tagFilter, openId, page, pageSize, setParams]);
 
   const execMap = useMemo(() => Object.fromEntries(execs.map((e) => [e.id, e])), [execs]);
   const isAdmin = user.role === "admin";
@@ -160,6 +179,12 @@ export default function Leads() {
             className="border border-gray-300 hover:bg-gray-100 text-gray-700 px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1"
             onClick={() => setUploading(true)} data-testid="upload-leads-btn"
           ><UploadSimple size={12} weight="bold" /> Upload Excel</button>
+          {isFragvansh && (
+            <button
+              className="border border-[#7C3AED] text-[#7C3AED] hover:bg-[#F5F3FF] px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1"
+              onClick={() => setGmapsImporting(true)} data-testid="gmaps-import-btn"
+            ><MapPin size={12} weight="bold" /> Import GMaps CSV</button>
+          )}
           <button
             className="bg-[#002FA7] hover:bg-[#002288] text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1"
             onClick={() => setCreating(true)} data-testid="new-lead-btn"
@@ -225,6 +250,30 @@ export default function Leads() {
           )}
         </div>
       </div>
+
+      {/* Tag filter (Fragvansh labels) — toggle chips, match-any */}
+      {isFragvansh && allTags.length > 0 && (
+        <div className="border border-gray-200 bg-white p-3 flex items-center gap-1.5 flex-wrap" data-testid="leads-tag-filter">
+          <span className="text-[10px] uppercase tracking-widest text-gray-400 font-bold mr-1">Labels:</span>
+          {allTags.map(({ tag, count }) => {
+            const active = tagFilter.includes(tag);
+            return (
+              <button key={tag}
+                onClick={() => setTagFilter((prev) => active ? prev.filter((t) => t !== tag) : [...prev, tag])}
+                className={`px-2 py-1 text-[10px] uppercase tracking-widest font-bold border transition-colors ${
+                  active ? "bg-[#7C3AED] text-white border-[#7C3AED]" : "border-gray-300 text-gray-600 hover:border-[#7C3AED] hover:text-[#7C3AED]"}`}
+                data-testid={`tag-filter-${tag}`}>
+                {active ? "✓ " : ""}{tag} <span className="opacity-60">({count})</span>
+              </button>
+            );
+          })}
+          {tagFilter.length > 0 && (
+            <button onClick={() => setTagFilter([])}
+              className="px-2 py-1 text-[10px] uppercase tracking-widest font-bold text-gray-400 hover:text-gray-900"
+              data-testid="tag-filter-clear">clear</button>
+          )}
+        </div>
+      )}
 
       {view === "table" ? (
         <>
@@ -300,6 +349,8 @@ export default function Leads() {
                   <div className="mt-2 flex items-center gap-2 flex-wrap">
                     <SourceBadge source={l.source} />
                     <EnquiryTypeBadge lead={l} />
+                    <AlsoInBadge lead={l} />
+                    {isFragvansh && (l.tags || []).map((t) => <TagBadge key={t} tag={t} />)}
                     <span className="text-[10px] uppercase tracking-widest text-gray-400 font-bold ml-auto">
                       {execMap[l.assigned_to]?.name || "Unassigned"}
                     </span>
@@ -353,7 +404,13 @@ export default function Leads() {
                           <Star size={16} weight={l.starred ? "fill" : "regular"} />
                         </button>
                         <FollowupChip lead={l} />
+                        <AlsoInBadge lead={l} />
                       </div>
+                      {isFragvansh && (l.tags || []).length > 0 && (
+                        <div className="flex items-center gap-1 flex-wrap mt-0.5">
+                          {(l.tags || []).map((t) => <TagBadge key={t} tag={t} />)}
+                        </div>
+                      )}
                       {l.phone && (
                         <div className="text-xs text-gray-500 font-mono flex items-center gap-1.5">
                           <span>{l.phone}</span>
@@ -431,6 +488,117 @@ export default function Leads() {
       {openId && <LeadDrawer leadId={openId} onClose={() => { setOpenId(null); load(); }} />}
       {creating && <NewLeadModal execs={execs} onClose={() => setCreating(false)} onCreated={(id) => { setCreating(false); load(); if (id) setOpenId(id); }} isAdmin={isAdmin} />}
       {uploading && <UploadLeadsModal execs={execs} onClose={() => setUploading(false)} onUploaded={() => { setUploading(false); load(); }} isAdmin={isAdmin} />}
+      {gmapsImporting && <GmapsImportModal onClose={() => setGmapsImporting(false)} onImported={() => { setGmapsImporting(false); load(); }} />}
+    </div>
+  );
+}
+
+// ---- Google Maps CSV import (Fragvansh) ----
+// Parses the scraper's CSV client-side and batches it to /ingest/gmaps — the
+// same endpoint the Colab notebook streams to, so dedup/tagging is identical.
+function parseCsv(text) {
+  const rows = [];
+  let cur = [], field = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else if (c === '"') inQuotes = true;
+    else if (c === ",") { cur.push(field); field = ""; }
+    else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      cur.push(field); field = "";
+      if (cur.some((f) => f !== "")) rows.push(cur);
+      cur = [];
+    } else field += c;
+  }
+  if (field !== "" || cur.length) { cur.push(field); if (cur.some((f) => f !== "")) rows.push(cur); }
+  return rows;
+}
+
+function GmapsImportModal({ onClose, onImported }) {
+  const [file, setFile] = useState(null);
+  const [ingestKey, setIngestKey] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+
+  // The ingest key is shown in Settings → Integration URLs; fetch it here so the
+  // admin doesn't have to copy-paste.
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data } = await api.get("/settings/webhooks-info");
+        if (data?.gmaps?.ingest_key) setIngestKey(data.gmaps.ingest_key);
+      } catch { /* non-admin or citspray view — manual key entry below */ }
+    })();
+  }, []);
+
+  const run = async () => {
+    if (!file) return toast.error("Choose the scraper CSV first");
+    if (!ingestKey.trim()) return toast.error("Ingest key required (Settings → Integration URLs → Google Maps)");
+    setBusy(true);
+    setResult(null);
+    try {
+      const text = await file.text();
+      const rows = parseCsv(text);
+      if (rows.length < 2) throw new Error("CSV appears empty");
+      const header = rows[0].map((h) => h.trim().toLowerCase());
+      const records = rows.slice(1).map((r) => {
+        const rec = {};
+        header.forEach((h, i) => { if (r[i] !== undefined && r[i] !== "") rec[h] = r[i]; });
+        return rec;
+      }).filter((r) => r.name || r.phone);
+      let totals = { created: 0, duplicates: 0, skipped_no_phone: 0 };
+      for (let i = 0; i < records.length; i += 100) {
+        const { data } = await api.post("/ingest/gmaps", { records: records.slice(i, i + 100) },
+          { headers: { "X-Ingest-Key": ingestKey.trim() } });
+        totals = {
+          created: totals.created + (data.created || 0),
+          duplicates: totals.duplicates + (data.duplicates || 0),
+          skipped_no_phone: totals.skipped_no_phone + (data.skipped_no_phone || 0),
+        };
+      }
+      setResult(totals);
+      toast.success(`Imported: ${totals.created} new · ${totals.duplicates} duplicates · ${totals.skipped_no_phone} without phone`);
+      onImported();
+    } catch (e) {
+      toast.error(errMsg(e, "Import failed"));
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" data-testid="gmaps-import-modal">
+      <div className="bg-white border border-gray-200 w-full max-w-md p-5 space-y-4">
+        <div className="font-chivo font-black text-lg">Import Google Maps CSV</div>
+        <p className="text-xs text-gray-500">
+          Upload a CSV from the Google Maps scraper. Each row becomes a Fragvansh lead
+          (source: Google Maps), tagged with its search keyword, round-robin assigned.
+          Rows without a phone number are skipped; existing numbers are left untouched.
+        </p>
+        <input type="file" accept=".csv,text/csv" onChange={(e) => setFile(e.target.files?.[0] || null)}
+          className="w-full border border-gray-300 px-2 py-2 text-sm" data-testid="gmaps-csv-input" />
+        <div>
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Ingest key</div>
+          <input value={ingestKey} onChange={(e) => setIngestKey(e.target.value)} placeholder="Auto-filled for admins"
+            className="w-full border border-gray-300 px-2 py-2 text-sm font-mono" data-testid="gmaps-key-input" />
+        </div>
+        {result && (
+          <div className="text-xs bg-gray-50 border border-gray-200 p-2 font-mono">
+            created: {result.created} · duplicates: {result.duplicates} · no phone: {result.skipped_no_phone}
+          </div>
+        )}
+        <div className="flex justify-end gap-2">
+          <button onClick={onClose} className="border border-gray-300 px-3 py-2 text-[10px] uppercase tracking-widest font-bold" disabled={busy}>Close</button>
+          <button onClick={run} disabled={busy || !file}
+            className="bg-[#7C3AED] hover:bg-[#6D28D9] text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50"
+            data-testid="gmaps-import-run">
+            {busy ? "Importing…" : "Import"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -475,8 +643,9 @@ function Kanban_({ leads, onOpen, execMap, onToggleStar }) {
                     <SourceBadge source={l.source} />
                   </div>
                   <div className="text-xs text-gray-500 mt-1 truncate">{l.requirement || "—"}</div>
-                  <div className="mt-2 flex items-center gap-2">
+                  <div className="mt-2 flex items-center gap-2 flex-wrap">
                     <EnquiryTypeBadge lead={l} />
+                    <AlsoInBadge lead={l} />
                     <div className="text-[10px] uppercase tracking-widest text-gray-400 font-bold">
                       {execMap[l.assigned_to]?.name || "Unassigned"}
                     </div>
