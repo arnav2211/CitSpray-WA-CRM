@@ -73,8 +73,9 @@ def other_company(company: str) -> str:
 
 def _resolve_company(user: Optional[dict], x_company: Optional[str]) -> str:
     """Company scope for a request: admins follow the X-Company header switcher;
-    everyone else is pinned to the company on their user record."""
-    if user and user.get("role") != "admin":
+    data-entry users do too (they enter leads FOR a chosen company but can't
+    read either book); everyone else is pinned to their own user.company."""
+    if user and user.get("role") not in ("admin", "data_entry"):
         return normalize_company(user.get("company"))
     return normalize_company(x_company)
 
@@ -2651,8 +2652,10 @@ async def _process_upload_task(
     target_assignee: Optional[str],
     source: Optional[str],
     override_date_str: Optional[str],
-    user_id: str
+    user_id: str,
+    company: Optional[str] = None,
 ):
+    company = normalize_company(company)
     imported_count = 0
     duplicate_count = 0
     error_count = 0
@@ -2697,7 +2700,7 @@ async def _process_upload_task(
             
         existing = None
         if canonical_phone:
-            existing = await _find_lead_by_phone(canonical_phone)
+            existing = await _find_lead_by_phone(canonical_phone, company=company)
             
         email = str(row.get("email")).strip() if (row.get("email") and not (isinstance(row.get("email"), float) and pd.isna(row.get("email")))) else None
         requirement = str(row.get("requirement")).strip() if (row.get("requirement") and not (isinstance(row.get("requirement"), float) and pd.isna(row.get("requirement")))) else None
@@ -2714,6 +2717,7 @@ async def _process_upload_task(
         gst_no = str(row.get("gst_no")).strip() if (row.get("gst_no") and not (isinstance(row.get("gst_no"), float) and pd.isna(row.get("gst_no")))) else None
         
         lead_payload = {
+            "company": company,
             "customer_name": cust_name,
             "phone": canonical_phone,
             "email": email,
@@ -2790,9 +2794,12 @@ async def upload_leads(
     source: Optional[str] = Form(None),
     month: Optional[int] = Form(None),
     year: Optional[int] = Form(None),
-    user: dict = Depends(get_current_user)
+    user: dict = Depends(get_current_user),
+    x_company: Optional[str] = Header(None, alias="X-Company"),
 ):
-    """Bulk upload leads from an Excel or CSV file."""
+    """Bulk upload leads from an Excel or CSV file. The whole file lands in the
+    active company (admins + data-entry pick it via the switcher)."""
+    company = _resolve_company(user, x_company)
     target_assignee = assigned_to
     if user["role"] == "executive":
         target_assignee = user["id"]
@@ -2893,7 +2900,8 @@ async def upload_leads(
         target_assignee,
         source,
         iso(override_date) if override_date else None,
-        user["id"]
+        user["id"],
+        company,
     )
     
     return {

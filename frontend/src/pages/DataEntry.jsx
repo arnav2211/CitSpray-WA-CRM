@@ -1,11 +1,13 @@
 import React, { useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
-import { FileArrowUp, Plus, Trash, DownloadSimple, CheckCircle, Warning, XCircle } from "@phosphor-icons/react";
+import { FileArrowUp, Plus, Trash, DownloadSimple, CheckCircle, Warning, XCircle, Buildings } from "@phosphor-icons/react";
+import { useCompany, COMPANIES } from "@/context/CompanyContext";
 
 const SOURCES = ["IndiaMART", "Justdial", "ExportersIndia", "Excel Upload", "Manual", "Web", "Others"];
 
 export default function DataEntry() {
+  const { company, companyLabel, canSwitch, setCompany } = useCompany();
   const [activeTab, setActiveTab] = useState("manual"); // "manual" or "bulk"
 
   // Manual Form State
@@ -173,6 +175,34 @@ export default function DataEntry() {
         <h1 className="font-chivo font-black text-2xl md:text-4xl text-gray-900">Lead Entry</h1>
         <p className="text-sm text-gray-500 mt-1">
           Manually enter leads or upload an Excel sheet. leads are automatically distributed via round-robin.
+        </p>
+      </div>
+
+      {/* Which company does this data belong to? Every lead entered/uploaded on
+          this page lands in the selected company only. */}
+      <div className={`border-2 p-4 ${company === "fragvansh" ? "border-[#7C3AED] bg-[#F5F3FF]" : "border-[#002FA7] bg-[#EAF1FF]"}`}
+        data-testid="dataentry-company-picker">
+        <div className="flex items-center gap-2 text-[10px] uppercase tracking-widest font-bold text-gray-600 mb-2">
+          <Buildings size={14} weight="bold" /> Uploading data for
+        </div>
+        {canSwitch ? (
+          <div className="flex gap-2">
+            {Object.entries(COMPANIES).map(([key, label]) => (
+              <button key={key} type="button" onClick={() => key !== company && setCompany(key)}
+                data-testid={`dataentry-company-${key}`}
+                className={`px-4 py-2 text-xs uppercase tracking-widest font-bold border-2 transition-colors ${
+                  company === key
+                    ? (key === "fragvansh" ? "bg-[#7C3AED] text-white border-[#7C3AED]" : "bg-[#002FA7] text-white border-[#002FA7]")
+                    : "bg-white border-gray-300 text-gray-500 hover:border-gray-900 hover:text-gray-900"}`}>
+                {company === key ? "✓ " : ""}{label}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="font-chivo font-bold">{companyLabel}</div>
+        )}
+        <p className="text-[11px] text-gray-500 mt-2">
+          Every lead you enter or upload below goes to <b>{companyLabel}</b> — double-check before starting.
         </p>
       </div>
 

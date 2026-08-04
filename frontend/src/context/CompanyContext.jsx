@@ -15,7 +15,9 @@ export function CompanyProvider({ children }) {
     return COMPANIES[v] ? v : "citspray";
   });
 
-  const isAdmin = user && user.role === "admin";
+  // Admins switch to VIEW either company; data-entry switches to choose which
+  // company they are ENTERING data for (they can't read either book anyway).
+  const isAdmin = user && (user.role === "admin" || user.role === "data_entry");
   const company = isAdmin ? stored : ((user && COMPANIES[user.company]) ? user.company : "citspray");
 
   const setCompany = useCallback((c) => {
