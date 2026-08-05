@@ -12,6 +12,68 @@ import { fmtIST } from "@/lib/format";
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
 const SOURCES = ["IndiaMART", "ExportersIndia", "Justdial", "Manual", "WhatsApp", "Website", "Export", "Google Maps"];
 
+// Compact label filter (Fragvansh): one small button that opens a searchable
+// multi-select — scraper keywords are long and numerous, a flat chip wall was
+// unusable. Match-any semantics; selections apply instantly, panel stays open
+// so several labels can be picked in one go.
+function LabelFilter({ allTags, selected, onChange }) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
+  const boxRef = React.useRef(null);
+
+  useEffect(() => {
+    const onDoc = (e) => { if (boxRef.current && !boxRef.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, []);
+
+  const ql = q.trim().toLowerCase();
+  const shown = allTags.filter(({ tag }) => !ql || tag.includes(ql));
+  const toggle = (tag) =>
+    onChange(selected.includes(tag) ? selected.filter((t) => t !== tag) : [...selected, tag]);
+
+  return (
+    <div className="relative inline-block" ref={boxRef} data-testid="leads-label-filter">
+      <button onClick={() => setOpen((v) => !v)}
+        className={`px-3 py-2 text-[10px] uppercase tracking-widest font-bold border flex items-center gap-1.5 ${
+          selected.length ? "bg-[#7C3AED] text-white border-[#7C3AED]" : "border-gray-300 text-gray-600 hover:border-[#7C3AED] hover:text-[#7C3AED] bg-white"}`}
+        data-testid="label-filter-btn">
+        Labels{selected.length ? ` (${selected.length})` : ""} <span className="text-[8px]">▼</span>
+      </button>
+      {open && (
+        <div className="absolute z-40 mt-1 w-80 max-w-[90vw] bg-white border border-gray-300 shadow-lg" data-testid="label-filter-panel">
+          <div className="p-2 border-b border-gray-200 flex items-center gap-2">
+            <MagnifyingGlass size={12} className="text-gray-400 shrink-0" />
+            <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search labels…"
+              className="flex-1 text-xs outline-none" data-testid="label-filter-search" />
+            {selected.length > 0 && (
+              <button onClick={() => onChange([])}
+                className="text-[10px] uppercase tracking-widest font-bold text-gray-400 hover:text-[#E60000] shrink-0"
+                data-testid="label-filter-clear">clear ({selected.length})</button>
+            )}
+          </div>
+          <div className="max-h-72 overflow-y-auto">
+            {shown.length === 0 && <div className="p-3 text-xs text-gray-400">No labels match</div>}
+            {shown.map(({ tag, count }) => {
+              const active = selected.includes(tag);
+              return (
+                <label key={tag}
+                  className="flex items-center gap-2 px-3 py-2 text-xs cursor-pointer hover:bg-gray-50 border-b border-gray-100"
+                  data-testid={`label-filter-opt-${tag}`}>
+                  <input type="checkbox" checked={active} onChange={() => toggle(tag)}
+                    className="rounded border-gray-300 text-[#7C3AED] focus:ring-[#7C3AED] shrink-0" />
+                  <span className={`flex-1 ${active ? "font-bold text-[#7C3AED]" : "text-gray-700"}`}>{tag}</span>
+                  <span className="text-gray-400 shrink-0">({count})</span>
+                </label>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Inline follow-up urgency chip for a lead row: red=overdue, amber=due, blue=upcoming.
 function FollowupChip({ lead }) {
   if (!lead.followup_due_at) return null;
@@ -251,28 +313,9 @@ export default function Leads() {
         </div>
       </div>
 
-      {/* Tag filter (Fragvansh labels) — toggle chips, match-any */}
+      {/* Label filter (Fragvansh) — compact searchable multi-select dropdown */}
       {isFragvansh && allTags.length > 0 && (
-        <div className="border border-gray-200 bg-white p-3 flex items-center gap-1.5 flex-wrap" data-testid="leads-tag-filter">
-          <span className="text-[10px] uppercase tracking-widest text-gray-400 font-bold mr-1">Labels:</span>
-          {allTags.map(({ tag, count }) => {
-            const active = tagFilter.includes(tag);
-            return (
-              <button key={tag}
-                onClick={() => setTagFilter((prev) => active ? prev.filter((t) => t !== tag) : [...prev, tag])}
-                className={`px-2 py-1 text-[10px] uppercase tracking-widest font-bold border transition-colors ${
-                  active ? "bg-[#7C3AED] text-white border-[#7C3AED]" : "border-gray-300 text-gray-600 hover:border-[#7C3AED] hover:text-[#7C3AED]"}`}
-                data-testid={`tag-filter-${tag}`}>
-                {active ? "✓ " : ""}{tag} <span className="opacity-60">({count})</span>
-              </button>
-            );
-          })}
-          {tagFilter.length > 0 && (
-            <button onClick={() => setTagFilter([])}
-              className="px-2 py-1 text-[10px] uppercase tracking-widest font-bold text-gray-400 hover:text-gray-900"
-              data-testid="tag-filter-clear">clear</button>
-          )}
-        </div>
+        <LabelFilter allTags={allTags} selected={tagFilter} onChange={setTagFilter} />
       )}
 
       {view === "table" ? (
