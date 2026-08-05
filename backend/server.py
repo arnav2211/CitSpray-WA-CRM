@@ -2098,8 +2098,11 @@ async def _find_lead_by_phone(phone: str, exclude_id: Optional[str] = None, comp
     pattern = phone_match_pattern(phone)
     if not pattern:
         return None
+    # company_filter (not plain equality) so a doc that was created without the
+    # company stamp still matches for CitSpray — a missed stamp must never cause
+    # duplicate leads to cascade (bug seen 2026-08-05 with calling-app sync).
     query: Dict[str, Any] = {
-        "company": normalize_company(company),
+        "$and": [company_filter(company)],
         "$or": [
             {"phone": {"$regex": pattern}},
             {"phones": {"$regex": pattern}},
@@ -3408,15 +3411,17 @@ async def list_lead_calls(lead_id: str, user: dict = Depends(get_current_user)):
 
 
 @api.post("/calls/sync-batch")
-async def sync_call_batch(body: CallSyncBatchInput, user: dict = Depends(get_current_user)):
+async def sync_call_batch(body: CallSyncBatchInput, user: dict = Depends(get_current_user),
+                          x_company: Optional[str] = Header(None, alias="X-Company")):
     # Only allow executives or admin
     if user["role"] == "data_entry":
         raise HTTPException(status_code=403, detail="Access denied")
-    
+
+    company = _resolve_company(user, x_company)
     synced_count = 0
     matched_count = 0
     reassigned_count = 0
-    
+
     for record in body.logs:
         norm = normalize_phone_display(record.phone)
         if not norm:
@@ -3435,11 +3440,14 @@ async def sync_call_batch(body: CallSyncBatchInput, user: dict = Depends(get_cur
                 else:
                     outcome = "no_response"
             
-        lead = await _find_lead_by_phone(norm)
+        # A "New Call Lead" may ONLY be created when the number truly does not
+        # exist in LeadOrbit — repeated calls must stack on the existing lead.
+        lead = await _find_lead_by_phone(norm, company=company)
         if not lead:
             lead_id = str(uuid.uuid4())
             lead_doc = {
                 "id": lead_id,
+                "company": company,
                 "phone": norm,
                 "customer_name": f"New Call Lead {norm}",
                 "status": "new",
