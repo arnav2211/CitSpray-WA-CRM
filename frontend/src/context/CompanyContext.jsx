@@ -24,9 +24,11 @@ export function CompanyProvider({ children }) {
     if (!COMPANIES[c]) return;
     localStorage.setItem("active_company", c);
     setStored(c);
-    // Simplest correct scope-flip: every page refetches everything under the new
-    // company header, and no stale cross-company state can linger anywhere.
-    window.location.reload();
+    // Scope-flip = full reload WITHOUT the query string: params like ?lead=<id>
+    // deep-link into the other company's data (e.g. /chat kept showing the
+    // previously open conversation after switching). Dropping the query resets
+    // every page cleanly under the new X-Company header.
+    window.location.href = window.location.pathname;
   }, []);
 
   return (

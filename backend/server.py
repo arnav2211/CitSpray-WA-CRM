@@ -5765,10 +5765,12 @@ async def search_messages(
 
 
 @api.get("/inbox/conversations/{lead_id}")
-async def get_one_conversation(lead_id: str, user: dict = Depends(get_current_user)):
+async def get_one_conversation(lead_id: str, user: dict = Depends(get_current_user),
+                               x_company: Optional[str] = Header(None, alias="X-Company")):
     """Fetch a single conversation row — used by the chat UI when the user
     deep-links / clicks a search hit and the lead isn't in the current paginated
-    page. RBAC matches the list endpoint."""
+    page. RBAC matches the list endpoint. Scoped to the active company so a
+    stale ?lead= link can't surface the other company's chat after switching."""
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
@@ -5776,6 +5778,8 @@ async def get_one_conversation(lead_id: str, user: dict = Depends(get_current_us
         raise HTTPException(status_code=403, detail="Not allowed")
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not allowed")
+    if normalize_company(lead.get("company")) != _resolve_company(user, x_company):
+        raise HTTPException(status_code=404, detail="Lead belongs to the other company — switch companies to view it")
     last = await db.messages.find_one({"lead_id": lead_id}, {"_id": 0}, sort=[("at", -1)])
     unread = await db.messages.count_documents({"lead_id": lead_id, "direction": "in", "read": {"$ne": True}})
     last_in_at = None
