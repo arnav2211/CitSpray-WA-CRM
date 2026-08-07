@@ -3472,6 +3472,14 @@ async def sync_call_batch(body: CallSyncBatchInput, user: dict = Depends(get_cur
             await db.leads.insert_one(lead_doc)
             await log_activity(user["id"], "lead_created", lead_id, {"source": "Auto-Created", "phone": norm})
             lead = lead_doc
+            # Fragvansh only (owner decision 2026-08-07): numbers first seen via a
+            # telecaller's dialed call get the welcome template too. CitSpray's
+            # call-sync behavior is unchanged — its New Call Leads never welcomed.
+            if company != DEFAULT_COMPANY:
+                try:
+                    await auto_send_whatsapp_on_create(lead)
+                except Exception as e:
+                    logger.warning(f"calls-sync auto whatsapp failed: {e}")
 
         # Duplicate check (same phone, same user, same timestamp or duration-adjusted matching)
         existing_logs = await db.call_logs.find({
@@ -6816,9 +6824,9 @@ async def ingest_gmaps(body: GmapsIngestInput, request: Request):
                             ("keyword", "category", "website", "rating", "reviews", "hours", "plus_code", "maps_url")
                             if rec.get(k)},
             "dedup_hash": _lead_dedup_hash(name, None, norm),
-            # Scraped numbers must never get the WhatsApp welcome blast — the
-            # telecaller makes first contact by phone.
-            "_suppress_auto_welcome": True,
+            # Scraped leads DO get the Fragvansh welcome template (owner decision
+            # 2026-08-07: every new Fragvansh lead, all sources). The template is
+            # only sent at all when the company has a default configured.
         }
         lead = await _create_lead_internal(data, by_user_id=None)
         created_ids.append(lead["id"])
