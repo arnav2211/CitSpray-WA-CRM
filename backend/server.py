@@ -2095,17 +2095,28 @@ async def _find_lead_by_phone(phone: str, exclude_id: Optional[str] = None, comp
     companies (deliberately no cross-company dedup)."""
     if not phone:
         return None
-    pattern = phone_match_pattern(phone)
-    if not pattern:
+    digits = re.sub(r"\D+", "", phone or "")
+    if not digits:
         return None
+    # Stored phones are canonical (normalize_phone_display + the startup
+    # `_phones_canonicalized` migration): Indian -> bare 10-digit, everything
+    # else -> "+<digits>". So instead of an unanchored suffix $regex — which
+    # cannot use the phone/phones indexes and collection-scans all leads on
+    # EVERY lookup (this melted the VPS on 2026-08-07 when the calling apps
+    # sync-batched dozens of numbers concurrently) — match the exact canonical
+    # candidates with $in, which is a straight index hit.
+    if len(digits) >= 10:
+        candidates = [digits[-10:], digits, "+" + digits]
+    else:
+        candidates = [digits, "+" + digits]
     # company_filter (not plain equality) so a doc that was created without the
     # company stamp still matches for CitSpray — a missed stamp must never cause
     # duplicate leads to cascade (bug seen 2026-08-05 with calling-app sync).
     query: Dict[str, Any] = {
         "$and": [company_filter(company)],
         "$or": [
-            {"phone": {"$regex": pattern}},
-            {"phones": {"$regex": pattern}},
+            {"phone": {"$in": candidates}},
+            {"phones": {"$in": candidates}},
         ],
     }
     if exclude_id:
@@ -11974,6 +11985,9 @@ async def seed_data():
     await db.messages.create_index("lead_id")
     await db.messages.create_index([("lead_id", 1), ("at", -1)])
     await db.messages.create_index("wamid")
+    # Daily-calls / activity reports run distinct(lead_id) filtered by sender+
+    # direction+time window — without this it is a full collection scan.
+    await db.messages.create_index([("by_user_id", 1), ("direction", 1), ("at", 1)])
     await db.followups.create_index("executive_id")
     await db.followups.create_index("due_at")
     await db.activity_logs.create_index("lead_id")
@@ -11981,6 +11995,8 @@ async def seed_data():
     await db.quick_replies.create_index("title")
     await db.call_logs.create_index([("lead_id", 1), ("at", -1)])
     await db.call_logs.create_index([("by_user_id", 1), ("at", -1)])
+    # calls sync-batch dedupes on (phone, by_user_id) sorted by at.
+    await db.call_logs.create_index([("phone", 1), ("by_user_id", 1), ("at", -1)])
     await db.call_logs.create_index("outcome")
     await db.chat_flows.create_index("is_active")
     await db.chat_nodes.create_index([("flow_id", 1), ("is_start_node", -1)])
