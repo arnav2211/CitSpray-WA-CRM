@@ -1962,6 +1962,12 @@ async def assign_lead(lead_id: str, target_user_id: Optional[str] = None, by_use
         user = await db.users.find_one({"id": target_user_id, "active": True})
         if not user:
             raise HTTPException(status_code=400, detail="Target executive not found/active")
+        # HARD company wall (owner rule): a lead may never be assigned to an
+        # executive of the other company, no matter which endpoint asked.
+        if user.get("role") == "executive":
+            _tgt_lead = await db.leads.find_one({"id": lead_id}, {"_id": 0, "company": 1})
+            if _tgt_lead is not None and normalize_company(user.get("company")) != normalize_company(_tgt_lead.get("company")):
+                raise HTTPException(status_code=400, detail="Executive belongs to the other company — cross-company assignment is not allowed")
         chosen_id = target_user_id
     else:
         # Auto-pick rotates within the lead's own company pool.
@@ -3607,15 +3613,18 @@ class CallEventInput(BaseModel):
 
 
 @api.post("/calls/events")
-async def report_call_event(body: CallEventInput, user: dict = Depends(get_current_user)):
+async def report_call_event(body: CallEventInput, user: dict = Depends(get_current_user),
+                            x_company: Optional[str] = Header(None, alias="X-Company")):
     if user["role"] == "data_entry":
         raise HTTPException(status_code=403, detail="Access denied")
-        
+
     norm = normalize_phone_display(body.phone)
     if not norm:
         raise HTTPException(status_code=400, detail="Invalid phone number")
-        
-    lead = await _find_lead_by_phone(norm)
+
+    # Scope to the caller's company — a Fragvansh exec's call event must never
+    # attach to (or reveal) a CitSpray lead with the same number.
+    lead = await _find_lead_by_phone(norm, company=_resolve_company(user, x_company))
     if not lead:
         return {"success": True, "detail": "Lead not found, event skipped"}
         
@@ -5871,7 +5880,8 @@ async def mark_thread_read(lead_id: str, user: dict = Depends(get_current_user))
 
 
 @api.post("/inbox/start-chat")
-async def start_chat(body: StartChatInput, user: dict = Depends(get_current_user)):
+async def start_chat(body: StartChatInput, user: dict = Depends(get_current_user),
+                     x_company: Optional[str] = Header(None, alias="X-Company")):
     phone = normalize_phone_display((body.phone or "").strip())
     if not phone:
         raise HTTPException(status_code=400, detail="Phone is required")
@@ -5879,7 +5889,12 @@ async def start_chat(body: StartChatInput, user: dict = Depends(get_current_user
     if len(digits) < 10:
         raise HTTPException(status_code=400, detail="Phone must contain at least 10 digits")
     suffix = digits[-10:]
-    existing = await _find_lead_by_phone(phone)
+    # Company-scoped: a Fragvansh exec starting a chat must create/find the lead
+    # in FRAGVANSH — this endpoint predated multi-company and silently dropped
+    # every started chat into CitSpray (bug seen 2026-08-08: Prachi's manual
+    # chats landed in the CitSpray book).
+    company = _resolve_company(user, x_company)
+    existing = await _find_lead_by_phone(phone, company=company)
     if existing:
         # Same exec or admin → return so caller can open it
         if user["role"] == "admin" or existing.get("assigned_to") == user["id"] or not existing.get("assigned_to"):
@@ -5904,6 +5919,7 @@ async def start_chat(body: StartChatInput, user: dict = Depends(get_current_user
         "phone": phone,
         "requirement": body.requirement or "",
         "source": "Manual",
+        "company": company,
         "dedup_hash": _lead_dedup_hash(body.customer_name or "manual", iso(now_utc()), suffix),
         "assigned_to": target_assignee,
         "has_whatsapp": True,
