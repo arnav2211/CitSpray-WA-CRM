@@ -7092,6 +7092,116 @@ async def webhook_indiamart_recent(admin: dict = Depends(require_admin), limit: 
     ).sort("received_at", -1).to_list(limit)
     return docs
 
+# ------------- JustDial API webhook -------------
+# JD pushes ONE lead per HTTP call (GET query-string, POST form, or POST JSON)
+# and requires the literal plain-text response body "RECEIVED". All three JD
+# accounts point at the SAME URL; every payload carries `parentid` (the JD
+# contract id), which is the authoritative company router:
+_JUSTDIAL_PARENT_COMPANY = {
+    "PX712.X712.260602013210.J1G3": ("fragvansh", "Fragvansh"),
+    "PX712.X712.210512133109.Z4H5": ("citspray", "Mangalam Citspray Fragances"),
+    "PX712.X712.170818095006.L7G4": ("citspray", "Citspray Aroma Sciences"),
+}
+
+async def _extract_justdial_params(request: Request) -> dict:
+    """JD may send GET params, urlencoded form, or a JSON object — merge them all
+    (query first, body wins) into one lower-cased dict of strings."""
+    params: Dict[str, Any] = dict(request.query_params)
+    if request.method == "POST":
+        ctype = (request.headers.get("content-type") or "").lower()
+        try:
+            if "json" in ctype:
+                body = await request.json()
+                if isinstance(body, dict):
+                    params.update(body)
+            else:
+                form = await request.form()
+                params.update(dict(form))
+        except Exception:
+            pass  # malformed body — the query params (if any) still count
+    return {str(k).strip().lower(): ("" if v is None else str(v).strip()) for k, v in params.items()}
+
+async def _process_justdial_lead(params: dict, raw_id: str) -> None:
+    """Runs AFTER the 'RECEIVED' response is already on the wire — JD must never
+    see a slow or failed response because of our own processing."""
+    try:
+        parentid = params.get("parentid") or ""
+        company, jd_account = _JUSTDIAL_PARENT_COMPANY.get(parentid, (DEFAULT_COMPANY, None))
+        name = " ".join(x for x in (params.get("prefix"), params.get("name")) if x).strip() or "Justdial Buyer"
+        mobile = params.get("mobile") or ""
+        landline = params.get("phone") or ""
+        phone = mobile or landline
+        leadid = params.get("leadid") or ""
+        # Idempotency on JD's own lead id: JD retries the HTTP call when it doesn't
+        # see "RECEIVED" in time — a replayed leadid must be a no-op, not a
+        # repeat-enquiry bump.
+        if leadid:
+            already = await db.leads.find_one(
+                {"company": company, "source_data.leadid": leadid}, {"_id": 0, "id": 1}
+            )
+            if already:
+                await db.webhook_payloads.update_one(
+                    {"id": raw_id}, {"$set": {"processed": True, "lead_ids": [already["id"]], "jd_retry": True}}
+                )
+                return
+        lead_ts = " ".join(x for x in (params.get("date"), params.get("time")) if x) or iso(now_utc())
+        data = {
+            "company": company,
+            "customer_name": name,
+            "phone": phone,
+            "phones": [landline] if (mobile and landline) else [],
+            "email": params.get("email") or None,
+            "requirement": params.get("category") or None,
+            "area": params.get("area") or None,
+            "city": params.get("city") or None,
+            "source": "Justdial",
+            "source_data": {
+                **params,
+                "via": "justdial_api",
+                **({"jd_account": jd_account} if jd_account else {"jd_account_unmatched_parentid": parentid}),
+            },
+            "dedup_hash": _lead_dedup_hash(name, lead_ts, leadid or phone),
+        }
+        lead = await _create_lead_internal(data, by_user_id=None)
+        await db.webhook_payloads.update_one(
+            {"id": raw_id}, {"$set": {"processed": True, "lead_ids": [lead["id"]]}}
+        )
+    except Exception as e:
+        logger.exception(f"JustDial webhook processing failed: {e}")
+        await db.webhook_payloads.update_one(
+            {"id": raw_id}, {"$set": {"processed": False, "error": str(e)[:300]}}
+        )
+
+@api.get("/webhooks/justdial")
+@api.post("/webhooks/justdial")
+async def webhook_justdial(request: Request):
+    params = await _extract_justdial_params(request)
+    parentid = params.get("parentid") or ""
+    company, _ = _JUSTDIAL_PARENT_COMPANY.get(parentid, (DEFAULT_COMPANY, None))
+    raw = {
+        "id": str(uuid.uuid4()),
+        "source": "Justdial",
+        "identifier": parentid or None,
+        "company": company,
+        "payload": params,
+        "received_at": iso(now_utc()),
+        "processed": False,
+    }
+    await db.webhook_payloads.insert_one(raw.copy())
+    # A ping / configuration test with no lead content: acknowledge, create nothing.
+    if params.get("mobile") or params.get("phone") or params.get("leadid"):
+        asyncio.create_task(_process_justdial_lead(params, raw["id"]))
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse("RECEIVED")
+
+@api.get("/webhooks/justdial/_debug/recent")
+async def webhook_justdial_recent(admin: dict = Depends(require_admin), limit: int = 20):
+    """Admin-only: inspect last N raw JustDial webhook payloads."""
+    docs = await db.webhook_payloads.find(
+        {"source": "Justdial"}, {"_id": 0}
+    ).sort("received_at", -1).to_list(limit)
+    return docs
+
 # ------------- Shopify (citspray.com website) webhooks -------------
 # Orders placed on the Shopify storefront flow into the CRM as source="Website"
 # leads (round-robin assigned so executives can call), and the customer receives
