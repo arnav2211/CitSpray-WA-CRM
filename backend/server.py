@@ -1872,10 +1872,25 @@ async def _pick_buyleads_executive(source: str, company: Optional[str] = None) -
     eligible.sort(key=lambda e: e["username"])
     # Round-robin on a stored username pointer per source (robust to the
     # eligible set changing between calls — see pick_next_executive).
+    # Pointer advance is ATOMIC (CAS + retry) for the same reason as
+    # pick_next_executive: concurrent workers must not double-serve one exec.
     ptr_doc = await db.buyleads_routing.find_one({"source": src_key}, {"_id": 0, "last_assigned_username": 1})
     last_uname = (ptr_doc or {}).get("last_assigned_username") or ""
-    chosen = next((e for e in eligible if e["username"] > last_uname), eligible[0])
-    await db.buyleads_routing.update_one({"source": src_key}, {"$set": {"last_assigned_username": chosen["username"]}}, upsert=True)
+    if len(eligible) == 1:
+        chosen = eligible[0]
+        await db.buyleads_routing.update_one({"source": src_key}, {"$set": {"last_assigned_username": chosen["username"]}}, upsert=True)
+        return chosen
+    for _ in range(6):
+        chosen = next((e for e in eligible if e["username"] > last_uname), eligible[0])
+        res = await db.buyleads_routing.update_one(
+            {"source": src_key,
+             "$or": [{"last_assigned_username": last_uname}] + ([{"last_assigned_username": {"$exists": False}}, {"last_assigned_username": None}] if not last_uname else [])},
+            {"$set": {"last_assigned_username": chosen["username"]}},
+        )
+        if res.modified_count:
+            return chosen
+        ptr_doc = await db.buyleads_routing.find_one({"source": src_key}, {"_id": 0, "last_assigned_username": 1})
+        last_uname = (ptr_doc or {}).get("last_assigned_username") or ""
     return chosen
 
 
@@ -1941,10 +1956,32 @@ async def pick_next_executive(exclude_user_id: Optional[str] = None, company: Op
     else:
         ptr_doc = await db.routing_rules.find_one({"key": ptr_key}, {"_id": 0, "last_assigned_username": 1})
         last_uname = ((ptr_doc or {}).get("last_assigned_username") or "")
-    chosen = next((e for e in eligible if e["username"] > last_uname), eligible[0])
-    await db.routing_rules.update_one(
-        {"key": ptr_key}, {"$set": {"last_assigned_username": chosen["username"]}}, upsert=True
-    )
+    if len(eligible) == 1:
+        # No rotation possible; skip the CAS loop (it can never advance the pointer
+        # to a different value, which would spin below).
+        chosen = eligible[0]
+        await db.routing_rules.update_one(
+            {"key": ptr_key}, {"$set": {"last_assigned_username": chosen["username"]}}, upsert=True
+        )
+        return chosen
+    # ATOMIC pointer advance (compare-and-swap). The naive read-then-write let two
+    # gunicorn workers processing near-simultaneous leads (e.g. IndiaMART webhook +
+    # buyleads pull) read the same pointer and BOTH pick the same executive —
+    # seen 2026-08-10: Varsha got two leads in the same minute. If another worker
+    # advanced the pointer between our read and write, re-read and re-pick.
+    await db.routing_rules.update_one({"key": ptr_key}, {"$setOnInsert": {"_ptr": True}}, upsert=True)
+    for _ in range(6):
+        chosen = next((e for e in eligible if e["username"] > last_uname), eligible[0])
+        res = await db.routing_rules.update_one(
+            {"key": ptr_key,
+             "$or": [{"last_assigned_username": last_uname}] + ([{"last_assigned_username": {"$exists": False}}, {"last_assigned_username": None}] if not last_uname else [])},
+            {"$set": {"last_assigned_username": chosen["username"]}},
+        )
+        if res.modified_count:
+            return chosen
+        ptr_doc = await db.routing_rules.find_one({"key": ptr_key}, {"_id": 0, "last_assigned_username": 1})
+        last_uname = ((ptr_doc or {}).get("last_assigned_username") or "")
+    # Contention never resolved after retries (pathological) — assign anyway.
     return chosen
 
 async def log_activity(actor_id: Optional[str], action: str, lead_id: Optional[str] = None, meta: Optional[dict] = None):
