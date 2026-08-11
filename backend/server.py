@@ -12039,6 +12039,11 @@ async def gmail_poll_task():
         cfg = await db.gmail_connections.find_one({"key": slot}, {"_id": 0})
         if not cfg:
             continue
+        # paused: connection kept (tokens intact, instantly resumable) but the
+        # mailbox is not polled — set when the JustDial API push replaced email
+        # ingestion (2026-08-11). Clear the flag to resume.
+        if cfg.get("paused"):
+            continue
         if cfg.get("connection_type") != "imap" and not GMAIL_ENABLED:
             continue
         has_active_slots = True
