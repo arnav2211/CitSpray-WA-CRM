@@ -1753,7 +1753,14 @@ async def _is_user_available_by_attendance(user: dict) -> bool:
     - while the office is open: available only if punched IN today and NOT punched out
       (early punch-out closes their queue for the day);
     - outside office hours / Sundays / holidays: only the configured WFH pool
-      (e.g. Ankita & Anmol) receives leads."""
+      (e.g. Ankita & Anmol) receives leads.
+    Non-executives (admins / data-entry) are always available: they never punch
+    in on the fingerprint device, so the attendance lookup below would always
+    say "away" and callers would treat an admin-owned lead as abandoned — the
+    inbound-WhatsApp reassign kept pulling admin's leads away mid-conversation
+    (2026-08-20). _attendance_login_allowed already exempts them the same way."""
+    if user.get("role") != "executive":
+        return True
     cfg = await get_attendance_config()
     if not cfg.get("attendance_routing_enabled", True):
         return True
