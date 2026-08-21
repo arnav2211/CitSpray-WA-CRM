@@ -1149,14 +1149,9 @@ function SettingsTab() {
   // ON, nobody is blocked from the CRM and leads keep routing to everyone.
   const toggleBypass = async (enable) => {
     if (enable && !window.confirm(
-      "Turn OFF attendance checks for EVERYONE?
-
-" +
-      "Use this only when the punch-in device / WiFi is down.
-" +
-      "While it is on, all executives can log in and receive leads even without punching in.
-
-" +
+      "Turn OFF attendance checks for EVERYONE?\n\n" +
+      "Use this only when the punch-in device / WiFi is down.\n" +
+      "While it is on, all executives can log in and receive leads even without punching in.\n\n" +
       "Remember to turn it back off once the device is working."
     )) return;
     setSaving(true);
