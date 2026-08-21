@@ -1145,6 +1145,29 @@ function SettingsTab() {
     finally { setSaving(false); }
   };
 
+  // Emergency switch for when the punch-in device can't reach the cloud: while
+  // ON, nobody is blocked from the CRM and leads keep routing to everyone.
+  const toggleBypass = async (enable) => {
+    if (enable && !window.confirm(
+      "Turn OFF attendance checks for EVERYONE?
+
+" +
+      "Use this only when the punch-in device / WiFi is down.
+" +
+      "While it is on, all executives can log in and receive leads even without punching in.
+
+" +
+      "Remember to turn it back off once the device is working."
+    )) return;
+    setSaving(true);
+    try {
+      const { data } = await api.post("/attendance/bypass", { enabled: enable });
+      setCfg({ ...data, all_users: cfg.all_users });
+      toast.success(enable ? "Attendance bypassed for everyone" : "Attendance checks back ON");
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setSaving(false); }
+  };
+
   if (!cfg) return <div className="py-14 text-center"><Spinner size={28} className="animate-spin inline text-[#002FA7]" /></div>;
 
   const execs = (cfg.all_users || []).filter((u) => u.role === "executive");
@@ -1170,6 +1193,40 @@ function SettingsTab() {
         <h3 className="font-bold text-xs uppercase tracking-wider text-gray-500 mb-2 flex items-center gap-1.5">
           <Gear size={15} className="text-[#002FA7]" /> Attendance Rules
         </h3>
+
+        {cfg.attendance_bypass_all ? (
+          <div className="mb-4 border-2 border-amber-500 bg-amber-50 p-3">
+            <div className="flex items-start gap-2">
+              <Warning size={18} weight="fill" className="text-amber-600 shrink-0 mt-0.5" />
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-bold text-amber-900">Attendance bypassed for everyone</div>
+                <div className="text-[11px] text-amber-800 mt-0.5 leading-relaxed">
+                  Nobody is blocked from the CRM and leads route to all executives, punched in or not.
+                  {cfg.bypass_enabled_by && <> Turned on by <b>{cfg.bypass_enabled_by}</b></>}
+                  {cfg.bypass_enabled_at && <> on {new Date(cfg.bypass_enabled_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</>}.
+                  <br />Punches are still <b>not</b> recorded &mdash; adjust payroll for these days once the device is back.
+                </div>
+                <button onClick={() => toggleBypass(false)} disabled={saving}
+                  className="mt-2 px-3 py-1.5 text-[10px] font-bold uppercase tracking-widest bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-50">
+                  Turn bypass off
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="mb-4 border border-dashed border-gray-300 p-3 flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-sm font-semibold text-gray-800">Punch-in device down?</div>
+              <div className="text-[11px] text-gray-400 mt-0.5 leading-relaxed">
+                Bypass attendance for everyone so nobody is locked out and leads keep flowing.
+              </div>
+            </div>
+            <button onClick={() => toggleBypass(true)} disabled={saving}
+              className="shrink-0 px-3 py-1.5 text-[10px] font-bold uppercase tracking-widest border border-amber-500 text-amber-700 hover:bg-amber-50 disabled:opacity-50">
+              Bypass all
+            </button>
+          </div>
+        )}
         <Row label="Office timing" hint="Mon–Sat. Arrivals after start are 'late'; allowed till the grace time without penalty.">
           <div className="flex items-center gap-1 font-mono text-sm">
             <input type="time" value={cfg.office_start} onChange={(e) => save({ office_start: e.target.value })} className="border border-gray-300 px-1.5 py-1 text-xs" />

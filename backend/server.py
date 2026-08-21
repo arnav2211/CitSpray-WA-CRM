@@ -505,6 +505,8 @@ class AttendanceSettingsInput(BaseModel):
     wfh_pool_user_ids: Optional[List[str]] = None
     wfh_afterhours_enabled: Optional[bool] = None
     attendance_routing_enabled: Optional[bool] = None
+    attendance_login_lock: Optional[bool] = None
+    attendance_bypass_all: Optional[bool] = None
 
 
 class ReceiverNumbersInput(BaseModel):
@@ -1700,6 +1702,7 @@ ATTENDANCE_DEFAULTS = {
     "wfh_afterhours_enabled": True,
     "attendance_routing_enabled": True,  # master switch: gate lead assignment on punch-in status
     "attendance_login_lock": True,       # executives can only use the CRM while punched in
+    "attendance_bypass_all": False,      # EMERGENCY: device/WiFi down -> ignore attendance everywhere
 }
 
 
@@ -1712,6 +1715,9 @@ async def get_attendance_config() -> dict:
     # legacy fields kept for the device punch endpoints
     cfg["shift_start"] = doc.get("shift_start", cfg["office_start"])
     cfg["grace_period_minutes"] = doc.get("grace_period_minutes", 30)
+    # audit trail for the emergency bypass (who turned it on, when, why)
+    for k in ("bypass_enabled_at", "bypass_enabled_by", "bypass_reason"):
+        cfg[k] = doc.get(k)
     return cfg
 
 
@@ -1762,6 +1768,11 @@ async def _is_user_available_by_attendance(user: dict) -> bool:
     if user.get("role") != "executive":
         return True
     cfg = await get_attendance_config()
+    # Emergency bypass: the fingerprint device can't reach the cloud, so NOBODY
+    # has a punch-in on record. Treat everyone as present rather than starving
+    # the whole team of leads.
+    if cfg.get("attendance_bypass_all"):
+        return True
     if not cfg.get("attendance_routing_enabled", True):
         return True
     if user.get("bypass_attendance"):
@@ -1793,6 +1804,10 @@ async def _attendance_login_allowed(user: dict) -> Optional[dict]:
     if user.get("bypass_attendance"):
         return None
     cfg = await get_attendance_config()
+    # Emergency bypass (device/WiFi down): punches aren't reaching the cloud, so
+    # locking on "no punch-in today" would lock the entire team out of the CRM.
+    if cfg.get("attendance_bypass_all"):
+        return None
     if not cfg.get("attendance_login_lock", True):
         return None
     if user["id"] in (cfg.get("wfh_pool_user_ids") or []):
@@ -13389,6 +13404,39 @@ async def get_attendance_settings_ep(admin: dict = Depends(require_admin)):
     ).to_list(200)
     cfg["all_users"] = [u for u in users if u.get("username") not in ("scanner", "test_user")]
     return cfg
+
+
+class AttendanceBypassInput(BaseModel):
+    enabled: bool
+    reason: Optional[str] = None
+
+
+@api.post("/attendance/bypass")
+async def set_attendance_bypass_ep(body: AttendanceBypassInput, admin: dict = Depends(require_admin)):
+    """EMERGENCY switch for when the fingerprint device can't reach the cloud.
+
+    While ON, attendance is ignored everywhere: every executive can log in and
+    receives leads normally, regardless of punch-in status. It does NOT fabricate
+    attendance records — payroll still reads the real (missing) punches, so those
+    days need a manual payroll adjustment once the device is back.
+    """
+    patch: Dict[str, Any] = {
+        "attendance_bypass_all": bool(body.enabled),
+        "updated_by": admin["id"],
+        "updated_at": iso(now_utc()),
+    }
+    if body.enabled:
+        patch["bypass_enabled_at"] = iso(now_utc())
+        patch["bypass_enabled_by"] = admin.get("name") or admin.get("username")
+        patch["bypass_reason"] = (body.reason or "").strip() or "Punch-in device offline"
+    else:
+        patch["bypass_enabled_at"] = None
+        patch["bypass_enabled_by"] = None
+        patch["bypass_reason"] = None
+    await db.attendance_settings.update_one({"key": "general_settings"}, {"$set": patch}, upsert=True)
+    await log_activity(admin["id"], "attendance_bypass_enabled" if body.enabled else "attendance_bypass_disabled",
+                       None, {"reason": patch.get("bypass_reason")})
+    return await get_attendance_config()
 
 
 @api.put("/attendance/settings")
