@@ -12784,7 +12784,11 @@ def _load_gemini_keys() -> List[str]:
 
 GEMINI_API_KEYS = _load_gemini_keys()
 GEMINI_API_KEY = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""   # legacy alias
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
+# "gemini-flash-latest" is Google's rolling alias for the current flash model.
+# Pinning a version (e.g. gemini-2.0-flash) silently breaks the AI button the
+# day Google retires it -- which is exactly what happened on 2026-08-22.
+GEMINI_FALLBACK_MODEL = "gemini-flash-latest"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", GEMINI_FALLBACK_MODEL).strip() or GEMINI_FALLBACK_MODEL
 
 # A key that just returned a quota/permission error is benched for a while so
 # the next request doesn't waste a round-trip on it. In-memory per worker:
@@ -12827,44 +12831,54 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
         raise HTTPException(status_code=503, detail=(
             "AI is not configured yet. Get a FREE API key at aistudio.google.com/apikey "
             "and add GEMINI_API_KEYS=<key1,key2> to backend/.env, then reload."))
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    models = [GEMINI_MODEL] + ([GEMINI_FALLBACK_MODEL] if GEMINI_MODEL != GEMINI_FALLBACK_MODEL else [])
     gen_cfg: Dict[str, Any] = {"temperature": temperature, "maxOutputTokens": max_output_tokens}
     if json_mode:
         gen_cfg["responseMimeType"] = "application/json"
     payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gen_cfg}
     last_detail = "no response"
-    for key in keys:
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as cli:
-                resp = await cli.post(url, params={"key": key}, json=payload)
-        except Exception as e:
-            last_detail = f"network error: {e}"
-            continue
-        if resp.status_code == 200:
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        model_retired = False
+        for key in keys:
             try:
-                return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                async with httpx.AsyncClient(timeout=30.0) as cli:
+                    resp = await cli.post(url, params={"key": key}, json=payload)
             except Exception as e:
-                last_detail = f"unexpected response shape: {e}"
+                last_detail = f"network error: {e}"
                 continue
-        try:
-            err = (resp.json().get("error") or {})
-        except Exception:
-            err = {}
-        msg = err.get("message") or (resp.text or "")[:200]
-        last_detail = msg
-        if resp.status_code == 429:
-            # Per-minute limits recover in seconds; per-day quota is gone until
-            # Google's reset — bench accordingly instead of hammering the key.
-            per_day = "per day" in msg.lower() or "perday" in msg.lower().replace(" ", "")
-            _gemini_bench(key, 6 * 3600 if per_day else 90, "quota exhausted")
-            continue
-        if resp.status_code in (400, 403) and ("API_KEY" in msg.upper() or "PERMISSION" in msg.upper()
-                                               or "SUSPENDED" in msg.upper()):
-            _gemini_bench(key, 12 * 3600, "key rejected")
-            continue
-        if resp.status_code >= 500:
-            continue    # model overloaded — just try the next key
-        break           # genuine request error (bad prompt): another key won't help
+            if resp.status_code == 200:
+                try:
+                    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                except Exception as e:
+                    last_detail = f"unexpected response shape: {e}"
+                    continue
+            try:
+                err = (resp.json().get("error") or {})
+            except Exception:
+                err = {}
+            msg = err.get("message") or (resp.text or "")[:200]
+            last_detail = msg
+            if resp.status_code == 404:
+                # Model retired/unknown — no key can fix that; fall back to the alias.
+                model_retired = True
+                logger.warning(f"Gemini model {model} unavailable: {msg[:120]}")
+                break
+            if resp.status_code == 429:
+                # Per-minute limits recover in seconds; per-day quota is gone until
+                # Google's reset — bench accordingly instead of hammering the key.
+                per_day = "per day" in msg.lower() or "perday" in msg.lower().replace(" ", "")
+                _gemini_bench(key, 6 * 3600 if per_day else 90, "quota exhausted")
+                continue
+            if resp.status_code in (400, 403) and ("API_KEY" in msg.upper() or "PERMISSION" in msg.upper()
+                                                   or "SUSPENDED" in msg.upper()):
+                _gemini_bench(key, 12 * 3600, "key rejected")
+                continue
+            if resp.status_code >= 500:
+                continue    # model overloaded — just try the next key
+            break           # genuine request error (bad prompt): another key won't help
+        if not model_retired:
+            break           # the failure wasn't the model — don't retry with another one
     raise HTTPException(status_code=502, detail=f"Gemini error: {last_detail}")
 
 
