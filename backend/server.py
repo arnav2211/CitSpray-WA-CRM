@@ -15,6 +15,7 @@ import smtplib
 import ssl
 import asyncio
 import io
+import time
 from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal, Any, Dict
@@ -12768,8 +12769,104 @@ async def translate_text(body: TranslateRequest, user: dict = Depends(get_curren
 
 # ------------- AI Assistant (Gemini free tier) -------------
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+def _load_gemini_keys() -> List[str]:
+    """Gemini keys, in priority order. GEMINI_API_KEYS takes a comma-separated
+    list so several free-tier keys can share the load; GEMINI_API_KEY (single)
+    is still honoured for backwards compatibility. Duplicates are dropped."""
+    raw = os.environ.get("GEMINI_API_KEYS", "") or os.environ.get("GEMINI_API_KEY", "")
+    out: List[str] = []
+    for chunk in raw.replace(";", ",").split(","):
+        for k in chunk.split():          # also tolerates whitespace/newline separated
+            if k not in out:
+                out.append(k)
+    return out
+
+
+GEMINI_API_KEYS = _load_gemini_keys()
+GEMINI_API_KEY = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""   # legacy alias
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
+
+# A key that just returned a quota/permission error is benched for a while so
+# the next request doesn't waste a round-trip on it. In-memory per worker:
+# worst case each worker re-learns a dead key once.
+_GEMINI_BENCH: Dict[str, float] = {}      # key -> unix ts until which it is skipped
+_GEMINI_RR = {"i": 0}                     # round-robin cursor: spread load across keys
+
+
+def _gemini_mask(key: str) -> str:
+    return f"...{key[-6:]}" if len(key) > 6 else "***"
+
+
+def _gemini_bench(key: str, seconds: float, why: str) -> None:
+    _GEMINI_BENCH[key] = time.time() + seconds
+    logger.warning(f"Gemini key {_gemini_mask(key)} benched {int(seconds)}s ({why})")
+
+
+def _gemini_key_order() -> List[str]:
+    """Healthy keys first, starting at the round-robin cursor. If every key is
+    benched we still return them all — a stale bench must never mean 'no AI'."""
+    now = time.time()
+    healthy = [k for k in GEMINI_API_KEYS if _GEMINI_BENCH.get(k, 0) <= now]
+    pool = healthy or list(GEMINI_API_KEYS)
+    if not pool:
+        return []
+    start = _GEMINI_RR["i"] % len(pool)
+    _GEMINI_RR["i"] = (start + 1) % len(pool)
+    return pool[start:] + pool[:start]
+
+
+async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
+                           max_output_tokens: int = 500, json_mode: bool = True) -> str:
+    """Call Gemini, transparently rotating through the configured keys.
+
+    A key that is out of quota (429) or rejected (400/403 invalid key) is benched
+    and the next key is tried immediately, so one exhausted free-tier key never
+    takes the feature down. Returns the raw model text."""
+    keys = _gemini_key_order()
+    if not keys:
+        raise HTTPException(status_code=503, detail=(
+            "AI is not configured yet. Get a FREE API key at aistudio.google.com/apikey "
+            "and add GEMINI_API_KEYS=<key1,key2> to backend/.env, then reload."))
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    gen_cfg: Dict[str, Any] = {"temperature": temperature, "maxOutputTokens": max_output_tokens}
+    if json_mode:
+        gen_cfg["responseMimeType"] = "application/json"
+    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gen_cfg}
+    last_detail = "no response"
+    for key in keys:
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as cli:
+                resp = await cli.post(url, params={"key": key}, json=payload)
+        except Exception as e:
+            last_detail = f"network error: {e}"
+            continue
+        if resp.status_code == 200:
+            try:
+                return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            except Exception as e:
+                last_detail = f"unexpected response shape: {e}"
+                continue
+        try:
+            err = (resp.json().get("error") or {})
+        except Exception:
+            err = {}
+        msg = err.get("message") or (resp.text or "")[:200]
+        last_detail = msg
+        if resp.status_code == 429:
+            # Per-minute limits recover in seconds; per-day quota is gone until
+            # Google's reset — bench accordingly instead of hammering the key.
+            per_day = "per day" in msg.lower() or "perday" in msg.lower().replace(" ", "")
+            _gemini_bench(key, 6 * 3600 if per_day else 90, "quota exhausted")
+            continue
+        if resp.status_code in (400, 403) and ("API_KEY" in msg.upper() or "PERMISSION" in msg.upper()
+                                               or "SUSPENDED" in msg.upper()):
+            _gemini_bench(key, 12 * 3600, "key rejected")
+            continue
+        if resp.status_code >= 500:
+            continue    # model overloaded — just try the next key
+        break           # genuine request error (bad prompt): another key won't help
+    raise HTTPException(status_code=502, detail=f"Gemini error: {last_detail}")
+
 
 class AISuggestRequest(BaseModel):
     lead_id: str
@@ -12788,10 +12885,10 @@ async def ai_suggest(body: AISuggestRequest, user: dict = Depends(get_current_us
     Executives can only use it on their own leads."""
     if user["role"] == "data_entry":
         raise HTTPException(status_code=403, detail="Not allowed")
-    if not GEMINI_API_KEY:
+    if not GEMINI_API_KEYS:
         raise HTTPException(status_code=503, detail=(
             "AI is not configured yet. Get a FREE API key at aistudio.google.com/apikey "
-            "and add GEMINI_API_KEY=<key> to backend/.env, then restart."))
+            "and add GEMINI_API_KEYS=<key1,key2> to backend/.env, then reload."))
     lead = await db.leads.find_one({"id": body.lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
@@ -12829,18 +12926,8 @@ TASK: {brief}
 Rules: WhatsApp tone (short, warm, professional), Indian business English (Hinglish OK if the customer used it), no placeholders like [Name] — use what you know, max 60 words per option.
 Return STRICT JSON only: {{"suggestions": ["option 1", "option 2"]}}"""
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     try:
-        async with httpx.AsyncClient(timeout=30.0) as cli:
-            resp = await cli.post(url, params={"key": GEMINI_API_KEY}, json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.7, "maxOutputTokens": 500, "responseMimeType": "application/json"},
-            })
-        if resp.status_code != 200:
-            detail = (resp.json().get("error", {}) or {}).get("message", resp.text[:200]) if resp.text else str(resp.status_code)
-            raise HTTPException(status_code=502, detail=f"Gemini error: {detail}")
-        data = resp.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        text = await _gemini_generate(prompt, temperature=0.7, max_output_tokens=500, json_mode=True)
         parsed = json.loads(text)
         suggestions = [s.strip() for s in (parsed.get("suggestions") or []) if isinstance(s, str) and s.strip()][:3]
         if not suggestions:
@@ -12854,7 +12941,14 @@ Return STRICT JSON only: {{"suggestions": ["option 1", "option 2"]}}"""
 
 @api.get("/ai/status")
 async def ai_status(user: dict = Depends(get_current_user)):
-    return {"configured": bool(GEMINI_API_KEY), "model": GEMINI_MODEL if GEMINI_API_KEY else None}
+    now = time.time()
+    healthy = [k for k in GEMINI_API_KEYS if _GEMINI_BENCH.get(k, 0) <= now]
+    return {
+        "configured": bool(GEMINI_API_KEYS),
+        "model": GEMINI_MODEL if GEMINI_API_KEYS else None,
+        "keys_total": len(GEMINI_API_KEYS),
+        "keys_healthy": len(healthy),
+    }
 
 # ------------- Android app self-update -------------
 # The LeadOrbit app polls this on launch. Publish a new version by dropping
