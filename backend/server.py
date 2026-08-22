@@ -12787,8 +12787,10 @@ GEMINI_API_KEY = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""   # legacy alias
 # "gemini-flash-latest" is Google's rolling alias for the current flash model.
 # Pinning a version (e.g. gemini-2.0-flash) silently breaks the AI button the
 # day Google retires it -- which is exactly what happened on 2026-08-22.
-GEMINI_FALLBACK_MODEL = "gemini-flash-latest"
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", GEMINI_FALLBACK_MODEL).strip() or GEMINI_FALLBACK_MODEL
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip() or "gemini-3.6-flash"
+# Tried in order when the one before is retired (404) or overloaded (5xx on every
+# key): the rolling alias survives retirements, 2.5-flash is the stable backstop.
+GEMINI_FALLBACK_MODELS = ["gemini-flash-latest", "gemini-2.5-flash"]
 
 # A key that just returned a quota/permission error is benched for a while so
 # the next request doesn't waste a round-trip on it. In-memory per worker:
@@ -12831,7 +12833,7 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
         raise HTTPException(status_code=503, detail=(
             "AI is not configured yet. Get a FREE API key at aistudio.google.com/apikey "
             "and add GEMINI_API_KEYS=<key1,key2> to backend/.env, then reload."))
-    models = [GEMINI_MODEL] + ([GEMINI_FALLBACK_MODEL] if GEMINI_MODEL != GEMINI_FALLBACK_MODEL else [])
+    models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
     gen_cfg: Dict[str, Any] = {"temperature": temperature, "maxOutputTokens": max_output_tokens}
     if json_mode:
         gen_cfg["responseMimeType"] = "application/json"
@@ -12840,6 +12842,7 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         model_retired = False
+        model_overloaded = False
         for key in keys:
             try:
                 async with httpx.AsyncClient(timeout=30.0) as cli:
@@ -12875,28 +12878,52 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
                 _gemini_bench(key, 12 * 3600, "key rejected")
                 continue
             if resp.status_code >= 500:
-                continue    # model overloaded — just try the next key
+                # "High demand" is model-side, not key-side; note it so we can
+                # move to the next model once the keys are exhausted.
+                model_overloaded = True
+                continue
             break           # genuine request error (bad prompt): another key won't help
-        if not model_retired:
+        if not (model_retired or model_overloaded):
             break           # the failure wasn't the model — don't retry with another one
     raise HTTPException(status_code=502, detail=f"Gemini error: {last_detail}")
 
 
 class AISuggestRequest(BaseModel):
     lead_id: str
-    intent: str = "reply"   # 'reply' | 'followup' | 'close_order'
-    extra: Optional[str] = None  # optional hint from the executive
+    intent: str = "reply"          # kept for backwards compatibility; unused
+    extra: Optional[str] = None    # optional hint from the executive
 
-_AI_INTENT_BRIEF = {
-    "reply": "Draft the next WhatsApp reply to the customer, moving the sale forward.",
-    "followup": "Draft a short, polite follow-up nudge — the customer has gone quiet.",
-    "close_order": "Draft a message that pushes to FINALIZE the order: confirm quantity, price, delivery and payment, and ask for the go-ahead.",
-}
+
+# How far back the assistant reads. Only the real human conversation is sent to
+# the model - templates and automated messages are stripped out, which keeps the
+# prompt small (cheaper on the free tier) and stops the AI from "replying" to
+# our own welcome blast.
+AI_CONTEXT_HOURS = 72
+
+
+def _ai_conversation_lines(msgs: List[dict]) -> List[str]:
+    """Human conversation only: drop our templates and automated sends."""
+    lines: List[str] = []
+    for m in msgs:
+        if m.get("direction") == "out":
+            if m.get("template_name"):
+                continue            # welcome / order / blast template
+            if not m.get("by_user_id"):
+                continue            # auto-reply sequence, chatbot flow, system message
+        text = (m.get("body") or m.get("caption") or "").strip()
+        if not text:
+            continue
+        who = "Customer" if m.get("direction") == "in" else "Us"
+        lines.append(who + ": " + text[:400])
+    return lines
+
 
 @api.post("/ai/suggest")
 async def ai_suggest(body: AISuggestRequest, user: dict = Depends(get_current_user)):
-    """Suggest 2 message drafts for a lead using Gemini (free tier).
-    Executives can only use it on their own leads."""
+    """Draft ONE reply for a lead from the recent human conversation.
+
+    The draft is only returned to the caller - nothing is sent to the customer.
+    The UI drops it into the composer for the executive to edit and send."""
     if user["role"] == "data_entry":
         raise HTTPException(status_code=403, detail="Not allowed")
     if not GEMINI_API_KEYS:
@@ -12909,49 +12936,72 @@ async def ai_suggest(body: AISuggestRequest, user: dict = Depends(get_current_us
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not your lead")
 
-    msgs = await db.messages.find(
-        {"lead_id": body.lead_id}, {"_id": 0, "direction": 1, "body": 1, "caption": 1, "at": 1}
-    ).sort("at", -1).to_list(25)
-    msgs.reverse()
-    convo_lines = []
-    for m in msgs:
-        text = (m.get("body") or m.get("caption") or "").strip()
-        if not text:
-            continue
-        who = "Customer" if m.get("direction") == "in" else "Us"
-        convo_lines.append(f"{who}: {text[:400]}")
-    convo = "\n".join(convo_lines[-25:]) or "(no WhatsApp conversation yet)"
+    NL = chr(10)
+    proj = {"_id": 0, "direction": 1, "body": 1, "caption": 1, "at": 1,
+            "template_name": 1, "by_user_id": 1}
+    since = iso(now_utc() - timedelta(hours=AI_CONTEXT_HOURS))
+    recent = await db.messages.find(
+        {"lead_id": body.lead_id, "at": {"$gte": since}}, proj).sort("at", 1).to_list(80)
+    convo_lines = _ai_conversation_lines(recent)
+    if not convo_lines:
+        # Nothing human in the window (e.g. only our welcome template went out) -
+        # fall back to the most recent real messages whenever they happened.
+        older = await db.messages.find({"lead_id": body.lead_id}, proj).sort("at", -1).to_list(60)
+        older.reverse()
+        convo_lines = _ai_conversation_lines(older)
+    convo = NL.join(convo_lines[-30:]) or "(no conversation yet - this is the first message)"
 
-    brief = _AI_INTENT_BRIEF.get(body.intent, _AI_INTENT_BRIEF["reply"])
-    prompt = f"""You are a sales assistant for CitSpray / Mangalam Agro, an Indian agro-products company selling citrus sprays and related products. An executive needs help writing a WhatsApp message to a customer.
+    if normalize_company(lead.get("company")) == "fragvansh":
+        biz = ("FragVansh, Nagpur - a B2B bulk supplier of industrial chemicals, essential oils "
+               "and fragrance/perfumery raw materials (GST invoice, pan-India supply)")
+    else:
+        biz = ("CitSpray / Mangalam Agro, an Indian company selling aroma chemicals, "
+               "essential oils, phenyl and related agro/fragrance products")
 
-LEAD:
-- Customer: {lead.get('customer_name') or 'Unknown'} ({lead.get('city') or ''} {lead.get('state') or ''})
-- Requirement: {(lead.get('requirement') or 'not specified')[:300]}
-- Lead status: {lead.get('status')} | Source: {lead.get('source')}
-- Last call outcome: {lead.get('last_call_outcome') or 'none'}
+    prompt = NL.join([
+        "You are helping a sales executive at " + biz + " write the next WhatsApp reply.",
+        "",
+        "LEAD",
+        "- Customer: " + str(lead.get("customer_name") or "Unknown")
+        + " (" + str(lead.get("city") or "") + " " + str(lead.get("state") or "") + ")",
+        "- Requirement: " + str(lead.get("requirement") or "not specified")[:300],
+        "- Status: " + str(lead.get("status")) + " | Source: " + str(lead.get("source")),
+        "- Last call outcome: " + str(lead.get("last_call_outcome") or "none"),
+        "",
+        "CONVERSATION (oldest first; our automated messages are not shown)",
+        convo,
+        "",
+        "TASK",
+        "Write the single best next reply for us to send - answer what the customer "
+        "actually asked and move the enquiry forward.",
+        ("Executive's note: " + body.extra.strip()) if body.extra else "",
+        "",
+        "RULES",
+        "- Reply with the message text ONLY. No options, no preamble, no quotes, no JSON, no markdown.",
+        "- WhatsApp tone: short, warm, professional Indian business English "
+        "(match Hinglish if the customer used it).",
+        "- Never invent prices, stock or delivery dates that are not in the conversation.",
+        "- No placeholders like [Name] - use what you actually know.",
+        "- Maximum 60 words.",
+    ])
 
-RECENT CONVERSATION:
-{convo}
+    raw = await _gemini_generate(prompt, temperature=0.7, max_output_tokens=300, json_mode=False)
+    suggestion = (raw or "").strip()
+    # Models sometimes wrap the answer in code fences or quotes despite the rules.
+    if suggestion.startswith("```"):
+        parts = suggestion.split("```")
+        suggestion = (parts[1] if len(parts) > 1 else parts[0]).strip()
+        if suggestion.lower().startswith("text"):
+            suggestion = suggestion[4:].strip()
+    q = chr(34)
+    if len(suggestion) > 1 and suggestion[0] == q and suggestion[-1] == q:
+        suggestion = suggestion[1:-1].strip()
+    if not suggestion:
+        raise HTTPException(status_code=502, detail="AI returned an empty draft - try again")
+    # `suggestions` kept so an older cached frontend keeps working.
+    return {"suggestion": suggestion, "suggestions": [suggestion],
+            "context_messages": len(convo_lines)}
 
-TASK: {brief}
-{('Executive note: ' + body.extra.strip()) if body.extra else ''}
-
-Rules: WhatsApp tone (short, warm, professional), Indian business English (Hinglish OK if the customer used it), no placeholders like [Name] — use what you know, max 60 words per option.
-Return STRICT JSON only: {{"suggestions": ["option 1", "option 2"]}}"""
-
-    try:
-        text = await _gemini_generate(prompt, temperature=0.7, max_output_tokens=500, json_mode=True)
-        parsed = json.loads(text)
-        suggestions = [s.strip() for s in (parsed.get("suggestions") or []) if isinstance(s, str) and s.strip()][:3]
-        if not suggestions:
-            raise ValueError("empty suggestions")
-        return {"suggestions": suggestions, "intent": body.intent}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"ai_suggest failed: {e}")
-        raise HTTPException(status_code=502, detail="AI suggestion failed — try again")
 
 @api.get("/ai/status")
 async def ai_status(user: dict = Depends(get_current_user)):
