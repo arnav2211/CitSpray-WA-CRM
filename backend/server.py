@@ -12894,22 +12894,61 @@ class AISuggestRequest(BaseModel):
     extra: Optional[str] = None    # optional hint from the executive
 
 
-# How far back the assistant reads. Only the real human conversation is sent to
-# the model - templates and automated messages are stripped out, which keeps the
-# prompt small (cheaper on the free tier) and stops the AI from "replying" to
-# our own welcome blast.
-AI_CONTEXT_HOURS = 72
+# How far back the assistant reads, measured BACKWARDS FROM THE LAST REAL
+# MESSAGE (customer or executive) rather than from "now" - a thread that went
+# quiet last week must still hand the model the whole exchange, not nothing.
+# Only the real human conversation is sent: templates and automated messages are
+# stripped out, which keeps the prompt small (cheaper on the free tier) and stops
+# the AI from "replying" to our own welcome blast.
+AI_CONTEXT_DAYS = 7
+
+
+def _ai_is_human_message(m: dict) -> bool:
+    """True only for real conversation. Everything we generated automatically is
+    excluded: welcome/order/blast templates, the auto-reply sequence, chatbot
+    flow replies. Fail-safe - a message is kept only when it carries an explicit
+    human sender, so any future automated path is excluded by default."""
+    if m.get("direction") == "in":
+        return True                 # the customer's own words
+    if m.get("template_name"):
+        return False                # any template, automatic or manually picked
+    if not m.get("by_user_id"):
+        return False                # sequence / flow / system send
+    return True
+
+
+def _ai_message_dt(m: dict) -> Optional[datetime]:
+    raw = m.get("at")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _ai_context_messages(msgs: List[dict]) -> List[dict]:
+    """The human messages worth sending to the model: everything within
+    AI_CONTEXT_DAYS of the MOST RECENT human message (not of 'now')."""
+    human = [m for m in msgs if _ai_is_human_message(m)]
+    if not human:
+        return []
+    anchor = None
+    for m in reversed(human):
+        anchor = _ai_message_dt(m)
+        if anchor:
+            break
+    if not anchor:
+        return human[-30:]
+    cutoff = anchor - timedelta(days=AI_CONTEXT_DAYS)
+    windowed = [m for m in human if (_ai_message_dt(m) or anchor) >= cutoff]
+    return windowed or human[-30:]
 
 
 def _ai_conversation_lines(msgs: List[dict]) -> List[str]:
-    """Human conversation only: drop our templates and automated sends."""
+    """Render the in-window human conversation for the prompt."""
     lines: List[str] = []
-    for m in msgs:
-        if m.get("direction") == "out":
-            if m.get("template_name"):
-                continue            # welcome / order / blast template
-            if not m.get("by_user_id"):
-                continue            # auto-reply sequence, chatbot flow, system message
+    for m in _ai_context_messages(msgs):
         text = (m.get("body") or m.get("caption") or "").strip()
         if not text:
             continue
@@ -12936,20 +12975,25 @@ async def ai_suggest(body: AISuggestRequest, user: dict = Depends(get_current_us
     if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
         raise HTTPException(status_code=403, detail="Not your lead")
 
+    # Outside the 24h customer-care window only a template may be sent, so a
+    # free-text draft is unusable - refuse rather than burn a request on it.
+    if not await _is_within_24h_window(lead):
+        raise HTTPException(status_code=409, detail={
+            "code": "outside_24h_window",
+            "message": "The 24-hour window is closed for this chat - only a template can be sent, "
+                       "so an AI draft cannot be used.",
+        })
+
     NL = chr(10)
     proj = {"_id": 0, "direction": 1, "body": 1, "caption": 1, "at": 1,
             "template_name": 1, "by_user_id": 1}
-    since = iso(now_utc() - timedelta(hours=AI_CONTEXT_HOURS))
+    # Pull a generous recent slice; _ai_context_messages then keeps the 7 days
+    # ending at the last real message.
     recent = await db.messages.find(
-        {"lead_id": body.lead_id, "at": {"$gte": since}}, proj).sort("at", 1).to_list(80)
+        {"lead_id": body.lead_id}, proj).sort("at", -1).to_list(150)
+    recent.reverse()
     convo_lines = _ai_conversation_lines(recent)
-    if not convo_lines:
-        # Nothing human in the window (e.g. only our welcome template went out) -
-        # fall back to the most recent real messages whenever they happened.
-        older = await db.messages.find({"lead_id": body.lead_id}, proj).sort("at", -1).to_list(60)
-        older.reverse()
-        convo_lines = _ai_conversation_lines(older)
-    convo = NL.join(convo_lines[-30:]) or "(no conversation yet - this is the first message)"
+    convo = NL.join(convo_lines[-40:]) or "(no conversation yet - this is the first message)"
 
     if normalize_company(lead.get("company")) == "fragvansh":
         biz = ("FragVansh, Nagpur - a B2B bulk supplier of industrial chemicals, essential oils "

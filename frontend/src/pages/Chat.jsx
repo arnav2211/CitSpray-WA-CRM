@@ -714,6 +714,9 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   // into the composer. It never sends: the executive edits and hits send.
   const askAI = async () => {
     if (aiLoading) return;
+    // Outside the 24h window only a template can be sent, so a free-text draft
+    // would be unusable - don't spend an AI request on it.
+    if (!within24h) { toast.error("24-hour window closed - send a template instead"); return; }
     setAiLoading(true);
     try {
       const { data } = await api.post("/ai/suggest", { lead_id: conv.id });
@@ -1765,9 +1768,11 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                     className={`px-3 py-2 text-[10px] uppercase tracking-widest font-bold rounded ${showTpl ? "bg-gray-900 text-white" : "border border-gray-300 hover:bg-gray-200"}`} data-testid="tpl-toggle">
                     Tpl
                   </button>
-                  <button onClick={askAI} disabled={aiLoading}
-                    title="Draft a reply from the recent conversation (goes into the message box - nothing is sent)"
-                    className={`px-2.5 py-2 text-[10px] uppercase tracking-widest font-bold rounded flex items-center gap-1 disabled:opacity-60 ${aiLoading ? "bg-[#7C3AED] text-white" : "border border-[#7C3AED] text-[#7C3AED] hover:bg-[#7C3AED]/10"}`}
+                  <button onClick={askAI} disabled={aiLoading || !within24h}
+                    title={within24h
+                      ? "Draft a reply from the recent conversation (goes into the message box - nothing is sent)"
+                      : "24-hour window closed - only a template can be sent, so AI drafting is unavailable"}
+                    className={`px-2.5 py-2 text-[10px] uppercase tracking-widest font-bold rounded flex items-center gap-1 disabled:opacity-40 disabled:cursor-not-allowed ${aiLoading ? "bg-[#7C3AED] text-white" : "border border-[#7C3AED] text-[#7C3AED] hover:bg-[#7C3AED]/10"}`}
                     data-testid="ai-toggle">
                     <Sparkle size={13} weight="fill" className={aiLoading ? "animate-pulse" : ""} />
                     {aiLoading ? "Drafting..." : "AI"}
