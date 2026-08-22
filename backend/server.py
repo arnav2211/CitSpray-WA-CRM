@@ -12822,7 +12822,7 @@ def _gemini_key_order() -> List[str]:
 
 
 async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
-                           max_output_tokens: int = 500, json_mode: bool = True) -> str:
+                           max_output_tokens: int = 1500, json_mode: bool = True) -> str:
     """Call Gemini, transparently rotating through the configured keys.
 
     A key that is out of quota (429) or rejected (400/403 invalid key) is benched
@@ -12981,11 +12981,16 @@ async def ai_suggest(body: AISuggestRequest, user: dict = Depends(get_current_us
         "- WhatsApp tone: short, warm, professional Indian business English "
         "(match Hinglish if the customer used it).",
         "- Never invent prices, stock or delivery dates that are not in the conversation.",
-        "- No placeholders like [Name] - use what you actually know.",
+        "- Never write a placeholder in brackets such as [Name] or [Insert Price]. "
+        "If you do not know the rate, stock or delivery time, ask for the required "
+        "quantity and delivery location instead of inventing one.",
         "- Maximum 60 words.",
     ])
 
-    raw = await _gemini_generate(prompt, temperature=0.7, max_output_tokens=300, json_mode=False)
+    # Budget must cover the model's internal reasoning tokens, not just the
+    # reply: gemini-3.x burned ~800 'thinking' tokens before emitting text, so
+    # a small cap came back truncated mid-word.
+    raw = await _gemini_generate(prompt, temperature=0.7, max_output_tokens=1500, json_mode=False)
     suggestion = (raw or "").strip()
     # Models sometimes wrap the answer in code fences or quotes despite the rules.
     if suggestion.startswith("```"):
