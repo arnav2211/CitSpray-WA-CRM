@@ -16,6 +16,10 @@ import ssl
 import asyncio
 import io
 import time
+import mimetypes
+# Python 3.10's mimetypes doesn't know WebP, so StaticFiles served stickers
+# as text/plain and Meta refused to fetch them as media (2026-09-01).
+mimetypes.add_type("image/webp", ".webp")
 from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal, Any, Dict
