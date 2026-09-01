@@ -2700,6 +2700,16 @@ function renderMedia(m) {
   const url = m.media_url;  // outbound (admin-provided/uploaded public URL)
   const downloadUrl = url ? `${url}${url.includes("?") ? "&" : "?"}download=1` : null;
   const filename = m.filename || (url ? url.split("/").pop() : "media");
+  if (type === "sticker" && url) {
+    // Stickers render free-standing: transparent, small, no crop, no bubble fill.
+    return (
+      <div className="relative group/media" data-testid={`msg-media-sticker-${m.id}`}>
+        <img src={url} alt="sticker" className="block w-[140px] h-[140px] object-contain cursor-zoom-in"
+          loading="lazy"
+          onClick={() => window.dispatchEvent(new CustomEvent("lightbox:open", { detail: { url, filename, downloadUrl, kind: "image" } }))} />
+      </div>
+    );
+  }
   if (type === "image" && url) {
     return (
       <div className="relative group/media" data-testid={`msg-media-image-${m.id}`}>
@@ -2752,7 +2762,7 @@ function renderMedia(m) {
   }
   // Inbound without a downloaded URL — show a lightweight placeholder using media_id
   if (m.media_id) {
-    const icon = type === "image" ? "🖼️" : type === "video" ? "🎬" : type === "audio" ? "🎧" : "📄";
+    const icon = type === "image" ? "🖼️" : type === "video" ? "🎬" : type === "audio" ? "🎧" : type === "sticker" ? "💟" : "📄";
     return (
       <div className="flex items-center gap-2 bg-gray-100 px-3 py-2 text-gray-700" data-testid={`msg-media-placeholder-${m.id}`}>
         <span className="text-lg">{icon}</span>

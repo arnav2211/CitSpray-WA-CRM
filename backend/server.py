@@ -8326,7 +8326,7 @@ async def wa_send_media(to_phone: str, media_type: str, url: str, caption: Optio
     """Send an image, video, or document message via the existing WA abstraction.
     `media_type` is one of 'image','video','document'. `url` must be public HTTPS.
     Caption supported on image/video; filename on document."""
-    if media_type not in ("image", "video", "document"):
+    if media_type not in ("image", "video", "document", "sticker"):
         return {"error": f"invalid media_type {media_type}", "status": "failed"}
     media_block: Dict[str, Any] = {"link": url}
     if caption and media_type in ("image", "video", "document"):
@@ -9397,6 +9397,12 @@ async def _handle_wa_webhook(request: Request, company: str):
                         inbound_media_id = vid.get("id")
                         inbound_caption = vid.get("caption")
                         inbound_mime = vid.get("mime_type")
+                    elif msg_type == "sticker":
+                        stk = m.get("sticker") or {}
+                        body_text = "[sticker]"
+                        inbound_media_type = "sticker"
+                        inbound_media_id = stk.get("id")
+                        inbound_mime = stk.get("mime_type") or "image/webp"
                     elif msg_type == "location":
                         loc = m.get("location") or {}
                         body_text = f"[location: {loc.get('latitude')},{loc.get('longitude')}]"
