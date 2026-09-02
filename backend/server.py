@@ -12797,10 +12797,13 @@ GEMINI_API_KEY = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""   # legacy alias
 # "gemini-flash-latest" is Google's rolling alias for the current flash model.
 # Pinning a version (e.g. gemini-2.0-flash) silently breaks the AI button the
 # day Google retires it -- which is exactly what happened on 2026-08-22.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip() or "gemini-3.6-flash"
+# Fast, non-"thinking" model first: a WhatsApp draft must land in ~2s for a
+# telecaller. Measured 2026-09-02: 3.1-flash-lite 1.9s, flash-lite-latest 1.0s,
+# while 3.6-flash stalled >60s and 2.5-flash returned 503 "high demand".
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite").strip() or "gemini-3.1-flash-lite"
 # Tried in order when the one before is retired (404) or overloaded (5xx on every
 # key): the rolling alias survives retirements, 2.5-flash is the stable backstop.
-GEMINI_FALLBACK_MODELS = ["gemini-flash-latest", "gemini-2.5-flash"]
+GEMINI_FALLBACK_MODELS = ["gemini-flash-lite-latest", "gemini-3.6-flash", "gemini-flash-latest", "gemini-2.5-flash"]
 
 # A key that just returned a quota/permission error is benched for a while so
 # the next request doesn't waste a round-trip on it. In-memory per worker:
@@ -12855,11 +12858,14 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
         model_overloaded = False
         for key in keys:
             try:
-                async with httpx.AsyncClient(timeout=30.0) as cli:
+                async with httpx.AsyncClient(timeout=14.0) as cli:
                     resp = await cli.post(url, params={"key": key}, json=payload)
             except Exception as e:
+                # timeout / network: treat like an overloaded model so the chain
+                # moves on to the next model instead of burning every key on it
                 last_detail = f"network error: {e}"
-                continue
+                model_overloaded = True
+                break
             if resp.status_code == 200:
                 try:
                     return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
