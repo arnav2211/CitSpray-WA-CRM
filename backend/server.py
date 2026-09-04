@@ -1723,6 +1723,29 @@ async def get_attendance_config() -> dict:
     # audit trail for the emergency bypass (who turned it on, when, why)
     for k in ("bypass_enabled_at", "bypass_enabled_by", "bypass_reason"):
         cfg[k] = doc.get(k)
+    # SAFETY VALVE: the emergency bypass is a ONE-DAY switch. It was turned on
+    # for the 21-Aug WiFi outage and never turned off, so for two weeks every
+    # executive counted as "present" and an absent one (no punch-in since
+    # 27-Aug) kept receiving leads. Once the IST day it was enabled on is over,
+    # treat it as off and persist that so the Payroll banner agrees. Admin can
+    # switch it on again the next morning if the device is still down.
+    if cfg.get("attendance_bypass_all"):
+        on_day = None
+        try:
+            on_at = datetime.fromisoformat(str(cfg.get("bypass_enabled_at")).replace("Z", "+00:00"))
+            on_day = on_at.astimezone(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d")
+        except Exception:
+            on_day = None
+        if on_day != _ist_now().strftime("%Y-%m-%d"):
+            cfg["attendance_bypass_all"] = False
+            res = await db.attendance_settings.update_one(
+                {"key": "general_settings", "attendance_bypass_all": True},
+                {"$set": {"attendance_bypass_all": False, "bypass_expired_at": iso(now_utc()),
+                          "bypass_enabled_at": None, "bypass_enabled_by": None, "bypass_reason": None}})
+            if res.modified_count:
+                await log_activity(None, "attendance_bypass_expired", None,
+                                   {"enabled_at": doc.get("bypass_enabled_at"), "enabled_by": doc.get("bypass_enabled_by")})
+            cfg["bypass_enabled_at"] = cfg["bypass_enabled_by"] = cfg["bypass_reason"] = None
     return cfg
 
 

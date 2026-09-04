@@ -1200,6 +1200,7 @@ function SettingsTab() {
                   {cfg.bypass_enabled_by && <> Turned on by <b>{cfg.bypass_enabled_by}</b></>}
                   {cfg.bypass_enabled_at && <> on {new Date(cfg.bypass_enabled_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</>}.
                   <br />Punches are still <b>not</b> recorded &mdash; adjust payroll for these days once the device is back.
+                  <br />This switch is for <b>today only</b>: it turns itself off at midnight. If the device is still down tomorrow, turn it on again.
                 </div>
                 <button onClick={() => toggleBypass(false)} disabled={saving}
                   className="mt-2 px-3 py-1.5 text-[10px] font-bold uppercase tracking-widest bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-50">
@@ -1213,7 +1214,7 @@ function SettingsTab() {
             <div className="min-w-0">
               <div className="text-sm font-semibold text-gray-800">Punch-in device down?</div>
               <div className="text-[11px] text-gray-400 mt-0.5 leading-relaxed">
-                Bypass attendance for everyone so nobody is locked out and leads keep flowing.
+                Bypass attendance for everyone so nobody is locked out and leads keep flowing. Lasts for today only &mdash; it switches itself off at midnight.
               </div>
             </div>
             <button onClick={() => toggleBypass(true)} disabled={saving}
