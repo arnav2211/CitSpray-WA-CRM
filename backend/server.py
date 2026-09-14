@@ -816,13 +816,16 @@ async def me(user: dict = Depends(get_current_user)):
 
 # ------------- Users management -------------
 @api.get("/users")
-async def list_users(user: dict = Depends(get_current_user)):
+async def list_users(user: dict = Depends(get_current_user), include_former: bool = False):
     # Admins get the full record; everyone else only needs names/roles for
     # dropdowns — never salaries, face embeddings, or receiver numbers.
+    # Former employees (fired / resigned) are hidden from every list unless
+    # explicitly requested — they only live on in the attendance history.
+    q: Dict[str, Any] = {} if include_former else {"employment_status": {"$ne": "former"}}
     if user.get("role") == "admin":
-        users = await db.users.find({}, {"_id": 0, "password_hash": 0}).to_list(500)
+        users = await db.users.find(q, {"_id": 0, "password_hash": 0}).to_list(500)
     else:
-        users = await db.users.find({}, {
+        users = await db.users.find(q, {
             "_id": 0, "id": 1, "name": 1, "username": 1, "role": 1,
             "active": 1, "department": 1, "employee_code": 1,
         }).to_list(500)
@@ -873,6 +876,11 @@ async def update_user(user_id: str, body: UserUpdate, admin: dict = Depends(requ
         updates["receiver_numbers"] = rx
     if body.password:
         updates["password_hash"] = hash_password(body.password)
+    if updates.get("active") is True and u.get("employment_status") == "former":
+        # Re-activating an offboarded employee = rehire: clear the leaving record
+        # so the retention purge no longer targets them.
+        updates.update({"employment_status": "active", "left_at": None, "left_reason": None,
+                        "left_note": None, "retain_until": None, "rehired_at": iso(now_utc())})
     if updates:
         ops: Dict[str, Any] = {"$set": updates}
         if body.password:
@@ -946,6 +954,147 @@ async def delete_user(
                     
     await db.users.delete_one({"id": user_id})
     return {"ok": True}
+
+# ------------- Offboarding (fired / resigned) -------------
+# An employee who leaves is NOT deleted: the user record stays (inactive,
+# employment_status="former") so their attendance and salary history remain
+# viewable for FORMER_RETENTION_DAYS, after which the daily retention task
+# purges attendance/leave/salary records. Everything else that references them
+# as a live team member is cut immediately: leads and pending follow-ups move to
+# the remaining executives of the same company (or become unassigned when there
+# is nobody left), routing pools drop them, sessions are revoked.
+FORMER_RETENTION_DAYS = 365
+
+
+class OffboardInput(BaseModel):
+    reason: Literal["fired", "resigned"] = "resigned"
+    note: Optional[str] = None
+    confirm: bool = False
+
+
+async def _offboard_user(u: dict, admin: dict, reason: str, note: Optional[str]) -> dict:
+    uid = u["id"]
+    now_iso = iso(now_utc())
+    comp = normalize_company(u.get("company"))
+    summary: Dict[str, Any] = {"leads_reassigned": 0, "leads_unassigned": 0, "targets": [],
+                               "followups_moved": 0, "leaves_cancelled": 0, "transfer_requests_closed": 0}
+    # 1. Leads: equal split across the remaining active executives of the SAME company.
+    #    Deliberately no sort_at bump — a whole book moving must not bury the new
+    #    owners' fresh leads (lesson from 2026-07-20).
+    targets = await db.users.find(
+        {"role": "executive", "active": True, "id": {"$ne": uid}, "username": {"$ne": "test_user"},
+         "employment_status": {"$ne": "former"}, **company_filter(comp)},
+        {"_id": 0, "id": 1, "username": 1, "name": 1}).to_list(500)
+    targets.sort(key=lambda t: t["username"])
+    lead_ids = [d["id"] async for d in db.leads.find({"assigned_to": uid}, {"_id": 0, "id": 1})]
+    new_owner: Dict[str, Optional[str]] = {}
+    if lead_ids and targets:
+        ops = []
+        for i, lid in enumerate(lead_ids):
+            t = targets[i % len(targets)]
+            new_owner[lid] = t["id"]
+            ops.append(UpdateOne(
+                {"id": lid, "assigned_to": uid},
+                {"$set": {"assigned_to": t["id"], "last_assignment_at": now_iso, "opened_at": None},
+                 "$push": {"assignment_history": {"user_id": t["id"], "at": now_iso, "by": admin["id"],
+                                                  "reason": f"owner_{reason}"}}}))
+        for k in range(0, len(ops), 2000):
+            res = await db.leads.bulk_write(ops[k:k + 2000], ordered=False)
+            summary["leads_reassigned"] += res.modified_count
+        summary["targets"] = [t["name"] for t in targets]
+    elif lead_ids:
+        res = await db.leads.update_many(
+            {"assigned_to": uid},
+            {"$set": {"assigned_to": None, "last_assignment_at": now_iso, "opened_at": None},
+             "$push": {"assignment_history": {"user_id": None, "at": now_iso, "by": admin["id"],
+                                              "reason": f"owner_{reason}_unassigned"}}})
+        summary["leads_unassigned"] = res.modified_count
+    # 2. Pending follow-ups travel with their lead
+    fus = await db.followups.find({"executive_id": uid, "status": "pending"}, {"_id": 0, "id": 1, "lead_id": 1}).to_list(100000)
+    if fus:
+        res = await db.followups.bulk_write(
+            [UpdateOne({"id": f["id"]}, {"$set": {"executive_id": new_owner.get(f.get("lead_id"))}}) for f in fus],
+            ordered=False)
+        summary["followups_moved"] = res.modified_count
+    # 3. Open requests are closed
+    r = await db.leaves.update_many({"user_id": uid, "status": "pending", "cancelled": {"$ne": True}},
+                                    {"$set": {"cancelled": True, "cancelled_at": now_iso, "cancelled_by": admin["id"],
+                                              "admin_note": "Employee left the company"}})
+    summary["leaves_cancelled"] = r.modified_count
+    r = await db.transfer_requests.update_many({"from_user_id": uid, "status": "pending"},
+                                               {"$set": {"status": "rejected", "decided_at": now_iso,
+                                                         "admin_note": "Employee left the company"}})
+    summary["transfer_requests_closed"] = r.modified_count
+    # 4. Routing pools / device routing
+    await db.attendance_settings.update_one({"key": "general_settings"}, {"$pull": {"wfh_pool_user_ids": uid}})
+    # 5. The user record itself: inactive, flagged former, sessions revoked.
+    retain_until = iso(now_utc() + timedelta(days=FORMER_RETENTION_DAYS))
+    await db.users.update_one({"id": uid}, {
+        "$set": {"active": False, "employment_status": "former", "left_at": now_iso, "left_reason": reason,
+                 "left_note": (note or "").strip() or None, "left_by": admin["id"], "retain_until": retain_until,
+                 "bypass_attendance": False, "receiver_numbers": [], "working_hours": [], "scanner_access": False},
+        "$unset": {"face_embedding": ""},
+        "$inc": {"token_version": 1},
+    })
+    await log_activity(admin["id"], "user_offboarded", None, {"user_id": uid, "name": u.get("name"), "reason": reason, **summary})
+    summary["retain_until"] = retain_until
+    return summary
+
+
+@api.post("/users/{user_id}/offboard")
+async def offboard_user_ep(user_id: str, body: OffboardInput, admin: dict = Depends(require_admin)):
+    """Fire / resign an employee. The UI asks twice; the API additionally
+    requires confirm=true so a stray call can never do this by accident."""
+    if user_id == admin["id"]:
+        raise HTTPException(status_code=400, detail="You cannot offboard yourself")
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Confirmation required")
+    u = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    if u.get("employment_status") == "former":
+        raise HTTPException(status_code=409, detail=f"{u.get('name')} has already left")
+    if u.get("role") == "admin":
+        raise HTTPException(status_code=400, detail="Admins cannot be offboarded here — change their role first")
+    summary = await _offboard_user(u, admin, body.reason, body.note)
+    return {"ok": True, "name": u.get("name"), **summary}
+
+
+@api.get("/users/former")
+async def list_former_users(admin: dict = Depends(require_admin)):
+    """Previous employees whose attendance/salary history is still retained."""
+    users = await db.users.find({"employment_status": "former", "purged": {"$ne": True}},
+                                {"_id": 0, "password_hash": 0, "face_embedding": 0}).sort("left_at", -1).to_list(500)
+    admins = {a["id"]: a.get("name") async for a in db.users.find({"role": "admin"}, {"_id": 0, "id": 1, "name": 1})}
+    for u in users:
+        u["attendance_days"] = await db.attendance_logs.count_documents({"user_id": u["id"]})
+        first = await db.attendance_logs.find({"user_id": u["id"]}, {"_id": 0, "date": 1}).sort("date", 1).to_list(1)
+        last = await db.attendance_logs.find({"user_id": u["id"]}, {"_id": 0, "date": 1}).sort("date", -1).to_list(1)
+        u["attendance_first"] = first[0]["date"] if first else None
+        u["attendance_last"] = last[0]["date"] if last else None
+        u["left_by_name"] = admins.get(u.get("left_by"))
+    return users
+
+
+async def former_records_retention_task():
+    """Daily: once an ex-employee's retain_until (12 months after leaving) has
+    passed, purge their attendance / leave / salary-payment records. The user
+    stub is kept (flagged purged) so old lead histories still resolve a name."""
+    try:
+        now_iso = iso(now_utc())
+        cur = db.users.find({"employment_status": "former", "purged": {"$ne": True}, "retain_until": {"$lte": now_iso}},
+                            {"_id": 0, "id": 1, "name": 1})
+        async for u in cur:
+            a = (await db.attendance_logs.delete_many({"user_id": u["id"]})).deleted_count
+            lv = (await db.leaves.delete_many({"user_id": u["id"]})).deleted_count
+            sp = (await db.salary_payments.delete_many({"user_id": u["id"]})).deleted_count
+            await db.users.update_one({"id": u["id"]}, {"$set": {"purged": True, "purged_at": now_iso, "employee_code": None}})
+            await log_activity(None, "former_records_purged", None,
+                               {"user_id": u["id"], "name": u.get("name"), "attendance": a, "leaves": lv, "salary_payments": sp})
+            logger.info(f"retention: purged records of former employee {u.get('name')} ({a} attendance, {lv} leaves, {sp} payments)")
+    except Exception as e:
+        logger.exception(f"former_records_retention_task failed: {e}")
+
 
 @api.get("/admin/data-entry-stats")
 async def get_data_entry_stats(admin: dict = Depends(require_admin)):
@@ -12436,6 +12585,8 @@ async def on_startup():
     scheduler.add_job(winback_whatsapp_task, "cron", hour=11, minute=15, timezone="Asia/Kolkata", id="winback_whatsapp", max_instances=1, coalesce=True)
     scheduler.add_job(meta_capi_task, "interval", minutes=30, id="meta_capi", max_instances=1, coalesce=True)
     scheduler.add_job(shopify_popup_leads_task, "interval", minutes=10, id="shopify_popup_leads", max_instances=1, coalesce=True)
+    # 03:30 IST daily — purge attendance/leave/salary records of ex-employees 12 months after they left
+    scheduler.add_job(former_records_retention_task, "cron", hour=3, minute=30, timezone="Asia/Kolkata", id="former_retention", max_instances=1, coalesce=True)
     try:
         await db.attendance_logs.create_index([("user_id", 1), ("date", 1)])
         await db.leaves.create_index([("user_id", 1), ("start_date", 1)])
@@ -13849,14 +14000,17 @@ async def calculate_payroll(
     lookahead_date = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
 
     # Payroll covers every active employee on the machine (any department) + all executives.
-    users_list = await db.users.find(
-        {"active": True, "role": {"$ne": "admin"}},
-        {"_id": 0, "password_hash": 0}
-    ).to_list(200)
-    users_list = [u for u in users_list if u.get("username") not in ("scanner", "test_user")
-                  and (u.get("employee_code") or u.get("role") == "executive")]
     if user_id:
-        users_list = [u for u in users_list if u["id"] == user_id]
+        # A single sheet may be for a former employee (inactive, history retained)
+        one = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+        users_list = [one] if one else []
+    else:
+        users_list = await db.users.find(
+            {"active": True, "role": {"$ne": "admin"}},
+            {"_id": 0, "password_hash": 0}
+        ).to_list(200)
+        users_list = [u for u in users_list if u.get("username") not in ("scanner", "test_user")
+                      and (u.get("employee_code") or u.get("role") == "executive")]
     users_list.sort(key=lambda u: (u.get("department") or "zz", u.get("name") or ""))
 
     holidays_list = await db.holidays.find({"date": {"$gte": lookback_date, "$lte": lookahead_date}}).to_list(1000)

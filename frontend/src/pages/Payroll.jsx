@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
 import {
@@ -279,7 +280,12 @@ function RegisterTab() {
             <input type="date" value={customEnd} min={customStart} onChange={(e) => setCustomEnd(e.target.value)} className="border border-gray-300 px-2 py-1.5 text-sm bg-white" />
           </div>
         )}
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-3">
+          <Link to="/users?former=1" title="Fired / resigned employees — attendance & salary history kept for 12 months"
+            className="text-[10px] uppercase tracking-widest font-bold text-gray-500 hover:text-gray-900 flex items-center gap-1"
+            data-testid="payroll-former-link">
+            <Clock size={13} /> Previous employees
+          </Link>
           <button onClick={() => doPrint("register")}
             className="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 text-xs uppercase tracking-widest font-bold flex items-center gap-1.5">
             <Printer size={16} /> Print Register
@@ -736,7 +742,7 @@ function SalarySheetContent({ p }) {
 }
 
 /* Print-only wrapper */
-function PrintSheet({ p }) {
+export function PrintSheet({ p }) {
   return <div className="hidden print:block"><SalarySheetContent p={p} /></div>;
 }
 
@@ -765,7 +771,7 @@ function amountInWords(num) {
 }
 
 /* ---- A5 salary voucher: employee signs to confirm they received the salary ---- */
-function SalaryVoucher({ p }) {
+export function SalaryVoucher({ p }) {
   const c = p.counts || {};
   const paidOn = p.payment?.paid_at ? String(p.payment.paid_at).slice(0, 10) : "____________";
   return (
@@ -836,7 +842,7 @@ function SalaryVoucher({ p }) {
 }
 
 /* On-screen modal for the admin: employee's own joining-date cycle + print */
-function EmployeeSheetModal({ userMeta, onClose, onPrint, onVoucher, onOverride, onEditPunch, onClearPunchOut }) {
+export function EmployeeSheetModal({ userMeta, onClose, onPrint, onVoucher, onOverride, onEditPunch, onClearPunchOut }) {
   const [offset, setOffset] = useState(-1);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -1283,7 +1289,7 @@ function SettingsTab() {
   );
 }
 
-function PrintStyles({ a5 = false }) {
+export function PrintStyles({ a5 = false }) {
   return (
     <style>{`
       @media print {
