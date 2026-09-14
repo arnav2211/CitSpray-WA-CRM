@@ -978,37 +978,51 @@ async def _offboard_user(u: dict, admin: dict, reason: str, note: Optional[str])
     comp = normalize_company(u.get("company"))
     summary: Dict[str, Any] = {"leads_reassigned": 0, "leads_unassigned": 0, "targets": [],
                                "followups_moved": 0, "leaves_cancelled": 0, "transfer_requests_closed": 0}
-    # 1. Leads: equal split across the remaining active executives of the SAME company.
-    #    Deliberately no sort_at bump — a whole book moving must not bury the new
-    #    owners' fresh leads (lesson from 2026-07-20).
-    targets = await db.users.find(
-        {"role": "executive", "active": True, "id": {"$ne": uid}, "username": {"$ne": "test_user"},
-         "employment_status": {"$ne": "former"}, **company_filter(comp)},
-        {"_id": 0, "id": 1, "username": 1, "name": 1}).to_list(500)
-    targets.sort(key=lambda t: t["username"])
-    lead_ids = [d["id"] async for d in db.leads.find({"assigned_to": uid}, {"_id": 0, "id": 1})]
+    # 1. Leads: equal split across the remaining active executives of the lead's
+    #    OWN company book (a lead never crosses the CitSpray/Fragvansh wall, even
+    #    if the leaver somehow held leads of the other book). Deliberately no
+    #    sort_at bump — a whole book moving must not bury the new owners' fresh
+    #    leads (lesson from 2026-07-20).
+    targets_by_comp: Dict[str, List[dict]] = {}
+    for c in COMPANIES:
+        ts = await db.users.find(
+            {"role": "executive", "active": True, "id": {"$ne": uid}, "username": {"$ne": "test_user"},
+             "employment_status": {"$ne": "former"}, **company_filter(c)},
+            {"_id": 0, "id": 1, "username": 1, "name": 1}).to_list(500)
+        ts.sort(key=lambda t: t["username"])
+        targets_by_comp[c] = ts
     new_owner: Dict[str, Optional[str]] = {}
-    if lead_ids and targets:
-        ops = []
-        for i, lid in enumerate(lead_ids):
-            t = targets[i % len(targets)]
-            new_owner[lid] = t["id"]
-            ops.append(UpdateOne(
-                {"id": lid, "assigned_to": uid},
-                {"$set": {"assigned_to": t["id"], "last_assignment_at": now_iso, "opened_at": None},
-                 "$push": {"assignment_history": {"user_id": t["id"], "at": now_iso, "by": admin["id"],
-                                                  "reason": f"owner_{reason}"}}}))
-        for k in range(0, len(ops), 2000):
-            res = await db.leads.bulk_write(ops[k:k + 2000], ordered=False)
-            summary["leads_reassigned"] += res.modified_count
-        summary["targets"] = [t["name"] for t in targets]
-    elif lead_ids:
+    ops: List[UpdateOne] = []
+    unassign_ids: List[str] = []
+    counters: Dict[str, int] = {}
+    target_names: set = set()
+    async for ld in db.leads.find({"assigned_to": uid}, {"_id": 0, "id": 1, "company": 1}):
+        c = normalize_company(ld.get("company"))
+        ts = targets_by_comp.get(c) or []
+        if not ts:
+            unassign_ids.append(ld["id"])
+            continue
+        i = counters.get(c, 0)
+        t = ts[i % len(ts)]
+        counters[c] = i + 1
+        new_owner[ld["id"]] = t["id"]
+        target_names.add(t["name"])
+        ops.append(UpdateOne(
+            {"id": ld["id"], "assigned_to": uid},
+            {"$set": {"assigned_to": t["id"], "last_assignment_at": now_iso, "opened_at": None},
+             "$push": {"assignment_history": {"user_id": t["id"], "at": now_iso, "by": admin["id"],
+                                              "reason": f"owner_{reason}"}}}))
+    for k in range(0, len(ops), 2000):
+        res = await db.leads.bulk_write(ops[k:k + 2000], ordered=False)
+        summary["leads_reassigned"] += res.modified_count
+    summary["targets"] = sorted(target_names)
+    for k in range(0, len(unassign_ids), 5000):
         res = await db.leads.update_many(
-            {"assigned_to": uid},
+            {"id": {"$in": unassign_ids[k:k + 5000]}, "assigned_to": uid},
             {"$set": {"assigned_to": None, "last_assignment_at": now_iso, "opened_at": None},
              "$push": {"assignment_history": {"user_id": None, "at": now_iso, "by": admin["id"],
                                               "reason": f"owner_{reason}_unassigned"}}})
-        summary["leads_unassigned"] = res.modified_count
+        summary["leads_unassigned"] += res.modified_count
     # 2. Pending follow-ups travel with their lead
     fus = await db.followups.find({"executive_id": uid, "status": "pending"}, {"_id": 0, "id": 1, "lead_id": 1}).to_list(100000)
     if fus:
