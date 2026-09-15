@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
@@ -447,7 +448,7 @@ function RegisterTab() {
       {printTarget === "sheet" && sheetPrintData && <PrintSheet p={sheetPrintData} />}
       {printTarget === "voucher" && voucherData && <SalaryVoucher p={voucherData} />}
 
-      <PrintStyles a5={printTarget === "voucher"} />
+      <PrintStyles a5={printTarget === "voucher"} sheet={printTarget === "sheet"} />
     </div>
   );
 }
@@ -588,7 +589,7 @@ function AttendanceCalendar({ p }) {
   ];
   return (
     <div className="mb-4">
-      <div className="grid grid-cols-7 gap-px bg-gray-300 border border-gray-300 text-[9px]">
+      <div className="cal-grid grid grid-cols-7 gap-px bg-gray-300 border border-gray-300 text-[9px]">
         {WEEKDAYS.map((w) => (
           <div key={w} className="bg-gray-100 text-center font-bold uppercase tracking-wider py-1">{w}</div>
         ))}
@@ -598,13 +599,13 @@ function AttendanceCalendar({ p }) {
           const dt = new Date(date + "T00:00:00");
           const dayLabel = `${dt.getDate()}${dt.getDate() === 1 || date === p.period_start ? " " + MONTHS[dt.getMonth()] : ""}`;
           if (!inPeriod || !d || ["not_joined"].includes(d.status)) {
-            return <div key={date} className="bg-gray-50 min-h-[52px] p-1 text-gray-300 font-mono">{inPeriod ? dayLabel : ""}</div>;
+            return <div key={date} className="cal-cell bg-gray-50 min-h-[52px] p-1 text-gray-300 font-mono">{inPeriod ? dayLabel : ""}</div>;
           }
           if (d.status === "future") {
-            return <div key={date} className="bg-white min-h-[52px] p-1 text-gray-300 font-mono">{dayLabel}</div>;
+            return <div key={date} className="cal-cell bg-white min-h-[52px] p-1 text-gray-300 font-mono">{dayLabel}</div>;
           }
           return (
-            <div key={date} className={`min-h-[52px] p-1 border-0 ${STATUS_STYLE[d.status] || "bg-white"}`}
+            <div key={date} className={`cal-cell min-h-[52px] p-1 border-0 ${STATUS_STYLE[d.status] || "bg-white"}`}
               title={`${date}: ${d.details || STATUS_LABEL[d.status] || d.status}`}>
               <div className="flex items-center justify-between">
                 <span className="font-mono font-black">{dayLabel}</span>
@@ -612,13 +613,13 @@ function AttendanceCalendar({ p }) {
               </div>
               <div className="font-bold leading-tight truncate">{STATUS_LABEL[d.status] ?? d.status}</div>
               {(d.punch_in || d.punch_out) && (
-                <div className="font-mono text-[8px] leading-tight">{d.punch_in || "--"}–{d.punch_out || "--"}</div>
+                <div className="cal-times font-mono text-[8px] leading-tight">{d.punch_in || "--"}–{d.punch_out || "--"}</div>
               )}
             </div>
           );
         })}
       </div>
-      <div className="flex flex-wrap gap-1.5 mt-1.5">
+      <div className="cal-legend flex flex-wrap gap-1.5 mt-1.5">
         {legend.map(([s, label]) => (
           <span key={s} className={`px-1.5 py-0.5 border text-[8px] font-bold uppercase rounded-sm ${STATUS_STYLE[s]}`}>{label}</span>
         ))}
@@ -638,15 +639,15 @@ function SalarySheetContent({ p }) {
   return (
     <div className="bg-white text-black">
       <div className="border-b-2 border-black pb-3 mb-3">
-        <div className="font-black text-xl md:text-2xl uppercase">CitSpray — Attendance &amp; Salary Sheet</div>
-        <div className="text-[11px] font-mono mt-1 leading-relaxed">
+        <div className="sheet-head font-black text-xl md:text-2xl uppercase">CitSpray — Attendance &amp; Salary Sheet</div>
+        <div className="sheet-meta text-[11px] font-mono mt-1 leading-relaxed">
           <b>{p.name}</b> · {p.department || p.role}{p.employee_code ? ` · Machine ID ${p.employee_code}` : ""} · Joined {p.joining_date}<br />
           Salary period: <b>{p.period_start} → {p.period_end}</b> (joining-date cycle) · Pay date: <b>{p.pay_date || "—"}</b> · Generated {new Date().toLocaleDateString("en-IN")}
         </div>
       </div>
 
       {/* Attendance summary chips */}
-      <div className="text-[11px] mb-3 font-mono flex items-center justify-between gap-3 flex-wrap">
+      <div className="sheet-summary text-[11px] mb-3 font-mono flex items-center justify-between gap-3 flex-wrap">
         <span>
           Present: <b>{c.present}</b> · Half days: <b>{(c.half_day || 0) + (c.missing_punch_out || 0)}</b> ·
           Approved leave: <b>{c.leave_approved || 0}</b> · Uninformed absent: <b>{c.absent_uninformed || 0}</b> ·
@@ -663,8 +664,8 @@ function SalarySheetContent({ p }) {
       {/* Calendar view */}
       <AttendanceCalendar p={p} />
 
-      {/* Day-by-day attendance */}
-      <table className="w-full text-[11px] border-collapse mb-4">
+      {/* Day-by-day attendance (starts a new page when printed) */}
+      <table className="sheet-days w-full text-[11px] border-collapse mb-4">
         <thead>
           <tr className="border-b-2 border-black text-left uppercase text-[9px]">
             <th className="py-1 pr-2">Date</th><th className="py-1 pr-2">Day</th>
@@ -692,7 +693,7 @@ function SalarySheetContent({ p }) {
       </table>
 
       {/* Salary calculation, line by line */}
-      <div className="border-2 border-black p-3 mb-4">
+      <div className="sheet-calc border-2 border-black p-3 mb-4">
         <div className="font-black text-xs uppercase tracking-widest mb-2">How this salary was calculated</div>
         <table className="w-full text-[12px] font-mono">
           <tbody>
@@ -711,7 +712,7 @@ function SalarySheetContent({ p }) {
                 <td className="text-right">-{money(g.amt)}</td>
               </tr>
             ))}
-            <tr className="border-t-2 border-black font-black text-base">
+            <tr className="sheet-net border-t-2 border-black font-black text-base">
               <td className="py-1">NET PAYABLE on {p.pay_date || "pay date"}</td>
               <td className="text-right">{money(p.final_salary_payout)}</td>
             </tr>
@@ -724,7 +725,7 @@ function SalarySheetContent({ p }) {
       )}
 
       {/* Rules legend for transparency */}
-      <div className="text-[9px] text-gray-700 leading-relaxed border-t border-gray-400 pt-2">
+      <div className="sheet-rules text-[9px] text-gray-700 leading-relaxed border-t border-gray-400 pt-2">
         <b>Company rules:</b> Office Mon–Sat 10:30 AM – 7:00 PM. Arrival allowed till 11:00 AM (later arrivals are flagged, no cut).
         Leaving after 3 PM but before 7 PM = half day (½ day cut). Leaving before 3 PM = full day cut.
         Approved leave = 1 day's salary cut per day; absence without approval = 2 days' cut per day.
@@ -733,7 +734,7 @@ function SalarySheetContent({ p }) {
         Declared company holidays are fully paid. Daily rate = Base ÷ number of days in the salary cycle.
       </div>
 
-      <div className="flex justify-between mt-14 pt-6 text-center text-[10px] font-bold uppercase tracking-widest">
+      <div className="sheet-sign flex justify-between mt-14 pt-6 text-center text-[10px] font-bold uppercase tracking-widest">
         <div className="w-1/3 border-t border-black pt-1 mx-4">Employee Signature</div>
         <div className="w-1/3 border-t border-black pt-1 mx-4">Authorized Signatory</div>
       </div>
@@ -741,9 +742,19 @@ function SalarySheetContent({ p }) {
   );
 }
 
-/* Print-only wrapper */
+/* Print-only wrapper. Rendered through a portal straight into <body> so the
+   print CSS can hide the whole app (#root) and let the sheet flow over as many
+   pages as it needs. Salary figures print exactly as they were shown on screen
+   (p.__showMoney), instead of following the page-level eye toggle. */
 export function PrintSheet({ p }) {
-  return <div className="hidden print:block"><SalarySheetContent p={p} /></div>;
+  return createPortal(
+    <div className="sheet-page hidden print:block">
+      <HideMoneyContext.Provider value={!p.__showMoney}>
+        <SalarySheetContent p={p} />
+      </HideMoneyContext.Provider>
+    </div>,
+    document.body
+  );
 }
 
 /* ---- Amount in words (Indian numbering: lakh / crore) ---- */
@@ -923,9 +934,10 @@ export function EmployeeSheetModal({ userMeta, onClose, onPrint, onVoucher, onOv
               data-testid="sheet-voucher-btn">
               <Receipt size={14} /> Voucher
             </button>
-            <button onClick={() => data && onPrint(data)} disabled={!data}
+            <button onClick={() => data && onPrint({ ...data, __showMoney: showMoney })} disabled={!data}
+              title={showMoney ? "Prints with salary amounts" : "Prints with salary amounts hidden — click 'Salary hidden' first to include them"}
               className="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 disabled:opacity-50">
-              <Printer size={14} /> Print
+              <Printer size={14} /> Print {showMoney ? "with salary" : "(no salary)"}
             </button>
             <button onClick={onClose} className="text-gray-400 hover:text-gray-900 text-sm font-bold px-1">✕</button>
           </div>
@@ -1289,7 +1301,7 @@ function SettingsTab() {
   );
 }
 
-export function PrintStyles({ a5 = false }) {
+export function PrintStyles({ a5 = false, sheet = false }) {
   return (
     <style>{`
       @media print {
@@ -1299,6 +1311,31 @@ export function PrintStyles({ a5 = false }) {
         .border { border-color: #ddd !important; }
         .shadow-sm, .shadow-lg { box-shadow: none !important; }
       }
+      ${sheet ? `
+      /* Employee attendance & salary sheet: the app itself is hidden, the sheet
+         (portalled into <body>) prints in readable sizes across as many A4
+         pages as it needs — calendar + calculation first, day-by-day next. */
+      @page { size: A4 portrait; margin: 12mm; }
+      @media print {
+        #root { display: none !important; }
+        .sheet-page { display: block !important; width: 100%; font-size: 12px; }
+        .sheet-page .sheet-head { font-size: 22px !important; }
+        .sheet-page .sheet-meta, .sheet-page .sheet-summary { font-size: 12px !important; line-height: 1.6; }
+        .sheet-page .cal-grid { font-size: 11px !important; }
+        .sheet-page .cal-cell { min-height: 74px !important; padding: 5px !important; }
+        .sheet-page .cal-cell .cal-times { font-size: 10px !important; }
+        .sheet-page .cal-legend span { font-size: 10px !important; }
+        .sheet-page .sheet-calc { font-size: 13px !important; }
+        .sheet-page .sheet-calc .sheet-net { font-size: 17px !important; }
+        .sheet-page .sheet-days { break-before: page; page-break-before: always; }
+        .sheet-page .sheet-days th, .sheet-page .sheet-days td { font-size: 11.5px !important; padding-top: 3px !important; padding-bottom: 3px !important; }
+        .sheet-page .sheet-days thead { display: table-header-group; }
+        .sheet-page .sheet-days tr { break-inside: avoid; page-break-inside: avoid; }
+        .sheet-page .sheet-calc, .sheet-page .sheet-rules, .sheet-page .sheet-sign { break-inside: avoid; page-break-inside: avoid; }
+        .sheet-page .sheet-rules { font-size: 10.5px !important; }
+        .sheet-page .sheet-sign { margin-top: 48px !important; font-size: 11px !important; }
+        .sheet-page * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+      }` : ""}
       ${a5 ? `
       /* Salary voucher prints on A5 — everything else is hidden */
       @page { size: A5 portrait; margin: 8mm; }

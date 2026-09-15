@@ -380,7 +380,7 @@ function FormerEmployeesPanel({ onClose }) {
       )}
       {printTarget === "sheet" && printData && <PrintSheet p={printData} />}
       {printTarget === "voucher" && printData && <SalaryVoucher p={printData} />}
-      {printTarget && <PrintStyles a5={printTarget === "voucher"} />}
+      {printTarget && <PrintStyles a5={printTarget === "voucher"} sheet={printTarget === "sheet"} />}
     </div>
   );
 }
