@@ -1944,7 +1944,33 @@ async def _office_open_now(cfg: Optional[dict] = None) -> bool:
     return start <= mins < end
 
 
-async def _is_user_available_by_attendance(user: dict) -> bool:
+async def _present_on_latest_office_day(user_id: str, cfg: Optional[dict] = None) -> bool:
+    """Did this person punch in on the most recent office day?
+    "Most recent office day" = today once the office day has begun, otherwise
+    the previous one; Sundays and full holidays are skipped. Used for the
+    after-hours WFH pool: someone who was absent all day (sick, or on a leave
+    nobody has entered yet) must not have the night's leads queue behind them.
+    2026-09-17/18: Adiksha was absent, her leave was only entered on the 18th
+    afternoon, and until then 22 night/early-morning leads were routed to her
+    through the pool and each waited unopened before bouncing on."""
+    cfg = cfg or await get_attendance_config()
+    now = _ist_now()
+    d = now.date()
+    if now.hour * 60 + now.minute < _hhmm_to_minutes(cfg["office_start"], 630):
+        d -= timedelta(days=1)
+    ds = d.strftime("%Y-%m-%d")
+    for _ in range(10):
+        ds = d.strftime("%Y-%m-%d")
+        if d.weekday() != 6:
+            hol = await db.holidays.find_one({"date": ds}, {"_id": 0, "holiday_type": 1})
+            if not (hol and (hol.get("holiday_type") or "full") == "full"):
+                break
+        d -= timedelta(days=1)
+    log = await db.attendance_logs.find_one({"user_id": user_id, "date": ds}, {"_id": 0, "check_in": 1})
+    return bool(log and log.get("check_in"))
+
+
+async def _is_user_available_by_attendance(user: dict, for_new_lead: bool = False) -> bool:
     """Gate lead assignment on real attendance:
     - bypass_attendance users are always available;
     - while the office is open: available only if punched IN today and NOT punched out
@@ -1977,7 +2003,14 @@ async def _is_user_available_by_attendance(user: dict) -> bool:
     # office closed → WFH pool only
     if not cfg.get("wfh_afterhours_enabled", True):
         return False
-    return user["id"] in (cfg.get("wfh_pool_user_ids") or [])
+    if user["id"] not in (cfg.get("wfh_pool_user_ids") or []):
+        return False
+    # NEW leads additionally require that the pool member was actually present
+    # on the latest office day. Deliberately NOT applied to the sticky-owner /
+    # inbound-WhatsApp checks: an absent owner keeps their existing customers.
+    if for_new_lead:
+        return await _present_on_latest_office_day(user["id"], cfg)
+    return True
 
 
 async def _attendance_login_allowed(user: dict) -> Optional[dict]:
@@ -2077,7 +2110,7 @@ async def _pick_buyleads_executive(source: str, company: Optional[str] = None) -
             continue
         if await _is_user_on_leave(uid):
             continue
-        if not await _is_user_available_by_attendance(u):
+        if not await _is_user_available_by_attendance(u, for_new_lead=True):
             continue
         eligible.append(u)
     if not eligible:
@@ -2125,7 +2158,7 @@ async def pick_next_executive(exclude_user_id: Optional[str] = None, company: Op
     # Filter by attendance (punched in or bypass)
     after_attendance = []
     for e in execs:
-        if await _is_user_available_by_attendance(e):
+        if await _is_user_available_by_attendance(e, for_new_lead=True):
             after_attendance.append(e)
     execs = after_attendance
     
@@ -10188,6 +10221,20 @@ async def reorder_reminder_task():
             # Route to the executive who took the LAST order (admin mapping);
             # if that telecaller has left, round-robin to anybody.
             owner = await _crm_user_for_oms_telecaller(o.get("telecaller_id"), o.get("telecaller_name"))
+            if owner:
+                # Never hand work to someone on leave. A short leave just defers the
+                # nudge (no dedup key is written, so tomorrow's run retries and the
+                # customer stays with the telecaller who knows them); a long one
+                # reroutes it round-robin so the reorder chance isn't lost.
+                _lv = await _is_user_on_leave(owner["id"])
+                if _lv:
+                    try:
+                        _days_left = (datetime.strptime(_lv.get("end_date"), "%Y-%m-%d").date() - _ist_now().date()).days
+                    except Exception:
+                        _days_left = 0
+                    if _days_left <= 3:
+                        continue
+                    owner = None
             if not owner:
                 owner = await pick_next_executive()
             if not owner:
@@ -13967,7 +14014,7 @@ async def attendance_today(admin: dict = Depends(require_admin)):
             "check_out": ((log or {}).get("check_out") or {}).get("time"),
             "status": (log or {}).get("status"),
             "on_leave": bool(leave),
-            "available_for_leads": await _is_user_available_by_attendance(u) if u.get("role") == "executive" else None,
+            "available_for_leads": await _is_user_available_by_attendance(u, for_new_lead=True) if u.get("role") == "executive" else None,
         })
     return {"date": today, "office_open": office_open, "employees": out}
 
