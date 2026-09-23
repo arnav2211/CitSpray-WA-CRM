@@ -329,7 +329,8 @@ async def wa_send_text(to_phone: str, body: str, reply_to_wamid: Optional[str] =
     return {"status": "sent", "wamid": wamid, "raw": data}
 
 
-async def wa_send_template(to_phone: str, template_name: str, lang_code: Optional[str] = None, body_params: Optional[List[str]] = None, company: Optional[str] = None) -> Dict[str, Any]:
+async def wa_send_template(to_phone: str, template_name: str, lang_code: Optional[str] = None, body_params: Optional[List[str]] = None, company: Optional[str] = None,
+                           header_image_url: Optional[str] = None) -> Dict[str, Any]:
     cfg = await get_wa_config(company)
     if not cfg["enabled"]:
         return {"mock": True, "status": "sent_mock", "wamid": None}
@@ -345,11 +346,17 @@ async def wa_send_template(to_phone: str, template_name: str, lang_code: Optiona
     # Sending an empty components/parameters array, or any params for a template
     # with zero placeholders, triggers Meta error (#132000).
     cleaned_params = [str(p) for p in (body_params or []) if str(p) != ""]
+    components: List[Dict[str, Any]] = []
+    if header_image_url:
+        # IMAGE-header templates need the header component on every send.
+        components.append({"type": "header", "parameters": [{"type": "image", "image": {"link": header_image_url}}]})
     if cleaned_params:
-        template_block["components"] = [{
+        components.append({
             "type": "body",
             "parameters": [{"type": "text", "text": p} for p in cleaned_params],
-        }]
+        })
+    if components:
+        template_block["components"] = components
     payload = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
@@ -7554,6 +7561,163 @@ async def _shopify_send_template_for_lead(lead: dict, tpl_name: str, params: Lis
     else:
         logger.warning(f"Shopify WA template '{tpl_name}' failed for lead {lead['id']}: {msg.get('error')}")
     return msg
+
+# ── OMS dispatch → WhatsApp ────────────────────────────────────────────────
+# The OMS calls this the moment a courier / transport order is dispatched.
+# Inside the customer's 24h window the message goes as a free-form text (with
+# the dispatch slip as an image when there is one); outside it, as a template:
+# the IMAGE-header dispatch template when approved and a slip exists, else the
+# plain order_shipped template. Everything lands in the lead's chat like any
+# other message, so the executives see it.
+OMS_TPL_DISPATCHED_IMG = os.environ.get("OMS_TPL_DISPATCHED_IMG", "order_dispatched_slip").strip()
+
+
+class OmsDispatchNotify(BaseModel):
+    company: Optional[str] = None
+    oms_order_id: str
+    order_no: str
+    customer_name: Optional[str] = ""
+    phones: List[str] = []
+    dispatch_type: str = "courier"            # courier | transport
+    courier: Optional[str] = ""               # "Amazon Shipping", "DTDC", "Delhivery Surface (via Shiprocket)"
+    transporter: Optional[str] = ""
+    tracking_no: Optional[str] = ""
+    tracking_url: Optional[str] = ""
+    slip_image_url: Optional[str] = ""        # public https image of the dispatch slip
+    telecaller_id: Optional[str] = None       # OMS user id → CRM owner for a brand-new lead
+    force: bool = False                       # resend even if this order was already notified
+
+
+def _require_oms_service(request: Request) -> dict:
+    """The OMS signs a short-lived JWT {svc: "oms"} with the shared OMS_JWT_SECRET."""
+    auth = request.headers.get("authorization") or ""
+    token = auth[7:] if auth.lower().startswith("bearer ") else ""
+    secret = os.environ.get("OMS_JWT_SECRET", "9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c")
+    try:
+        payload = jwt.decode(token, secret, algorithms=["HS256"])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid OMS service token")
+    if payload.get("svc") != "oms":
+        raise HTTPException(status_code=401, detail="Not an OMS service token")
+    return payload
+
+
+def _tidy_name(name: Optional[str]) -> str:
+    n = " ".join((name or "").split())
+    if not n:
+        return "Customer"
+    return " ".join(w.capitalize() for w in n.split()) if n.isupper() else n
+
+
+@api.post("/oms/dispatch-notify")
+async def oms_dispatch_notify(body: OmsDispatchNotify, request: Request):
+    _require_oms_service(request)
+    company = normalize_company(body.company)
+    phones: List[str] = []
+    for p in body.phones:
+        d = normalize_phone_display(p)
+        if d and d not in phones:
+            phones.append(d)
+    if not phones:
+        return {"status": "skipped", "error": "customer has no phone number"}
+
+    lead, phone = None, None
+    for p in phones:
+        lead = await _find_lead_by_phone(p, company=company)
+        if lead:
+            phone = p
+            break
+    if not lead:
+        data: Dict[str, Any] = {
+            "customer_name": body.customer_name or "Customer", "phone": phones[0], "phones": phones[1:],
+            "company": company, "source": "OMS Customer",
+            "source_data": {"oms_order_id": body.oms_order_id, "order_no": body.order_no},
+            "_suppress_auto_welcome": True,
+        }
+        if body.telecaller_id:
+            m = await db.user_mappings.find_one({"oms_user_id": body.telecaller_id}, {"_id": 0})
+            if m and m.get("crm_user_id"):
+                data["assigned_to"] = m["crm_user_id"]
+        lead = await _create_lead_internal(data)
+        phone = phones[0]
+    if not lead:
+        return {"status": "failed", "error": "could not find or create the customer in the CRM"}
+
+    if not body.force:
+        prior = await db.messages.find_one(
+            {"lead_id": lead["id"], "oms_order_id": body.oms_order_id, "oms_event": "dispatched",
+             "status": {"$in": ["sent", "delivered", "read", "sent_mock"]}},
+            {"_id": 0, "id": 1, "at": 1, "wamid": 1})
+        if prior:
+            return {"status": "already_sent", "lead_id": lead["id"], "phone": phone, "at": prior.get("at"), "wamid": prior.get("wamid")}
+
+    name = _tidy_name(body.customer_name or lead.get("customer_name"))
+    transport = (body.dispatch_type or "").lower() == "transport"
+    via = (body.transporter if transport else body.courier) or ("the transporter" if transport else "our courier")
+    ref = (body.tracking_no or "").strip() or "-"
+    brand = "FragVansh" if company == "fragvansh" else "CitSpray Aroma Sciences"
+    if transport:
+        track_line = f"LR / Bilty no. {ref} with {via}. Please collect the parcel from the transporter's office in your city."
+        tpl_track = f"LR / Bilty no. {ref} with {via}"
+    else:
+        track_line = f"Tracking no.: {ref}" + (f"\nTrack it here: {body.tracking_url}" if body.tracking_url else "")
+        tpl_track = body.tracking_url or ref
+    slip = (body.slip_image_url or "").strip()
+    if not slip.lower().startswith("https://"):
+        slip = ""
+    text = (f"Hello {name}, your order {body.order_no} from {brand} has been dispatched via {via}.\n\n"
+            f"{track_line}\n\n"
+            + ("The dispatch slip is attached.\n" if slip else "")
+            + "Reply to this message if you need any help.")
+
+    within = await _within_24h_for_phone(lead["id"], phone)
+    tpl_name, extra, preview = None, {}, text
+    if within:
+        if slip:
+            api_result = await wa_send_media(phone, "image", slip, caption=text, company=company)
+            extra = {"media_type": "image", "media_url": slip, "caption": text}
+            preview = f"[image] {text}"
+            channel = "image"
+        else:
+            api_result = await wa_send_text(phone, text, company=company)
+            channel = "text"
+    else:
+        cfg = await get_wa_config(company)
+        img_meta = await _resolve_template_meta(OMS_TPL_DISPATCHED_IMG, None, company) if slip else {}
+        if slip and (img_meta.get("status") or "").upper() == "APPROVED":
+            tpl_name, params, header, tpl_meta = OMS_TPL_DISPATCHED_IMG, [name, body.order_no, via, ref], slip, img_meta
+        else:
+            tpl_meta = await _resolve_template_meta(SHOPIFY_TPL_ORDER_SHIPPED, None, company)
+            if not tpl_meta:
+                return {"status": "failed", "lead_id": lead["id"], "phone": phone, "within_24h": False,
+                        "error": f"no approved dispatch template for {company} and the 24h window is closed"}
+            tpl_name, params, header = SHOPIFY_TPL_ORDER_SHIPPED, [name, body.order_no, via, tpl_track], None
+        api_result = await wa_send_template(phone, tpl_name, tpl_meta.get("language") or cfg["default_template_lang"],
+                                            params, company=company, header_image_url=header)
+        preview = render_template_text(tpl_meta.get("body"), params) or f"[Template: {tpl_name}]"
+        if header:
+            extra = {"media_type": "image", "media_url": header}
+            preview = f"[image] {preview}"
+        channel = "template"
+
+    msg = {
+        "id": str(uuid.uuid4()), "lead_id": lead["id"], "direction": "out", "body": preview, "to_phone": phone,
+        "template_name": tpl_name, "status": api_result.get("status", "failed"), "wamid": api_result.get("wamid"),
+        "error": api_result.get("error"), "error_code": api_result.get("code"), "at": iso(now_utc()), "by_user_id": None,
+        "oms_order_id": body.oms_order_id, "oms_order_no": body.order_no, "oms_event": "dispatched", **extra,
+    }
+    await db.messages.insert_one(msg.copy())
+    ok = msg["status"] in ("sent", "delivered", "read", "sent_mock")
+    if ok:
+        await db.leads.update_one({"id": lead["id"]}, {"$set": {"has_whatsapp": True, "last_message_at": msg["at"], "last_action_at": msg["at"]}})
+        await _set_wa_status(lead["id"], phone, True)
+    else:
+        logger.warning(f"OMS dispatch WA failed for {body.order_no}: {msg.get('error')}")
+    await log_activity(None, "oms_order_dispatched", lead["id"],
+                       {"order": body.order_no, "channel": channel, "template": tpl_name, "status": msg["status"], "wamid": msg["wamid"]})
+    return {"status": msg["status"], "channel": channel, "template": tpl_name, "wamid": msg["wamid"],
+            "lead_id": lead["id"], "phone": phone, "within_24h": within, "error": msg.get("error")}
+
 
 # ── OMS website-order push (re-applied 2026-07-27; keep in sync with GitHub repo) ──
 OMS_WEBSITE_USERNAME = os.environ.get("OMS_WEBSITE_USERNAME", "website").strip()
