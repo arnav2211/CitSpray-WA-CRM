@@ -13158,12 +13158,52 @@ class TranslateRequest(BaseModel):
     text: str
     target_lang: str = "en"
 
+_TRANSLATE_LANGS = {
+    "hi": "Hindi", "mr": "Marathi", "gu": "Gujarati", "ta": "Tamil", "te": "Telugu", "kn": "Kannada",
+    "ml": "Malayalam", "bn": "Bengali", "pa": "Punjabi", "or": "Odia", "as": "Assamese", "ur": "Urdu",
+    "en": "English", "es": "Spanish", "ar": "Arabic", "fr": "French", "de": "German",
+}
+
+
+async def _translate_via_gemini(text: str, target_lang: str) -> str:
+    """Translate with Gemini (our own keys + failover). Returns the bare translation."""
+    lang = _TRANSLATE_LANGS.get(target_lang.lower(), target_lang)
+    prompt = (
+        f"You are a translator for a WhatsApp sales chat in India. Translate the message below into {lang}.\n"
+        "Rules: output ONLY the translated message - no quotes, no explanation, no alternatives. "
+        "Keep names, phone numbers, prices, quantities, units, product and chemical names, GST numbers and URLs exactly as they are. "
+        "Keep the same tone, politeness and line breaks. "
+        "If the message is Hinglish (Hindi written in English letters) and the target is Hindi, write it in Devanagari script. "
+        "If the target is English, translate the meaning into natural, simple English.\n\n"
+        f"Message:\n{text}"
+    )
+    raw = await _gemini_generate(prompt, temperature=0.2, max_output_tokens=1500, json_mode=False)
+    out = (raw or "").strip()
+    out = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", out).strip()
+    if len(out) >= 2 and out[0] == out[-1] and out[0] in "\"'\u201c\u201d":
+        out = out[1:-1].strip()
+    if not out:
+        raise RuntimeError("empty translation")
+    return out
+
+
 @api.post("/translate")
 async def translate_text(body: TranslateRequest, user: dict = Depends(get_current_user)):
     text = body.text.strip()
     target_lang = body.target_lang.strip()
     if not text:
         return {"translated_text": "", "source_lang": ""}
+
+    # 1. Gemini first: our own keys, rotates on quota, never IP-rate-limited.
+    #    (The unofficial Google endpoint below answered 429 to almost every
+    #    request from this server between 26 Aug and 23 Sep 2026.)
+    try:
+        translated = await _translate_via_gemini(text, target_lang)
+        return {"translated_text": translated, "source_lang": "auto", "engine": "gemini"}
+    except Exception as e:
+        logger.warning(f"translate: gemini failed ({e}); trying google fallback")
+
+    # 2. Best-effort fallback: free Google endpoint (rate-limited).
     
     url = "https://translate.googleapis.com/translate_a/single"
     params = {
@@ -13185,12 +13225,11 @@ async def translate_text(body: TranslateRequest, user: dict = Depends(get_curren
                             translated_segments.append(segment[0])
                 translated_text = "".join(translated_segments)
                 source_lang = data[2] if len(data) > 2 else "auto"
-                return {"translated_text": translated_text, "source_lang": source_lang}
-            else:
-                raise HTTPException(status_code=500, detail=f"Google Translate API error: status {resp.status_code}")
+                return {"translated_text": translated_text, "source_lang": source_lang, "engine": "google"}
+            logger.error(f"Translation failed: google status {resp.status_code}")
     except Exception as e:
         logger.error(f"Translation failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)}")
+    raise HTTPException(status_code=503, detail="Translation is temporarily unavailable. Please try again in a minute.")
 
 # ------------- AI Assistant (Gemini free tier) -------------
 
