@@ -7684,6 +7684,20 @@ async def oms_dispatch_notify(body: OmsDispatchNotify, request: Request):
     else:
         cfg = await get_wa_config(company)
         img_meta = await _resolve_template_meta(OMS_TPL_DISPATCHED_IMG, None, company) if slip else {}
+        if slip and img_meta and (img_meta.get("status") or "").upper() != "APPROVED":
+            # The cache lags Meta's review; ask Meta before giving up on the slip.
+            try:
+                async with httpx.AsyncClient(timeout=15) as cli:
+                    r = await cli.get(f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['waba_id']}/message_templates",
+                                      params={"name": OMS_TPL_DISPATCHED_IMG, "fields": "name,status,language"},
+                                      headers={"Authorization": f"Bearer {cfg['access_token']}"})
+                for t in (r.json().get("data") or []) if r.status_code < 400 else []:
+                    if t.get("name") == OMS_TPL_DISPATCHED_IMG:
+                        img_meta["status"] = t.get("status")
+                        await db.whatsapp_templates.update_one({"name": OMS_TPL_DISPATCHED_IMG, "company": company},
+                                                               {"$set": {"status": t.get("status")}})
+            except Exception as e:
+                logger.warning(f"template status refresh failed: {e}")
         if slip and (img_meta.get("status") or "").upper() == "APPROVED":
             tpl_name, params, header, tpl_meta = OMS_TPL_DISPATCHED_IMG, [name, body.order_no, via, ref], slip, img_meta
         else:
