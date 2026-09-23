@@ -7699,7 +7699,8 @@ async def oms_dispatch_notify(body: OmsDispatchNotify, request: Request):
             except Exception as e:
                 logger.warning(f"template status refresh failed: {e}")
         if slip and (img_meta.get("status") or "").upper() == "APPROVED":
-            tpl_name, params, header, tpl_meta = OMS_TPL_DISPATCHED_IMG, [name, body.order_no, via, ref], slip, img_meta
+            # {{4}} carries the number and, for couriers, the tracking link too.
+            tpl_name, params, header, tpl_meta = OMS_TPL_DISPATCHED_IMG, [name, body.order_no, via, tpl_track if transport else (f"{ref} - {body.tracking_url}" if body.tracking_url else ref)], slip, img_meta
         else:
             tpl_meta = await _resolve_template_meta(SHOPIFY_TPL_ORDER_SHIPPED, None, company)
             if not tpl_meta:
