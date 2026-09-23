@@ -13179,7 +13179,17 @@ async def _translate_via_gemini(text: str, target_lang: str) -> str:
     )
     # Short per-model timeout: a translation should take ~2 s, so a model that
     # hasn't answered in 8 s is stuck - move on rather than keep the user waiting.
-    raw = await _gemini_generate(prompt, temperature=0.2, max_output_tokens=1500, json_mode=False, per_model_timeout=8.0)
+    try:
+        raw = await _gemini_generate(prompt, temperature=0.2, max_output_tokens=1500, json_mode=False, per_model_timeout=8.0)
+    except HTTPException as e:
+        # Google's 503 storms last seconds: one short pause and a second pass
+        # rescues most calls (23 Sep: the same model answered 200 two seconds
+        # after a 503). Anything else (no keys, quota, bad request) is final.
+        d = str(getattr(e, "detail", "")).lower()
+        if e.status_code != 502 or not any(k in d for k in ("overload", "high demand", "unavailable", "network error", "503", "try again")):
+            raise
+        await asyncio.sleep(1.5)
+        raw = await _gemini_generate(prompt, temperature=0.2, max_output_tokens=1500, json_mode=False, per_model_timeout=8.0)
     out = (raw or "").strip()
     out = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", out).strip()
     if len(out) >= 2 and out[0] == out[-1] and out[0] in "\"'\u201c\u201d":
@@ -13338,7 +13348,8 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
     _now = time.time()
     _bench = await _gemini_model_bench()
     _all = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
-    models = [m for m in _all if _bench.get(_gemini_bench_key(m), 0.0) <= _now] +              [m for m in _all if _bench.get(_gemini_bench_key(m), 0.0) > _now]
+    models = [m for m in _all if _bench.get(_gemini_bench_key(m), 0.0) <= _now] +              sorted([m for m in _all if _bench.get(_gemini_bench_key(m), 0.0) > _now],
+                    key=lambda m: _bench.get(_gemini_bench_key(m), 0.0))
     gen_cfg: Dict[str, Any] = {"temperature": temperature, "maxOutputTokens": max_output_tokens}
     if json_mode:
         gen_cfg["responseMimeType"] = "application/json"
