@@ -13254,6 +13254,7 @@ GEMINI_API_KEY = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""   # legacy alias
 # Fast, non-"thinking" model first: a WhatsApp draft must land in ~2s for a
 # telecaller. Measured 2026-09-02: 3.1-flash-lite 1.9s, flash-lite-latest 1.0s,
 # while 3.6-flash stalled >60s and 2.5-flash returned 503 "high demand".
+logging.getLogger("httpx").setLevel(logging.WARNING)   # no request-URL access lines (they can carry secrets)
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite").strip() or "gemini-3.1-flash-lite"
 # Tried in order when the one before is retired (404) or overloaded (5xx on every
 # key): the rolling alias survives retirements, 2.5-flash is the stable backstop.
@@ -13313,7 +13314,9 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
         for key in keys:
             try:
                 async with httpx.AsyncClient(timeout=14.0) as cli:
-                    resp = await cli.post(url, params={"key": key}, json=payload)
+                    # Key goes in a header: httpx logs request URLs at INFO level,
+                    # and ?key=... in the URL was writing the keys into backend.log.
+                    resp = await cli.post(url, headers={"x-goog-api-key": key}, json=payload)
             except Exception as e:
                 # timeout / network: treat like an overloaded model so the chain
                 # moves on to the next model instead of burning every key on it
@@ -13348,10 +13351,11 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
                 _gemini_bench(key, 12 * 3600, "key rejected")
                 continue
             if resp.status_code >= 500:
-                # "High demand" is model-side, not key-side; note it so we can
-                # move to the next model once the keys are exhausted.
+                # "High demand" is model-side, not key-side: one 503 is enough,
+                # move straight to the next model instead of burning the other
+                # keys on it (that walk cost a translation 36 s on 23 Sep).
                 model_overloaded = True
-                continue
+                break
             break           # genuine request error (bad prompt): another key won't help
         if not (model_retired or model_overloaded):
             break           # the failure wasn't the model — don't retry with another one
