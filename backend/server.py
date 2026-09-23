@@ -13177,7 +13177,9 @@ async def _translate_via_gemini(text: str, target_lang: str) -> str:
         "If the target is English, translate the meaning into natural, simple English.\n\n"
         f"Message:\n{text}"
     )
-    raw = await _gemini_generate(prompt, temperature=0.2, max_output_tokens=1500, json_mode=False)
+    # Short per-model timeout: a translation should take ~2 s, so a model that
+    # hasn't answered in 8 s is stuck - move on rather than keep the user waiting.
+    raw = await _gemini_generate(prompt, temperature=0.2, max_output_tokens=1500, json_mode=False, per_model_timeout=8.0)
     out = (raw or "").strip()
     out = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", out).strip()
     if len(out) >= 2 and out[0] == out[-1] and out[0] in "\"'\u201c\u201d":
@@ -13290,7 +13292,8 @@ def _gemini_key_order() -> List[str]:
 
 
 async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
-                           max_output_tokens: int = 1500, json_mode: bool = True) -> str:
+                           max_output_tokens: int = 1500, json_mode: bool = True,
+                           per_model_timeout: float = 14.0) -> str:
     """Call Gemini, transparently rotating through the configured keys.
 
     A key that is out of quota (429) or rejected (400/403 invalid key) is benched
@@ -13311,9 +13314,10 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         model_retired = False
         model_overloaded = False
-        for key in keys:
+        for ki, key in enumerate(keys):
+            _t0 = time.monotonic()
             try:
-                async with httpx.AsyncClient(timeout=14.0) as cli:
+                async with httpx.AsyncClient(timeout=per_model_timeout) as cli:
                     # Key goes in a header: httpx logs request URLs at INFO level,
                     # and ?key=... in the URL was writing the keys into backend.log.
                     resp = await cli.post(url, headers={"x-goog-api-key": key}, json=payload)
@@ -13322,7 +13326,9 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
                 # moves on to the next model instead of burning every key on it
                 last_detail = f"network error: {e}"
                 model_overloaded = True
+                logger.info(f"gemini {model} key#{ki+1} -> {type(e).__name__} after {time.monotonic()-_t0:.1f}s")
                 break
+            logger.info(f"gemini {model} key#{ki+1} -> {resp.status_code} in {time.monotonic()-_t0:.1f}s")
             if resp.status_code == 200:
                 try:
                     return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
