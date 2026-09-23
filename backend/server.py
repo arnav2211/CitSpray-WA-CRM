@@ -13257,7 +13257,33 @@ GEMINI_API_KEY = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""   # legacy alias
 # telecaller. Measured 2026-09-02: 3.1-flash-lite 1.9s, flash-lite-latest 1.0s,
 # while 3.6-flash stalled >60s and 2.5-flash returned 503 "high demand".
 logging.getLogger("httpx").setLevel(logging.WARNING)   # no request-URL access lines (they can carry secrets)
-_GEMINI_MODEL_BENCH: Dict[str, float] = {}   # model -> monotonic time until which it is tried last
+def _gemini_bench_key(model: str) -> str:
+    return model.replace(".", "_")   # Mongo field names cannot contain dots
+
+
+async def _gemini_model_bench() -> Dict[str, float]:
+    """{model_key: epoch until which the model is tried LAST}. Shared through the
+    DB so one slow discovery teaches all gunicorn workers at once."""
+    try:
+        doc = await db.system_settings.find_one({"key": "gemini_model_bench"}, {"_id": 0, "models": 1})
+        return (doc or {}).get("models") or {}
+    except Exception:
+        return {}
+
+
+async def _gemini_model_bench_set(model: str, seconds: float) -> None:
+    try:
+        await db.system_settings.update_one({"key": "gemini_model_bench"},
+                                            {"$set": {f"models.{_gemini_bench_key(model)}": time.time() + seconds}}, upsert=True)
+    except Exception:
+        pass
+
+
+async def _gemini_model_bench_clear(model: str) -> None:
+    try:
+        await db.system_settings.update_one({"key": "gemini_model_bench"}, {"$unset": {f"models.{_gemini_bench_key(model)}": ""}})
+    except Exception:
+        pass
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite").strip() or "gemini-3.1-flash-lite"
 # Tried in order when the one before is retired (404) or overloaded (5xx on every
 # key): the rolling alias survives retirements, 2.5-flash is the stable backstop.
@@ -13309,9 +13335,10 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
     # the END of the order for 2 minutes, so the next call goes straight to the
     # model that is actually answering instead of re-walking the sick ones
     # (23 Sep: 3 of 5 models were 503 and every translate call took 15 s).
-    _now = time.monotonic()
+    _now = time.time()
+    _bench = await _gemini_model_bench()
     _all = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
-    models = [m for m in _all if _GEMINI_MODEL_BENCH.get(m, 0.0) <= _now] +              [m for m in _all if _GEMINI_MODEL_BENCH.get(m, 0.0) > _now]
+    models = [m for m in _all if _bench.get(_gemini_bench_key(m), 0.0) <= _now] +              [m for m in _all if _bench.get(_gemini_bench_key(m), 0.0) > _now]
     gen_cfg: Dict[str, Any] = {"temperature": temperature, "maxOutputTokens": max_output_tokens}
     if json_mode:
         gen_cfg["responseMimeType"] = "application/json"
@@ -13333,12 +13360,13 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
                 # moves on to the next model instead of burning every key on it
                 last_detail = f"network error: {e}"
                 model_overloaded = True
-                _GEMINI_MODEL_BENCH[model] = time.monotonic() + 120
+                await _gemini_model_bench_set(model, 300)
                 logger.info(f"gemini {model} key#{ki+1} -> {type(e).__name__} after {time.monotonic()-_t0:.1f}s")
                 break
             logger.info(f"gemini {model} key#{ki+1} -> {resp.status_code} in {time.monotonic()-_t0:.1f}s")
             if resp.status_code == 200:
-                _GEMINI_MODEL_BENCH.pop(model, None)
+                if _bench.get(_gemini_bench_key(model), 0.0) > _now:
+                    await _gemini_model_bench_clear(model)
                 try:
                     return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
                 except Exception as e:
@@ -13370,7 +13398,7 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
                 # move straight to the next model instead of burning the other
                 # keys on it (that walk cost a translation 36 s on 23 Sep).
                 model_overloaded = True
-                _GEMINI_MODEL_BENCH[model] = time.monotonic() + 120
+                await _gemini_model_bench_set(model, 300)
                 break
             break           # genuine request error (bad prompt): another key won't help
         if not (model_retired or model_overloaded):
