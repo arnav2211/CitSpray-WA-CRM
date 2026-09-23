@@ -7711,7 +7711,8 @@ async def oms_dispatch_notify(body: OmsDispatchNotify, request: Request):
                                             params, company=company, header_image_url=header)
         preview = render_template_text(tpl_meta.get("body"), params) or f"[Template: {tpl_name}]"
         if header:
-            extra = {"media_type": "image", "media_url": header}
+            # the chat bubble shows an image's text from `caption`, so keep it there too
+            extra = {"media_type": "image", "media_url": header, "caption": preview}
             preview = f"[image] {preview}"
         channel = "template"
 
