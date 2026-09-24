@@ -188,6 +188,7 @@ function OffboardModal({ user, users, onClose, onDone }) {
   const [step, setStep] = useState(1);
   const [reason, setReason] = useState("resigned");
   const [note, setNote] = useState("");
+  const [lastDay, setLastDay] = useState("");
   const [loading, setLoading] = useState(false);
   const company = user.company || "citspray";
   const companyName = company === "fragvansh" ? "Fragvansh" : "CitSpray";
@@ -201,7 +202,7 @@ function OffboardModal({ user, users, onClose, onDone }) {
   const confirm = async () => {
     setLoading(true);
     try {
-      const { data } = await api.post(`/users/${user.id}/offboard`, { reason, note, confirm: true });
+      const { data } = await api.post(`/users/${user.id}/offboard`, { reason, note, last_working_day: lastDay || null, confirm: true });
       const bits = [];
       if (data.leads_reassigned) bits.push(`${data.leads_reassigned} leads split between ${(data.targets || []).join(", ")}`);
       if (data.leads_unassigned) bits.push(`${data.leads_unassigned} leads are now unassigned`);
@@ -230,8 +231,18 @@ function OffboardModal({ user, users, onClose, onDone }) {
                 </button>
               ))}
             </div>
-            <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note for the record (optional) — e.g. last working day, reason"
-              className="w-full border border-gray-300 px-3 py-2 text-sm mb-4" rows={2} />
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+              <label className="block">
+                <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Last working day</div>
+                <input type="date" value={lastDay} onChange={(e) => setLastDay(e.target.value)} className="w-full border border-gray-300 px-3 py-2 text-sm" data-testid="offboard-last-day" />
+                <div className="text-[10px] text-gray-400 mt-1">Salary stops here. Leave empty to use their last punch-in.</div>
+              </label>
+              <label className="block">
+                <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Note (optional)</div>
+                <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Reason, handover, dues…"
+                  className="w-full border border-gray-300 px-3 py-2 text-sm" rows={2} />
+              </label>
+            </div>
 
             <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">What happens now</div>
             <ul className="text-sm text-gray-700 space-y-1.5 mb-5 list-disc pl-5">
@@ -345,8 +356,11 @@ function FormerEmployeesPanel({ onClose }) {
                   <td className="px-4 py-2 font-mono text-xs">{u.employee_code || "—"}</td>
                   <td className="px-4 py-2 text-xs">{d(u.joining_date)}</td>
                   <td className="px-4 py-2 text-xs">
-                    {d(u.left_at)}
+                    {d(u.last_working_day || u.left_at)}
                     <span className={`ml-1.5 text-[9px] uppercase tracking-widest font-bold ${u.left_reason === "fired" ? "text-[#E60000]" : "text-gray-500"}`}>{u.left_reason || "left"}</span>
+                    {u.last_working_day && u.left_at && u.last_working_day !== String(u.left_at).slice(0, 10) && (
+                      <div className="text-[10px] text-gray-400">removed {d(u.left_at)}</div>
+                    )}
                     {u.left_note && <div className="text-[10px] text-gray-400 max-w-[220px] truncate" title={u.left_note}>{u.left_note}</div>}
                   </td>
                   <td className="px-4 py-2 text-xs">

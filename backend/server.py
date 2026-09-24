@@ -887,7 +887,7 @@ async def update_user(user_id: str, body: UserUpdate, admin: dict = Depends(requ
         # Re-activating an offboarded employee = rehire: clear the leaving record
         # so the retention purge no longer targets them.
         updates.update({"employment_status": "active", "left_at": None, "left_reason": None,
-                        "left_note": None, "retain_until": None, "rehired_at": iso(now_utc())})
+                        "left_note": None, "retain_until": None, "last_working_day": None, "rehired_at": iso(now_utc())})
     if updates:
         ops: Dict[str, Any] = {"$set": updates}
         if body.password:
@@ -976,12 +976,21 @@ FORMER_RETENTION_DAYS = 365
 class OffboardInput(BaseModel):
     reason: Literal["fired", "resigned"] = "resigned"
     note: Optional[str] = None
+    last_working_day: Optional[str] = None   # YYYY-MM-DD; default = last attendance date
     confirm: bool = False
 
 
-async def _offboard_user(u: dict, admin: dict, reason: str, note: Optional[str]) -> dict:
+async def _offboard_user(u: dict, admin: dict, reason: str, note: Optional[str],
+                         last_working_day: Optional[str] = None) -> dict:
     uid = u["id"]
     now_iso = iso(now_utc())
+    # Payroll stops at the last working day: given by admin, else the last day
+    # they punched in, else today.
+    lwd = (last_working_day or "").strip()[:10]
+    if not lwd:
+        _last = await db.attendance_logs.find({"user_id": uid, "date": {"$lte": _ist_now().strftime("%Y-%m-%d")}},
+                                              {"_id": 0, "date": 1}).sort("date", -1).to_list(1)
+        lwd = _last[0]["date"] if _last else _ist_now().strftime("%Y-%m-%d")
     comp = normalize_company(u.get("company"))
     summary: Dict[str, Any] = {"leads_reassigned": 0, "leads_unassigned": 0, "targets": [],
                                "followups_moved": 0, "leaves_cancelled": 0, "transfer_requests_closed": 0}
@@ -1052,6 +1061,7 @@ async def _offboard_user(u: dict, admin: dict, reason: str, note: Optional[str])
     retain_until = iso(now_utc() + timedelta(days=FORMER_RETENTION_DAYS))
     await db.users.update_one({"id": uid}, {
         "$set": {"active": False, "employment_status": "former", "left_at": now_iso, "left_reason": reason,
+                 "last_working_day": lwd,
                  "left_note": (note or "").strip() or None, "left_by": admin["id"], "retain_until": retain_until,
                  "bypass_attendance": False, "receiver_numbers": [], "working_hours": [], "scanner_access": False},
         "$unset": {"face_embedding": ""},
@@ -1077,7 +1087,7 @@ async def offboard_user_ep(user_id: str, body: OffboardInput, admin: dict = Depe
         raise HTTPException(status_code=409, detail=f"{u.get('name')} has already left")
     if u.get("role") == "admin":
         raise HTTPException(status_code=400, detail="Admins cannot be offboarded here — change their role first")
-    summary = await _offboard_user(u, admin, body.reason, body.note)
+    summary = await _offboard_user(u, admin, body.reason, body.note, body.last_working_day)
     return {"ok": True, "name": u.get("name"), **summary}
 
 
@@ -14386,6 +14396,15 @@ async def calculate_payroll(
     for u in users_list:
         uid = u["id"]
         joining_date_str = u.get("joining_date") or today_ist
+        # Former employees: days after their last working day are "not employed"
+        # (no pay, no cut) - otherwise a resigned person's final sheet shows
+        # every day after leaving as an uninformed absence and nets to zero.
+        left_str = u.get("last_working_day") or ""
+        if not left_str and u.get("employment_status") == "former" and u.get("left_at"):
+            try:
+                left_str = datetime.fromisoformat(str(u["left_at"]).replace("Z", "+00:00")).astimezone(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d")
+            except Exception:
+                left_str = ""
         base_salary = float(u.get("base_salary") or 0.0)
         # Daily rate = base ÷ number of days in THIS cycle (e.g. 30 or 31),
         # instead of a flat /31. Everything else (Sundays paid, holidays paid,
@@ -14486,6 +14505,11 @@ async def calculate_payroll(
             if d_str < joining_date_str:
                 day["status"] = "not_joined"
                 day["details"] = "Not yet joined"
+                daily_breakdown.append(day)
+                continue
+            if left_str and d_str > left_str:
+                day["status"] = "not_joined"
+                day["details"] = f"Left the company (last working day {left_str})"
                 daily_breakdown.append(day)
                 continue
             if d_str > today_ist:
@@ -14633,7 +14657,7 @@ async def calculate_payroll(
         # with leave/absence on BOTH the day before and after is always unpaid.
         total_credits = 0.0
         for d_str in date_list:
-            if d_str < joining_date_str or d_str > today_ist:
+            if d_str < joining_date_str or d_str > today_ist or (left_str and d_str > left_str):
                 continue
             ddt = datetime.strptime(d_str, "%Y-%m-%d")
             if ddt.weekday() == 6:
@@ -14647,7 +14671,7 @@ async def calculate_payroll(
 
         def _side_absent(x_str: str) -> bool:
             """True when x_str is a workday the employee did not work at all."""
-            if x_str < joining_date_str or x_str > today_ist:
+            if x_str < joining_date_str or x_str > today_ist or (left_str and x_str > left_str):
                 return False  # outside knowable range → don't penalize
             xd = datetime.strptime(x_str, "%Y-%m-%d")
             if xd.weekday() == 6:
