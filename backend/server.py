@@ -13893,6 +13893,25 @@ async def _register_device_punch(emp_code: str, time_str: str):
         logger.info(f"Registered check-in for user {user['name']} via fingerprint device")
         return True
         
+    elif log.get("provisional"):
+        # A placeholder check-in was entered by admin while the device could not
+        # reach the cloud (WiFi down). The first REAL scan of the day replaces the
+        # placeholder time and its late/on-time status - it must not be taken as
+        # a punch-out. Later scans then follow the normal check-out logic.
+        status = "present"
+        try:
+            sh_h, sh_m = map(int, settings_doc.get("shift_start", "09:30").split(":"))
+            if (dt.hour * 60 + dt.minute) - (sh_h * 60 + sh_m) > settings_doc.get("grace_period_minutes", 15):
+                status = "late"
+        except Exception:
+            pass
+        await db.attendance_logs.update_one({"id": log["id"]}, {
+            "$set": {"check_in": {"time": punch_time_str, "photo_path": "fingerprint_device", "verification_score": 0.0},
+                     "status": status, "provisional": False, "provisional_replaced_at": iso(now_utc())},
+            "$unset": {"note": ""}})
+        logger.info(f"Device scan replaced provisional check-in for {user['name']} ({punch_time_str})")
+        return True
+
     elif "check_out" not in log:
         # Freeze window: fingerprint readers often register the same finger
         # 2-3 times in a row; don't let a duplicate scan become a check-out.
