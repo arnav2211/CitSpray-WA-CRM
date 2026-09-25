@@ -1875,6 +1875,24 @@ def _is_buylead(lead_data: dict) -> bool:
     return False
 
 
+# List filters by lead type (used by /leads and /inbox/conversations).
+# IndiaMART stores its QUERY_TYPE code both in source_data and in enquiry_type;
+# matching either keeps older rows (only one of the two set) in the filter.
+LEAD_TYPE_FILTERS: Dict[str, Dict[str, Any]] = {
+    "im_buylead": {"source": "IndiaMART", "$or": [
+        {"source_data.QUERY_TYPE": "B"}, {"enquiry_type": {"$in": ["B", "b"]}}]},
+}
+
+
+def _lead_type_clause(lead_type: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not lead_type:
+        return None
+    clause = LEAD_TYPE_FILTERS.get(lead_type.strip().lower())
+    if clause is None:
+        raise HTTPException(status_code=400, detail=f"Unknown lead_type. Use one of {sorted(LEAD_TYPE_FILTERS)}")
+    return clause
+
+
 ATTENDANCE_DEFAULTS = {
     "office_start": "10:30",
     "late_grace_until": "11:00",
@@ -2829,6 +2847,7 @@ async def list_leads(
     paginate: bool = False,
     starred: Optional[bool] = None,
     tags: Optional[str] = None,  # comma-separated; matches leads carrying ANY of them
+    lead_type: Optional[str] = None,  # e.g. "im_buylead" = IndiaMART buy leads only
     x_company: Optional[str] = Header(None, alias="X-Company"),
 ):
     """List leads with optional filters. Backwards-compatible:
@@ -2857,6 +2876,9 @@ async def list_leads(
         query["starred"] = True
     if source:
         query["source"] = source
+    _lt = _lead_type_clause(lead_type)
+    if _lt:
+        query["$and"].append(_lt)   # in $and so its $or never collides with the free-text $or
     if last_call_outcome:
         if last_call_outcome not in CALL_OUTCOMES:
             raise HTTPException(status_code=400, detail=f"Invalid outcome. Must be one of {CALL_OUTCOMES}")
@@ -5727,6 +5749,7 @@ async def list_conversations(
     limit: int = 50,
     offset: int = 0,
     starred: Optional[bool] = None,
+    lead_type: Optional[str] = None,  # e.g. "im_buylead" = IndiaMART buy leads only
     x_company: Optional[str] = Header(None, alias="X-Company"),
 ):
     """Returns a list of leads optimized for the chat inbox: each row carries last_msg preview,
@@ -5753,6 +5776,9 @@ async def list_conversations(
         query["status"] = status
     if starred:
         query["starred"] = True
+    _lt = _lead_type_clause(lead_type)
+    if _lt:
+        query["$and"].append(_lt)
     if not include_all:
         query["has_whatsapp"] = True
     q_clean = q.strip() if q else None

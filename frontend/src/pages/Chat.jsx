@@ -76,6 +76,7 @@ export default function Chat() {
   const [filterUnreplied, setFilterUnreplied] = useState(false);
   const [filterReplied, setFilterReplied] = useState(false);
   const [filterStarred, setFilterStarred] = useState(false);
+  const [filterBuyleads, setFilterBuyleads] = useState(false);   // IndiaMART buy leads only
   const [filterStatus, setFilterStatus] = useState("");
   const [filterAssignee, setFilterAssignee] = useState(params.get("agent") || "");
   const [execs, setExecs] = useState([]);
@@ -152,6 +153,7 @@ export default function Chat() {
           status: filterStatus || undefined,
           assigned_to: filterAssignee || undefined,
           starred: filterStarred ? true : undefined,
+          lead_type: filterBuyleads ? "im_buylead" : undefined,
           limit: PAGE_SIZE,
           offset: nextOffset,
         },
@@ -181,7 +183,7 @@ export default function Chat() {
     } finally {
       setLoadingMore(false);
     }
-  }, [search, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred, page, loadingMore, hasMore]);
+  }, [search, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred, filterBuyleads, page, loadingMore, hasMore]);
 
   // Refresh-only fetch — re-pulls page 0 for live unread updates without
   // disrupting any further pages the user has scrolled into.
@@ -195,6 +197,7 @@ export default function Chat() {
           status: filterStatus || undefined,
           assigned_to: filterAssignee || undefined,
           starred: filterStarred ? true : undefined,
+          lead_type: filterBuyleads ? "im_buylead" : undefined,
           limit: PAGE_SIZE,
           offset: 0,
         },
@@ -212,7 +215,7 @@ export default function Chat() {
         return merged;
       });
     } catch (_) { /* silent */ }
-  }, [search, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred]);
+  }, [search, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred, filterBuyleads]);
 
   // Run global message search (debounced 250ms via the effect re-trigger)
   const runMessageSearch = useCallback(async (term) => {
@@ -249,7 +252,7 @@ export default function Chat() {
     setPage(0);
     fetchConvs({ reset: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred]);
+  }, [search, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred, filterBuyleads]);
 
   // Live polling — refresh ONLY page 0 (keeps further pages stable while user scrolls)
   useEffect(() => {
@@ -404,6 +407,7 @@ export default function Chat() {
               setFilterUnreplied(false);
             }} testId="filter-replied">Replied</FilterChip>
             <FilterChip active={filterStarred} onClick={() => setFilterStarred(v => !v)} testId="filter-starred">Starred</FilterChip>
+            <FilterChip active={filterBuyleads} onClick={() => setFilterBuyleads(v => !v)} testId="filter-im-buyleads">IM Buy leads</FilterChip>
             <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)} className="border border-gray-300 px-2 py-1 text-xs" data-testid="filter-status">
               <option value="">All status</option>
               {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}

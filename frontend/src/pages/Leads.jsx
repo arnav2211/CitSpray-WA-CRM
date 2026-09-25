@@ -11,6 +11,7 @@ import { fmtIST } from "@/lib/format";
 
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
 const SOURCES = ["IndiaMART", "ExportersIndia", "Justdial", "Manual", "WhatsApp", "Website", "Export", "Google Maps"];
+const IM_BUYLEAD = "IndiaMART:buylead";   // source-filter value = IndiaMART buy leads (QUERY_TYPE B)
 
 // Compact label filter (Fragvansh): one small button that opens a searchable
 // multi-select — scraper keywords are long and numerous, a flat chip wall was
@@ -132,7 +133,9 @@ export default function Leads() {
         params: {
           q: q || undefined,
           status: statusFilter || undefined,
-          source: sourceFilter || undefined,
+          // "IndiaMART:buylead" is a sub-option of the source filter
+          source: sourceFilter === IM_BUYLEAD ? "IndiaMART" : (sourceFilter || undefined),
+          lead_type: sourceFilter === IM_BUYLEAD ? "im_buylead" : undefined,
           assigned_to: assignedFilter || undefined,
           last_call_outcome: outcomeFilter || undefined,
           date_from: dateFrom || undefined,
@@ -271,7 +274,12 @@ export default function Leads() {
         </select>
         <select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)} className="border border-gray-300 px-2 py-2 text-sm" data-testid="leads-source-filter">
           <option value="">All sources</option>
-          {SOURCES.map((s) => <option key={s} value={s}>{s}</option>)}
+          {SOURCES.map((s) => (
+            <React.Fragment key={s}>
+              <option value={s}>{s}</option>
+              {s === "IndiaMART" && <option value={IM_BUYLEAD}>IndiaMART — Buy leads only</option>}
+            </React.Fragment>
+          ))}
         </select>
         {isAdmin && (
           <select value={assignedFilter} onChange={(e) => setAssignedFilter(e.target.value)} className="border border-gray-300 px-2 py-2 text-sm" data-testid="leads-assignee-filter">
