@@ -14007,7 +14007,10 @@ async def _load_parked_punches(user: dict) -> int:
     if not code or not user.get("active", True):
         return 0
     join = user.get("joining_date") or "0000-00-00"
-    parked = await db.unmapped_punches.find({"emp_code": code, "date": {"$gte": join}},
+    # Never past today: the machine has sent scans with a wrong clock before
+    # (years 2000 / 2027 / 2035 in July 2026).
+    today = _ist_now().strftime("%Y-%m-%d")
+    parked = await db.unmapped_punches.find({"emp_code": code, "date": {"$gte": max(join, "2025-01-01"), "$lte": today}},
                                             {"_id": 0, "time": 1}).sort("time", 1).to_list(5000)
     done = 0
     for p in parked:
@@ -14017,7 +14020,7 @@ async def _load_parked_punches(user: dict) -> int:
         except Exception as e:
             logger.warning(f"parked punch replay failed for {code} {p['time']}: {e}")
     if parked:
-        await db.unmapped_punches.delete_many({"emp_code": code, "date": {"$gte": join}})
+        await db.unmapped_punches.delete_many({"emp_code": code, "date": {"$gte": max(join, "2025-01-01"), "$lte": today}})
         await log_activity(None, "parked_punches_loaded", None,
                            {"user_id": user.get("id"), "name": user.get("name"), "code": code,
                             "scans": len(parked), "registered": done})
