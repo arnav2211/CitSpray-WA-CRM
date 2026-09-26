@@ -424,6 +424,7 @@ function UserModal({ user, onClose, onSaved }) {
   const submit = async (e) => {
     e.preventDefault();
     setLoading(true);
+    let loaded = 0;
     try {
       if (isEdit) {
         const body = { 
@@ -439,11 +440,14 @@ function UserModal({ user, onClose, onSaved }) {
           company: f.company
         };
         if (f.password) body.password = f.password;
-        await api.patch(`/users/${user.id}`, body);
+        const { data } = await api.patch(`/users/${user.id}`, body);
+        loaded = data?.parked_scans_loaded || 0;
       } else {
-        await api.post("/users", { ...f, base_salary: Number(f.base_salary), employee_code: f.employee_code || null, department: f.department || null });
+        const { data } = await api.post("/users", { ...f, base_salary: Number(f.base_salary), employee_code: f.employee_code || null, department: f.department || null });
+        loaded = data?.parked_scans_loaded || 0;
       }
-      toast.success("Saved"); onSaved();
+      toast.success(loaded ? `Saved — ${loaded} earlier machine scan${loaded === 1 ? "" : "s"} loaded into attendance` : "Saved");
+      onSaved();
     } catch (err) { toast.error(errMsg(err)); }
     finally { setLoading(false); }
   };

@@ -863,6 +863,8 @@ async def create_user(body: UserCreate, admin: dict = Depends(require_admin)):
         "company": normalize_company(body.company),
     }
     await db.users.insert_one(doc.copy())
+    if doc.get("employee_code"):
+        doc["parked_scans_loaded"] = await _load_parked_punches(doc)
     return strip_mongo(doc)
 
 @api.patch("/users/{user_id}")
@@ -895,6 +897,10 @@ async def update_user(user_id: str, body: UserUpdate, admin: dict = Depends(requ
             ops["$inc"] = {"token_version": 1}
         await db.users.update_one({"id": user_id}, ops)
     doc = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+    # Machine number, joining date or active flag changed -> pick up any scans
+    # the machine sent for that number before it belonged to anyone.
+    if doc and doc.get("employee_code") and ({"employee_code", "joining_date", "active"} & set(updates)):
+        doc["parked_scans_loaded"] = await _load_parked_punches(doc)
     return doc
 
 @api.delete("/users/{user_id}")
@@ -12866,6 +12872,7 @@ async def on_startup():
     scheduler.add_job(former_records_retention_task, "cron", hour=3, minute=30, timezone="Asia/Kolkata", id="former_retention", max_instances=1, coalesce=True)
     try:
         await db.attendance_logs.create_index([("user_id", 1), ("date", 1)])
+        await db.unmapped_punches.create_index([("emp_code", 1), ("time", 1)], unique=True)
         await db.leaves.create_index([("user_id", 1), ("start_date", 1)])
         await db.admin_alerts.create_index([("meta.dedup_key", 1)])
         await db.winback_sends.create_index([("dedup_key", 1)], unique=True)
@@ -13885,6 +13892,16 @@ async def _register_device_punch(emp_code: str, time_str: str):
     user = await db.users.find_one({"employee_code": emp_code, "active": True})
     if not user:
         logger.warning(f"Device punch: user with employee_code={emp_code} not found or inactive")
+        # Keep the scan: when admin later adds a person with this machine number,
+        # their scans from the joining date onward are loaded automatically.
+        try:
+            await db.unmapped_punches.update_one(
+                {"emp_code": str(emp_code).strip(), "time": time_str},
+                {"$setOnInsert": {"emp_code": str(emp_code).strip(), "time": time_str,
+                                  "date": time_str[:10], "received_at": iso(now_utc())}},
+                upsert=True)
+        except Exception as _e:
+            logger.warning(f"could not park unmapped punch {emp_code} {time_str}: {_e}")
         return False
         
     try:
@@ -13980,6 +13997,33 @@ async def _register_device_punch(emp_code: str, time_str: str):
     else:
         logger.info(f"User {user['name']} already checked out today. Ignoring extra device punch.")
         return False
+
+async def _load_parked_punches(user: dict) -> int:
+    """Register the parked (unmapped) scans for this user's machine number, from
+    their joining date onward, in time order - exactly as if the machine had sent
+    them after the user existed. Earlier scans on the same number belong to a
+    previous holder of that number and are left alone. Returns scans registered."""
+    code = str(user.get("employee_code") or "").strip()
+    if not code or not user.get("active", True):
+        return 0
+    join = user.get("joining_date") or "0000-00-00"
+    parked = await db.unmapped_punches.find({"emp_code": code, "date": {"$gte": join}},
+                                            {"_id": 0, "time": 1}).sort("time", 1).to_list(5000)
+    done = 0
+    for p in parked:
+        try:
+            if await _register_device_punch(code, p["time"]):
+                done += 1
+        except Exception as e:
+            logger.warning(f"parked punch replay failed for {code} {p['time']}: {e}")
+    if parked:
+        await db.unmapped_punches.delete_many({"emp_code": code, "date": {"$gte": join}})
+        await log_activity(None, "parked_punches_loaded", None,
+                           {"user_id": user.get("id"), "name": user.get("name"), "code": code,
+                            "scans": len(parked), "registered": done})
+        logger.info(f"loaded {done}/{len(parked)} parked scans for {user.get('name')} (machine {code})")
+    return done
+
 
 @api.get("/iclock/cdata")
 @api.get("/iclock/cdata.aspx")
