@@ -7975,6 +7975,9 @@ async def _oms_push_order(lead: dict, order: dict, paid: bool) -> dict:
         "payment_mode_details": (order.get("gateway") or "") if paid else "Cash on Delivery",
         "billing_address_id": bill_addr_id or ship_addr_id or "",
         "shipping_address_id": ship_addr_id or bill_addr_id or "",
+        # lets the OMS fulfil the Shopify order when it dispatches
+        "shopify_order_id": str(order.get("id") or ""),
+        "shopify_order_name": order_no,
     }
     ok, data = await _oms_api("POST", "/api/orders", token, payload)
     if not ok:
@@ -8199,6 +8202,12 @@ async def _shopify_handle_fulfillment(fulfillment: dict, topic: str) -> dict:
     if topic == "fulfillments/create" or tracking_no:
         if await _fulfillment_template_already_sent(lead["id"], SHOPIFY_TPL_ORDER_SHIPPED, order_no):
             return {"skipped": "shipped already sent", "order": order_no}
+        # The OMS already WhatsApp'd this customer (with the courier slip) when it
+        # dispatched the order; the fulfilment it then created must not send a second one.
+        if lead.get("oms_order_number") and await db.messages.find_one(
+                {"lead_id": lead["id"], "oms_event": "dispatched", "oms_order_no": lead["oms_order_number"],
+                 "status": {"$in": ["sent", "delivered", "read", "sent_mock"]}}, {"_id": 0, "id": 1}):
+            return {"skipped": "OMS dispatch WhatsApp already sent", "order": order_no}
         tracking_url = fulfillment.get("tracking_url") or ""
         company = fulfillment.get("tracking_company") or "our courier"
         tracking_bits = " ".join(filter(None, [tracking_no, tracking_url])) or "your order-status page"
