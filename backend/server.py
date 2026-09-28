@@ -1859,12 +1859,12 @@ def _is_round_robin_source(source: Optional[str]) -> bool:
     auto-reassignment. Historic data has messy casing ('indiamart', 'INDIAMART',
     'india mart', 'Justdial'...), so normalize before comparing."""
     s = (source or "").strip().lower().replace(" ", "")
-    return s in ("indiamart", "justdial", "exportersindia")
+    return s in ("indiamart", "justdial", "exportersindia", "tradeindia")
 
 
 # Mongo-side filter matching the same three sources (case/space-insensitive) for
 # the auto-reassign queries.
-ROUND_ROBIN_SOURCE_REGEX = r"^\s*(india\s*mart|just\s*dial|exporters\s*india)\s*$"
+ROUND_ROBIN_SOURCE_REGEX = r"^\s*(india\s*mart|just\s*dial|exporters\s*india|trade\s*india)\s*$"
 
 
 def _is_buylead(lead_data: dict) -> bool:
@@ -5742,6 +5742,34 @@ class TransferRequestInput(BaseModel):
     lead_id: str
     reason: Optional[str] = ""
 
+def _slim_enquiry_history(ld: dict, limit: int = 10) -> List[Dict[str, Any]]:
+    """Compact enquiry history for the chat panel (newest first): when, which
+    portal, what was asked. Keeps the 4-second inbox polling light - the full
+    enquiry objects carry every portal field."""
+    out: List[Dict[str, Any]] = []
+    for e in (ld.get("enquiries") or []):
+        if not isinstance(e, dict):
+            continue
+        sd = e.get("source_data") or {}
+        what = None
+        for k in ("QUERY_PRODUCT_NAME", "product_name", "product", "category", "subject"):
+            v = sd.get(k) if isinstance(sd, dict) else None
+            if v and str(v).strip():
+                what = str(v).strip()
+                break
+        out.append({"at": e.get("created_at"), "source": e.get("source"),
+                    "type": (sd.get("QUERY_TYPE") if isinstance(sd, dict) else None),
+                    "what": (what or (e.get("requirement") or ""))[:160]})
+    out.sort(key=lambda x: x.get("at") or "", reverse=True)
+    return out[:limit]
+
+
+# Lead fields the chat panel shows for reference (enquiry type, GST, labels...).
+_CHAT_EXTRA_FIELDS = ["enquiry_type", "gst_no", "emails", "tags", "country", "company", "aliases",
+                      "last_enquiry_at", "last_enquiry_source", "justdial_profile_url",
+                      "last_call_at", "last_call_outcome"]
+
+
 @api.get("/inbox/conversations")
 async def list_conversations(
     user: dict = Depends(get_current_user),
@@ -5978,8 +6006,9 @@ async def list_conversations(
                 "id", "customer_name", "phone", "phones", "active_wa_phone", "email", "requirement",
                 "area", "city", "state", "source", "source_data", "status",
                 "assigned_to", "contact_link", "created_at", "opened_at", "last_action_at",
-                "has_whatsapp", "notes", "starred",
+                "has_whatsapp", "notes", "starred", *_CHAT_EXTRA_FIELDS,
             ]},
+            "enquiry_history": _slim_enquiry_history(ld),
             "last_message": {
                 "body": last.get("body"),
                 "direction": last.get("direction"),
@@ -6174,8 +6203,9 @@ async def get_one_conversation(lead_id: str, user: dict = Depends(get_current_us
             "id", "customer_name", "phone", "phones", "email", "requirement",
             "area", "city", "state", "source", "source_data", "status",
             "assigned_to", "contact_link", "created_at", "opened_at", "last_action_at",
-            "has_whatsapp", "notes", "starred",
+            "has_whatsapp", "notes", "starred", *_CHAT_EXTRA_FIELDS,
         ]},
+        "enquiry_history": _slim_enquiry_history(lead),
         "last_message": {
             "body": last.get("body"),
             "direction": last.get("direction"),
@@ -6670,6 +6700,263 @@ async def run_exportersindia_pull_now(admin: dict = Depends(require_admin), date
     if not cfg["api_key"] or not cfg["email"]:
         raise HTTPException(status_code=400, detail="api_key and email must be configured before running a pull")
     return await _pull_exportersindia_once(force_date_from=date_from, company=company)
+
+
+# ------------- TradeIndia "My Inquiry" pull API -------------
+# GET https://www.tradeindia.com/utils/my_inquiry.html?userid&profile_id&key&from_date&to_date[&limit&page_no]
+# Config per company in system_settings "tradeindia_pull[:company]".
+DEFAULT_TI_PULL_URL = "https://www.tradeindia.com/utils/my_inquiry.html"
+DEFAULT_TI_INTERVAL = 300   # seconds
+TI_PAGE_LIMIT = 100
+
+
+def _ti_pull_key(company: Optional[str] = None) -> str:
+    return _scoped_key("tradeindia_pull", company)
+
+
+async def _get_tradeindia_pull_cfg(company: Optional[str] = None) -> Dict[str, Any]:
+    doc = await db.system_settings.find_one({"key": _ti_pull_key(company)}, {"_id": 0}) or {}
+    return {
+        "userid": str(doc.get("userid") or "").strip(),
+        "profile_id": str(doc.get("profile_id") or "").strip(),
+        "api_key": str(doc.get("api_key") or "").strip(),
+        "pull_url": (doc.get("pull_url") or DEFAULT_TI_PULL_URL).strip(),
+        "interval_seconds": int(doc.get("interval_seconds") or DEFAULT_TI_INTERVAL),
+        "enabled": bool(doc.get("enabled", False)),
+        "last_pulled_at": doc.get("last_pulled_at"),
+        "last_success_at": doc.get("last_success_at"),
+        "last_error": doc.get("last_error"),
+        "last_created_count": doc.get("last_created_count"),
+        "last_received_count": doc.get("last_received_count"),
+        "last_unrecognised_count": doc.get("last_unrecognised_count"),
+        "last_date_from": doc.get("last_date_from"),
+    }
+
+
+def _ti_get(e: dict, *keys: str) -> Optional[str]:
+    """First non-empty value among several spellings (TradeIndia field names vary
+    between accounts/versions: snake_case, UPPER, sender_* prefixes)."""
+    for k in keys:
+        for kk in (k, k.upper()):
+            v = e.get(kk)
+            if v is not None and str(v).strip() and str(v).strip().lower() not in ("null", "none", "na", "n/a"):
+                return str(v).strip()
+    return None
+
+
+def _ti_entries(payload: Any) -> List[dict]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        for k in ("data", "DATA", "inquiries", "inquiry", "result", "results", "response", "RESPONSE", "records"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, dict)]
+            if isinstance(v, dict) and v:
+                return [v]
+    return []
+
+
+async def _handle_tradeindia_entries(entries: List[dict], company: str) -> Dict[str, Any]:
+    created, repeat, seen_before, unrecognised = [], 0, 0, 0
+    for e in entries:
+        ext_id = _ti_get(e, "rfi_id", "inquiry_id", "inq_id", "enquiry_id", "id")
+        name = _ti_get(e, "sender_name", "name", "buyer_name", "contact_person") or "TradeIndia Buyer"
+        phone = _ti_get(e, "sender_mobile", "sender_mobile_no", "mobile", "mobile_no", "sender_phone", "phone", "contact_no")
+        email = _ti_get(e, "sender_email", "email", "buyer_email")
+        if not (phone or email):
+            unrecognised += 1
+            continue
+        gen_date = _ti_get(e, "generated_date", "inquiry_date", "date", "enq_date", "created_date")
+        gen_time = _ti_get(e, "generated_time", "inquiry_time", "time")
+        # Each TradeIndia enquiry is processed once; overlapping pull windows would
+        # otherwise log the same enquiry as a "repeat enquiry" every tick.
+        seen_key = ext_id or f"{phone or email}|{gen_date or ''} {gen_time or ''}"
+        try:
+            await db.portal_seen.insert_one({"source": "TradeIndia", "company": company, "ext_id": seen_key,
+                                             "at": iso(now_utc())})
+        except Exception:
+            seen_before += 1
+            continue
+        product = _ti_get(e, "product_name", "product", "subject")
+        message = _ti_get(e, "message", "inquiry_message", "msg", "description", "requirement")
+        subject = _ti_get(e, "subject")
+        requirement = message or subject or product
+        itype = _ti_get(e, "inquiry_type", "enquiry_type", "type", "lead_type")
+        data = {
+            "company": company,
+            "customer_name": name,
+            "phone": phone,
+            "email": email,
+            "requirement": requirement,
+            "area": _ti_get(e, "sender_address", "address"),
+            "city": _ti_get(e, "sender_city", "city"),
+            "state": _ti_get(e, "sender_state", "state"),
+            "country": _ti_get(e, "sender_country", "country"),
+            "source": "TradeIndia",
+            "source_data": e,
+        }
+        if itype:
+            data["enquiry_type"] = itype
+        if not phone:
+            dh = _lead_dedup_hash(name, f"{gen_date} {gen_time}", ext_id or email or "")
+            if dh:
+                data["dedup_hash"] = dh
+        existed = await _find_lead_by_phone(normalize_phone_display(phone), company=company) if phone else None
+        lead = await _create_lead_internal(data, by_user_id=None)
+        if existed:
+            repeat += 1
+        elif lead and lead.get("id"):
+            created.append(lead["id"])
+    return {"created": created, "repeat_enquiries": repeat, "already_seen": seen_before, "unrecognised": unrecognised}
+
+
+async def _pull_tradeindia_once(company: Optional[str] = None, force_date_from: Optional[str] = None) -> Dict[str, Any]:
+    company = normalize_company(company)
+    key = _ti_pull_key(company)
+    cfg = await _get_tradeindia_pull_cfg(company)
+    if not (cfg["userid"] and cfg["profile_id"] and cfg["api_key"]):
+        return {"skipped": True, "reason": "userid, profile_id and key must be configured"}
+    today = _ist_now().strftime("%Y-%m-%d")
+    if force_date_from:
+        date_from = force_date_from
+    elif cfg.get("last_success_at"):
+        try:
+            d = datetime.fromisoformat(cfg["last_success_at"].replace("Z", "+00:00")) + timedelta(hours=5, minutes=30)
+            date_from = (d - timedelta(days=1)).strftime("%Y-%m-%d")   # overlap; portal_seen drops repeats
+        except Exception:
+            date_from = today
+    else:
+        date_from = today
+    started = iso(now_utc())
+    entries: List[dict] = []
+    raw_pages: List[Any] = []
+    try:
+        async with httpx.AsyncClient(timeout=40) as cli:
+            for page in range(1, 11):
+                r = await cli.get(cfg["pull_url"], params={
+                    "userid": cfg["userid"], "profile_id": cfg["profile_id"], "key": cfg["api_key"],
+                    "from_date": date_from, "to_date": today, "limit": TI_PAGE_LIMIT, "page_no": page})
+                try:
+                    payload = r.json()
+                except Exception:
+                    payload = {"raw": r.text[:2000]}
+                raw_pages.append(payload)
+                if r.status_code >= 400 or (isinstance(payload, dict) and payload.get("success") is False):
+                    msg = (payload.get("message") if isinstance(payload, dict) else None) or r.text[:200]
+                    raise RuntimeError(f"HTTP {r.status_code}: {msg}")
+                batch = _ti_entries(payload)
+                entries.extend(batch)
+                if len(batch) < TI_PAGE_LIMIT:
+                    break
+    except Exception as ex:
+        err = str(ex)[:300]
+        await db.system_settings.update_one({"key": key}, {"$set": {
+            "key": key, "last_pulled_at": started, "last_error": err, "last_date_from": date_from}}, upsert=True)
+        return {"ok": False, "error": err, "date_from": date_from}
+    # Keep every raw response for inspection (field names, new inquiry types).
+    await db.webhook_payloads.insert_one({"id": str(uuid.uuid4()), "source": "TradeIndia", "identifier": "pull",
+                                          "company": company, "payload": raw_pages, "received_at": started,
+                                          "processed": True, "entry_count": len(entries)})
+    res = await _handle_tradeindia_entries(entries, company)
+    await db.system_settings.update_one({"key": key}, {"$set": {
+        "key": key, "last_pulled_at": started, "last_success_at": iso(now_utc()), "last_error": None,
+        "last_date_from": date_from, "last_received_count": len(entries),
+        "last_created_count": len(res["created"]), "last_unrecognised_count": res["unrecognised"]}}, upsert=True)
+    if res["unrecognised"]:
+        logger.warning(f"TradeIndia pull ({company}): {res['unrecognised']} entries without phone/email - check field names in webhook_payloads")
+    return {"ok": True, "date_from": date_from, "received": len(entries), **res}
+
+
+async def tradeindia_pull_task():
+    """Ticks every minute; each company's pull runs when its own interval is due.
+    A lock on the config doc keeps the 4 gunicorn workers from pulling together."""
+    for _company in COMPANIES:
+        try:
+            cfg = await _get_tradeindia_pull_cfg(_company)
+            if not cfg["enabled"] or not (cfg["userid"] and cfg["profile_id"] and cfg["api_key"]):
+                continue
+            last = cfg.get("last_pulled_at")
+            if last:
+                try:
+                    if (now_utc() - datetime.fromisoformat(last.replace("Z", "+00:00"))).total_seconds() < cfg["interval_seconds"] - 5:
+                        continue
+                except Exception:
+                    pass
+            now = datetime.now(timezone.utc)
+            got = await db.system_settings.find_one_and_update(
+                {"key": _ti_pull_key(_company), "$or": [{"lock_acquired_at": None}, {"lock_acquired_at": {"$exists": False}},
+                                                          {"lock_acquired_at": {"$lt": now - timedelta(minutes=4)}}]},
+                {"$set": {"lock_acquired_at": now}})
+            if not got:
+                continue
+            try:
+                res = await _pull_tradeindia_once(_company)
+                if res.get("ok"):
+                    logger.info(f"TradeIndia pull ok ({_company}) from={res.get('date_from')} received={res.get('received')} created={len(res.get('created') or [])}")
+                else:
+                    logger.warning(f"TradeIndia pull failed ({_company}): {res.get('error') or res.get('reason')}")
+            finally:
+                await db.system_settings.update_one({"key": _ti_pull_key(_company)}, {"$set": {"lock_acquired_at": None}})
+        except Exception as e:
+            logger.exception(f"TradeIndia pull task crashed ({_company}): {e}")
+
+
+class TradeIndiaPullInput(BaseModel):
+    userid: Optional[str] = None
+    profile_id: Optional[str] = None
+    api_key: Optional[str] = None
+    interval_minutes: Optional[int] = None
+    enabled: Optional[bool] = None
+
+
+@api.get("/settings/tradeindia-pull")
+async def get_tradeindia_pull(admin: dict = Depends(require_admin),
+                              x_company: Optional[str] = Header(None, alias="X-Company")):
+    cfg = await _get_tradeindia_pull_cfg(_resolve_company(admin, x_company))
+    return {
+        "userid": cfg["userid"], "profile_id": cfg["profile_id"],
+        "has_key": bool(cfg["api_key"]), "api_key_masked": _mask_token(cfg["api_key"]) if cfg["api_key"] else "",
+        "interval_minutes": max(1, cfg["interval_seconds"] // 60), "enabled": cfg["enabled"],
+        "last_pulled_at": cfg["last_pulled_at"], "last_success_at": cfg["last_success_at"],
+        "last_error": cfg["last_error"], "last_created_count": cfg["last_created_count"],
+        "last_received_count": cfg["last_received_count"], "last_unrecognised_count": cfg["last_unrecognised_count"],
+        "last_date_from": cfg["last_date_from"], "pull_url": cfg["pull_url"],
+    }
+
+
+@api.put("/settings/tradeindia-pull")
+async def update_tradeindia_pull(body: TradeIndiaPullInput, admin: dict = Depends(require_admin),
+                                 x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(admin, x_company)
+    key = _ti_pull_key(company)
+    upd: Dict[str, Any] = {"key": key, "updated_by": admin["id"], "updated_at": iso(now_utc())}
+    if body.userid is not None:
+        upd["userid"] = body.userid.strip()
+    if body.profile_id is not None:
+        upd["profile_id"] = body.profile_id.strip()
+    if body.api_key is not None and body.api_key.strip():
+        upd["api_key"] = body.api_key.strip()
+    if body.interval_minutes is not None:
+        if int(body.interval_minutes) < 1:
+            raise HTTPException(status_code=400, detail="Minimum interval is 1 minute")
+        upd["interval_seconds"] = int(body.interval_minutes) * 60
+    if body.enabled is not None:
+        upd["enabled"] = bool(body.enabled)
+    await db.system_settings.update_one({"key": key}, {"$set": upd}, upsert=True)
+    await log_activity(admin["id"], "tradeindia_pull_updated", None,
+                       {"company": company, **{k: ("***" if k == "api_key" else v) for k, v in upd.items()}})
+    return await get_tradeindia_pull(admin, x_company)
+
+
+@api.post("/settings/tradeindia-pull/run-now")
+async def run_tradeindia_pull_now(admin: dict = Depends(require_admin), date_from: Optional[str] = Query(None),
+                                  x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(admin, x_company)
+    cfg = await _get_tradeindia_pull_cfg(company)
+    if not (cfg["userid"] and cfg["profile_id"] and cfg["api_key"]):
+        raise HTTPException(status_code=400, detail="Set userid, profile_id and key first")
+    return await _pull_tradeindia_once(company, force_date_from=date_from)
 
 
 class ExportersIndiaSettingsInput(BaseModel):
@@ -12877,11 +13164,14 @@ async def on_startup():
     scheduler.add_job(winback_whatsapp_task, "cron", hour=11, minute=15, timezone="Asia/Kolkata", id="winback_whatsapp", max_instances=1, coalesce=True)
     scheduler.add_job(meta_capi_task, "interval", minutes=30, id="meta_capi", max_instances=1, coalesce=True)
     scheduler.add_job(shopify_popup_leads_task, "interval", minutes=10, id="shopify_popup_leads", max_instances=1, coalesce=True)
+    # TradeIndia pull: ticks every minute, each company pulls on its own interval
+    scheduler.add_job(tradeindia_pull_task, "interval", seconds=60, id="tradeindia_pull", max_instances=1, coalesce=True)
     # 03:30 IST daily — purge attendance/leave/salary records of ex-employees 12 months after they left
     scheduler.add_job(former_records_retention_task, "cron", hour=3, minute=30, timezone="Asia/Kolkata", id="former_retention", max_instances=1, coalesce=True)
     try:
         await db.attendance_logs.create_index([("user_id", 1), ("date", 1)])
         await db.unmapped_punches.create_index([("emp_code", 1), ("time", 1)], unique=True)
+        await db.portal_seen.create_index([("source", 1), ("company", 1), ("ext_id", 1)], unique=True)
         await db.leaves.create_index([("user_id", 1), ("start_date", 1)])
         await db.admin_alerts.create_index([("meta.dedup_key", 1)])
         await db.winback_sends.create_index([("dedup_key", 1)], unique=True)

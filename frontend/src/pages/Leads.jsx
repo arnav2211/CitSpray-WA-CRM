@@ -10,7 +10,7 @@ import LeadDrawer from "@/components/LeadDrawer";
 import { fmtIST } from "@/lib/format";
 
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
-const SOURCES = ["IndiaMART", "ExportersIndia", "Justdial", "Manual", "WhatsApp", "Website", "Export", "Google Maps"];
+const SOURCES = ["IndiaMART", "ExportersIndia", "TradeIndia", "Justdial", "Manual", "WhatsApp", "Website", "Export", "Google Maps"];
 const IM_BUYLEAD = "IndiaMART:buylead";   // source-filter value = IndiaMART buy leads (QUERY_TYPE B)
 
 // Compact label filter (Fragvansh): one small button that opens a searchable

@@ -22,6 +22,7 @@ export function SourceBadge({ source }) {
   const map = {
     IndiaMART: "border-[#002FA7] text-[#002FA7]",
     ExportersIndia: "border-[#BE185D] text-[#BE185D]",
+    TradeIndia: "border-[#0E7490] text-[#0E7490]",
     Justdial: "border-[#E60000] text-[#E60000]",
     Manual: "border-gray-500 text-gray-700",
     WhatsApp: "border-[#008A00] text-[#008A00]",

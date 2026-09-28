@@ -13,6 +13,7 @@ import {
 import { fmtIST, fmtISTTime, fmtSmartShort, fmtSmartLong, fmtTime12, fmtDaySeparator, istDayKey } from "@/lib/format";
 import { StatusBadge, SourceBadge } from "@/components/Badges";
 import OMSDataSection from "@/components/OMSDataSection";
+import LeadReference from "@/components/LeadReference";
 import TagsEditor from "@/components/TagsEditor";
 import { useCompany } from "@/context/CompanyContext";
 
@@ -1911,7 +1912,6 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                 )}
               </InfoRow>
               {conv.email && <InfoRow label="Email"><span className="font-mono text-xs break-all">{conv.email}</span></InfoRow>}
-              <InfoRow label="Source"><SourceBadge source={conv.source} /></InfoRow>
               <InfoRow label="Status"><StatusBadge status={conv.status} /></InfoRow>
               <InfoRow label="Starred">
                 <button
@@ -1928,6 +1928,14 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                   </span>
                 </button>
               </InfoRow>
+              <LeadReference
+                lead={conv}
+                calls={calls}
+                followups={followups}
+                execs={execs}
+                lastInAt={conv.last_in_at}
+                lastOutAt={conv.last_out_at}
+              />
               <InfoRow label="Requirement">
                 <div className="text-xs text-gray-700 whitespace-pre-wrap">{conv.requirement || "—"}</div>
               </InfoRow>
@@ -1947,8 +1955,6 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                   <div className="text-xs text-gray-700">{[conv.area, conv.city, conv.state].filter(Boolean).join(", ")}</div>
                 </InfoRow>
               )}
-              {conv.created_at && <InfoRow label="Created"><span className="text-xs text-gray-700">{fmtIST(conv.created_at)}</span></InfoRow>}
-
               <OMSDataSection leadId={conv.id} />
 
               {/* Call Activity Section */}

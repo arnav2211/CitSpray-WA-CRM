@@ -125,6 +125,8 @@ export default function Settings() {
 
       <ExportersIndiaPanel onChanged={load} />
 
+      <TradeIndiaPanel />
+
       <CallRoutingPanel />
 
       <EmailAutoSendPanel />
@@ -552,6 +554,104 @@ function ExportersIndiaPanel({ onChanged }) {
 }
 
 
+
+
+// ---------------- TradeIndia pull (admin) ----------------
+function TradeIndiaPanel() {
+  const [cfg, setCfg] = useState(null);
+  const [userid, setUserid] = useState("");
+  const [profileId, setProfileId] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [mins, setMins] = useState(5);
+  const [saving, setSaving] = useState(false);
+  const [running, setRunning] = useState(false);
+
+  const load = async () => {
+    try {
+      const { data } = await api.get("/settings/tradeindia-pull");
+      setCfg(data); setUserid(data.userid || ""); setProfileId(data.profile_id || ""); setMins(data.interval_minutes || 5); setApiKey("");
+    } catch (e) { toast.error(errMsg(e)); }
+  };
+  useEffect(() => { load(); }, []);
+
+  const save = async (patch) => {
+    setSaving(true);
+    try { await api.put("/settings/tradeindia-pull", patch); toast.success("Saved"); await load(); }
+    catch (e) { toast.error(errMsg(e)); }
+    finally { setSaving(false); }
+  };
+  const runNow = async () => {
+    setRunning(true);
+    try {
+      const { data } = await api.post("/settings/tradeindia-pull/run-now");
+      if (data.ok === false) toast.error(`TradeIndia: ${data.error}`);
+      else toast.success(`Pulled ${data.received ?? 0} enquiries — ${(data.created || []).length} new lead(s), ${data.repeat_enquiries || 0} repeat`);
+      await load();
+    } catch (e) { toast.error(errMsg(e, "Pull failed")); }
+    finally { setRunning(false); }
+  };
+
+  if (!cfg) return null;
+  const configured = cfg.userid && cfg.profile_id && cfg.has_key;
+  return (
+    <div className="border border-gray-200 bg-white" data-testid="tradeindia-panel">
+      <div className="px-5 py-4 border-b border-gray-200 flex items-start justify-between gap-3">
+        <div>
+          <h2 className="font-chivo font-bold text-lg flex items-center gap-2"><ShieldCheck size={18} weight="bold" /> TradeIndia Pull API</h2>
+          <p className="text-xs text-gray-500 mt-1 max-w-2xl">
+            LeadOrbit checks TradeIndia's "My Inquiry" API on this interval and imports new enquiries as leads
+            (source TradeIndia, assigned by round-robin like the other portals). Each enquiry is imported once.
+          </p>
+        </div>
+        <label className="inline-flex items-center gap-2 cursor-pointer" data-testid="ti-enable-toggle">
+          <input type="checkbox" checked={cfg.enabled} disabled={!configured}
+            onChange={() => save({ enabled: !cfg.enabled })} className="w-4 h-4 accent-[#25D366]" />
+          <span className="text-[10px] uppercase tracking-widest font-bold">{cfg.enabled ? "Enabled" : "Disabled"}</span>
+        </label>
+      </div>
+      <div className="p-5 space-y-4">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <label className="block">
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">User ID</div>
+            <input value={userid} onChange={(e) => setUserid(e.target.value)} className="w-full border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="ti-userid" />
+          </label>
+          <label className="block">
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Profile ID</div>
+            <input value={profileId} onChange={(e) => setProfileId(e.target.value)} className="w-full border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="ti-profile" />
+          </label>
+          <label className="block">
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Key {cfg.has_key && <span className="normal-case tracking-normal font-mono text-gray-400">({cfg.api_key_masked})</span>}</div>
+            <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={cfg.has_key ? "Leave blank to keep" : "Paste key"}
+              className="w-full border border-gray-300 px-3 py-2 text-sm font-mono" data-testid="ti-key" />
+          </label>
+        </div>
+        <div className="flex items-end gap-3 flex-wrap">
+          <label className="block">
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-1">Check every (minutes)</div>
+            <input type="number" min="1" max="120" value={mins} onChange={(e) => setMins(Number(e.target.value))} className="w-24 border border-gray-300 px-2 py-2 text-sm" />
+          </label>
+          <button type="button" disabled={saving}
+            onClick={() => save({ userid, profile_id: profileId, api_key: apiKey || undefined, interval_minutes: mins })}
+            className="bg-[#002FA7] hover:bg-[#002288] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 disabled:opacity-50" data-testid="ti-save">
+            <FloppyDisk size={14} weight="bold" /> {saving ? "Saving…" : "Save"}
+          </button>
+          <button type="button" onClick={runNow} disabled={running || !configured}
+            className="bg-[#25D366] hover:bg-[#1da851] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 disabled:opacity-50" data-testid="ti-run-now">
+            <Lightning size={14} weight="bold" /> {running ? "Pulling…" : "Run pull now"}
+          </button>
+        </div>
+        <div className="text-xs bg-gray-50 border border-gray-200 p-2 space-y-1">
+          <div>Last successful pull: <b>{cfg.last_success_at ? fmtIST(cfg.last_success_at) : "Never"}</b>
+            {typeof cfg.last_received_count === "number" && <span className="ml-2 text-gray-500">({cfg.last_received_count} received, +{cfg.last_created_count || 0} new)</span>}
+          </div>
+          {cfg.last_pulled_at && <div className="text-gray-500">Last attempt: {fmtIST(cfg.last_pulled_at)}</div>}
+          {cfg.last_unrecognised_count > 0 && <div className="text-[#B85F00]">{cfg.last_unrecognised_count} enquiries had no phone/email and were skipped.</div>}
+          {cfg.last_error && <div className="text-[11px] text-[#E60000] font-mono bg-[#FFE9E9] p-2 border border-[#E60000]">⚠ {cfg.last_error}</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 
 // ---------------- Buyleads Routing (admin) ----------------
