@@ -8259,6 +8259,8 @@ async def _oms_push_order(lead: dict, order: dict, paid: bool) -> dict:
         "payment_status": "full" if paid else "unpaid",
         "amount_paid": lines["total_incl"] if paid else 0,
         "mode_of_payment": "Online" if paid else "COD",
+        # COD orders must reach the courier as COD so it collects the money
+        "is_cod": not paid,
         "payment_mode_details": (order.get("gateway") or "") if paid else "Cash on Delivery",
         "billing_address_id": bill_addr_id or ship_addr_id or "",
         "shipping_address_id": ship_addr_id or bill_addr_id or "",
