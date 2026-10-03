@@ -1,6 +1,7 @@
 import React from "react";
 import { fmtSmartLong } from "@/lib/format";
 import { SourceBadge, EnquiryTypeBadge } from "@/components/Badges";
+import CodVerificationCard from "@/components/CodVerificationCard";
 
 /* Everything an executive needs for reference while chatting: what kind of
    lead this is, who owns it, when the customer enquired, when they were last
@@ -135,7 +136,7 @@ function historyOf(lead) {
   }).sort((a, b) => (b.at || "").localeCompare(a.at || ""));
 }
 
-export default function LeadReference({ lead, calls = [], followups = [], execs = [], lastInAt, lastOutAt }) {
+export default function LeadReference({ lead, calls = [], followups = [], execs = [], lastInAt, lastOutAt, onLeadChange }) {
   if (!lead) return null;
   const owner = (execs || []).find((u) => u.id === lead.assigned_to);
   const lastCall = calls[0];
@@ -151,6 +152,7 @@ export default function LeadReference({ lead, calls = [], followups = [], execs 
 
   return (
     <div className="space-y-3" data-testid="lead-reference">
+      <CodVerificationCard lead={lead} onChange={onLeadChange} />
       <Section title="At a glance" testId="lead-glance">
         <Row k="Lead type" testId="glance-type">
           <span className="inline-flex items-center gap-1.5 flex-wrap">

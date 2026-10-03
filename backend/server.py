@@ -5767,7 +5767,9 @@ def _slim_enquiry_history(ld: dict, limit: int = 10) -> List[Dict[str, Any]]:
 # Lead fields the chat panel shows for reference (enquiry type, GST, labels...).
 _CHAT_EXTRA_FIELDS = ["enquiry_type", "gst_no", "emails", "tags", "country", "company", "aliases",
                       "last_enquiry_at", "last_enquiry_source", "justdial_profile_url",
-                      "last_call_at", "last_call_outcome"]
+                      "last_call_at", "last_call_outcome",
+                      # website COD verification state, shown in the /chat details panel
+                      "cod_status", "cod_asked_at", "cod_responded_at", "cod_resolved_via", "oms_order_number"]
 
 
 @api.get("/inbox/conversations")
@@ -8285,10 +8287,114 @@ async def _oms_push_order(lead: dict, order: dict, paid: bool) -> dict:
 
 async def _oms_push_from_lead(lead: dict) -> dict:
     """Push using the Shopify payload stashed on the lead (used on COD confirmation)."""
-    snap = (lead.get("source_data") or {}).get("oms_payload")
+    sd = lead.get("source_data") or {}
+    snap = sd.get("oms_payload")
     if not snap:
         return {"error": "no stored order payload on lead"}
+    if not snap.get("id") and sd.get("shopify_order_id"):
+        # older snapshots were stored without the Shopify id
+        snap = {**snap, "id": sd.get("shopify_order_id")}
     return await _oms_push_order(lead, snap, paid=False)
+
+
+# ── Website: estimated delivery by pincode ────────────────────────────────────
+# Public (no login) endpoint behind the pincode box on citspray.com. It asks the
+# OMS for the same courier ETAs the dispatch desk sees (Amazon Shipping and the
+# Shiprocket couriers) and turns the fastest realistic quote into a delivery
+# window. Results are cached per pincode so the carriers are not hit per view.
+# The store's domains get an explicit allow-origin header because the global
+# CORS list is limited to the CRM's own domain.
+EDD_CACHE_HOURS = 12
+EDD_WEIGHT_KG = 0.5                 # a typical website parcel
+EDD_ORIGINS = {"https://www.citspray.com", "https://citspray.com", "https://qt6c0h-5b.myshopify.com"}
+_EDD_IST = timezone(timedelta(hours=5, minutes=30))
+_edd_hits: Dict[str, List[float]] = {}
+
+
+def _edd_parse_day(s) -> Optional[datetime]:
+    """Courier ETA strings come in a few shapes ('Oct 06, 2026', '2026-10-06', ...)."""
+    s = str(s or "").strip()
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", s)
+    if m:
+        return datetime.strptime(m.group(1), "%Y-%m-%d")
+    m = re.match(r"([A-Za-z]{3} \d{1,2}, \d{4})", s)
+    if m:
+        return datetime.strptime(m.group(1), "%b %d, %Y")
+    m = re.match(r"(\d{1,2} [A-Za-z]{3} \d{4})", s)
+    if m:
+        return datetime.strptime(m.group(1), "%d %b %Y")
+    return None
+
+
+def _edd_window(options: list) -> dict:
+    """Delivery window from the courier quotes. Carriers quote from a pickup today;
+    we pack within a working day, so every quote moves a day later (two days when
+    the order lands on a Saturday). The window runs from the fastest courier to at
+    most two days after it."""
+    today = datetime.now(_EDD_IST).date()
+    dispatch = 2 if today.weekday() == 5 else 1
+    quotes = []
+    for o in options:
+        if not o.get("serviceable"):
+            continue
+        if "air" in (o.get("service") or "").lower():
+            continue  # we ship surface only; air quotes would over-promise
+        d = _edd_parse_day(o.get("eta"))
+        if d and d.date() >= today:
+            quotes.append((d.date() + timedelta(days=dispatch), o.get("carrier") or "", o.get("service") or ""))
+    if not quotes:
+        return {}
+    quotes.sort()
+    start = quotes[0][0]
+    end = min(start + timedelta(days=2), max(quotes[-1][0], start + timedelta(days=1)))
+    courier = quotes[0][1]
+    if courier == "Shiprocket" and quotes[0][2]:
+        courier = quotes[0][2]
+    return {"from": start.isoformat(), "to": end.isoformat(), "courier": courier}
+
+
+def _edd_json(request: Request, payload: dict, status: int = 200) -> JSONResponse:
+    headers = {"Cache-Control": "public, max-age=600"}
+    origin = request.headers.get("origin") or ""
+    if origin in EDD_ORIGINS:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Vary"] = "Origin"
+    return JSONResponse(payload, status_code=status, headers=headers)
+
+
+@api.get("/public/edd")
+async def public_estimated_delivery(request: Request, pincode: str = ""):
+    pin = re.sub(r"\D", "", pincode or "")[:6]
+    if len(pin) != 6 or pin[0] == "0":
+        return _edd_json(request, {"serviceable": None, "error": "Enter a valid 6-digit pincode"}, 400)
+    ip = ((request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+          or (request.client.host if request.client else "") or "?")
+    now_ts = time.time()
+    hits = [t for t in _edd_hits.get(ip, []) if now_ts - t < 60]
+    if len(hits) >= 30:
+        return _edd_json(request, {"serviceable": None, "error": "Too many checks. Please try again in a minute."}, 429)
+    hits.append(now_ts)
+    _edd_hits[ip] = hits
+    cached = await db.edd_cache.find_one({"pincode": pin}, {"_id": 0})
+    if cached and (cached.get("expires_at") or "") > iso(now_utc()):
+        return _edd_json(request, {**cached["result"], "cached": True})
+    wuser = await _oms_website_user()
+    if not wuser:
+        return _edd_json(request, {"serviceable": None, "error": "Delivery check is unavailable right now"}, 503)
+    token = _oms_mint_token(wuser["id"])
+    ok, data = await _oms_api("GET", f"/api/rates/compare?pincode={pin}&weight={EDD_WEIGHT_KG}&cod=false", token)
+    if not ok or not isinstance(data, dict):
+        return _edd_json(request, {"serviceable": None, "error": "Delivery check is unavailable right now"}, 503)
+    options = data.get("options") or []
+    window = _edd_window(options)
+    cod_ok = any(o.get("serviceable") and o.get("carrier") in ("Amazon Shipping", "Shiprocket", "Delhivery") for o in options)
+    result = {"pincode": pin, "city": data.get("city") or "", "state": data.get("state") or "",
+              "serviceable": bool(window), **window, "cod": bool(window) and cod_ok,
+              "checked_at": iso(now_utc())}
+    await db.edd_cache.update_one({"pincode": pin}, {"$set": {
+        "pincode": pin, "result": result,
+        "expires_at": iso(now_utc() + timedelta(hours=EDD_CACHE_HOURS))}}, upsert=True)
+    return _edd_json(request, result)
 
 
 # ── COD confirmation ──────────────────────────────────────────────────────
@@ -8303,56 +8409,113 @@ def _shopify_is_cod(order: dict) -> bool:
     gateways = " ".join(order.get("payment_gateway_names") or []).lower()
     gw = str(order.get("gateway") or "").lower()
     blob = f"{gateways} {gw}"
+    fs = (order.get("financial_status") or "").lower()
     if "cash on delivery" in blob or "cod" in blob:
+        return True
+    # Shopify's built-in manual payment method reports gateway="manual" with the
+    # money still uncollected. This store's only manual method is Cash on
+    # Delivery, so an unpaid manual order is a COD order.
+    if "manual" in blob and fs in ("pending", "unpaid"):
         return True
     # No gateway named but money not captured -> treat as COD rather than
     # silently skipping verification.
-    return (order.get("financial_status") or "").lower() in ("pending", "unpaid") and not blob.strip()
+    return fs in ("pending", "unpaid") and not blob.strip()
+
+
+async def _cod_resolve(lead: dict, action: str, by_user_id: Optional[str] = None, via: str = "whatsapp") -> dict:
+    """Confirm or cancel a COD order. Confirm books it into OMS.
+    Reached two ways: the customer taps Confirm/Cancel on the cod_verification
+    template (via="whatsapp"), or an executive clicks Confirm/Cancel in the CRM
+    after speaking to the customer (via="crm")."""
+    fresh = await db.leads.find_one({"id": lead["id"]}, {"_id": 0}) or lead
+    order_no = ((fresh.get("source_data") or {}).get("order_number")) or ""
+    current = fresh.get("cod_status") or ""
+    if via == "whatsapp" and current != "pending":
+        return {"ignored": True, "cod_status": current}  # not awaiting confirmation (or already handled)
+    who = "customer" if via == "whatsapp" else "executive"
+
+    if action == "cancel":
+        await db.leads.update_one({"id": fresh["id"]}, {"$set": {
+            "cod_status": "cancelled", "cod_responded_at": iso(now_utc()), "cod_resolved_via": via}})
+        await log_activity(by_user_id, "cod_cancelled", fresh["id"], {"order": order_no, "via": via})
+        result = {"cod_status": "cancelled"}
+        if fresh.get("oms_order_number"):
+            result["warning"] = f"OMS order {fresh['oms_order_number']} already exists for {order_no}; cancel it in OMS too."
+        if via == "whatsapp":
+            try:
+                await create_system_alert(
+                    "cod_cancelled", f"COD order {order_no} cancelled by customer",
+                    f"{fresh.get('customer_name')} ({fresh.get('phone')}) tapped Cancel on {order_no}. "
+                    f"Do not dispatch.", dedup_key=f"cod_cancel:{fresh['id']}:{order_no}")
+            except Exception as e:
+                logger.warning(f"cod cancel alert failed: {e}")
+        return result
+
+    # Confirmed → book it into OMS (idempotent: _oms_push_order skips leads that already carry oms_order_id)
+    if current != "confirmed":
+        await db.leads.update_one({"id": fresh["id"]}, {"$set": {
+            "cod_status": "confirmed", "cod_responded_at": iso(now_utc()), "cod_resolved_via": via}})
+        await log_activity(by_user_id, "cod_confirmed", fresh["id"], {"order": order_no, "via": via})
+    result = {"cod_status": "confirmed"}
+    try:
+        res = await _oms_push_from_lead(fresh)
+        if res.get("error"):
+            logger.warning(f"OMS COD push failed for {order_no}: {res['error']}")
+            result["error"] = res["error"]
+            await create_system_alert(
+                "cod_oms_failed", f"COD {order_no} confirmed but OMS push failed",
+                f"{fresh.get('customer_name')} ({who}) confirmed {order_no} but it did not reach OMS: "
+                f"{res['error']}. Create it manually.", dedup_key=f"cod_oms_fail:{fresh['id']}")
+        else:
+            result["oms_order_number"] = res.get("oms_order_number") or fresh.get("oms_order_number")
+            logger.info(f"COD {order_no} confirmed by {who} -> OMS {result['oms_order_number']}")
+    except Exception as e:
+        logger.exception(f"OMS COD push crashed for {order_no}: {e}")
+        result["error"] = str(e)
+    return result
 
 
 async def _handle_cod_button_reply(lead: dict, body_text: str) -> None:
     """Customer tapped Confirm/Cancel on the cod_verification template."""
     t = (body_text or "").lower()
-    confirmed = "confirm order" in t
-    cancelled = "cancel order" in t
-    if not (confirmed or cancelled):
-        return
+    if "confirm order" in t:
+        await _cod_resolve(lead, "confirm", via="whatsapp")
+    elif "cancel order" in t:
+        await _cod_resolve(lead, "cancel", via="whatsapp")
 
-    fresh = await db.leads.find_one({"id": lead["id"]}, {"_id": 0}) or lead
-    if (fresh.get("cod_status") or "") != "pending":
-        return  # not awaiting confirmation (or already handled) — ignore
 
-    order_no = ((fresh.get("source_data") or {}).get("order_number")) or ""
-
-    if cancelled:
-        await db.leads.update_one({"id": fresh["id"]}, {"$set": {
-            "cod_status": "cancelled", "cod_responded_at": iso(now_utc())}})
-        await log_activity(None, "cod_cancelled", fresh["id"], {"order": order_no})
-        try:
-            await create_system_alert(
-                "cod_cancelled", f"COD order {order_no} cancelled by customer",
-                f"{fresh.get('customer_name')} ({fresh.get('phone')}) tapped Cancel on {order_no}. "
-                f"Do not dispatch.", dedup_key=f"cod_cancel:{fresh['id']}:{order_no}")
-        except Exception as e:
-            logger.warning(f"cod cancel alert failed: {e}")
-        return
-
-    # Confirmed → book it into OMS
-    await db.leads.update_one({"id": fresh["id"]}, {"$set": {
-        "cod_status": "confirmed", "cod_responded_at": iso(now_utc())}})
-    await log_activity(None, "cod_confirmed", fresh["id"], {"order": order_no})
-    try:
-        res = await _oms_push_from_lead(fresh)
-        if res.get("error"):
-            logger.warning(f"OMS COD push failed for {order_no}: {res['error']}")
-            await create_system_alert(
-                "cod_oms_failed", f"COD {order_no} confirmed but OMS push failed",
-                f"{fresh.get('customer_name')} confirmed {order_no} but it did not reach OMS: "
-                f"{res['error']}. Create it manually.", dedup_key=f"cod_oms_fail:{fresh['id']}")
-        else:
-            logger.info(f"COD {order_no} confirmed -> OMS {res.get('oms_order_number')}")
-    except Exception as e:
-        logger.exception(f"OMS COD push crashed for {order_no}: {e}")
+@api.post("/leads/{lead_id}/cod/{action}")
+async def cod_action(lead_id: str, action: str, user: dict = Depends(get_current_user)):
+    """Executive action on a website COD order: `confirm` after speaking to the
+    customer (books it into OMS), `cancel`, or `resend` the cod_verification
+    WhatsApp so the customer can tap Confirm themselves."""
+    if action not in ("confirm", "cancel", "resend"):
+        raise HTTPException(status_code=400, detail="action must be confirm, cancel or resend")
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    sd = lead.get("source_data") or {}
+    order_no = sd.get("order_number")
+    if not order_no:
+        raise HTTPException(status_code=400, detail="This lead has no website order to confirm")
+    if action == "resend":
+        if not lead.get("phone"):
+            raise HTTPException(status_code=400, detail="Lead has no phone number")
+        if (lead.get("cod_status") or "") == "confirmed":
+            raise HTTPException(status_code=400, detail="Order is already confirmed")
+        total = sd.get("total_price") or ""
+        currency = sd.get("currency") or "INR"
+        msg = await _shopify_send_template_for_lead(
+            lead, SHOPIFY_TPL_COD, [lead.get("customer_name") or "there", order_no, f"{currency} {total}"])
+        ok = msg.get("status") in ("sent", "delivered", "read", "sent_mock")
+        if ok:
+            await db.leads.update_one({"id": lead_id}, {"$set": {
+                "cod_status": "pending", "cod_asked_at": iso(now_utc())}})
+            await log_activity(user.get("id"), "cod_verification_sent", lead_id, {"order": order_no, "via": "crm"})
+        return {"ok": ok, "status": msg.get("status"), "error": msg.get("error"),
+                "cod_status": "pending" if ok else lead.get("cod_status")}
+    res = await _cod_resolve(lead, action, by_user_id=user.get("id"), via="crm")
+    return {"ok": not res.get("error"), **res}
 
 
 
@@ -8390,6 +8553,9 @@ async def _shopify_handle_order_created(order: dict) -> dict:
         "_suppress_auto_welcome": True,
     }
     data["source_data"]["oms_payload"] = {
+        # Shopify order id travels with the snapshot so a COD order confirmed later
+        # still reaches OMS with shopify_order_id (needed to fulfil on dispatch).
+        "id": order.get("id"),
         "name": order_no, "order_number": order.get("order_number"),
         "total_price": total, "gateway": data["source_data"]["gateway"],
         "line_items": order.get("line_items") or [], "shipping_lines": order.get("shipping_lines") or [],
@@ -10347,7 +10513,9 @@ async def _handle_wa_webhook(request: Request, company: str):
                         logger.warning(f"inbound availability reassign failed: {_e}")
 
                     # ---- Auto-Reply Sequence Trigger ----
-                    if not lead.get("auto_reply_sequence_triggered"):
+                    # A template quick-reply tap (e.g. COD "Confirm Order") is not an
+                    # enquiry — never answer it with the welcome/catalogue sequence.
+                    if msg_type != "button" and not lead.get("auto_reply_sequence_triggered"):
                         # Only consume the first-time token when the sequence is actually live.
                         # This prevents permanently locking leads whose first reply predated
                         # the feature being set up — if disabled, the next inbound message

@@ -9,6 +9,7 @@ import { X, Phone, EnvelopeSimple, MapPin, ArrowSquareOut, PaperPlaneRight, Cloc
 import { fmtIST, fmtISTTime, fmtTime12, fmtSmartLong, fmtDaySeparator, istDayKey, queryTypeInfo } from "@/lib/format";
 import OMSDataSection from "@/components/OMSDataSection";
 import TagsEditor from "@/components/TagsEditor";
+import CodVerificationCard from "@/components/CodVerificationCard";
 
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
 
@@ -565,6 +566,8 @@ export default function LeadDrawer({ leadId, onClose }) {
                 </div>
               </section>
             )}
+
+            <CodVerificationCard lead={lead} onChange={() => loadAll(activeLeadId)} />
 
             {isFragvansh && (
               <TagsSection lead={lead} canEdit={canEdit} onSave={(tags) => update({ tags })} />
