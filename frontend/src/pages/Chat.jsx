@@ -8,8 +8,9 @@ import {
   Funnel, Lightning, ArrowsLeftRight, X, Tag, NotePencil, Info,
   Paperclip, Image as ImageIcon, VideoCamera, FileText, Microphone, MapPin, IdentificationCard, Stop,
   DownloadSimple, Question, ChatTeardropText, CaretLeft, QrCode, PhoneCall, CalendarBlank, Check, Clock, Star,
-  Sparkle,
+  Sparkle, Camera, UploadSimple,
 } from "@phosphor-icons/react";
+import { MediaPreviewModal, CameraModal, makeMediaItems, releaseMediaItems } from "@/components/ChatMediaComposer";
 import { fmtIST, fmtISTTime, fmtSmartShort, fmtSmartLong, fmtTime12, fmtDaySeparator, istDayKey } from "@/lib/format";
 import { StatusBadge, SourceBadge } from "@/components/Badges";
 import OMSDataSection from "@/components/OMSDataSection";
@@ -1339,18 +1340,136 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
     }
   };
 
+  // ────────── WhatsApp-style media: preview + caption before sending ──────────
+  // Files arrive from the attach menu, a paste into the message box, a drop on
+  // the chat, or the camera. They open in a preview where each one gets its own
+  // caption; nothing is sent until Send is pressed in the preview.
+  const [mediaItems, setMediaItems] = useState(null);
+  const [mediaSending, setMediaSending] = useState(false);
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [dropActive, setDropActive] = useState(false);
+  const dragDepthRef = useRef(0);
+  const movedDraftRef = useRef(null);   // composer text that became the first caption
+
+  const closeMediaPreview = () => {
+    releaseMediaItems(mediaItems);
+    setMediaItems(null);
+    movedDraftRef.current = null;
+  };
+
+  // A preview belongs to one conversation: never let it follow the user to another chat.
+  useEffect(() => {
+    setMediaItems((cur) => { releaseMediaItems(cur); return null; });
+    setCameraOpen(false);
+    movedDraftRef.current = null;
+  }, [conv.id]);
+
+  const openMediaPreview = async (files, { forceKind = null, takeDraft = false } = {}) => {
+    const list = Array.from(files || []).filter(Boolean);
+    if (!list.length) return;
+    if (!canMessage) { toast.error("You can't message this lead"); return; }
+    if (!within24h) { toast.error("Outside the 24-hour window - only a template can be sent"); return; }
+    const items = (await makeMediaItems(list.slice(0, 10), { forceKind })).filter((it) => {
+      if (it.file.size > 50 * 1024 * 1024) { toast.error(`${it.file.name}: too large (max 50 MB)`); releaseMediaItems([it]); return false; }
+      return true;
+    });
+    if (!items.length) return;
+    if (list.length > 10) toast.message("Only the first 10 files were added");
+    // Like WhatsApp: text already typed in the box becomes the first caption.
+    if (takeDraft && !mediaItems && draft.trim() && items[0].kind !== "audio") {
+      items[0].caption = draft.trim().slice(0, 1024);
+      movedDraftRef.current = draft;
+    }
+    setMediaItems((cur) => (cur ? [...cur, ...items] : items));
+  };
+
+  const sendMediaItems = async () => {
+    if (!mediaItems?.length || mediaSending) return;
+    setMediaSending(true);
+    const failed = [];
+    let sent = 0;
+    for (const it of mediaItems) {
+      try {
+        const fd = new FormData();
+        fd.append("file", it.file);
+        fd.append("kind", it.kind);
+        const { data: up } = await api.post("/chatflows/upload-media", fd, {
+          headers: { "Content-Type": "multipart/form-data" },
+        });
+        const payload = { lead_id: conv.id, media_type: it.kind, media_url: up.url };
+        if (it.kind === "document" && up.filename) payload.filename = up.filename;
+        if (it.kind !== "audio" && it.caption.trim()) payload.caption = it.caption.trim();
+        if (sent === 0 && replyTo?.id) payload.reply_to_message_id = replyTo.id;
+        await api.post("/whatsapp/send-media", payload);
+        sent += 1;
+      } catch (e) {
+        failed.push(it);
+        toast.error(errMsg(e, `Failed to send ${it.file.name}`));
+      }
+    }
+    setMediaSending(false);
+    if (sent) {
+      setReplyTo(null);
+      loadMessages();
+      onChanged?.();
+    }
+    if (failed.length) {
+      // keep only what failed so it can be retried; release the rest
+      releaseMediaItems(mediaItems.filter((i) => !failed.includes(i)));
+      setMediaItems(failed);
+      if (sent) toast.success(`Sent ${sent}, ${failed.length} failed - press Send to retry`);
+      return;
+    }
+    if (movedDraftRef.current !== null && draft === movedDraftRef.current) setDraft("");
+    toast.success(sent > 1 ? `Sent ${sent} files` : "Sent");
+    closeMediaPreview();
+  };
+
+  const onDragEnterThread = (e) => {
+    if (!Array.from(e.dataTransfer?.types || []).includes("Files")) return;
+    e.preventDefault();
+    dragDepthRef.current += 1;
+    setDropActive(true);
+  };
+  const onDragOverThread = (e) => {
+    if (!Array.from(e.dataTransfer?.types || []).includes("Files")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = canMessage && within24h ? "copy" : "none";
+  };
+  const onDragLeaveThread = (e) => {
+    if (!Array.from(e.dataTransfer?.types || []).includes("Files")) return;
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDropActive(false);
+  };
+  const onDropThread = (e) => {
+    if (!Array.from(e.dataTransfer?.types || []).includes("Files")) return;
+    e.preventDefault();
+    dragDepthRef.current = 0;
+    setDropActive(false);
+    openMediaPreview(e.dataTransfer.files, { takeDraft: true });
+  };
+
+  const onComposerPaste = (e) => {
+    const files = Array.from(e.clipboardData?.files || []);
+    if (!files.length) return;            // plain text paste behaves as before
+    e.preventDefault();
+    openMediaPreview(files, { takeDraft: true });
+  };
+
   const pickFile = (kind) => {
     fileKindRef.current = kind;
     if (fileInputRef.current) {
       fileInputRef.current.accept = kind === "image" ? "image/*" : kind === "video" ? "video/*" : kind === "audio" ? "audio/*" : "";
+      fileInputRef.current.multiple = kind !== "audio";
       fileInputRef.current.value = "";
       fileInputRef.current.click();
     }
   };
 
   const onFilePicked = (e) => {
-    const f = e.target.files?.[0];
-    if (f) uploadAndSend(f, fileKindRef.current);
+    const files = Array.from(e.target.files || []);
+    setShowAttach(false);
+    if (files.length) openMediaPreview(files, { forceKind: fileKindRef.current });
   };
 
   const startRecording = async () => {
@@ -1453,7 +1572,19 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
 
   return (
     <>
-    <div className="flex flex-col h-full overflow-hidden">
+    <div className="flex flex-col h-full overflow-hidden relative"
+      onDragEnter={onDragEnterThread} onDragOver={onDragOverThread} onDragLeave={onDragLeaveThread} onDrop={onDropThread}>
+      {dropActive && (
+        <div className="absolute inset-0 z-40 bg-[#25D366]/10 border-4 border-dashed border-[#25D366] flex items-center justify-center pointer-events-none" data-testid="chat-drop-overlay">
+          <div className="bg-white px-5 py-4 rounded-lg shadow-lg text-center">
+            <UploadSimple size={32} className="mx-auto text-[#25D366]" />
+            <div className="font-semibold mt-1">
+              {!canMessage ? "You can't message this lead" : within24h ? "Drop files to send" : "24-hour window closed - templates only"}
+            </div>
+            {canMessage && within24h && <div className="text-xs text-gray-500">You can add a caption before sending</div>}
+          </div>
+        </div>
+      )}
       {/* Top bar */}
       <div className="shrink-0 bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-3" data-testid="chat-topbar">
         <button onClick={onClose} className="md:hidden p-1 -ml-1" data-testid="back-btn"><ArrowLeft size={18} /></button>
@@ -1757,6 +1888,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                     <div className="absolute bottom-full mb-2 left-3 bg-white border border-gray-200 shadow-md z-10 w-52 rounded-md py-1" data-testid="attach-menu">
                       <button onClick={() => pickFile("image")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-image"><ImageIcon size={16} className="text-[#C2410C]" /> Photo</button>
                       <button onClick={() => pickFile("video")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-video"><VideoCamera size={16} className="text-[#BE185D]" /> Video</button>
+                      <button onClick={() => { setShowAttach(false); setCameraOpen(true); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-camera"><Camera size={16} className="text-[#0F766E]" /> Camera</button>
                       <button onClick={() => pickFile("document")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-document"><FileText size={16} className="text-[#475569]" /> Document</button>
                       <button onClick={() => pickFile("audio")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-audio-file"><Microphone size={16} className="text-[#7C3AED]" /> Audio file</button>
                       <button onClick={startRecording} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-record"><Microphone size={16} weight="fill" className="text-[#E60000]" /> Record voice note</button>
@@ -1841,6 +1973,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                     ref={inputRef}
                     value={draft}
                     onChange={(e) => setDraft(e.target.value)}
+                    onPaste={onComposerPaste}
                     disabled={!within24h}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && !e.shiftKey && !isMobile) {
@@ -2152,6 +2285,22 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
         )}
       </div>
     </div>
+      {mediaItems && mediaItems.length > 0 && (
+        <MediaPreviewModal
+          items={mediaItems}
+          setItems={setMediaItems}
+          onClose={() => { if (!mediaSending) closeMediaPreview(); }}
+          onSend={sendMediaItems}
+          sending={mediaSending}
+          customerName={conv.customer_name}
+        />
+      )}
+      {cameraOpen && (
+        <CameraModal
+          onClose={() => setCameraOpen(false)}
+          onCaptured={(files) => { setCameraOpen(false); openMediaPreview(files); }}
+        />
+      )}
       {attachMode === "location" && (
         <LocationSendModal onClose={() => setAttachMode(null)} onSend={sendLocation} sending={sending} />
       )}
