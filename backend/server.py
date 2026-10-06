@@ -3600,35 +3600,122 @@ async def list_messages(
 
 
 # ------------- Call logs -------------
-def _check_duplicate_call(norm_phone: str, user_id: str, new_at_str: str, new_duration: int, existing_logs: list) -> Optional[dict]:
+# One phone call can reach us up to three times: the old in-app dialer's "ended"
+# event (stamped with server time when the call ENDS), the CallLog sync (stamped with
+# the call's START) and the post-call popup (start + the executive's outcome/notes).
+# Those fold into one record; a separate call, e.g. a redial 30 s later, stays its
+# own record. (Until 2026-10-06 any two calls to a number within 60 s were treated
+# as one, and the later call's report overwrote the earlier call's talk time and
+# outcome - two answered calls to a lead showed as one 0 s "Rejected" call.)
+_CALL_SAME_TOL = 4      # s: two reports of one call agree on its start (or end)
+_CALL_DUR_TOL = 4       # s: ... and on its talk time
+_CALL_RING_MIN = -45    # s: start-vs-end comparisons mix phone and server clocks,
+_CALL_RING_MAX = 150    #    so allow ring time plus some phone clock drift
+_CALL_AUTO_SUMMARY = ("Auto-logged", "Synced via")
+_CALL_SPECIFIC_OUTCOMES = ("rejected", "busy", "not_reachable", "invalid")
+
+
+def _parse_call_dt(s) -> Optional[datetime]:
     try:
-        new_dt = datetime.fromisoformat(new_at_str.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
-        
+
+
+def _call_anchors(doc: dict) -> tuple:
+    """(start, end) known for a stored call record. Older records only have `at`:
+    the in-app dialer's events stored server time ('+00:00') = the END of the call,
+    app syncs stored the phone's call START ('...Z')."""
+    s = _parse_call_dt(doc["call_start_at"]) if doc.get("call_start_at") else None
+    e = _parse_call_dt(doc["call_end_at"]) if doc.get("call_end_at") else None
+    if s or e:
+        return s, e
+    at = str(doc.get("at") or "")
+    dt = _parse_call_dt(at) if at else None
+    if not dt:
+        return None, None
+    return (dt, None) if at.endswith("Z") else (None, dt)
+
+
+def _find_same_call(rep_start: Optional[datetime], rep_end: Optional[datetime], rep_dur: int,
+                    existing_logs: list) -> Optional[dict]:
+    """The stored record this app report describes, or None when it is a new call."""
+    best, best_err = None, None
     for doc in existing_logs:
-        if doc.get("phone") != norm_phone or doc.get("by_user_id") != user_id:
-            continue
-            
-        doc_at = doc.get("at")
-        if not doc_at:
-            continue
-            
-        try:
-            doc_dt = datetime.fromisoformat(doc_at.replace("Z", "+00:00"))
-            doc_duration = doc.get("duration_seconds") or 0
-            
-            diff_time = abs((new_dt - doc_dt).total_seconds())
-            diff_new_end = abs((new_dt - doc_dt).total_seconds() - new_duration)
-            diff_doc_end = abs((doc_dt - new_dt).total_seconds() - doc_duration)
-            
-            # If any of the differences is within 60 seconds, it's a duplicate
-            if diff_time <= 60 or diff_new_end <= 60 or diff_doc_end <= 60:
-                return doc
-        except Exception:
-            pass
-            
-    return None
+        d_s, d_e = _call_anchors(doc)
+        d_dur = int(doc.get("duration_seconds") or 0)
+        err = None
+        if rep_start and d_s:
+            diff = abs((rep_start - d_s).total_seconds())
+            if diff <= _CALL_SAME_TOL:
+                err = diff
+        elif rep_end and d_e:
+            diff = abs((rep_end - d_e).total_seconds())
+            if diff <= _CALL_SAME_TOL and abs(rep_dur - d_dur) <= _CALL_DUR_TOL:
+                err = diff
+        else:
+            start, end = (rep_start, d_e) if rep_start else (d_s, rep_end)
+            if start and end and abs(rep_dur - d_dur) <= _CALL_DUR_TOL:
+                ring = (end - start).total_seconds() - max(rep_dur, d_dur)
+                if _CALL_RING_MIN <= ring <= _CALL_RING_MAX:
+                    err = _CALL_SAME_TOL + abs(ring)
+        if err is not None and (best_err is None or err < best_err):
+            best, best_err = doc, err
+    return best
+
+
+def _merge_call_report(existing: dict, outcome: str, duration: int, by_exec: bool, note: str,
+                       rep_start: Optional[str], rep_end: Optional[str]) -> dict:
+    """$set that folds one more report of the same call into `existing`. Talk time
+    only grows (a later 0 s report can't wipe it); a call with talk time is
+    'connected' whatever was picked in the popup (the pick is kept as exec_outcome);
+    the executive's own outcome and notes beat automatic reports."""
+    dur = max(int(existing.get("duration_seconds") or 0), int(duration or 0))
+    upd: Dict[str, Any] = {"duration_seconds": dur}
+    d_s, d_e = _call_anchors(existing)
+    if not existing.get("call_start_at") and (rep_start or d_s):
+        upd["call_start_at"] = rep_start or existing.get("at")
+    if not existing.get("call_end_at") and (rep_end or d_e):
+        upd["call_end_at"] = rep_end or existing.get("at")
+    if by_exec:
+        upd["exec_outcome"] = outcome
+    exec_pick = outcome if by_exec else existing.get("exec_outcome")
+    if dur > 0:
+        upd["outcome"] = "connected"
+    elif exec_pick:
+        upd["outcome"] = exec_pick
+    elif outcome == "no_response" and existing.get("outcome") in _CALL_SPECIFIC_OUTCOMES:
+        upd["outcome"] = existing["outcome"]
+    else:
+        upd["outcome"] = outcome
+    cur = existing.get("summary") or ""
+    if note:
+        upd["summary"] = note
+    elif not cur or any(m in cur for m in _CALL_AUTO_SUMMARY):
+        upd["summary"] = f"Call ended. Duration: {dur}s. (Auto-logged via app)"
+    return upd
+
+
+async def _call_bump_lead(lead: dict, doc_id: str, outcome: str, lead_status: Optional[str] = None,
+                          promote_on_connect_only: bool = False):
+    """Lead's last-call fields follow its LATEST call only, so a late sync of an
+    earlier call can't overwrite the newest call's outcome."""
+    upd: Dict[str, Any] = {}
+    latest = await db.call_logs.find_one({"lead_id": lead["id"]}, {"_id": 0, "id": 1, "at": 1}, sort=[("at", -1)])
+    if not latest or latest.get("id") == doc_id:
+        at = (latest or {}).get("at") or iso(now_utc())
+        upd["last_call_outcome"] = outcome
+        upd["last_call_at"] = at
+        new_dt, cur_dt = _parse_call_dt(at), _parse_call_dt(lead.get("last_action_at") or "")
+        if new_dt and (not cur_dt or new_dt > cur_dt):
+            upd["last_action_at"] = at
+    if lead.get("status") == "new" and (outcome == "connected" if promote_on_connect_only else outcome != "initiated"):
+        upd["status"] = "contacted"
+    if lead_status in ("new", "contacted", "qualified", "converted", "lost"):
+        upd["status"] = lead_status
+    if upd:
+        await db.leads.update_one({"id": lead["id"]}, {"$set": upd})
 
 
 async def _set_wa_status(lead_id: str, phone: Optional[str], has_wa: bool):
@@ -3815,43 +3902,30 @@ async def sync_call_batch(body: CallSyncBatchInput, user: dict = Depends(get_cur
                 except Exception as e:
                     logger.warning(f"calls-sync auto whatsapp failed: {e}")
 
-        # Duplicate check (same phone, same user, same timestamp or duration-adjusted matching)
+        # Same call already reported (dialer event / CallLog sync / popup)? Fold this
+        # report in; the timestamp of every sync-batch report is the call's START.
         existing_logs = await db.call_logs.find({
             "phone": norm,
             "by_user_id": user["id"]
-        }).sort("at", -1).to_list(50)
-        existing = _check_duplicate_call(norm, user["id"], record.timestamp, record.duration_seconds or 0, existing_logs)
-        
+        }, {"_id": 0}).sort("at", -1).to_list(50)
+        dur = int(record.duration_seconds or 0)
+        note_str = record.note.strip() if record.note else ""
+        by_exec = bool(note_str or record.lead_status)  # the post-call popup = the executive's pick
+        rep_start = _parse_call_dt(record.timestamp)
+        existing = _find_same_call(rep_start, None, dur, existing_logs) if rep_start else None
+
         if existing:
-            # If the sync payload contains a user note/outcome (e.g. from PostCallActivity),
-            # we should update the existing call log with the note and outcome!
-            note_str = record.note.strip() if record.note else ""
-            update_fields = {
-                "outcome": outcome,
-            }
-            if note_str:
-                update_fields["summary"] = note_str
-            if record.duration_seconds and not existing.get("duration_seconds"):
-                update_fields["duration_seconds"] = record.duration_seconds
-                
+            update_fields = _merge_call_report(existing, outcome, dur, by_exec, note_str, record.timestamp, None)
             await db.call_logs.update_one({"id": existing["id"]}, {"$set": update_fields})
-            
             if lead:
-                lead_update = {
-                    "last_call_outcome": outcome,
-                    "last_call_at": record.timestamp,
-                    "last_action_at": record.timestamp,
-                }
-                if outcome != "initiated" and lead.get("status") == "new":
-                    lead_update["status"] = "contacted"
-                if record.lead_status and record.lead_status in ["new", "contacted", "qualified", "converted", "lost"]:
-                    lead_update["status"] = record.lead_status
-                await db.leads.update_one({"id": lead["id"]}, {"$set": lead_update})
+                await _call_bump_lead(lead, existing["id"], update_fields["outcome"], record.lead_status)
             continue
 
-        note_str = record.note.strip() if record.note else ""
+        picked = outcome
+        if dur > 0:
+            outcome = "connected"  # it was answered, whatever was picked in the popup
         summary_val = note_str if note_str else f"Synced via Android App ({record.direction or 'outgoing'} Call, Outcome: {outcome}, Duration: {record.duration_seconds}s)"
-        
+
         doc = {
             "id": str(uuid.uuid4()),
             "phone": norm,
@@ -3860,11 +3934,14 @@ async def sync_call_batch(body: CallSyncBatchInput, user: dict = Depends(get_cur
             "by_user_id": user["id"],
             "by_user_name": user["name"],
             "at": record.timestamp,
+            "call_start_at": record.timestamp,
             "duration_seconds": record.duration_seconds,
             "synced_from_app": True,
             "direction": record.direction or "outgoing",
         }
-        
+        if by_exec:
+            doc["exec_outcome"] = picked
+
         if lead:
             lead_id = lead["id"]
             doc["lead_id"] = lead_id
@@ -3872,19 +3949,8 @@ async def sync_call_batch(body: CallSyncBatchInput, user: dict = Depends(get_cur
             
             # Save the call log
             await db.call_logs.insert_one(doc.copy())
-            
-            # Update lead fields
-            update_fields: Dict[str, Any] = {
-                "last_call_outcome": outcome,
-                "last_call_at": doc["at"],
-                "last_action_at": doc["at"],
-            }
-            if outcome != "initiated" and lead.get("status") == "new":
-                update_fields["status"] = "contacted"
-            if record.lead_status and record.lead_status in ["new", "contacted", "qualified", "converted", "lost"]:
-                update_fields["status"] = record.lead_status
-            await db.leads.update_one({"id": lead_id}, {"$set": update_fields})
-            
+            await _call_bump_lead(lead, doc["id"], outcome, record.lead_status)
+
             # Log standard activity
             await log_activity(user["id"], "call_logged", lead_id, {
                 "outcome": outcome, 
@@ -3981,26 +4047,19 @@ async def report_call_event(body: CallEventInput, user: dict = Depends(get_curre
         outcome = body.outcome or "no_response"
         duration = body.duration_seconds or 0
         
-        # Duplicate check (same phone, same user, same timestamp or duration-adjusted matching)
+        # Same call already synced from the CallLog? Fold in; this report's time is the call's END.
+        reported_outcome = outcome
         existing_logs = await db.call_logs.find({
             "phone": norm,
             "by_user_id": user["id"]
-        }).sort("at", -1).to_list(50)
-        existing = _check_duplicate_call(norm, user["id"], now_str, duration, existing_logs)
-        
+        }, {"_id": 0}).sort("at", -1).to_list(50)
+        existing = _find_same_call(None, _parse_call_dt(now_str), duration, existing_logs)
+
         if existing:
-            # If it already exists, update duration, outcome, and summary
-            update_fields = {
-                "outcome": outcome,
-                "duration_seconds": duration,
-            }
-            # Only overwrite summary if existing one is empty or generic/auto-logged
-            existing_summary = existing.get("summary") or ""
-            if not existing_summary or "Auto-logged" in existing_summary or "Synced via" in existing_summary:
-                update_fields["summary"] = f"Call ended. Duration: {duration}s. (Auto-logged via app)"
-                
+            update_fields = _merge_call_report(existing, outcome, duration, False, "", None, now_str)
             await db.call_logs.update_one({"id": existing["id"]}, {"$set": update_fields})
             doc_id = existing["id"]
+            outcome = update_fields["outcome"]
         else:
             doc = {
                 "id": str(uuid.uuid4()),
@@ -4011,24 +4070,17 @@ async def report_call_event(body: CallEventInput, user: dict = Depends(get_curre
                 "by_user_id": user["id"],
                 "by_user_name": user["name"],
                 "at": now_str,
+                "call_end_at": now_str,
                 "duration_seconds": duration,
                 "direction": body.direction or "outgoing",
                 "synced_from_app": True
             }
             await db.call_logs.insert_one(doc.copy())
             doc_id = doc["id"]
-        
-        update_q = {
-            "last_call_outcome": outcome,
-            "last_call_at": now_str,
-            "last_action_at": now_str
-        }
-        if outcome == "connected" and lead.get("status") == "new":
-            update_q["status"] = "contacted"
-            
-        await db.leads.update_one({"id": lead_id}, {"$set": update_q})
+
+        await _call_bump_lead(lead, doc_id, outcome, promote_on_connect_only=True)
         await log_activity(user["id"], "call_logged", lead_id, {
-            "outcome": outcome,
+            "outcome": reported_outcome,
             "phone": norm,
             "duration_seconds": duration,
             "synced_from_app": True
