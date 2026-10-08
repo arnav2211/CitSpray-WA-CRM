@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
@@ -160,6 +160,9 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
               <Item to="/dashboard" icon={ChartBar} testId="nav-dashboard" onNavigate={handleNavigate}>Dashboard</Item>
               <Item to="/chat" icon={ChatTeardropDots} testId="nav-chat" onNavigate={handleNavigate}>WhatsApp</Item>
               <Item to="/leads" icon={Kanban} testId="nav-leads" onNavigate={handleNavigate}>Leads</Item>
+              {(isAdmin || user?.international_team) && (
+                <Item to="/international" icon={Globe} testId="nav-international" onNavigate={handleNavigate}>International</Item>
+              )}
               <Item to="/followups" icon={Bell} testId="nav-followups" onNavigate={handleNavigate}>Follow-ups</Item>
               <Item to="/qa" icon={ChatTeardropText} testId="nav-qa" onNavigate={handleNavigate}
                 badge={pendingQA} badgeClass="bg-[#E67E00] text-white" highlight={pendingQA > 0}>Internal Q&amp;A</Item>

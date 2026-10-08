@@ -46,6 +46,8 @@ export default function App() {
               <Route path="/dashboard" element={<ExecutiveOrAdminOnly><Dashboard /></ExecutiveOrAdminOnly>} />
               <Route path="/chat" element={<ExecutiveOrAdminOnly><Chat /></ExecutiveOrAdminOnly>} />
               <Route path="/leads" element={<ExecutiveOrAdminOnly><Leads /></ExecutiveOrAdminOnly>} />
+              {/* keyed so switching between /leads and /international remounts with fresh filters */}
+              <Route path="/international" element={<ExecutiveOrAdminOnly><Leads key="international" international /></ExecutiveOrAdminOnly>} />
               <Route path="/leads/:id" element={<ExecutiveOrAdminOnly><><Leads /><LeadDetail /></></ExecutiveOrAdminOnly>} />
               <Route path="/calls" element={<ExecutiveOrAdminOnly><CallLogs /></ExecutiveOrAdminOnly>} />
               <Route path="/followups" element={<ExecutiveOrAdminOnly><Followups /></ExecutiveOrAdminOnly>} />

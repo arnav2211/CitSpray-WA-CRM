@@ -3,9 +3,10 @@ import { api, errMsg } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { useCompany } from "@/context/CompanyContext";
 import { Link, useSearchParams, useNavigate } from "react-router-dom";
-import { StatusBadge, SourceBadge, EnquiryTypeBadge, TagBadge, AlsoInBadge } from "@/components/Badges";
+import { StatusBadge, SourceBadge, EnquiryTypeBadge, TagBadge, AlsoInBadge, IntlBadge } from "@/components/Badges";
+import { IntlTeamPanel, IntlTabs, IntlAddLeadModal, IntlImportModal } from "@/components/InternationalPanel";
 import { toast } from "sonner";
-import { Kanban, Table, Plus, MagnifyingGlass, FileX, WhatsappLogo, UploadSimple, Star, Bell, Package, MapPin } from "@phosphor-icons/react";
+import { Kanban, Table, Plus, MagnifyingGlass, FileX, WhatsappLogo, UploadSimple, Star, Bell, Package, MapPin, Globe } from "@phosphor-icons/react";
 import LeadDrawer from "@/components/LeadDrawer";
 import { fmtIST } from "@/lib/format";
 
@@ -96,7 +97,9 @@ function FollowupChip({ lead }) {
   );
 }
 
-export default function Leads() {
+// `international` = the International section (sidebar): same list, scoped to
+// international leads, with the team panel, tabs and manual entry on top.
+export default function Leads({ international = false }) {
   const { user } = useAuth();
   const { isFragvansh } = useCompany();
   const nav = useNavigate();
@@ -122,6 +125,12 @@ export default function Leads() {
   const [page, setPage] = useState(parseInt(params.get("page") || "1", 10) || 1);
   const [pageSize, setPageSize] = useState(parseInt(params.get("size") || "25", 10) || 25);
   const [total, setTotal] = useState(0);
+  const [intlTab, setIntlTab] = useState(params.get("tab") || "all");
+  const [countryFilter, setCountryFilter] = useState(params.get("country") || "");
+  const [intlInfo, setIntlInfo] = useState(null);
+  const [intlAdding, setIntlAdding] = useState(false);
+  const [intlImporting, setIntlImporting] = useState(false);
+  const [intlRefresh, setIntlRefresh] = useState(0);
 
   // Monotonic request id: a slow earlier response must never overwrite the
   // results of a newer search (classic stale-response race while typing).
@@ -142,6 +151,8 @@ export default function Leads() {
           date_to: dateTo || undefined,
           starred: starredFilter ? true : undefined,
           tags: tagFilter.length ? tagFilter.join(",") : undefined,
+          intl: international ? intlTab : undefined,
+          country: international && countryFilter ? countryFilter : undefined,
           paginate: true,
           limit: pageSize,
           offset: (page - 1) * pageSize,
@@ -193,9 +204,9 @@ export default function Leads() {
 
   // Reset to first page whenever a filter changes (so we never end up on an
   // empty page after narrowing the result set).
-  useEffect(() => { setPage(1); }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, q, pageSize, starredFilter, tagFilter]);
+  useEffect(() => { setPage(1); }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, q, pageSize, starredFilter, tagFilter, intlTab, countryFilter]);
 
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, page, pageSize, starredFilter, tagFilter]);
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, page, pageSize, starredFilter, tagFilter, intlTab, countryFilter]);
   useEffect(() => {
     const t = setTimeout(() => load(), 300);
     return () => clearTimeout(t);
@@ -214,11 +225,13 @@ export default function Leads() {
     if (dateTo) p.date_to = dateTo;
     if (starredFilter) p.starred = "true";
     if (tagFilter.length) p.tags = tagFilter.join(",");
+    if (international && intlTab !== "all") p.tab = intlTab;
+    if (international && countryFilter) p.country = countryFilter;
     if (openId) p.lead = openId;
     if (page > 1) p.page = String(page);
     if (pageSize !== 25) p.size = String(pageSize);
     setParams(p, { replace: true });
-  }, [view, q, statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, starredFilter, tagFilter, openId, page, pageSize, setParams]);
+  }, [view, q, statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, starredFilter, tagFilter, openId, page, pageSize, setParams, international, intlTab, countryFilter]);
 
   const execMap = useMemo(() => Object.fromEntries(execs.map((e) => [e.id, e])), [execs]);
   const isAdmin = user.role === "admin";
@@ -228,8 +241,8 @@ export default function Leads() {
     <div className="p-4 md:p-8 space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0">
-          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Pipeline</div>
-          <h1 className="font-chivo font-black text-2xl md:text-4xl">All Leads <span className="text-gray-400">[{total}]</span></h1>
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">{international ? "International" : "Pipeline"}</div>
+          <h1 className="font-chivo font-black text-2xl md:text-4xl">{international ? "International Leads" : "All Leads"} <span className="text-gray-400">[{total}]</span></h1>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           <button
@@ -240,6 +253,20 @@ export default function Leads() {
             className={`border px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1 ${view === "kanban" ? "bg-gray-900 text-white border-gray-900" : "border-gray-300 hover:bg-gray-100"}`}
             onClick={() => setView("kanban")} data-testid="view-kanban-btn"
           ><Kanban size={12} weight="bold" /> Kanban</button>
+          {international ? (
+            <>
+              {isAdmin && intlInfo?.feed && (
+                <button
+                  className="border border-gray-300 hover:bg-gray-100 text-gray-700 px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1"
+                  onClick={() => setIntlImporting(true)} data-testid="intl-import-btn"
+                ><MapPin size={12} weight="bold" /> Import scraper CSV</button>
+              )}
+              <button
+                className="bg-[#002FA7] hover:bg-[#002288] text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1"
+                onClick={() => setIntlAdding(true)} data-testid="intl-add-btn"
+              ><Globe size={12} weight="bold" /> Add international lead</button>
+            </>
+          ) : (<>
           <button
             className="border border-gray-300 hover:bg-gray-100 text-gray-700 px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1"
             onClick={() => setUploading(true)} data-testid="upload-leads-btn"
@@ -254,8 +281,16 @@ export default function Leads() {
             className="bg-[#002FA7] hover:bg-[#002288] text-white px-3 py-2 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1"
             onClick={() => setCreating(true)} data-testid="new-lead-btn"
           ><Plus size={12} weight="bold" /> New Lead</button>
+          </>)}
         </div>
       </div>
+
+      {international && (
+        <>
+          <IntlTeamPanel isAdmin={isAdmin} refreshKey={intlRefresh} onInfo={setIntlInfo} />
+          <IntlTabs tab={intlTab} onTab={setIntlTab} isAdmin={isAdmin} pending={intlInfo?.pending} />
+        </>
+      )}
 
       {/* Filters */}
       <div className="border border-gray-200 bg-white p-3 md:p-4 grid grid-cols-1 md:grid-cols-5 gap-2 md:gap-3">
@@ -296,6 +331,12 @@ export default function Leads() {
           <option value="busy">Busy / Engaged</option>
           <option value="invalid">Invalid</option>
         </select>
+        {international && (
+          <select value={countryFilter} onChange={(e) => setCountryFilter(e.target.value)} className="border border-gray-300 px-2 py-2 text-sm" data-testid="intl-country-filter">
+            <option value="">All countries</option>
+            {(intlInfo?.countries || []).map((c) => <option key={c} value={c}>{c}</option>)}
+          </select>
+        )}
         <select value={starredFilter ? "true" : ""} onChange={(e) => setStarredFilter(e.target.value === "true")} className="border border-gray-300 px-2 py-2 text-sm" data-testid="leads-starred-filter">
           <option value="">All leads</option>
           <option value="true">Starred leads only</option>
@@ -399,6 +440,7 @@ export default function Leads() {
                   )}
                   <div className="mt-2 flex items-center gap-2 flex-wrap">
                     <SourceBadge source={l.source} />
+                    <IntlBadge lead={l} />
                     <EnquiryTypeBadge lead={l} />
                     <AlsoInBadge lead={l} />
                     <span className="text-[10px] uppercase tracking-widest text-gray-400 font-bold ml-auto">
@@ -477,7 +519,9 @@ export default function Leads() {
                     </td>
                     <td className="px-4 py-3 max-w-[260px] truncate">{l.requirement || "—"}</td>
                     <td className="px-4 py-3 text-xs text-gray-600">{[l.area, l.city, l.state, l.country].filter(Boolean).join(", ") || "—"}</td>
-                    <td className="px-4 py-3"><SourceBadge source={l.source} /></td>
+                    <td className="px-4 py-3">
+                      <div className="flex flex-col items-start gap-1"><SourceBadge source={l.source} /><IntlBadge lead={l} /></div>
+                    </td>
                     <td className="px-4 py-3">
                       <EnquiryTypeBadge lead={l} />
                       {l.source_data?.QUERY_TYPE === "P" && l.source_data?.RECEIVER_MOBILE && (
@@ -534,6 +578,8 @@ export default function Leads() {
       {creating && <NewLeadModal execs={execs} onClose={() => setCreating(false)} onCreated={(id) => { setCreating(false); load(); if (id) setOpenId(id); }} isAdmin={isAdmin} />}
       {uploading && <UploadLeadsModal execs={execs} onClose={() => setUploading(false)} onUploaded={() => { setUploading(false); load(); }} isAdmin={isAdmin} />}
       {gmapsImporting && <GmapsImportModal onClose={() => setGmapsImporting(false)} onImported={() => { setGmapsImporting(false); load(); }} />}
+      {intlAdding && <IntlAddLeadModal members={intlInfo?.members || []} isAdmin={isAdmin} onClose={() => setIntlAdding(false)} onCreated={(id) => { setIntlAdding(false); load(); setIntlRefresh((n) => n + 1); if (id) setOpenId(id); }} />}
+      {intlImporting && intlInfo?.feed && <IntlImportModal ingestKey={intlInfo.feed.ingest_key} onClose={() => setIntlImporting(false)} onImported={() => { setIntlImporting(false); load(); setIntlRefresh((n) => n + 1); }} />}
     </div>
   );
 }

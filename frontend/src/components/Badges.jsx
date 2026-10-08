@@ -59,6 +59,20 @@ const FREE_TYPE_COLORS = {
   catalog: "bg-[#ECFDF5] text-[#008A00]",
 };
 
+// International team lead marker; the channel shows where it came from
+// (Google Maps scraper / typed in manually on the International page).
+const INTL_CHANNEL = { scraper: "Scraper", manual: "Manual" };
+export function IntlBadge({ lead }) {
+  if (!lead?.international) return null;
+  const ch = INTL_CHANNEL[lead.intl_channel];
+  return (
+    <span className="inline-flex items-center px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest bg-[#0F766E] text-white"
+      title="International team lead" data-testid={`intl-badge-${lead.intl_channel || "x"}`}>
+      Intl{ch ? ` · ${ch}` : ""}
+    </span>
+  );
+}
+
 // Lead tag/label chip (Fragvansh labels feature)
 export function TagBadge({ tag, onRemove }) {
   if (!tag) return null;

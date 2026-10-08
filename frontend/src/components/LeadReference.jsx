@@ -1,6 +1,6 @@
 import React from "react";
 import { fmtSmartLong } from "@/lib/format";
-import { SourceBadge, EnquiryTypeBadge } from "@/components/Badges";
+import { SourceBadge, EnquiryTypeBadge, IntlBadge } from "@/components/Badges";
 import CodVerificationCard from "@/components/CodVerificationCard";
 
 /* Everything an executive needs for reference while chatting: what kind of
@@ -157,6 +157,7 @@ export default function LeadReference({ lead, calls = [], followups = [], execs 
         <Row k="Lead type" testId="glance-type">
           <span className="inline-flex items-center gap-1.5 flex-wrap">
             <SourceBadge source={lead.source} />
+            <IntlBadge lead={lead} />
             <EnquiryTypeBadge lead={lead} />
           </span>
         </Row>

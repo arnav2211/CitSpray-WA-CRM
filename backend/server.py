@@ -1013,20 +1013,27 @@ async def _offboard_user(u: dict, admin: dict, reason: str, note: Optional[str],
             {"_id": 0, "id": 1, "username": 1, "name": 1}).to_list(500)
         ts.sort(key=lambda t: t["username"])
         targets_by_comp[c] = ts
+    # International leads go to the rest of the International team when there is one.
+    intl_targets_by_comp: Dict[str, List[dict]] = {}
+    for c in COMPANIES:
+        intl_targets_by_comp[c] = [t for t in await _intl_team_members(c) if t["id"] != uid]
     new_owner: Dict[str, Optional[str]] = {}
     ops: List[UpdateOne] = []
     unassign_ids: List[str] = []
     counters: Dict[str, int] = {}
     target_names: set = set()
-    async for ld in db.leads.find({"assigned_to": uid}, {"_id": 0, "id": 1, "company": 1}):
+    async for ld in db.leads.find({"assigned_to": uid}, {"_id": 0, "id": 1, "company": 1, "international": 1}):
         c = normalize_company(ld.get("company"))
+        ckey = c
         ts = targets_by_comp.get(c) or []
+        if ld.get("international") and intl_targets_by_comp.get(c):
+            ts, ckey = intl_targets_by_comp[c], f"{c}:intl"
         if not ts:
             unassign_ids.append(ld["id"])
             continue
-        i = counters.get(c, 0)
+        i = counters.get(ckey, 0)
         t = ts[i % len(ts)]
-        counters[c] = i + 1
+        counters[ckey] = i + 1
         new_owner[ld["id"]] = t["id"]
         target_names.add(t["name"])
         ops.append(UpdateOne(
@@ -1069,7 +1076,8 @@ async def _offboard_user(u: dict, admin: dict, reason: str, note: Optional[str],
         "$set": {"active": False, "employment_status": "former", "left_at": now_iso, "left_reason": reason,
                  "last_working_day": lwd,
                  "left_note": (note or "").strip() or None, "left_by": admin["id"], "retain_until": retain_until,
-                 "bypass_attendance": False, "receiver_numbers": [], "working_hours": [], "scanner_access": False},
+                 "bypass_attendance": False, "receiver_numbers": [], "working_hours": [], "scanner_access": False,
+                 "international_team": False},
         "$unset": {"face_embedding": ""},
         "$inc": {"token_version": 1},
     })
@@ -2572,20 +2580,30 @@ async def _handle_repeat_enquiry(existing: dict, new_data: dict) -> None:
     lead_company = normalize_company(existing.get("company"))
     target_uid: Optional[str] = None
     try:
-        if _is_buylead({**new_data, "source": new_source}):
-            chosen_bl = await _pick_buyleads_executive(new_source, company=lead_company)
-            if chosen_bl:
-                target_uid = chosen_bl["id"]
-        if not target_uid:
-            chosen = await pick_next_executive(exclude_user_id=current_uid, company=lead_company)
-            if chosen:
-                target_uid = chosen["id"]
+        if existing.get("international"):
+            # International leads only move within the International team
+            chosen_i = await _pick_international_executive(
+                lead_company, existing.get("intl_channel") or "manual", exclude_user_id=current_uid)
+            if chosen_i:
+                target_uid = chosen_i["id"]
+        else:
+            if _is_buylead({**new_data, "source": new_source}):
+                chosen_bl = await _pick_buyleads_executive(new_source, company=lead_company)
+                if chosen_bl:
+                    target_uid = chosen_bl["id"]
+            if not target_uid:
+                chosen = await pick_next_executive(exclude_user_id=current_uid, company=lead_company)
+                if chosen:
+                    target_uid = chosen["id"]
     except Exception as e:
         logger.warning(f"repeat-enquiry reassign pick failed: {e}")
 
     if target_uid:
         update_ops["$set"]["assigned_to"] = target_uid
         update_ops["$set"]["last_assignment_at"] = iso(now_utc())
+        if existing.get("international"):
+            update_ops["$set"]["intl_assigned_at"] = iso(now_utc())
+            update_ops["$set"]["intl_pending"] = False
         update_ops["$push"] = {"assignment_history": {"user_id": target_uid, "at": iso(now_utc()), "by": None, "reason": "repeat_enquiry_sticky_fallback"}}
         await db.leads.update_one({"id": lead_id}, update_ops)
         await log_activity(None, "repeat_enquiry_reassigned", lead_id, {
@@ -2644,6 +2662,195 @@ async def _export_owner_uid() -> Optional[str]:
     return (u or {}).get("id")
 
 
+# ---- International team (2026-10-08) ------------------------------------------
+# Leads added on the International page or streamed in by the international Google
+# Maps scraper go to the International team (executives flagged
+# international_team) instead of the domestic pool: only members who are present
+# (the same attendance/leave gate as every lead), and everyone gets the same number
+# per day - counted per channel, so scraper and manual leads are each shared out
+# equally. Nobody present -> the lead waits (intl_pending) and the minute job hands
+# it out once the team punches in. Portal enquiries (IndiaMART etc.) from foreign
+# buyers are NOT part of this (owner decision 2026-10-08) and route as before.
+INTL_CHANNELS = ("scraper", "manual")
+
+
+def _intl_phone(raw: Any, country_code: Optional[str] = None) -> str:
+    """Canonical phone for an international lead. Scraped / typed numbers often come
+    in the country's local format ('04 123 4567', '(212) 555-0100'); with the
+    country's calling code they become '+97141234567' / '+12125550100' instead of
+    being misread as Indian numbers."""
+    s = str(raw or "").strip()
+    digits = re.sub(r"\D+", "", s)
+    if not digits:
+        return ""
+    if s.startswith("+"):
+        return normalize_phone_display("+" + digits)
+    if digits.startswith("00"):
+        return normalize_phone_display("+" + digits[2:])
+    cc = re.sub(r"\D+", "", str(country_code or ""))
+    if not cc or cc == "91":
+        return normalize_phone_display(digits)
+    if digits.startswith(cc) and len(digits) >= len(cc) + 7:
+        return "+" + digits
+    return "+" + cc + digits.lstrip("0")
+
+
+async def _intl_team_members(company: Optional[str]) -> List[dict]:
+    return await db.users.find(
+        {"international_team": True, "role": "executive", "active": True,
+         "employment_status": {"$ne": "former"}, **company_filter(company)},
+        {"_id": 0, "password_hash": 0, "face_embedding": 0}).sort("username", 1).to_list(100)
+
+
+def _intl_channel_for(data: dict) -> Optional[str]:
+    """International channel of a NEW lead (set only by the International page and
+    the international scraper feed), or None for every other lead."""
+    if not data.get("international"):
+        return None
+    ch = str(data.get("intl_channel") or "manual").lower()
+    return ch if ch in INTL_CHANNELS else "manual"
+
+
+def _intl_day_start_iso() -> str:
+    """Start of today (IST) as a UTC iso string."""
+    d = _ist_now().replace(hour=0, minute=0, second=0, microsecond=0)
+    return iso(d - timedelta(hours=5, minutes=30))
+
+
+async def _intl_counts(company: Optional[str], channel: str, member_ids: List[str],
+                       since_iso: Optional[str] = None) -> Dict[str, int]:
+    """International leads of one channel each member holds (distributed since `since_iso`)."""
+    if not member_ids:
+        return {}
+    match: Dict[str, Any] = {"international": True, "intl_channel": channel,
+                             "assigned_to": {"$in": member_ids}, **company_filter(company)}
+    if since_iso:
+        match["intl_assigned_at"] = {"$gte": since_iso}
+    rows = await db.leads.aggregate([{"$match": match},
+                                     {"$group": {"_id": "$assigned_to", "n": {"$sum": 1}}}]).to_list(200)
+    return {r["_id"]: r["n"] for r in rows}
+
+
+async def _intl_available(u: dict) -> bool:
+    if await _is_user_on_leave(u["id"]):
+        return False
+    return await _is_user_available_by_attendance(u, for_new_lead=True)
+
+
+async def _pick_international_executive(company: Optional[str], channel: str,
+                                        exclude_user_id: Optional[str] = None) -> Optional[dict]:
+    """Present team member with the fewest leads of this channel today (ties: fewest
+    overall, then alphabetical) - so everyone ends the day with the same number."""
+    members = [m for m in await _intl_team_members(company) if m["id"] != exclude_user_id]
+    eligible = [m for m in members if await _intl_available(m)]
+    if not eligible:
+        return None
+    ids = [m["id"] for m in eligible]
+    today = await _intl_counts(company, channel, ids, _intl_day_start_iso())
+    overall = await _intl_counts(company, channel, ids)
+    eligible.sort(key=lambda m: (today.get(m["id"], 0), overall.get(m["id"], 0), m["username"]))
+    return eligible[0]
+
+
+async def _intl_lock(company: Optional[str], ttl: int = 15) -> Optional[str]:
+    """Short Mongo lock so two workers can't hand the same 'fewest today' slot to one
+    person at the same moment. Returns a token, or None after ~5 s (the caller then
+    proceeds anyway - at worst one lead off balance)."""
+    key = f"intl_assign:{normalize_company(company)}"
+    token = uuid.uuid4().hex
+    for _ in range(50):
+        now = now_utc()
+        try:
+            await db.system_locks.find_one_and_update(
+                {"key": key, "$or": [{"expires_at": {"$lt": now}}, {"expires_at": {"$exists": False}}]},
+                {"$set": {"key": key, "token": token, "expires_at": now + timedelta(seconds=ttl)}},
+                upsert=True)
+            return token
+        except Exception:
+            await asyncio.sleep(0.1)
+    return None
+
+
+async def _assign_international_lead(lead_id: str, company: Optional[str], channel: str) -> Optional[str]:
+    """Give a lead to the right team member, or park it as waiting."""
+    token = await _intl_lock(company)
+    try:
+        chosen = await _pick_international_executive(company, channel)
+        if not chosen:
+            await db.leads.update_one({"id": lead_id, "assigned_to": None}, {"$set": {"intl_pending": True}})
+            return None
+        await assign_lead(lead_id, target_user_id=chosen["id"], by_user_id=None)
+        await db.leads.update_one({"id": lead_id},
+                                  {"$set": {"intl_assigned_at": iso(now_utc()), "intl_pending": False}})
+        return chosen["id"]
+    finally:
+        if token:
+            await db.system_locks.delete_one({"key": f"intl_assign:{normalize_company(company)}", "token": token})
+
+
+async def _distribute_pending_international():
+    """Minute job: hand out waiting International leads once the team is in. While
+    the office is open it waits until every member not on leave has punched in (or
+    45 min past office start), so the first person in doesn't get the whole pile."""
+    cfg = await get_attendance_config()
+    for co in COMPANIES:
+        base = {"international": True, "intl_pending": True, "assigned_to": None, **company_filter(co)}
+        if not await db.leads.count_documents(base, limit=1):
+            continue
+        members = await _intl_team_members(co)
+        avail, expected = [], 0
+        for m in members:
+            if await _is_user_on_leave(m["id"]):
+                continue
+            expected += 1
+            if await _is_user_available_by_attendance(m, for_new_lead=True):
+                avail.append(m)
+        if not avail:
+            continue
+        if await _office_open_now(cfg):
+            now = _ist_now()
+            if len(avail) < expected and now.hour * 60 + now.minute < _hhmm_to_minutes(cfg["office_start"], 630) + 45:
+                continue
+        moved = 0
+        async for ld in db.leads.find(base, {"_id": 0, "id": 1, "intl_channel": 1}).sort("created_at", 1).limit(300):
+            if not await _assign_international_lead(ld["id"], co, ld.get("intl_channel") or "manual"):
+                break
+            moved += 1
+        if moved:
+            logger.info(f"international: handed out {moved} waiting lead(s) ({co}) across {len(avail)} present member(s)")
+
+
+async def _intl_member_state(u: dict) -> dict:
+    if await _is_user_on_leave(u["id"]):
+        return {"code": "on_leave", "label": "On leave", "receiving": False}
+    receiving = await _is_user_available_by_attendance(u, for_new_lead=True)
+    log = await db.attendance_logs.find_one({"user_id": u["id"], "date": _ist_now().strftime("%Y-%m-%d")},
+                                            {"_id": 0, "check_in": 1, "check_out": 1})
+    if log and log.get("check_in") and not log.get("check_out"):
+        code, label = "present", "Present"
+    elif log and log.get("check_out"):
+        code, label = "punched_out", "Punched out"
+    else:
+        code, label = "not_in", "Not punched in"
+    if receiving and code != "present":
+        label += " (WFH after hours)"
+    return {"code": code, "label": label, "receiving": receiving}
+
+
+def _intl_list_clause(tab: Optional[str]) -> Optional[Dict[str, Any]]:
+    """/leads filter for the International page tabs."""
+    t = (tab or "").strip().lower()
+    if not t:
+        return None
+    if t in ("all", "team"):
+        return {"international": True}
+    if t in INTL_CHANNELS:
+        return {"international": True, "intl_channel": t}
+    if t == "waiting":
+        return {"international": True, "intl_pending": True, "assigned_to": None}
+    raise HTTPException(status_code=400, detail="Unknown international tab")
+
+
 async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) -> dict:
     # Which company this lead belongs to — every dedup lookup, assignment pool and
     # WhatsApp send below is scoped to it. Callers set data["company"]; anything
@@ -2668,6 +2875,9 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
             unique.append(p)
         data["phones"] = unique
 
+    # International team lead? (International page / international scraper feed)
+    _intl_ch = _intl_channel_for(data)
+
     # ---- Export routing: international phone OR source 'Export' ----
     # These leads must never enter the telecaller round-robin, and never get the
     # domestic auto-welcome (unsolicited WA to a foreign number is a policy /
@@ -2680,7 +2890,7 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
             _cc_country = _country_from_intl_phone(data.get("phone") or "")
             if _cc_country:
                 data["country"] = _cc_country
-        if not data.get("assigned_to"):
+        if not data.get("assigned_to") and not _intl_ch:
             try:
                 _owner_uid = await _export_owner_uid()
                 if _owner_uid:
@@ -2773,6 +2983,12 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
         "is_backlog": bool(data.get("_is_backlog")),
         "enquiries": [initial_enquiry],
     }
+    if _intl_ch:
+        lead["international"] = True
+        lead["intl_channel"] = _intl_ch
+        lead["intl_pending"] = False
+        if lead.get("assigned_to"):  # admin picked the person: still counts in the equal share
+            lead["intl_assigned_at"] = iso(now_utc())
     from pymongo.errors import DuplicateKeyError
     try:
         await db.leads.insert_one(lead.copy())
@@ -2805,12 +3021,16 @@ async def _create_lead_internal(data: dict, by_user_id: Optional[str] = None) ->
             # and an admin has configured mode=selected with agent_ids, route it
             # through the round-robin of that allow-list. Falls back to the normal
             # pick_next_executive() when mode=all or no eligible selected agent.
-            target_uid: Optional[str] = None
-            if _is_buylead(data):
-                chosen_bl = await _pick_buyleads_executive(lead["source"], company=company)
-                if chosen_bl:
-                    target_uid = chosen_bl["id"]
-            await assign_lead(lead["id"], target_user_id=target_uid, by_user_id=by_user_id)
+            if _intl_ch:
+                # International team: present members only, equal count per day
+                await _assign_international_lead(lead["id"], company, _intl_ch)
+            else:
+                target_uid: Optional[str] = None
+                if _is_buylead(data):
+                    chosen_bl = await _pick_buyleads_executive(lead["source"], company=company)
+                    if chosen_bl:
+                        target_uid = chosen_bl["id"]
+                await assign_lead(lead["id"], target_user_id=target_uid, by_user_id=by_user_id)
         except Exception as e:
             logger.warning(f"auto-assign failed: {e}")
     else:
@@ -2854,6 +3074,8 @@ async def list_leads(
     starred: Optional[bool] = None,
     tags: Optional[str] = None,  # comma-separated; matches leads carrying ANY of them
     lead_type: Optional[str] = None,  # e.g. "im_buylead" = IndiaMART buy leads only
+    intl: Optional[str] = None,       # International page tab: all|scraper|manual|waiting
+    country: Optional[str] = None,
     x_company: Optional[str] = Header(None, alias="X-Company"),
 ):
     """List leads with optional filters. Backwards-compatible:
@@ -2885,6 +3107,11 @@ async def list_leads(
     _lt = _lead_type_clause(lead_type)
     if _lt:
         query["$and"].append(_lt)   # in $and so its $or never collides with the free-text $or
+    _ic = _intl_list_clause(intl)
+    if _ic:
+        query["$and"].append(_ic)
+    if country:
+        query["country"] = country
     if last_call_outcome:
         if last_call_outcome not in CALL_OUTCOMES:
             raise HTTPException(status_code=400, detail=f"Invalid outcome. Must be one of {CALL_OUTCOMES}")
@@ -5818,6 +6045,7 @@ def _slim_enquiry_history(ld: dict, limit: int = 10) -> List[Dict[str, Any]]:
 
 # Lead fields the chat panel shows for reference (enquiry type, GST, labels...).
 _CHAT_EXTRA_FIELDS = ["enquiry_type", "gst_no", "emails", "tags", "country", "company", "aliases",
+                      "international", "intl_channel",
                       "last_enquiry_at", "last_enquiry_source", "justdial_profile_url",
                       "last_call_at", "last_call_outcome",
                       # website COD verification state, shown in the /chat details panel
@@ -7526,6 +7754,192 @@ async def ingest_gmaps(body: GmapsIngestInput, request: Request):
         "skipped_no_phone": skipped_no_phone,
         "lead_ids": created_ids,
     }
+
+
+class IntlGmapsIngestInput(BaseModel):
+    records: List[Dict[str, Any]]
+    country_code: Optional[str] = None   # calling code for local-format numbers, e.g. "971"
+    country: Optional[str] = None
+    company: Optional[str] = None
+
+
+@api.post("/ingest/gmaps/international")
+async def ingest_gmaps_international(body: IntlGmapsIngestInput, request: Request):
+    """International Google Maps scraper feed (Colab notebook or the CSV import on the
+    International page) -> International team leads, shared equally across the
+    present team members. Same ingest key as the Fragvansh feed. Numbers in local
+    format get the country's calling code; existing numbers are left untouched."""
+    supplied = (request.headers.get("X-Ingest-Key") or request.query_params.get("key") or "").strip()
+    expected = await _get_or_create_gmaps_key()
+    if not supplied or supplied != expected:
+        raise HTTPException(status_code=403, detail="Invalid or missing ingest key")
+    company = normalize_company(body.company or request.query_params.get("company") or DEFAULT_COMPANY)
+    created_ids: List[str] = []
+    duplicates = 0
+    skipped_no_phone = 0
+    for rec in body.records[:500]:
+        if not isinstance(rec, dict):
+            continue
+        phone = _intl_phone(rec.get("phone"), rec.get("country_code") or body.country_code)
+        if not phone or len(_normalize_phone(phone)) < 8:
+            skipped_no_phone += 1
+            continue
+        if await _find_lead_by_phone(phone, company=company):
+            duplicates += 1
+            continue
+        keyword = str(rec.get("keyword") or "").strip()
+        name = str(rec.get("name") or "").strip() or f"GMaps {phone}"
+        country = (str(rec.get("country") or body.country or "").strip()
+                   or (_country_from_intl_phone(phone) if phone.startswith("+") else None))
+        data = {
+            "company": company,
+            "customer_name": name,
+            "phone": phone,
+            "requirement": keyword or (rec.get("category") or "Google Maps lead"),
+            "area": str(rec.get("address") or "").strip() or None,
+            "country": country,
+            "source": "Google Maps",
+            "international": True,
+            "intl_channel": "scraper",
+            "source_data": {k: rec.get(k) for k in
+                            ("keyword", "category", "website", "rating", "reviews", "hours", "plus_code", "maps_url")
+                            if rec.get(k)},
+            "dedup_hash": _lead_dedup_hash(name, None, phone),
+        }
+        lead = await _create_lead_internal(data, by_user_id=None)
+        created_ids.append(lead["id"])
+    return {"ok": True, "created": len(created_ids), "duplicates": duplicates,
+            "skipped_no_phone": skipped_no_phone, "lead_ids": created_ids}
+
+
+class IntlTeamInput(BaseModel):
+    member_ids: List[str]
+
+
+class IntlLeadInput(BaseModel):
+    customer_name: str
+    phone: Optional[str] = None
+    country_code: Optional[str] = None
+    email: Optional[str] = None
+    company_name: Optional[str] = None
+    country: Optional[str] = None
+    city: Optional[str] = None
+    requirement: Optional[str] = None
+    note: Optional[str] = None
+    assigned_to: Optional[str] = None   # admin only: give it to this person instead of the equal share
+
+
+@api.get("/international/team")
+async def get_international_team(user: dict = Depends(get_current_user),
+                                 x_company: Optional[str] = Header(None, alias="X-Company")):
+    """International page header: team members with today's presence and lead
+    counts per channel, waiting leads, countries; admins also get the candidate
+    list and the scraper feed details."""
+    if user["role"] not in ("admin", "executive"):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    company = _resolve_company(user, x_company)
+    members = await _intl_team_members(company)
+    ids = [m["id"] for m in members]
+    day0 = _intl_day_start_iso()
+    today_by = {ch: await _intl_counts(company, ch, ids, day0) for ch in INTL_CHANNELS}
+    open_rows = await db.leads.aggregate([
+        {"$match": {"international": True, "assigned_to": {"$in": ids},
+                    "status": {"$in": ["new", "contacted", "qualified"]}, **company_filter(company)}},
+        {"$group": {"_id": "$assigned_to", "n": {"$sum": 1}}}]).to_list(200)
+    open_by = {r["_id"]: r["n"] for r in open_rows}
+    out = []
+    for m in members:
+        today = {ch: today_by[ch].get(m["id"], 0) for ch in INTL_CHANNELS}
+        out.append({"id": m["id"], "name": m.get("name"), "username": m.get("username"),
+                    "state": await _intl_member_state(m), "today": today,
+                    "today_total": sum(today.values()), "open": open_by.get(m["id"], 0)})
+    pending = await db.leads.count_documents(
+        {"international": True, "intl_pending": True, "assigned_to": None, **company_filter(company)})
+    countries = await db.leads.distinct("country", {"$and": [company_filter(company), {"international": True}]})
+    resp: Dict[str, Any] = {
+        "members": out, "pending": pending,
+        "countries": sorted({str(c).strip() for c in countries if c and str(c).strip()})[:300],
+        "is_member": bool(user.get("international_team")),
+    }
+    if user["role"] == "admin":
+        resp["candidates"] = [
+            {"id": u["id"], "name": u.get("name"), "username": u.get("username")}
+            async for u in db.users.find({"role": "executive", "active": True, "employment_status": {"$ne": "former"},
+                                          "username": {"$ne": "test_user"}, **company_filter(company)},
+                                         {"_id": 0, "id": 1, "name": 1, "username": 1}).sort("name", 1)]
+        base = (os.environ.get("PUBLIC_BASE_URL") or "https://crm.mangalamagro.in").rstrip("/")
+        resp["feed"] = {"url": f"{base}/api/ingest/gmaps/international", "ingest_key": await _get_or_create_gmaps_key()}
+    return resp
+
+
+@api.put("/international/team")
+async def set_international_team(body: IntlTeamInput, admin: dict = Depends(require_admin),
+                                 x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(admin, x_company)
+    valid = [u["id"] async for u in db.users.find(
+        {"id": {"$in": body.member_ids or []}, "role": "executive", "active": True, **company_filter(company)},
+        {"_id": 0, "id": 1})]
+    await db.users.update_many({"international_team": True, "id": {"$nin": valid}, **company_filter(company)},
+                               {"$set": {"international_team": False}})
+    if valid:
+        await db.users.update_many({"id": {"$in": valid}}, {"$set": {"international_team": True}})
+    await log_activity(admin["id"], "international_team_updated", None, {"company": company, "member_ids": valid})
+    return await get_international_team(user=admin, x_company=x_company)
+
+
+@api.post("/international/leads")
+async def create_international_lead(body: IntlLeadInput, user: dict = Depends(get_current_user),
+                                    x_company: Optional[str] = Header(None, alias="X-Company")):
+    """Manual entry on the International page. The lead is shared out like every
+    International lead (present team member with the fewest today), whoever typed it."""
+    if user["role"] not in ("admin", "executive"):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    company = _resolve_company(user, x_company)
+    name = (body.customer_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+    phone = _intl_phone(body.phone, body.country_code) if (body.phone or "").strip() else ""
+    if (body.phone or "").strip() and len(_normalize_phone(phone)) < 8:
+        raise HTTPException(status_code=400, detail="Phone number looks incomplete - include the country code")
+    email = (body.email or "").strip() or None
+    if not phone and not email:
+        raise HTTPException(status_code=400, detail="Give a phone number or an email")
+    if phone:
+        ex = await _find_lead_by_phone(phone, company=company)
+        if ex:
+            owner = await db.users.find_one({"id": ex.get("assigned_to")}, {"_id": 0, "name": 1}) if ex.get("assigned_to") else None
+            raise HTTPException(status_code=409, detail=f"This number is already in the CRM as '{ex.get('customer_name')}'"
+                                + (f" (with {owner.get('name')})" if owner else ""))
+    target = None
+    if body.assigned_to:
+        if user["role"] != "admin":
+            raise HTTPException(status_code=403, detail="Only an admin can choose who gets the lead")
+        target = await db.users.find_one({"id": body.assigned_to, "role": "executive", "active": True,
+                                          **company_filter(company)}, {"_id": 0, "id": 1})
+        if not target:
+            raise HTTPException(status_code=400, detail="That executive is not active in this company")
+    country = (body.country or "").strip() or (_country_from_intl_phone(phone) if phone.startswith("+") else None)
+    data = {
+        "company": company,
+        "customer_name": name,
+        "phone": phone or None,
+        "email": email,
+        "assigned_to": target["id"] if target else None,
+        "requirement": (body.requirement or "").strip() or None,
+        "city": (body.city or "").strip() or None,
+        "country": country,
+        "source": "Manual",
+        "international": True,
+        "intl_channel": "manual",
+        "source_data": {"company_name": body.company_name.strip()} if (body.company_name or "").strip() else {},
+    }
+    lead = await _create_lead_internal(data, by_user_id=user["id"])
+    if (body.note or "").strip():
+        await db.leads.update_one({"id": lead["id"]}, {"$push": {"notes": {
+            "id": str(uuid.uuid4()), "by_user_id": user["id"], "by_name": user.get("name"),
+            "body": body.note.strip(), "at": iso(now_utc())}}})
+    fresh = await db.leads.find_one({"id": lead["id"]}, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0})
+    return fresh or lead
 
 
 @api.post("/ingest/justdial")
@@ -10539,7 +10953,7 @@ async def _handle_wa_webhook(request: Request, company: str):
                         att_cfg = await get_attendance_config()
                         # Export / international leads are pinned to the export
                         # owner — never churn them to the domestic exec pool.
-                        _is_export_conv = (lead.get("source") == "Export") or ((lead.get("phone") or "").startswith("+"))
+                        _is_export_conv = (not lead.get("international")) and ((lead.get("source") == "Export") or ((lead.get("phone") or "").startswith("+")))
                         if assigned_uid and not _is_export_conv and att_cfg.get("attendance_routing_enabled", True) and await _office_open_now(att_cfg):
                             owner = await db.users.find_one({"id": assigned_uid, "active": True}, {"_id": 0, "password_hash": 0})
                             owner_ok = False
@@ -10633,7 +11047,7 @@ async def _redistribute_after_hours_leads():
     # Anything to move at all? (cheap check before counting attendance)
     pending = await db.leads.count_documents({
         "assigned_after_hours": True, "status": "new",
-        "opened_at": None, "assigned_to": {"$ne": None}})
+        "opened_at": None, "assigned_to": {"$ne": None}, "international": {"$ne": True}})
     if not pending:
         return
     execs = await db.users.find(
@@ -10653,7 +11067,7 @@ async def _redistribute_after_hours_leads():
     moved = 0
     cursor = db.leads.find({
         "assigned_after_hours": True, "status": "new",
-        "opened_at": None, "assigned_to": {"$ne": None},
+        "opened_at": None, "assigned_to": {"$ne": None}, "international": {"$ne": True},
     }, {"_id": 0, "id": 1, "assigned_to": 1, "company": 1}).sort("created_at", 1).limit(200)
     async for lead in cursor:
         chosen = await pick_next_executive(company=lead.get("company"))
@@ -10691,8 +11105,14 @@ async def _auto_reassign_lead(lead_id: str, current_assigned_to: Optional[str], 
     - Conditional findOneAndUpdate (optimistic lock): if two workers race on
       the same lead, only the first write succeeds.
     """
-    _ld = await db.leads.find_one({"id": lead_id}, {"_id": 0, "company": 1})
-    chosen = await pick_next_executive(exclude_user_id=current_assigned_to, company=(_ld or {}).get("company"))
+    _ld = await db.leads.find_one({"id": lead_id}, {"_id": 0, "company": 1, "international": 1, "intl_channel": 1})
+    _intl = bool((_ld or {}).get("international"))
+    if _intl:
+        # International leads only move within the International team
+        chosen = await _pick_international_executive((_ld or {}).get("company"), (_ld or {}).get("intl_channel") or "manual",
+                                                     exclude_user_id=current_assigned_to)
+    else:
+        chosen = await pick_next_executive(exclude_user_id=current_assigned_to, company=(_ld or {}).get("company"))
     if not chosen:
         return None
     chosen_id = chosen["id"]
@@ -10712,6 +11132,8 @@ async def _auto_reassign_lead(lead_id: str, current_assigned_to: Optional[str], 
         },
         "$push": {"assignment_history": entry},
     }
+    if _intl:
+        update["$set"]["intl_assigned_at"] = now_iso
     if reset_hop_count:
         update["$set"]["auto_reassign_count"] = 1
     else:
@@ -10775,6 +11197,11 @@ async def auto_reassign_task():
             await _redistribute_after_hours_leads()
         except Exception as e:
             logger.warning(f"after-hours redistribution failed: {e}")
+        # International leads that arrived while nobody on the team was in
+        try:
+            await _distribute_pending_international()
+        except Exception as e:
+            logger.warning(f"international waiting-lead distribution failed: {e}")
 
         # Only portal leads (IndiaMART / JustDial / ExportersIndia) take part in
         # auto-reassignment; hop cap stops the infinite ping-pong that was
@@ -13180,6 +13607,11 @@ async def seed_data():
     # calls sync-batch dedupes on (phone, by_user_id) sorted by at.
     await db.call_logs.create_index([("phone", 1), ("by_user_id", 1), ("at", -1)])
     await db.call_logs.create_index("outcome")
+    # International team: per-day equal-share counts + the waiting queue
+    await db.leads.create_index([("intl_channel", 1), ("intl_assigned_at", 1)], name="intl_assign_counts",
+                                partialFilterExpression={"international": True})
+    await db.leads.create_index([("intl_pending", 1), ("created_at", 1)], name="intl_waiting",
+                                partialFilterExpression={"intl_pending": True})
     await db.chat_flows.create_index("is_active")
     await db.chat_nodes.create_index([("flow_id", 1), ("is_start_node", -1)])
     await db.chat_options.create_index([("node_id", 1), ("position", 1)])
