@@ -11,7 +11,7 @@ export default function AppShell() {
   const navigate = useNavigate();
   const { user, isAttendanceLocked, refresh, logout } = useAuth();
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const onChat = loc.pathname.startsWith("/chat");
+  const onChat = loc.pathname.startsWith("/chat") || loc.pathname.startsWith("/international/chat");
 
   useEffect(() => {
     if (user && user.username !== "scanner" && user.role === "data_entry" && loc.pathname !== "/data-entry") {
@@ -127,6 +127,8 @@ export default function AppShell() {
 function pageTitle(path) {
   if (path.startsWith("/data-entry-inspect")) return "Data Entry Stats";
   if (path.startsWith("/data-entry")) return "Lead Entry";
+  if (path.startsWith("/international/chat")) return "International WhatsApp";
+  if (path.startsWith("/international")) return "International";
   if (path.startsWith("/chatflows")) return "Chatbot Flows";
   if (path.startsWith("/chat")) return "WhatsApp";
   if (path.startsWith("/leads")) return "Leads";

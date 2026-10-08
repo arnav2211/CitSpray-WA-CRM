@@ -6066,6 +6066,7 @@ async def list_conversations(
     offset: int = 0,
     starred: Optional[bool] = None,
     lead_type: Optional[str] = None,  # e.g. "im_buylead" = IndiaMART buy leads only
+    intl: Optional[str] = None,       # International WhatsApp inbox: all|scraper|manual; "exclude" = main inbox
     x_company: Optional[str] = Header(None, alias="X-Company"),
 ):
     """Returns a list of leads optimized for the chat inbox: each row carries last_msg preview,
@@ -6095,6 +6096,14 @@ async def list_conversations(
     _lt = _lead_type_clause(lead_type)
     if _lt:
         query["$and"].append(_lt)
+    # International leads have their own WhatsApp inbox (International → WhatsApp);
+    # the main inbox leaves them out.
+    if (intl or "").strip().lower() == "exclude":
+        query["$and"].append({"international": {"$ne": True}})
+    else:
+        _ic = _intl_list_clause(intl)
+        if _ic:
+            query["$and"].append(_ic)
     if not include_all:
         query["has_whatsapp"] = True
     q_clean = q.strip() if q else None

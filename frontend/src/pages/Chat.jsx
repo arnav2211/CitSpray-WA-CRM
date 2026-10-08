@@ -2,14 +2,15 @@ import React, { useEffect, useMemo, useRef, useState, useCallback } from "react"
 import { api, errMsg } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { toast } from "sonner";
-import { useSearchParams } from "react-router-dom";
+import { useSearchParams, useNavigate } from "react-router-dom";
 import {
   MagnifyingGlass, PaperPlaneRight, ChatCircleDots, Phone, ArrowsClockwise, Plus, ArrowLeft,
   Funnel, Lightning, ArrowsLeftRight, X, Tag, NotePencil, Info,
   Paperclip, Image as ImageIcon, VideoCamera, FileText, Microphone, MapPin, IdentificationCard, Stop,
   DownloadSimple, Question, ChatTeardropText, CaretLeft, QrCode, PhoneCall, CalendarBlank, Check, Clock, Star,
-  Sparkle, Camera, UploadSimple,
+  Sparkle, Camera, UploadSimple, Globe,
 } from "@phosphor-icons/react";
+import { IntlAddLeadModal } from "@/components/InternationalPanel";
 import { MediaPreviewModal, CameraModal, makeMediaItems, releaseMediaItems } from "@/components/ChatMediaComposer";
 import { fmtIST, fmtISTTime, fmtSmartShort, fmtSmartLong, fmtTime12, fmtDaySeparator, istDayKey } from "@/lib/format";
 import { StatusBadge, SourceBadge } from "@/components/Badges";
@@ -69,8 +70,12 @@ function getEpoch(isoStr) {
 }
 
 // ---------------- Page ----------------
-export default function Chat() {
+// `international` = the International WhatsApp inbox (sidebar → International
+// WhatsApp): only International team leads, including ones not on WhatsApp yet
+// so the team can start the conversation. The main inbox leaves them out.
+export default function Chat({ international = false }) {
   const { user } = useAuth();
+  const navTo = useNavigate();
   const [params, setParams] = useSearchParams();
   const [convs, setConvs] = useState([]);
   const [activeId, setActiveId] = useState(params.get("lead") || null);
@@ -156,6 +161,8 @@ export default function Chat() {
           assigned_to: filterAssignee || undefined,
           starred: filterStarred ? true : undefined,
           lead_type: filterBuyleads ? "im_buylead" : undefined,
+          intl: international ? "all" : "exclude",
+          include_all: international ? true : undefined,
           limit: PAGE_SIZE,
           offset: nextOffset,
         },
@@ -200,6 +207,8 @@ export default function Chat() {
           assigned_to: filterAssignee || undefined,
           starred: filterStarred ? true : undefined,
           lead_type: filterBuyleads ? "im_buylead" : undefined,
+          intl: international ? "all" : "exclude",
+          include_all: international ? true : undefined,
           limit: PAGE_SIZE,
           offset: 0,
         },
@@ -339,6 +348,20 @@ export default function Chat() {
     return () => { cancelled = true; };
   }, [activeId, convs]);
 
+  // An International lead opened in the main inbox (deep link from /leads, a
+  // follow-up, Q&A...) moves over to the International WhatsApp inbox.
+  useEffect(() => {
+    if (international || !activeConv?.international) return;
+    navTo(`/international/chat?${params.toString()}`, { replace: true });
+  }, [international, activeConv?.international]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Team list for the admin "assign to" choice in the International add-lead form
+  const [intlMembers, setIntlMembers] = useState([]);
+  useEffect(() => {
+    if (!international) return;
+    api.get("/international/team").then(({ data }) => setIntlMembers(data?.members || [])).catch(() => {});
+  }, [international]);
+
   const totalUnread = convs.reduce((s, c) => s + (c.unread || 0), 0);
   // Capture the initial deep-link params ONCE so the URL-sync effect below doesn't
   // strip them before ChatThread mounts (convs are loaded async).
@@ -358,16 +381,19 @@ export default function Chat() {
       >
         <div className="border-b border-gray-200 px-4 py-3 flex items-center justify-between">
           <div>
-            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Inbox</div>
+            <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold flex items-center gap-1">
+              {international ? <><Globe size={11} /> International</> : "Inbox"}
+            </div>
             <div className="font-chivo font-bold text-lg leading-none mt-0.5">
-              Chats {totalUnread > 0 && <span className="ml-1 inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 bg-[#25D366] text-white text-xs font-bold">{totalUnread}</span>}
+              {international ? "WhatsApp" : "Chats"} {totalUnread > 0 && <span className="ml-1 inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 bg-[#25D366] text-white text-xs font-bold">{totalUnread}</span>}
             </div>
           </div>
           <div className="flex items-center gap-1">
             <button onClick={fetchConvs} className="p-2 hover:bg-gray-100" title="Refresh" data-testid="refresh-conv-btn">
               <ArrowsClockwise size={16} />
             </button>
-            <button onClick={() => setShowNewChat(true)} className="bg-[#25D366] hover:bg-[#1da851] text-white p-2" title="Start new chat" data-testid="new-chat-btn">
+            <button onClick={() => setShowNewChat(true)} className="bg-[#25D366] hover:bg-[#1da851] text-white p-2"
+              title={international ? "Add international lead" : "Start new chat"} data-testid="new-chat-btn">
               <Plus size={16} weight="bold" />
             </button>
           </div>
@@ -409,7 +435,9 @@ export default function Chat() {
               setFilterUnreplied(false);
             }} testId="filter-replied">Replied</FilterChip>
             <FilterChip active={filterStarred} onClick={() => setFilterStarred(v => !v)} testId="filter-starred">Starred</FilterChip>
-            <FilterChip active={filterBuyleads} onClick={() => setFilterBuyleads(v => !v)} testId="filter-im-buyleads">IM Buy leads</FilterChip>
+            {!international && (
+              <FilterChip active={filterBuyleads} onClick={() => setFilterBuyleads(v => !v)} testId="filter-im-buyleads">IM Buy leads</FilterChip>
+            )}
             <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)} className="border border-gray-300 px-2 py-1 text-xs" data-testid="filter-status">
               <option value="">All status</option>
               {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
@@ -501,7 +529,15 @@ export default function Chat() {
         )}
       </section>
 
-      {showNewChat && (
+      {showNewChat && international && (
+        <IntlAddLeadModal
+          members={intlMembers}
+          isAdmin={isAdmin}
+          onClose={() => setShowNewChat(false)}
+          onCreated={(id) => { setShowNewChat(false); fetchConvs({ reset: true }); if (id) setActiveId(id); }}
+        />
+      )}
+      {showNewChat && !international && (
         <NewChatModal
           execs={execs}
           isAdmin={isAdmin}

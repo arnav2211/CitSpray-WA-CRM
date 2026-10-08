@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
@@ -15,9 +15,9 @@ const navActive = "bg-white border-[#002FA7] text-gray-900 font-semibold";
 const navHighlight = "bg-[#FFF4E5] border-[#E67E00] text-[#B85F00] font-semibold hover:bg-[#FFE9CC]";
 const navIdle = "border-transparent text-gray-700 hover:bg-gray-100";
 
-function Item({ to, icon: Icon, children, testId, onNavigate, badge, badgeClass = "bg-[#E60000] text-white", highlight = false }) {
+function Item({ to, icon: Icon, children, testId, onNavigate, badge, badgeClass = "bg-[#E60000] text-white", highlight = false, end = false }) {
   return (
-    <NavLink to={to} data-testid={testId} onClick={onNavigate}
+    <NavLink to={to} end={end} data-testid={testId} onClick={onNavigate}
       className={({ isActive }) => `${navBase} ${isActive ? navActive : highlight ? navHighlight : navIdle}`}>
       <Icon size={18} weight="regular" />
       <span className="flex-1">{children}</span>
@@ -161,7 +161,10 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
               <Item to="/chat" icon={ChatTeardropDots} testId="nav-chat" onNavigate={handleNavigate}>WhatsApp</Item>
               <Item to="/leads" icon={Kanban} testId="nav-leads" onNavigate={handleNavigate}>Leads</Item>
               {(isAdmin || user?.international_team) && (
-                <Item to="/international" icon={Globe} testId="nav-international" onNavigate={handleNavigate}>International</Item>
+                <>
+                  <Item to="/international" end icon={Globe} testId="nav-international" onNavigate={handleNavigate}>International</Item>
+                  <Item to="/international/chat" icon={WhatsappLogo} testId="nav-international-chat" onNavigate={handleNavigate}>International WhatsApp</Item>
+                </>
               )}
               <Item to="/followups" icon={Bell} testId="nav-followups" onNavigate={handleNavigate}>Follow-ups</Item>
               <Item to="/qa" icon={ChatTeardropText} testId="nav-qa" onNavigate={handleNavigate}
