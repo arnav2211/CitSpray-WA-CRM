@@ -159,7 +159,7 @@ export function CallAiSettingsPanel() {
           <h2 className="font-chivo font-bold text-lg flex items-center gap-2"><Sparkle size={18} weight="fill" className="text-[#6D28D9]" /> AI call summaries</h2>
           <p className="text-xs text-gray-500 mt-1 max-w-2xl">
             The LeadOrbit app uploads the phone's own call recording after each call; Gemini writes a summary that shows under the
-            call, then the recording is deleted from the server and the phone. Calls with team / admin numbers are skipped.
+            call, then the recording is deleted. Calls between two team members are skipped; team ↔ admin calls go to Team Calls.
           </p>
         </div>
         <label className="flex items-center gap-2 text-sm font-semibold">
