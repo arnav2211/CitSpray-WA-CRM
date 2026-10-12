@@ -74,8 +74,11 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
             return ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
         }
 
-        fun canDeleteOthersFiles(): Boolean =
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()
+        /** Android 11+: "All files access". Android 10 and older: storage write permission
+         *  (+ requestLegacyExternalStorage in the manifest for Android 10). */
+        fun canDeleteOthersFiles(context: Context): Boolean =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager()
+            else ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
     }
 
     private data class CallEntry(val number: String, val date: Long, val duration: Int, val incoming: Boolean)
@@ -189,7 +192,7 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
         }
         if (best != null) return best
         // Fallback: recorder folders MediaStore did not index (needs all-files access)
-        if (!(canDeleteOthersFiles() || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q)) return null
+        if (!canDeleteOthersFiles(applicationContext)) return null
         val root = Environment.getExternalStorageDirectory()
         var bestFile: File? = null
         var bestDelta = Long.MAX_VALUE
@@ -247,13 +250,16 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
 
     /** Delete the phone's copy once the server has it (needs "All files access"). */
     private fun deleteLocal(rec: Recording) {
-        if (!canDeleteOthersFiles() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Log.d(TAG, "all-files access not granted - keeping local recording ${rec.name}")
+        if (!canDeleteOthersFiles(applicationContext)) {
+            Log.d(TAG, "no permission to delete other apps' files - keeping local recording ${rec.name}")
             return
         }
         try {
             var gone = false
-            if (rec.file != null && rec.file.exists()) gone = rec.file.delete()
+            if (rec.file != null && rec.file.exists()) {
+                gone = rec.file.delete()
+                if (gone) android.media.MediaScannerConnection.scanFile(applicationContext, arrayOf(rec.file.absolutePath), null, null)
+            }
             if (rec.uri != null) {
                 try { applicationContext.contentResolver.delete(rec.uri, null, null); gone = true } catch (_: Exception) { }
             }

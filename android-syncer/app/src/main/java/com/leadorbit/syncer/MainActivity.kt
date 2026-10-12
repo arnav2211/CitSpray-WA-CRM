@@ -89,6 +89,10 @@ class MainActivity : AppCompatActivity() {
         } else {
             list.add(Manifest.permission.READ_EXTERNAL_STORAGE)
         }
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q) {
+            // Android 10 and older: lets the app delete uploaded call recordings
+            list.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
         return list
     }
 

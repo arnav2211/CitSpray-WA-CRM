@@ -3564,6 +3564,15 @@ async def create_lead(body: LeadCreate, user: dict = Depends(get_current_user),
     lead = await _create_lead_internal(data, by_user_id=user["id"])
     return lead
 
+# Must be registered BEFORE /leads/{lead_id}: otherwise "phone-map" is taken as a
+# lead id and the Android app always got 404 (so its "Log call with <name>"
+# notification after calls never fired). The handler itself lives further down.
+@api.get("/leads/phone-map", include_in_schema=False)
+async def leads_phone_map_route(user: dict = Depends(get_current_user),
+                                x_company: Optional[str] = Header(None, alias="X-Company")):
+    return await get_leads_phone_map(user=user, x_company=x_company)
+
+
 @api.get("/leads/{lead_id}")
 async def get_lead(lead_id: str, user: dict = Depends(get_current_user)):
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
