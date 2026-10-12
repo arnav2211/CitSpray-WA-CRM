@@ -54,14 +54,6 @@
         </activity>
 
 
-        <!-- Post-call summary notes log input dialog screen -->
-        <activity
-            android:name=".PostCallActivity"
-            android:configChanges="orientation|screenSize|keyboardHidden"
-            android:launchMode="singleInstance"
-            android:theme="@style/Theme.AppCompat.Light.Dialog"
-            android:windowSoftInputMode="adjustResize"
-            android:exported="false" />
 
 
         <!-- No LeadOrbit dialer: calls use the phone's normal phone app; CallReceiver +

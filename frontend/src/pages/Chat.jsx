@@ -840,13 +840,12 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   const submitCall = async () => {
     if (!callOutcome) { toast.error("Pick a call outcome"); return; }
     if (!callPhone) { toast.error("Pick a phone number"); return; }
-    if (callOutcome === "connected" && !callSummary.trim()) { toast.error("Summary required for connected calls"); return; }
     setSavingCall(true);
     try {
       await api.post(`/leads/${conv.id}/calls`, {
         phone: callPhone,
         outcome: callOutcome,
-        summary: callOutcome === "connected" ? callSummary.trim() : null,
+        summary: callSummary.trim() || null,
       });
       setCallOutcome(""); setCallSummary("");
       toast.success("Call logged");
@@ -2159,7 +2158,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                       <textarea
                         value={callSummary}
                         onChange={(e) => setCallSummary(e.target.value)}
-                        placeholder="Conversation summary (required)…"
+                        placeholder="Note (optional) — the AI summary is added from the call recording"
                         rows={2}
                         className="w-full border border-gray-300 p-1.5 text-xs bg-white outline-none focus:border-[#002FA7]"
                         data-testid="chat-call-summary-input"

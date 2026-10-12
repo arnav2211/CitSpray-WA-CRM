@@ -30,6 +30,7 @@ import CallLogs from "@/pages/CallLogs";
 // AttendanceScanner import removed
 import PayrollPage from "@/pages/Payroll";
 import LeavesPage from "@/pages/Leaves";
+import TeamCalls from "@/pages/TeamCalls";
 
 export default function App() {
   return (
@@ -51,6 +52,7 @@ export default function App() {
               <Route path="/international/chat" element={<ExecutiveOrAdminOnly><Chat key="international-chat" international /></ExecutiveOrAdminOnly>} />
               <Route path="/leads/:id" element={<ExecutiveOrAdminOnly><><Leads /><LeadDetail /></></ExecutiveOrAdminOnly>} />
               <Route path="/calls" element={<ExecutiveOrAdminOnly><CallLogs /></ExecutiveOrAdminOnly>} />
+              <Route path="/team-calls" element={<ExecutiveOrAdminOnly><TeamCalls /></ExecutiveOrAdminOnly>} />
               <Route path="/followups" element={<ExecutiveOrAdminOnly><Followups /></ExecutiveOrAdminOnly>} />
               <Route path="/qa" element={<ExecutiveOrAdminOnly><InternalQA /></ExecutiveOrAdminOnly>} />
               <Route path="/transfer-requests" element={<ExecutiveOrAdminOnly><TransferRequests /></ExecutiveOrAdminOnly>} />

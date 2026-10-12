@@ -224,13 +224,12 @@ export default function LeadDrawer({ leadId, onClose }) {
   const submitCall = async () => {
     if (!callOutcome) { toast.error("Pick a call outcome"); return; }
     if (!callPhone) { toast.error("Pick a phone number"); return; }
-    if (callOutcome === "connected" && !callSummary.trim()) { toast.error("Summary required for connected calls"); return; }
     setSavingCall(true);
     try {
       await api.post(`/leads/${activeLeadId}/calls`, {
         phone: callPhone,
         outcome: callOutcome,
-        summary: callOutcome === "connected" ? callSummary.trim() : null,
+        summary: callSummary.trim() || null,
       });
       setCallOutcome(""); setCallSummary("");
       loadAll();
@@ -975,7 +974,7 @@ function CallLogSection({ lead, calls, canEdit, callOutcome, setCallOutcome, cal
             <textarea
               value={callSummary}
               onChange={(e) => setCallSummary(e.target.value)}
-              placeholder="Conversation summary — what was discussed, lead requirement, follow-up note…"
+              placeholder="Note (optional) — the AI summary is added automatically from the call recording"
               rows={3}
               className="w-full border border-gray-300 p-2 text-sm"
               data-testid="call-summary-input"

@@ -188,7 +188,6 @@ export default function LeadReference({ lead, calls = [], followups = [], execs 
                 {fmtSmartLong(lastCall.at)} ({ago(lastCall.at)}){lastCall.by_user_name ? ` · ${lastCall.by_user_name}` : ""}
                 {lastCall.direction ? ` · ${lastCall.direction}` : ""}
               </div>
-              <CallAiSummary ai={(calls.find((c) => c.ai_summary) || {}).ai_summary} compact />
             </>
           ) : (
             <span className="text-[#E60000] font-semibold">Never called</span>
@@ -220,6 +219,20 @@ export default function LeadReference({ lead, calls = [], followups = [], execs 
         </Row>
         {lead.gst_no && <Row k="GSTIN"><span className="font-mono">{lead.gst_no}</span></Row>}
       </Section>
+
+      {calls.some((c) => c.ai_summary) && (
+        <Section title={`Call summaries (${calls.filter((c) => c.ai_summary).length})`} testId="lead-call-summaries">
+          {calls.filter((c) => c.ai_summary).slice(0, 15).map((c, i) => (
+            <div key={c.id} className="py-1.5">
+              <div className="flex items-center justify-between gap-2 text-[10px] text-gray-500">
+                <span className="uppercase tracking-widest font-bold">{i === 0 ? "Latest call" : "Earlier call"}{c.by_user_name ? ` · ${c.by_user_name}` : ""}</span>
+                <span className="font-mono">{fmtSmartLong(c.at)}{dur(c.duration_seconds) ? ` · ${dur(c.duration_seconds)}` : ""}</span>
+              </div>
+              <CallAiSummary ai={c.ai_summary} compact={i > 0} />
+            </div>
+          ))}
+        </Section>
+      )}
 
       {rows.length > 0 && (
         <Section title={`${lead.source} enquiry`} testId="lead-source-details">

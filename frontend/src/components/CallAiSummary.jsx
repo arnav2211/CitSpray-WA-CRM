@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { Sparkle } from "@phosphor-icons/react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
+import { fmtSmartLong } from "@/lib/format";
 
 /* AI summary of a recorded call (the phone's recording is summarised by Gemini
    on the server and then deleted). Shown under the call in every call list. */
@@ -32,6 +33,11 @@ export default function CallAiSummary({ ai, compact = false }) {
         {it && <span className={`border px-1.5 py-0.5 text-[9px] uppercase tracking-widest font-bold ${it[1]}`}>{it[0]}</span>}
       </div>
       <div className="text-gray-800 mt-1 leading-relaxed whitespace-pre-wrap">{ai.summary}</div>
+      {ai.followup_due_at && (
+        <div className="mt-1 text-[11px] font-semibold text-[#002FA7]" data-testid="call-ai-followup">
+          Follow-up set automatically for {fmtSmartLong(ai.followup_due_at)}
+        </div>
+      )}
       {!compact && facts.length > 0 && (
         <div className="mt-1.5 space-y-0.5">
           {facts.map(([k, v]) => (
@@ -102,6 +108,16 @@ export function CallAiSettingsPanel() {
             <span><b>Admins too</b><span className="block text-xs text-gray-500">Also summarise calls made from phones logged in as admin. Off = admins' calls are left alone (not uploaded, not deleted).</span></span>
           </label>
           <label className="flex items-start gap-2 text-sm">
+            <input type="checkbox" className="mt-1" checked={cfg.auto_followup !== false} disabled={saving}
+              onChange={(e) => save({ auto_followup: e.target.checked })} data-testid="call-ai-auto-followup" />
+            <span><b>Automatic follow-ups</b><span className="block text-xs text-gray-500">When the customer asks to be called back ("call me Monday", "send the rate, I'll decide next week") a follow-up is created for the lead's owner. Not created when the customer isn't interested or one is already set around that time.</span></span>
+          </label>
+          <label className="flex items-start gap-2 text-sm">
+            <input type="checkbox" className="mt-1" checked={cfg.summarize_internal !== false} disabled={saving}
+              onChange={(e) => save({ summarize_internal: e.target.checked })} data-testid="call-ai-internal" />
+            <span><b>Summarise team calls</b><span className="block text-xs text-gray-500">Calls between colleagues are summarised (rates, decisions, to-dos) on the Team Calls page instead of being skipped.</span></span>
+          </label>
+          <label className="flex items-start gap-2 text-sm">
             <input type="checkbox" className="mt-1" checked={cfg.auto_delete !== false} disabled={saving}
               onChange={(e) => save({ auto_delete: e.target.checked })} data-testid="call-ai-auto-delete" />
             <span><b>Auto-delete recordings from phones</b><span className="block text-xs text-gray-500">After a recording is safely uploaded the phone deletes its copy. Off = recordings stay on the phones. (The server always deletes its copy once the summary is made.)</span></span>
@@ -114,7 +130,7 @@ export function CallAiSettingsPanel() {
           </label>
         </div>
         <div className="space-y-2">
-          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Internal numbers (never summarised)</div>
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Team / internal numbers (their calls go to Team Calls)</div>
           <div className="text-xs text-gray-600 space-y-0.5">
             {(cfg.team_numbers || []).map((t) => (
               <div key={t.name}><b>{t.name}:</b> {t.numbers.length ? t.numbers.join(", ") : <span className="text-[#B85F00]">no number — add it on the Users page (receiver numbers)</span>}</div>

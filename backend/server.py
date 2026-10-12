@@ -3974,8 +3974,7 @@ async def log_call(lead_id: str, body: CallLogInput, user: dict = Depends(get_cu
     lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
-    if body.outcome == "connected" and not (body.summary or "").strip():
-        raise HTTPException(status_code=400, detail="Conversation summary is required for a connected call")
+    # Notes are optional: the AI call summary is added automatically from the recording.
         
     outcome_str = {
         "connected": "Connected",
@@ -13628,6 +13627,8 @@ async def seed_data():
     await db.call_recordings.create_index("id", unique=True)
     await db.call_recordings.create_index([("status", 1), ("next_try_at", 1)])
     await db.call_recordings.create_index([("user_id", 1), ("phone", 1), ("created_at", -1)])
+    await db.internal_calls.create_index([("participants", 1), ("call_start_at", -1)])
+    await db.internal_calls.create_index([("call_start_at", -1)])
     # International team: per-day equal-share counts + the waiting queue
     await db.leads.create_index([("intl_channel", 1), ("intl_assigned_at", 1)], name="intl_assign_counts",
                                 partialFilterExpression={"international": True})
@@ -14620,8 +14621,10 @@ async def ai_status(user: dict = Depends(get_current_user)):
 # (users' receiver_numbers + an extra list in Settings) to save Gemini credits.
 CALL_REC_DIR = UPLOAD_DIR / "call_recordings"
 CALL_REC_DIR.mkdir(exist_ok=True)
-CALL_AI_DEFAULTS = {"enabled": True, "min_seconds": 20, "internal_numbers": [], "include_admins": True,
-                    "auto_delete": True}   # auto_delete = phones delete their copy after upload
+CALL_AI_DEFAULTS = {"enabled": True, "min_seconds": 10, "internal_numbers": [], "include_admins": True,
+                    "auto_delete": True,         # phones delete their copy after upload
+                    "summarize_internal": True,  # team <-> team calls -> Team Calls page
+                    "auto_followup": True}       # follow-up created from what the customer said
 CALL_REC_MAX_BYTES = 40 * 1024 * 1024
 CALL_AI_INTEREST = ("hot", "warm", "cold", "not_interested", "unclear")
 
@@ -14648,6 +14651,15 @@ async def _internal_phone_keys(cfg: Optional[dict] = None) -> set:
         keys.update(_phone_key(n) for n in (u.get("receiver_numbers") or []))
     keys.discard("")
     return keys
+
+
+async def _internal_user_for_phone(phone: str) -> Optional[dict]:
+    key = _phone_key(phone)
+    async for u in db.users.find({"receiver_numbers": {"$exists": True, "$ne": []}},
+                                 {"_id": 0, "id": 1, "name": 1, "receiver_numbers": 1}):
+        if key in {_phone_key(n) for n in (u.get("receiver_numbers") or [])}:
+            return {"id": u["id"], "name": u.get("name")}
+    return {"id": None, "name": "Office / internal number"}
 
 
 def _call_ai_on_for(user: dict, cfg: dict) -> bool:
@@ -14690,13 +14702,25 @@ async def upload_call_recording(
         return {"ok": True, "skipped": "admin_off", "delete_local": False}
     if not norm:
         return {"ok": True, "skipped": "no_number", "delete_local": False}
+    kind, other = "customer", None
     if _phone_key(norm) in await _internal_phone_keys(cfg):
-        return {"ok": True, "skipped": "internal", "delete_local": False}
+        if not cfg.get("summarize_internal", True):
+            return {"ok": True, "skipped": "internal", "delete_local": False}
+        kind = "internal"
+        other = await _internal_user_for_phone(norm)
     if int(duration_seconds or 0) < int(cfg.get("min_seconds") or 0):
         return {"ok": True, "skipped": "short", "delete_local": False}
     start = _parse_call_dt(timestamp)
     if not start:
         raise HTTPException(status_code=400, detail="Bad timestamp")
+    if kind == "internal" and other and other.get("id"):
+        # the colleague's phone may already have uploaded the same conversation
+        my_keys = {_phone_key(n) for n in (user.get("receiver_numbers") or [])}
+        async for r in db.call_recordings.find({"kind": "internal", "user_id": other["id"]},
+                                               {"_id": 0, "id": 1, "phone": 1, "call_start_at": 1}).sort("created_at", -1).limit(30):
+            rs = _parse_call_dt(r.get("call_start_at"))
+            if _phone_key(r.get("phone")) in my_keys and rs and abs((rs - start).total_seconds()) <= 120:
+                return {"ok": True, "duplicate": True, "id": r["id"], "delete_local": bool(cfg.get("auto_delete", True))}
     # same call uploaded twice (retry after a network hiccup)
     async for r in db.call_recordings.find({"user_id": user["id"], "phone": norm}, {"_id": 0, "id": 1, "call_start_at": 1}).sort("created_at", -1).limit(20):
         rs = _parse_call_dt(r.get("call_start_at"))
@@ -14725,14 +14749,15 @@ async def upload_call_recording(
         "id": rid, "user_id": user["id"], "user_name": user.get("name"), "company": normalize_company(user.get("company")),
         "phone": norm, "call_start_at": timestamp, "duration_seconds": int(duration_seconds or 0),
         "direction": direction, "file": dest.name, "size": size, "status": "pending", "attempts": 0,
-        "next_try_at": now, "created_at": now,
+        "next_try_at": now, "created_at": now, "kind": kind,
+        "other_user_id": (other or {}).get("id"), "other_name": (other or {}).get("name"),
     })
     return {"ok": True, "id": rid, "delete_local": bool(cfg.get("auto_delete", True))}
 
 
 _CALL_AI_PROMPT = """You are listening to a recorded phone call of CitSpray Aroma Sciences (Mangalam Agro), an Indian
 manufacturer and exporter of fragrances, essential oils, aroma chemicals, menthol and camphor. Our executive {exec_name}
-talks to a customer{cust}. The call may be in Hindi, Marathi, English or a mix.
+talks to a customer{cust}. The call took place on {when}. It may be in Hindi, Marathi, English or a mix.
 Reply ONLY with JSON:
 {{"summary": "2-4 short sentences in English: what the customer wants and what was agreed",
  "products": ["product names discussed"],
@@ -14740,10 +14765,64 @@ Reply ONLY with JSON:
  "price_discussed": "prices or budget mentioned, or empty",
  "next_step": "what our executive promised or must do next, or empty",
  "follow_up": "when to call / follow up (e.g. 'Monday', '15 Oct'), or empty",
+ "follow_up_needed": true or false (should our executive contact this customer again?),
+ "follow_up_date": "YYYY-MM-DD of the next contact the customer asked for or was promised, worked out from words like
+   'Monday', 'tomorrow', 'next week' relative to the call date; empty if no time was mentioned",
+ "follow_up_time": "HH:MM (24 h) if a time was said, else empty",
  "interest": "hot | warm | cold | not_interested | unclear",
  "language": "main language spoken"}}
 If the recording has no real conversation (voicemail, ringing, silence, wrong number), set summary to a short
 note saying so and interest to "unclear". Never invent details that were not said."""
+
+
+_CALL_AI_INTERNAL_PROMPT = """This is a recorded INTERNAL phone call between two colleagues at CitSpray Aroma Sciences
+(Mangalam Agro), an Indian manufacturer and exporter of fragrances, essential oils, aroma chemicals, menthol and camphor:
+{a} and {b}, on {when}. It may be in Hindi, Marathi, English or a mix. Write notes they can look back at later
+(for example to remember a rate or an instruction).
+Reply ONLY with JSON:
+{{"summary": "2-4 short sentences in English",
+ "decisions": ["what was decided / instructed"],
+ "rates": [{{"item": "product", "rate": "price with unit", "for": "customer or context, or empty"}}],
+ "action_items": [{{"who": "person", "task": "what to do", "when": "deadline or empty"}}],
+ "customers": ["customer / lead names mentioned"]}}
+Use empty lists when nothing applies. Never invent details that were not said."""
+
+_AI_EMPTY = {"none", "n/a", "na", "null", "nil", "-", "--", "not mentioned", "not discussed", "no", "nothing", "unknown"}
+
+
+def _ai_txt(v, n: int) -> str:
+    s = str(v or "").strip()
+    return "" if s.lower().rstrip(".") in _AI_EMPTY else s[:n]
+
+
+def _ai_json(text: str) -> dict:
+    raw = (text or "").strip()
+    try:
+        data = json.loads(raw)
+    except Exception:
+        m = re.search(r"\{.*\}", raw, re.S)
+        data = json.loads(m.group(0)) if m else {}
+    if isinstance(data, list):
+        data = data[0] if data and isinstance(data[0], dict) else {}
+    return data if isinstance(data, dict) else {}
+
+
+def _call_ai_parse_internal(text: str) -> dict:
+    data = _ai_json(text)
+    rates = []
+    for r in (data.get("rates") or [])[:20]:
+        if isinstance(r, dict) and _ai_txt(r.get("item"), 80):
+            rates.append({"item": _ai_txt(r.get("item"), 80), "rate": _ai_txt(r.get("rate"), 80), "for": _ai_txt(r.get("for"), 120)})
+    actions = []
+    for a in (data.get("action_items") or [])[:20]:
+        if isinstance(a, dict) and _ai_txt(a.get("task"), 200):
+            actions.append({"who": _ai_txt(a.get("who"), 60), "task": _ai_txt(a.get("task"), 200), "when": _ai_txt(a.get("when"), 60)})
+    return {
+        "summary": _ai_txt(data.get("summary"), 1500),
+        "decisions": [x for x in (_ai_txt(d, 300) for d in (data.get("decisions") or [])[:20]) if x],
+        "rates": rates, "action_items": actions,
+        "customers": [x for x in (_ai_txt(c, 80) for c in (data.get("customers") or [])[:20]) if x],
+    }
 
 
 def _call_ai_parse(text: str) -> dict:
@@ -14758,10 +14837,14 @@ def _call_ai_parse(text: str) -> dict:
     out = {
         "summary": str(data.get("summary") or "").strip()[:1500],
         "products": [str(p).strip()[:80] for p in (data.get("products") or []) if str(p).strip()][:10],
-        "quantity": str(data.get("quantity") or "").strip()[:200],
-        "price_discussed": str(data.get("price_discussed") or "").strip()[:200],
-        "next_step": str(data.get("next_step") or "").strip()[:300],
-        "follow_up": str(data.get("follow_up") or "").strip()[:100],
+        "quantity": _ai_txt(data.get("quantity"), 200),
+        "price_discussed": _ai_txt(data.get("price_discussed"), 200),
+        "next_step": _ai_txt(data.get("next_step"), 300),
+        "follow_up": _ai_txt(data.get("follow_up"), 100),
+        "follow_up_needed": bool(data.get("follow_up_needed")) if not isinstance(data.get("follow_up_needed"), str)
+                            else data.get("follow_up_needed").strip().lower() in ("true", "yes", "1"),
+        "follow_up_date": _ai_txt(data.get("follow_up_date"), 10),
+        "follow_up_time": _ai_txt(data.get("follow_up_time"), 5),
         "interest": str(data.get("interest") or "unclear").strip().lower().replace(" ", "_"),
         "language": str(data.get("language") or "").strip()[:40],
     }
@@ -14810,18 +14893,20 @@ async def _process_one_call_recording() -> bool:
     if not doc.get("file") or not src_path.exists():
         await db.call_recordings.update_one({"id": rid}, {"$set": {"status": "failed", "error": "file missing"}})
         return True
-    # Match the call log first (no Gemini credit spent if it isn't synced yet)
+    is_internal = doc.get("kind") == "internal"
     start = _parse_call_dt(doc.get("call_start_at"))
-    logs = await db.call_logs.find({"phone": doc["phone"], "by_user_id": doc["user_id"]}, {"_id": 0}).sort("at", -1).to_list(50)
-    call = _find_same_call(start, None, int(doc.get("duration_seconds") or 0), logs) if start else None
-    if not call and age_min < 30:
-        await db.call_recordings.update_one({"id": rid}, {"$set": {"status": "pending", "next_try_at": iso(now + timedelta(minutes=2))}})
-        return True
-    lead = None
-    if call and call.get("lead_id"):
-        lead = await db.leads.find_one({"id": call["lead_id"]}, {"_id": 0, "id": 1, "customer_name": 1, "requirement": 1})
-    if not lead:
-        lead = await _find_lead_by_phone(doc["phone"], company=doc.get("company"))
+    call = lead = None
+    if not is_internal:
+        # Match the call log first (no Gemini credit spent if it isn't synced yet)
+        logs = await db.call_logs.find({"phone": doc["phone"], "by_user_id": doc["user_id"]}, {"_id": 0}).sort("at", -1).to_list(50)
+        call = _find_same_call(start, None, int(doc.get("duration_seconds") or 0), logs) if start else None
+        if not call and age_min < 30:
+            await db.call_recordings.update_one({"id": rid}, {"$set": {"status": "pending", "next_try_at": iso(now + timedelta(minutes=2))}})
+            return True
+        if call and call.get("lead_id"):
+            lead = await db.leads.find_one({"id": call["lead_id"]}, {"_id": 0, "id": 1, "customer_name": 1, "requirement": 1})
+        if not lead:
+            lead = await _find_lead_by_phone(doc["phone"], company=doc.get("company"))
     # Compress: mono 16 kHz Opus ~130 KB/min (a 10-min call is ~1.3 MB to Gemini)
     ogg = CALL_REC_DIR / f"{rid}.ogg"
     try:
@@ -14835,16 +14920,21 @@ async def _process_one_call_recording() -> bool:
     except Exception as e:
         await _retry(f"compress: {e}", 30)
         return True
-    cust = ""
-    if lead:
-        cust = f" ({lead.get('customer_name') or 'customer'}" + (f", enquiry: {lead.get('requirement')}" if lead.get("requirement") else "") + ")"
-    prompt = _CALL_AI_PROMPT.format(exec_name=doc.get("user_name") or "the executive", cust=cust)
+    when = ((start or now) + timedelta(hours=5, minutes=30)).strftime("%A %d %B %Y, %H:%M IST")
+    if is_internal:
+        prompt = _CALL_AI_INTERNAL_PROMPT.format(a=doc.get("user_name") or "a team member",
+                                                 b=doc.get("other_name") or "a colleague", when=when)
+    else:
+        cust = ""
+        if lead:
+            cust = f" ({lead.get('customer_name') or 'customer'}" + (f", enquiry: {lead.get('requirement')}" if lead.get("requirement") else "") + ")"
+        prompt = _CALL_AI_PROMPT.format(exec_name=doc.get("user_name") or "the executive", cust=cust, when=when)
     try:
         audio = base64.b64encode(ogg.read_bytes()).decode()
         text = await _gemini_generate(prompt, temperature=0.2, max_output_tokens=1200, json_mode=True,
                                       per_model_timeout=60.0,
                                       parts=[{"inline_data": {"mime_type": "audio/ogg", "data": audio}}])
-        ai = _call_ai_parse(text)
+        ai = _call_ai_parse_internal(text) if is_internal else _call_ai_parse(text)
         if not ai["summary"]:
             raise ValueError("empty summary")
     except Exception as e:
@@ -14858,7 +14948,24 @@ async def _process_one_call_recording() -> bool:
         return True
     ai["at"] = iso(now_utc())
     ai["recording_seconds"] = int(doc.get("duration_seconds") or 0)
-    if call:
+    if is_internal:
+        await db.internal_calls.insert_one({
+            "id": str(uuid.uuid4()), "recording_id": rid, "uploader_id": doc["user_id"], "uploader_name": doc.get("user_name"),
+            "other_user_id": doc.get("other_user_id"), "other_name": doc.get("other_name"), "phone": doc["phone"],
+            "direction": doc.get("direction"), "call_start_at": doc.get("call_start_at"),
+            "duration_seconds": int(doc.get("duration_seconds") or 0),
+            "participants": [x for x in (doc["user_id"], doc.get("other_user_id")) if x],
+            "ai": ai, "created_at": ai["at"]})
+    else:
+        try:
+            fu = await _call_ai_auto_followup(ai, lead, doc, call)
+            if fu:
+                ai["followup_id"], ai["followup_due_at"] = fu["id"], fu["due_at"]
+        except Exception as e:
+            logger.warning(f"call-ai auto follow-up failed: {e}")
+    if is_internal:
+        pass
+    elif call:
         await db.call_logs.update_one({"id": call["id"]}, {"$set": {"ai_summary": ai}})
     elif lead:
         # call never synced: keep the summary on the lead as a note instead
@@ -14871,6 +14978,75 @@ async def _process_one_call_recording() -> bool:
         "lead_id": (lead or {}).get("id"), "ai_summary": ai}})
     logger.info(f"call-ai: summarised {rid[:8]} ({doc.get('duration_seconds')}s) -> call {(call or {}).get('id', '-')[:8]}")
     return True
+
+
+async def _call_ai_auto_followup(ai: dict, lead: Optional[dict], doc: dict, call: Optional[dict]) -> Optional[dict]:
+    """Follow-up from what the customer said ('call me Monday', 'send the rate, I'll
+    decide next week'). Goes to the lead's owner; skipped when not interested, when
+    no follow-up is needed, or when someone already set one around that time."""
+    cfg = await _call_ai_cfg()
+    if not cfg.get("auto_followup", True) or not lead:
+        return None
+    if ai.get("interest") == "not_interested" or not ai.get("follow_up_needed"):
+        return None
+    now = now_utc()
+    day = None
+    if ai.get("follow_up_date"):
+        try:
+            day = datetime.strptime(ai["follow_up_date"], "%Y-%m-%d").date()
+        except Exception:
+            day = None
+    if day is None:                       # follow-up needed but no day said -> in 2 days
+        day = (_ist_now() + timedelta(days=2)).date()
+        if day.weekday() == 6:
+            day += timedelta(days=1)
+    try:
+        hh, mm = (int(x) for x in (ai.get("follow_up_time") or "11:00").split(":")[:2])
+    except Exception:
+        hh, mm = 11, 0
+    if not (10 <= hh <= 19):              # keep it inside office hours
+        hh, mm = 11, 0
+    due = datetime(day.year, day.month, day.day, hh, mm, tzinfo=timezone.utc) - timedelta(hours=5, minutes=30)
+    if due < now + timedelta(minutes=30):
+        due = now + timedelta(hours=1)
+    if due > now + timedelta(days=90):
+        return None
+    lo, hi = iso(due - timedelta(hours=24)), iso(due + timedelta(hours=24))
+    if await db.followups.find_one({"lead_id": lead["id"], "status": "pending", "due_at": {"$gte": lo, "$lte": hi}}, {"_id": 1}):
+        return None
+    owner = await db.leads.find_one({"id": lead["id"]}, {"_id": 0, "assigned_to": 1})
+    fu = {
+        "id": str(uuid.uuid4()), "lead_id": lead["id"],
+        "executive_id": (owner or {}).get("assigned_to") or doc["user_id"],
+        "created_by": None, "due_at": iso(due),
+        "note": ("AI: " + (ai.get("next_step") or ai.get("summary") or ""))[:400],
+        "status": "pending", "created_at": iso(now), "completed_at": None,
+        "meta": {"type": "ai_call", "call_log_id": (call or {}).get("id"), "recording_id": doc["id"]},
+    }
+    await db.followups.insert_one(fu.copy())
+    await log_activity(None, "followup_created", lead["id"], {"due_at": fu["due_at"], "by": "ai_call_summary"})
+    return fu
+
+
+@api.get("/team-calls")
+async def list_team_calls(user: dict = Depends(get_current_user), q: Optional[str] = None,
+                          person: Optional[str] = None, limit: int = 50, offset: int = 0):
+    """Team Calls page: AI notes of internal calls. Everyone sees the calls they were
+    part of; admins see all (optionally one person's)."""
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
+    query: Dict[str, Any] = {}
+    if user["role"] != "admin":
+        query["participants"] = user["id"]
+    elif person:
+        query["participants"] = person
+    if q and q.strip():
+        rx = {"$regex": re.escape(q.strip()), "$options": "i"}
+        query["$or"] = [{"ai.summary": rx}, {"ai.decisions": rx}, {"ai.rates.item": rx}, {"ai.customers": rx},
+                        {"ai.action_items.task": rx}, {"other_name": rx}, {"uploader_name": rx}]
+    limit = max(1, min(int(limit or 50), 200))
+    items = await db.internal_calls.find(query, {"_id": 0}).sort("call_start_at", -1).skip(max(0, int(offset or 0))).to_list(limit)
+    return {"items": items, "total": await db.internal_calls.count_documents(query)}
 
 
 async def call_ai_task():
@@ -14890,6 +15066,8 @@ class CallAiSettingsInput(BaseModel):
     internal_numbers: Optional[List[str]] = None
     include_admins: Optional[bool] = None
     auto_delete: Optional[bool] = None
+    summarize_internal: Optional[bool] = None
+    auto_followup: Optional[bool] = None
 
 
 @api.get("/settings/call-ai")
@@ -14916,6 +15094,10 @@ async def put_call_ai_settings(body: CallAiSettingsInput, admin: dict = Depends(
         upd["include_admins"] = bool(body.include_admins)
     if body.auto_delete is not None:
         upd["auto_delete"] = bool(body.auto_delete)
+    if body.summarize_internal is not None:
+        upd["summarize_internal"] = bool(body.summarize_internal)
+    if body.auto_followup is not None:
+        upd["auto_followup"] = bool(body.auto_followup)
     if body.internal_numbers is not None:
         upd["internal_numbers"] = _normalize_receiver_list(body.internal_numbers)
     if upd:

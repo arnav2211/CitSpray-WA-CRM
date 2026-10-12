@@ -127,6 +127,7 @@ export default function AppShell() {
 function pageTitle(path) {
   if (path.startsWith("/data-entry-inspect")) return "Data Entry Stats";
   if (path.startsWith("/data-entry")) return "Lead Entry";
+  if (path.startsWith("/team-calls")) return "Team Calls";
   if (path.startsWith("/international/chat")) return "International WhatsApp";
   if (path.startsWith("/international")) return "International";
   if (path.startsWith("/chatflows")) return "Chatbot Flows";
