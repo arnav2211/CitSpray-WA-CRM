@@ -206,7 +206,7 @@ export function CallAiSettingsPanel() {
           <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Team / internal numbers (their calls go to Team Calls)</div>
           <div className="text-xs text-gray-600 space-y-0.5">
             {(cfg.team_numbers || []).map((t) => (
-              <div key={t.name}><b>{t.name}:</b> {t.numbers.length ? t.numbers.join(", ") : <span className="text-[#B85F00]">no number — add it on the Users page (receiver numbers)</span>}</div>
+              <div key={t.name}><b>{t.name}:</b> {t.numbers.length ? t.numbers.join(", ") : <span className="text-[#B85F00]">no number — add it in Settings → Lead routing → Receiver numbers</span>}</div>
             ))}
           </div>
           <textarea value={extra} onChange={(e) => setExtra(e.target.value)} rows={3} placeholder="Extra numbers, one per line (office landline, owner's second phone…)"

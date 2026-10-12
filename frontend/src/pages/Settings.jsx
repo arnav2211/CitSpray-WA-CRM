@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
-import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck, Copy, Link as LinkIcon, Phone, Plus, Trash, Lightning, Users as UsersIcon, Calendar, X, EnvelopeSimple, Paperclip, PaperPlaneTilt } from "@phosphor-icons/react";
+import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck, Copy, Link as LinkIcon, Phone, Plus, Trash, Lightning, Users as UsersIcon, Calendar, X, EnvelopeSimple, Paperclip, PaperPlaneTilt, WhatsappLogo, Funnel, ArrowsSplit, Sparkle } from "@phosphor-icons/react";
 import { fmtIST } from "@/lib/format";
 import { useCompany } from "@/context/CompanyContext";
 import { CallAiSettingsPanel } from "@/components/CallAiSummary";
@@ -15,6 +16,17 @@ const FIELDS = [
   { k: "app_secret",            label: "App Secret (optional)",     secret: true,  hint: "Meta App → Settings → Basic → App Secret. Used to verify webhook signatures." },
   { k: "default_template",      label: "Default Welcome Template",  hint: "Template name used for the first-touch message when a new lead is created. Must be APPROVED in Meta." },
   { k: "default_template_lang", label: "Default Template Language", hint: "Language code registered on the template, e.g. en_US, en, hi." },
+];
+
+// Settings are grouped into sections; the section menu shows one at a time
+// (?section=... keeps it in the URL so a link opens the right one).
+const SECTIONS = [
+  { k: "whatsapp", label: "WhatsApp", icon: WhatsappLogo, desc: "Meta Cloud API connection, welcome template and the auto-reply sequence." },
+  { k: "sources", label: "Lead sources", icon: Funnel, desc: "Where leads come from: webhook URLs (IndiaMART, JustDial, Shopify, WhatsApp, Gmail), ExportersIndia and TradeIndia." },
+  { k: "routing", label: "Lead routing", icon: ArrowsSplit, desc: "Who gets which leads: buy-lead routing per source and IndiaMART call (PNS) receiver numbers." },
+  { k: "calls", label: "Calls & AI", icon: Sparkle, desc: "AI call summaries, automatic follow-ups, team calls and recording settings." },
+  { k: "email", label: "Email", icon: EnvelopeSimple, desc: "Automatic welcome email to new leads." },
+  { k: "team", label: "Team", icon: Calendar, desc: "Leave and holiday management." },
 ];
 
 // Every panel below reads/writes config for the ACTIVE company (X-Company header
@@ -35,6 +47,9 @@ function CompanyScopeBanner() {
 }
 
 export default function Settings() {
+  const [params, setParams] = useSearchParams();
+  const section = SECTIONS.some((s) => s.k === params.get("section")) ? params.get("section") : "whatsapp";
+  const setSection = (k) => setParams({ section: k }, { replace: true });
   const [cfg, setCfg] = useState(null);
   const [hooks, setHooks] = useState(null);
   const [form, setForm] = useState({});
@@ -109,8 +124,9 @@ export default function Settings() {
   const hasOverride = (k) => Object.prototype.hasOwnProperty.call(cfg.overrides || {}, k)
     || Object.prototype.hasOwnProperty.call(cfg.overrides || {}, `${k}_masked`);
 
+  const sec = SECTIONS.find((s) => s.k === section);
   return (
-    <div className="p-4 md:p-8 space-y-6 max-w-4xl">
+    <div className="p-4 md:p-8 space-y-4">
       <div>
         <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Admin</div>
         <h1 className="font-chivo font-black text-2xl md:text-4xl">Settings</h1>
@@ -118,24 +134,44 @@ export default function Settings() {
 
       <CompanyScopeBanner />
 
-      {hooks && <WebhooksPanel hooks={hooks} />}
+      <div className="flex flex-col md:flex-row gap-4 md:gap-6 items-start">
+        {/* Section menu: a column on desktop, a scrollable tab row on phones */}
+        <nav className="w-full md:w-56 shrink-0 md:sticky md:top-4 flex md:flex-col gap-1 overflow-x-auto border-b md:border-b-0 border-gray-200 pb-1 md:pb-0"
+          data-testid="settings-sections">
+          {SECTIONS.map(({ k, label, icon: Icon }) => (
+            <button key={k} onClick={() => setSection(k)} data-testid={`settings-section-${k}`}
+              className={`flex items-center gap-2 px-3 py-2.5 text-sm text-left whitespace-nowrap border-l-0 md:border-l-2 border-b-2 md:border-b-0 transition-colors ${
+                section === k ? "md:border-l-[#002FA7] border-b-[#002FA7] md:border-b-transparent bg-white font-semibold text-gray-900"
+                              : "border-transparent text-gray-600 hover:bg-gray-100"}`}>
+              <Icon size={16} /> {label}
+            </button>
+          ))}
+        </nav>
 
-      <BuyleadsRoutingPanel />
+        <div className="flex-1 min-w-0 max-w-4xl space-y-6 w-full">
+          <div className="border-b border-gray-200 pb-3">
+            <h2 className="font-chivo font-black text-xl">{sec.label}</h2>
+            <p className="text-xs text-gray-500 mt-1">{sec.desc}</p>
+          </div>
 
-      <LeaveManagementPanel />
-
-      <ExportersIndiaPanel onChanged={load} />
-
-      <TradeIndiaPanel />
-
-      <CallAiSettingsPanel />
-
-      <CallRoutingPanel />
-
-      <EmailAutoSendPanel />
-
-      <WhatsAppAutoSequencePanel />
-
+          {section === "sources" && (
+            <>
+              {hooks && <WebhooksPanel hooks={hooks} />}
+              <ExportersIndiaPanel onChanged={load} />
+              <TradeIndiaPanel />
+            </>
+          )}
+          {section === "routing" && (
+            <>
+              <BuyleadsRoutingPanel />
+              <CallRoutingPanel />
+            </>
+          )}
+          {section === "calls" && <CallAiSettingsPanel />}
+          {section === "email" && <EmailAutoSendPanel />}
+          {section === "team" && <LeaveManagementPanel />}
+          {section === "whatsapp" && (
+            <>
       <form onSubmit={submit} className="border border-gray-200 bg-white" data-testid="whatsapp-settings-form">
         <div className="px-5 py-4 border-b border-gray-200 flex items-center justify-between">
           <div>
@@ -213,6 +249,11 @@ export default function Settings() {
           </div>
         </div>
       </form>
+              <WhatsAppAutoSequencePanel />
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
