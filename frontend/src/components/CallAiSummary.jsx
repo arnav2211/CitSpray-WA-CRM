@@ -96,6 +96,11 @@ export function CallAiSettingsPanel() {
             <span><b className="text-lg font-chivo">{(s.pending || 0) + (s.processing || 0)}</b> waiting</span>
             <span><b className="text-lg font-chivo">{s.failed || 0}</b> failed</span>
           </div>
+          <label className="flex items-start gap-2 text-sm">
+            <input type="checkbox" className="mt-1" checked={cfg.include_admins !== false} disabled={saving}
+              onChange={(e) => save({ include_admins: e.target.checked })} data-testid="call-ai-include-admins" />
+            <span><b>Admins too</b><span className="block text-xs text-gray-500">Also summarise calls made from phones logged in as admin. Off = admins' calls are left alone (not uploaded, not deleted).</span></span>
+          </label>
           <label className="block">
             <span className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Skip calls shorter than (seconds)</span>
             <input type="number" min={0} max={600} defaultValue={cfg.min_seconds} key={cfg.min_seconds}

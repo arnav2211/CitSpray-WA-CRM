@@ -14611,7 +14611,7 @@ async def ai_status(user: dict = Depends(get_current_user)):
 # (users' receiver_numbers + an extra list in Settings) to save Gemini credits.
 CALL_REC_DIR = UPLOAD_DIR / "call_recordings"
 CALL_REC_DIR.mkdir(exist_ok=True)
-CALL_AI_DEFAULTS = {"enabled": True, "min_seconds": 20, "internal_numbers": []}
+CALL_AI_DEFAULTS = {"enabled": True, "min_seconds": 20, "internal_numbers": [], "include_admins": True}
 CALL_REC_MAX_BYTES = 40 * 1024 * 1024
 CALL_AI_INTEREST = ("hot", "warm", "cold", "not_interested", "unclear")
 
@@ -14657,6 +14657,9 @@ async def upload_call_recording(
     norm = normalize_phone_display(phone)
     if not cfg.get("enabled"):
         return {"ok": True, "skipped": "disabled", "delete_local": False}
+    # Settings switch "Admins too": an admin's own phone calls can be left out
+    if user.get("role") == "admin" and not cfg.get("include_admins", True):
+        return {"ok": True, "skipped": "admin_off", "delete_local": False}
     if not norm:
         return {"ok": True, "skipped": "no_number", "delete_local": False}
     if _phone_key(norm) in await _internal_phone_keys(cfg):
@@ -14857,6 +14860,7 @@ class CallAiSettingsInput(BaseModel):
     enabled: Optional[bool] = None
     min_seconds: Optional[int] = None
     internal_numbers: Optional[List[str]] = None
+    include_admins: Optional[bool] = None
 
 
 @api.get("/settings/call-ai")
@@ -14879,6 +14883,8 @@ async def put_call_ai_settings(body: CallAiSettingsInput, admin: dict = Depends(
         upd["enabled"] = bool(body.enabled)
     if body.min_seconds is not None:
         upd["min_seconds"] = max(0, min(600, int(body.min_seconds)))
+    if body.include_admins is not None:
+        upd["include_admins"] = bool(body.include_admins)
     if body.internal_numbers is not None:
         upd["internal_numbers"] = _normalize_receiver_list(body.internal_numbers)
     if upd:
