@@ -16,6 +16,7 @@ import { fmtIST, fmtISTTime, fmtSmartShort, fmtSmartLong, fmtTime12, fmtDaySepar
 import { StatusBadge, SourceBadge } from "@/components/Badges";
 import OMSDataSection from "@/components/OMSDataSection";
 import LeadReference from "@/components/LeadReference";
+import CallAiSummary from "@/components/CallAiSummary";
 import TagsEditor from "@/components/TagsEditor";
 import { useCompany } from "@/context/CompanyContext";
 
@@ -2197,6 +2198,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                         </div>
                         <div className="text-[10px] text-gray-400 font-mono mt-0.5">{c.phone} · logged by {c.by_user_name}</div>
                         {c.summary && <div className="text-gray-700 mt-1 whitespace-pre-wrap leading-normal">{c.summary}</div>}
+                        <CallAiSummary ai={c.ai_summary} />
                       </div>
                     );
                   })}

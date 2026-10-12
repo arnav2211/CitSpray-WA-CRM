@@ -13616,6 +13616,9 @@ async def seed_data():
     # calls sync-batch dedupes on (phone, by_user_id) sorted by at.
     await db.call_logs.create_index([("phone", 1), ("by_user_id", 1), ("at", -1)])
     await db.call_logs.create_index("outcome")
+    await db.call_recordings.create_index("id", unique=True)
+    await db.call_recordings.create_index([("status", 1), ("next_try_at", 1)])
+    await db.call_recordings.create_index([("user_id", 1), ("phone", 1), ("created_at", -1)])
     # International team: per-day equal-share counts + the waiting queue
     await db.leads.create_index([("intl_channel", 1), ("intl_assigned_at", 1)], name="intl_assign_counts",
                                 partialFilterExpression={"international": True})
@@ -13829,6 +13832,7 @@ async def on_startup():
     scheduler.add_job(shopify_popup_leads_task, "interval", minutes=10, id="shopify_popup_leads", max_instances=1, coalesce=True)
     # TradeIndia pull: ticks every minute, each company pulls on its own interval
     scheduler.add_job(tradeindia_pull_task, "interval", seconds=60, id="tradeindia_pull", max_instances=1, coalesce=True)
+    scheduler.add_job(call_ai_task, "interval", seconds=20, id="call_ai", max_instances=1, coalesce=True)
     # 03:30 IST daily — purge attendance/leave/salary records of ex-employees 12 months after they left
     scheduler.add_job(former_records_retention_task, "cron", hour=3, minute=30, timezone="Asia/Kolkata", id="former_retention", max_instances=1, coalesce=True)
     try:
@@ -14335,7 +14339,7 @@ def _gemini_key_order() -> List[str]:
 
 async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
                            max_output_tokens: int = 1500, json_mode: bool = True,
-                           per_model_timeout: float = 14.0) -> str:
+                           per_model_timeout: float = 14.0, parts: Optional[List[dict]] = None) -> str:
     """Call Gemini, transparently rotating through the configured keys.
 
     A key that is out of quota (429) or rejected (400/403 invalid key) is benched
@@ -14358,7 +14362,8 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
     gen_cfg: Dict[str, Any] = {"temperature": temperature, "maxOutputTokens": max_output_tokens}
     if json_mode:
         gen_cfg["responseMimeType"] = "application/json"
-    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gen_cfg}
+    # `parts` = extra inputs before the prompt, e.g. a call recording as inline audio
+    payload = {"contents": [{"parts": list(parts or []) + [{"text": prompt}]}], "generationConfig": gen_cfg}
     last_detail = "no response"
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -14596,6 +14601,291 @@ async def ai_status(user: dict = Depends(get_current_user)):
         "keys_total": len(GEMINI_API_KEYS),
         "keys_healthy": len(healthy),
     }
+
+# ------------- AI call summaries (2026-10-12) -------------
+# The LeadOrbit app uploads the phone's own call recording after a call (Android
+# does not let apps record calls themselves; the built-in recorder of Samsung /
+# Xiaomi / Vivo / Oppo / Realme... does). The server compresses it, asks Gemini
+# (free tier accepts audio) for a summary + key facts, saves that on the call log
+# and DELETES the recording. Calls with our own team / admin numbers are skipped
+# (users' receiver_numbers + an extra list in Settings) to save Gemini credits.
+CALL_REC_DIR = UPLOAD_DIR / "call_recordings"
+CALL_REC_DIR.mkdir(exist_ok=True)
+CALL_AI_DEFAULTS = {"enabled": True, "min_seconds": 20, "internal_numbers": []}
+CALL_REC_MAX_BYTES = 40 * 1024 * 1024
+CALL_AI_INTEREST = ("hot", "warm", "cold", "not_interested", "unclear")
+
+
+async def _call_ai_cfg() -> dict:
+    doc = await db.system_settings.find_one({"key": "call_ai"}, {"_id": 0}) or {}
+    cfg = dict(CALL_AI_DEFAULTS)
+    for k in cfg:
+        if doc.get(k) is not None:
+            cfg[k] = doc[k]
+    return cfg
+
+
+def _phone_key(p: Optional[str]) -> str:
+    d = _normalize_phone(p or "")
+    return d[-10:] if len(d) >= 10 else d
+
+
+async def _internal_phone_keys(cfg: Optional[dict] = None) -> set:
+    """Numbers of our own people: every user's receiver_numbers + the extra list."""
+    cfg = cfg or await _call_ai_cfg()
+    keys = {_phone_key(n) for n in (cfg.get("internal_numbers") or [])}
+    async for u in db.users.find({"receiver_numbers": {"$exists": True, "$ne": []}}, {"_id": 0, "receiver_numbers": 1}):
+        keys.update(_phone_key(n) for n in (u.get("receiver_numbers") or []))
+    keys.discard("")
+    return keys
+
+
+@api.post("/calls/recording")
+async def upload_call_recording(
+    phone: str = Form(...),
+    timestamp: str = Form(...),          # call START (phone clock), ISO
+    duration_seconds: int = Form(0),
+    direction: str = Form("outgoing"),
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user),
+):
+    """Phone app -> one call recording. `delete_local` tells the app it may delete
+    its copy (the server keeps it only until the summary is done)."""
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
+    cfg = await _call_ai_cfg()
+    norm = normalize_phone_display(phone)
+    if not cfg.get("enabled"):
+        return {"ok": True, "skipped": "disabled", "delete_local": False}
+    if not norm:
+        return {"ok": True, "skipped": "no_number", "delete_local": False}
+    if _phone_key(norm) in await _internal_phone_keys(cfg):
+        return {"ok": True, "skipped": "internal", "delete_local": False}
+    if int(duration_seconds or 0) < int(cfg.get("min_seconds") or 0):
+        return {"ok": True, "skipped": "short", "delete_local": False}
+    start = _parse_call_dt(timestamp)
+    if not start:
+        raise HTTPException(status_code=400, detail="Bad timestamp")
+    # same call uploaded twice (retry after a network hiccup)
+    async for r in db.call_recordings.find({"user_id": user["id"], "phone": norm}, {"_id": 0, "id": 1, "call_start_at": 1}).sort("created_at", -1).limit(20):
+        rs = _parse_call_dt(r.get("call_start_at"))
+        if rs and abs((rs - start).total_seconds()) <= _CALL_SAME_TOL:
+            return {"ok": True, "duplicate": True, "id": r["id"], "delete_local": True}
+    rid = str(uuid.uuid4())
+    ext = (Path(file.filename or "").suffix or ".m4a").lower()[:6]
+    dest = CALL_REC_DIR / f"{rid}{ext}"
+    size = 0
+    with open(dest, "wb") as fh:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > CALL_REC_MAX_BYTES:
+                fh.close()
+                dest.unlink(missing_ok=True)
+                raise HTTPException(status_code=413, detail="Recording too large")
+            fh.write(chunk)
+    if size == 0:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Empty file")
+    now = iso(now_utc())
+    await db.call_recordings.insert_one({
+        "id": rid, "user_id": user["id"], "user_name": user.get("name"), "company": normalize_company(user.get("company")),
+        "phone": norm, "call_start_at": timestamp, "duration_seconds": int(duration_seconds or 0),
+        "direction": direction, "file": dest.name, "size": size, "status": "pending", "attempts": 0,
+        "next_try_at": now, "created_at": now,
+    })
+    return {"ok": True, "id": rid, "delete_local": True}
+
+
+_CALL_AI_PROMPT = """You are listening to a recorded phone call of CitSpray Aroma Sciences (Mangalam Agro), an Indian
+manufacturer and exporter of fragrances, essential oils, aroma chemicals, menthol and camphor. Our executive {exec_name}
+talks to a customer{cust}. The call may be in Hindi, Marathi, English or a mix.
+Reply ONLY with JSON:
+{{"summary": "2-4 short sentences in English: what the customer wants and what was agreed",
+ "products": ["product names discussed"],
+ "quantity": "quantity / frequency mentioned, or empty",
+ "price_discussed": "prices or budget mentioned, or empty",
+ "next_step": "what our executive promised or must do next, or empty",
+ "follow_up": "when to call / follow up (e.g. 'Monday', '15 Oct'), or empty",
+ "interest": "hot | warm | cold | not_interested | unclear",
+ "language": "main language spoken"}}
+If the recording has no real conversation (voicemail, ringing, silence, wrong number), set summary to a short
+note saying so and interest to "unclear". Never invent details that were not said."""
+
+
+def _call_ai_parse(text: str) -> dict:
+    raw = text.strip()
+    try:
+        data = json.loads(raw)
+    except Exception:
+        m = re.search(r"\{.*\}", raw, re.S)
+        data = json.loads(m.group(0)) if m else {}
+    if isinstance(data, list):
+        data = data[0] if data and isinstance(data[0], dict) else {}
+    out = {
+        "summary": str(data.get("summary") or "").strip()[:1500],
+        "products": [str(p).strip()[:80] for p in (data.get("products") or []) if str(p).strip()][:10],
+        "quantity": str(data.get("quantity") or "").strip()[:200],
+        "price_discussed": str(data.get("price_discussed") or "").strip()[:200],
+        "next_step": str(data.get("next_step") or "").strip()[:300],
+        "follow_up": str(data.get("follow_up") or "").strip()[:100],
+        "interest": str(data.get("interest") or "unclear").strip().lower().replace(" ", "_"),
+        "language": str(data.get("language") or "").strip()[:40],
+    }
+    if out["interest"] not in CALL_AI_INTEREST:
+        out["interest"] = "unclear"
+    return out
+
+
+async def _call_rec_cleanup(doc: dict) -> None:
+    for name in (doc.get("file"), f"{doc.get('id')}.ogg"):
+        if name:
+            try:
+                (CALL_REC_DIR / name).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+async def _process_one_call_recording() -> bool:
+    """Claim one waiting recording (atomic, safe across workers) and summarise it."""
+    now = now_utc()
+    # a worker that died mid-job leaves 'processing' behind - give it back after 15 min
+    await db.call_recordings.update_many(
+        {"status": "processing", "claimed_at": {"$lt": iso(now - timedelta(minutes=15))}},
+        {"$set": {"status": "pending"}})
+    doc = await db.call_recordings.find_one_and_update(
+        {"status": "pending", "next_try_at": {"$lte": iso(now)}},
+        {"$set": {"status": "processing", "claimed_at": iso(now)}},
+        sort=[("created_at", 1)], return_document=True, projection={"_id": 0})
+    if not doc:
+        return False
+    rid = doc["id"]
+    age_min = (now - (_parse_call_dt(doc.get("created_at")) or now)).total_seconds() / 60
+
+    async def _retry(why: str, minutes: float):
+        attempts = int(doc.get("attempts") or 0) + 1
+        if attempts >= 10 or age_min > 48 * 60:
+            await _call_rec_cleanup(doc)
+            await db.call_recordings.update_one({"id": rid}, {"$set": {"status": "failed", "error": why[:300], "file": None}})
+            logger.warning(f"call-ai: {rid[:8]} gave up: {why[:120]}")
+        else:
+            await db.call_recordings.update_one({"id": rid}, {"$set": {
+                "status": "pending", "attempts": attempts, "error": why[:300],
+                "next_try_at": iso(now_utc() + timedelta(minutes=minutes))}})
+
+    src_path = CALL_REC_DIR / (doc.get("file") or "")
+    if not doc.get("file") or not src_path.exists():
+        await db.call_recordings.update_one({"id": rid}, {"$set": {"status": "failed", "error": "file missing"}})
+        return True
+    # Match the call log first (no Gemini credit spent if it isn't synced yet)
+    start = _parse_call_dt(doc.get("call_start_at"))
+    logs = await db.call_logs.find({"phone": doc["phone"], "by_user_id": doc["user_id"]}, {"_id": 0}).sort("at", -1).to_list(50)
+    call = _find_same_call(start, None, int(doc.get("duration_seconds") or 0), logs) if start else None
+    if not call and age_min < 30:
+        await db.call_recordings.update_one({"id": rid}, {"$set": {"status": "pending", "next_try_at": iso(now + timedelta(minutes=2))}})
+        return True
+    lead = None
+    if call and call.get("lead_id"):
+        lead = await db.leads.find_one({"id": call["lead_id"]}, {"_id": 0, "id": 1, "customer_name": 1, "requirement": 1})
+    if not lead:
+        lead = await _find_lead_by_phone(doc["phone"], company=doc.get("company"))
+    # Compress: mono 16 kHz Opus ~130 KB/min (a 10-min call is ~1.3 MB to Gemini)
+    ogg = CALL_REC_DIR / f"{rid}.ogg"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-loglevel", "error", "-i", str(src_path), "-vn", "-ac", "1", "-ar", "16000",
+            "-c:a", "libopus", "-b:a", "16k", str(ogg),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=180)
+        if proc.returncode != 0 or not ogg.exists():
+            raise RuntimeError((err or b"").decode(errors="replace")[:200] or "ffmpeg failed")
+    except Exception as e:
+        await _retry(f"compress: {e}", 30)
+        return True
+    cust = ""
+    if lead:
+        cust = f" ({lead.get('customer_name') or 'customer'}" + (f", enquiry: {lead.get('requirement')}" if lead.get("requirement") else "") + ")"
+    prompt = _CALL_AI_PROMPT.format(exec_name=doc.get("user_name") or "the executive", cust=cust)
+    try:
+        audio = base64.b64encode(ogg.read_bytes()).decode()
+        text = await _gemini_generate(prompt, temperature=0.2, max_output_tokens=1200, json_mode=True,
+                                      per_model_timeout=60.0,
+                                      parts=[{"inline_data": {"mime_type": "audio/ogg", "data": audio}}])
+        ai = _call_ai_parse(text)
+        if not ai["summary"]:
+            raise ValueError("empty summary")
+    except Exception as e:
+        try:
+            ogg.unlink(missing_ok=True)
+        except Exception:
+            pass
+        detail = getattr(e, "detail", None) or str(e)
+        # all keys out of quota / model busy -> try again later; the recording waits
+        await _retry(f"gemini: {detail}", 20 if "quota" in str(detail).lower() else 5)
+        return True
+    ai["at"] = iso(now_utc())
+    ai["recording_seconds"] = int(doc.get("duration_seconds") or 0)
+    if call:
+        await db.call_logs.update_one({"id": call["id"]}, {"$set": {"ai_summary": ai}})
+    elif lead:
+        # call never synced: keep the summary on the lead as a note instead
+        await db.leads.update_one({"id": lead["id"]}, {"$push": {"notes": {
+            "id": str(uuid.uuid4()), "by_user_id": doc["user_id"], "by_name": "AI call summary",
+            "body": f"[AI call summary - {doc.get('user_name')}] {ai['summary']}", "at": ai["at"]}}})
+    await _call_rec_cleanup(doc)
+    await db.call_recordings.update_one({"id": rid}, {"$set": {
+        "status": "done", "file": None, "done_at": ai["at"], "call_log_id": (call or {}).get("id"),
+        "lead_id": (lead or {}).get("id"), "ai_summary": ai}})
+    logger.info(f"call-ai: summarised {rid[:8]} ({doc.get('duration_seconds')}s) -> call {(call or {}).get('id', '-')[:8]}")
+    return True
+
+
+async def call_ai_task():
+    """Every 20 s: summarise up to 2 waiting recordings (each gunicorn worker claims
+    its own, so a burst after lunch drains quickly without hammering Gemini)."""
+    try:
+        for _ in range(2):
+            if not await _process_one_call_recording():
+                break
+    except Exception as e:
+        logger.warning(f"call_ai_task failed: {e}")
+
+
+class CallAiSettingsInput(BaseModel):
+    enabled: Optional[bool] = None
+    min_seconds: Optional[int] = None
+    internal_numbers: Optional[List[str]] = None
+
+
+@api.get("/settings/call-ai")
+async def get_call_ai_settings(admin: dict = Depends(require_admin)):
+    cfg = await _call_ai_cfg()
+    since = iso(now_utc() - timedelta(days=1))
+    stats = {s: await db.call_recordings.count_documents({"status": s, "created_at": {"$gte": since}})
+             for s in ("pending", "processing", "done", "failed")}
+    team = []
+    async for u in db.users.find({"active": True, "role": {"$in": ["executive", "admin"]}},
+                                 {"_id": 0, "name": 1, "receiver_numbers": 1}).sort("name", 1):
+        team.append({"name": u.get("name"), "numbers": u.get("receiver_numbers") or []})
+    return {**cfg, "stats_24h": stats, "team_numbers": team}
+
+
+@api.put("/settings/call-ai")
+async def put_call_ai_settings(body: CallAiSettingsInput, admin: dict = Depends(require_admin)):
+    upd: Dict[str, Any] = {}
+    if body.enabled is not None:
+        upd["enabled"] = bool(body.enabled)
+    if body.min_seconds is not None:
+        upd["min_seconds"] = max(0, min(600, int(body.min_seconds)))
+    if body.internal_numbers is not None:
+        upd["internal_numbers"] = _normalize_receiver_list(body.internal_numbers)
+    if upd:
+        await db.system_settings.update_one({"key": "call_ai"}, {"$set": {"key": "call_ai", **upd}}, upsert=True)
+        await log_activity(admin["id"], "call_ai_settings_updated", None, upd)
+    return await get_call_ai_settings(admin=admin)
+
 
 # ------------- Android app self-update -------------
 # The LeadOrbit app polls this on launch. Publish a new version by dropping

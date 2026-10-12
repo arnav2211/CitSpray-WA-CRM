@@ -13,20 +13,21 @@
     <!-- Permission to start the background syncer automatically on phone reboot -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     
-    <!-- Permissions required to dial and control calls natively -->
-    <uses-permission android:name="android.permission.CALL_PHONE" />
-    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+    <!-- Call recordings made by the phone's own recorder: read them for the AI
+         call summary, and (with "All files access") delete them after upload -->
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
 
     <!-- Permissions required for Foreground Service and Notifications -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- In-app self-update: needed to hand the downloaded APK to the installer -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.READ_CONTACTS" />
 
     <application
@@ -49,32 +50,8 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
             
-            <!-- Handle phone number dialing intent filters (required to qualify as a dialer app) -->
-            <intent-filter>
-                <action android:name="android.intent.action.DIAL" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <data android:scheme="tel" />
-            </intent-filter>
-            <intent-filter>
-                <action android:name="android.intent.action.DIAL" />
-                <category android:name="android.intent.category.DEFAULT" />
-            </intent-filter>
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="tel" />
-            </intent-filter>
         </activity>
 
-        <!-- Custom Call activity showing Speaker, Mute, Hangup UI -->
-        <activity
-            android:name=".CallActivity"
-            android:configChanges="orientation|screenSize|keyboardHidden"
-            android:launchMode="singleInstance"
-            android:showOnLockScreen="true"
-            android:turnScreenOn="true"
-            android:exported="false" />
 
         <!-- Post-call summary notes log input dialog screen -->
         <activity
@@ -85,16 +62,10 @@
             android:windowSoftInputMode="adjustResize"
             android:exported="false" />
 
-        <!-- Manual Dialpad Activity -->
-        <activity
-            android:name=".DialpadActivity"
-            android:configChanges="orientation|screenSize|keyboardHidden"
-            android:theme="@style/Theme.AppCompat.Light.NoActionBar"
-            android:exported="false" />
 
-        <!-- InCallService REMOVED: the phone's regular dialer now handles all
-             call UI. LeadOrbit only places calls (CallHelper) and syncs the
-             CallLog (CallReceiver + SyncWorker). -->
+        <!-- No LeadOrbit dialer: calls use the phone's normal phone app; CallReceiver +
+             SyncWorker read the call log and RecordingSyncWorker uploads the phone's
+             call recording for the AI summary. -->
 
         <!-- Real-time notification WebSocket sync service -->
         <service

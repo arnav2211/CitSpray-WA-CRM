@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck, Copy, Link as LinkIcon, Phone, Plus, Trash, Lightning, Users as UsersIcon, Calendar, X, EnvelopeSimple, Paperclip, PaperPlaneTilt } from "@phosphor-icons/react";
 import { fmtIST } from "@/lib/format";
 import { useCompany } from "@/context/CompanyContext";
+import { CallAiSettingsPanel } from "@/components/CallAiSummary";
 
 const FIELDS = [
   { k: "access_token",          label: "Access Token",              secret: true,  hint: "Permanent System User token with whatsapp_business_messaging + whatsapp_business_management scopes." },
@@ -126,6 +127,8 @@ export default function Settings() {
       <ExportersIndiaPanel onChanged={load} />
 
       <TradeIndiaPanel />
+
+      <CallAiSettingsPanel />
 
       <CallRoutingPanel />
 

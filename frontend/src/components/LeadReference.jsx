@@ -2,6 +2,7 @@ import React from "react";
 import { fmtSmartLong } from "@/lib/format";
 import { SourceBadge, EnquiryTypeBadge, IntlBadge } from "@/components/Badges";
 import CodVerificationCard from "@/components/CodVerificationCard";
+import CallAiSummary from "@/components/CallAiSummary";
 
 /* Everything an executive needs for reference while chatting: what kind of
    lead this is, who owns it, when the customer enquired, when they were last
@@ -187,6 +188,7 @@ export default function LeadReference({ lead, calls = [], followups = [], execs 
                 {fmtSmartLong(lastCall.at)} ({ago(lastCall.at)}){lastCall.by_user_name ? ` · ${lastCall.by_user_name}` : ""}
                 {lastCall.direction ? ` · ${lastCall.direction}` : ""}
               </div>
+              <CallAiSummary ai={(calls.find((c) => c.ai_summary) || {}).ai_summary} compact />
             </>
           ) : (
             <span className="text-[#E60000] font-semibold">Never called</span>

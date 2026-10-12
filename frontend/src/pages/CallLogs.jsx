@@ -17,6 +17,7 @@ import {
   CaretRight
 } from "@phosphor-icons/react";
 import { toast } from "sonner";
+import CallAiSummary from "@/components/CallAiSummary";
 
 const OUTCOME_LABELS = {
   connected: "Connected",
@@ -328,6 +329,7 @@ export default function CallLogs() {
                         {log.summary}
                       </div>
                     )}
+                    <CallAiSummary ai={log.ai_summary} compact />
                   </div>
                   {/* Tap-to-call */}
                   <a
@@ -405,8 +407,9 @@ export default function CallLogs() {
                           <span>{log.summary}</span>
                         </div>
                       ) : (
-                        <span className="text-[10px] text-gray-400 italic">No notes logged</span>
+                        !log.ai_summary && <span className="text-[10px] text-gray-400 italic">No notes logged</span>
                       )}
+                      <CallAiSummary ai={log.ai_summary} />
                     </td>
                   </tr>
                 ))}

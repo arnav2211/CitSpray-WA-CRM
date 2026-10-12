@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import CallAiSummary from "@/components/CallAiSummary";
 import { api, errMsg } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { toast } from "sonner";
@@ -1018,6 +1019,7 @@ function CallLogSection({ lead, calls, canEdit, callOutcome, setCallOutcome, cal
                 <div className="text-[10px] text-gray-400 font-mono">{fmtIST(c.at)} · {c.by_user_name}</div>
               </div>
               {c.summary && <div className="text-sm mt-2 whitespace-pre-wrap">{c.summary}</div>}
+              <CallAiSummary ai={c.ai_summary} />
             </div>
           );
         })}

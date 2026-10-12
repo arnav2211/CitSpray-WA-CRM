@@ -39,6 +39,8 @@ class CallReceiver : BroadcastReceiver() {
             if (TelephonyManager.EXTRA_STATE_IDLE == state) {
                 // Trigger a fast, one-time sync task immediately
                 triggerImmediateSync(context)
+                // ...and upload the phone's recording of it for an AI summary
+                RecordingSyncWorker.enqueueSoon(context)
                 // The system dialer handled the call UI — offer a "log outcome"
                 // notification for connected lead calls (replaces the popup the
                 // removed InCallService used to launch).
