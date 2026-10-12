@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo, AndroidLogo,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
@@ -38,6 +38,13 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
   const [pendingTransfers, setPendingTransfers] = useState(0);
   const [pendingLeaves, setPendingLeaves] = useState(0);
   const [pendingQA, setPendingQA] = useState(0);
+  // LeadOrbit Android app download (hidden inside the app's own WebView)
+  const [appVer, setAppVer] = useState(null);
+  const inAndroidApp = typeof navigator !== "undefined" && /; wv\)/.test(navigator.userAgent || "");
+  useEffect(() => {
+    if (inAndroidApp) return;
+    api.get("/app/version").then(({ data }) => setAppVer(data)).catch(() => {});
+  }, [inAndroidApp]);
 
   // Admin: poll pending leave-request count for the sidebar badge
   useEffect(() => {
@@ -215,6 +222,14 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
           {/* Clock-in from the CRM was removed — attendance is recorded only at
               the office fingerprint device, and being punched in is what grants
               CRM access in the first place. */}
+
+          {appVer?.apk_url && (
+            <a href={appVer.apk_url} download data-testid="download-app-link"
+              className="mt-3 w-full flex items-center justify-center gap-2 border border-[#3DDC84] text-[#1B7A47] py-2 text-xs uppercase tracking-wider font-bold hover:bg-[#EAFBF1]"
+              title="Install on staff phones (allow 'install unknown apps' when asked)">
+              <AndroidLogo size={14} weight="fill" /> Android app{appVer.version_name ? ` v${appVer.version_name}` : ""}
+            </a>
+          )}
 
           <button
             className="mt-3 w-full flex items-center justify-center gap-2 border border-gray-300 py-2 text-xs uppercase tracking-wider font-bold hover:bg-gray-100"
