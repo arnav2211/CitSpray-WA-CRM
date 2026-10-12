@@ -14656,10 +14656,10 @@ async def _internal_phone_keys(cfg: Optional[dict] = None) -> set:
 async def _internal_user_for_phone(phone: str) -> Optional[dict]:
     key = _phone_key(phone)
     async for u in db.users.find({"receiver_numbers": {"$exists": True, "$ne": []}},
-                                 {"_id": 0, "id": 1, "name": 1, "receiver_numbers": 1}):
+                                 {"_id": 0, "id": 1, "name": 1, "role": 1, "receiver_numbers": 1}):
         if key in {_phone_key(n) for n in (u.get("receiver_numbers") or [])}:
-            return {"id": u["id"], "name": u.get("name")}
-    return {"id": None, "name": "Office / internal number"}
+            return {"id": u["id"], "name": u.get("name"), "role": u.get("role")}
+    return {"id": None, "name": "Office / internal number", "role": None}
 
 
 def _call_ai_on_for(user: dict, cfg: dict) -> bool:
@@ -14708,6 +14708,9 @@ async def upload_call_recording(
             return {"ok": True, "skipped": "internal", "delete_local": False}
         kind = "internal"
         other = await _internal_user_for_phone(norm)
+        # Owner rule: only team <-> ADMIN calls are summarised; colleague <-> colleague calls are left alone
+        if user.get("role") != "admin" and (other or {}).get("role") != "admin":
+            return {"ok": True, "skipped": "internal_team", "delete_local": False}
     if int(duration_seconds or 0) < int(cfg.get("min_seconds") or 0):
         return {"ok": True, "skipped": "short", "delete_local": False}
     start = _parse_call_dt(timestamp)

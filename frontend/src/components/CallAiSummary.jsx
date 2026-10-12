@@ -115,7 +115,7 @@ export function CallAiSettingsPanel() {
           <label className="flex items-start gap-2 text-sm">
             <input type="checkbox" className="mt-1" checked={cfg.summarize_internal !== false} disabled={saving}
               onChange={(e) => save({ summarize_internal: e.target.checked })} data-testid="call-ai-internal" />
-            <span><b>Summarise team calls</b><span className="block text-xs text-gray-500">Calls between colleagues are summarised (rates, decisions, to-dos) on the Team Calls page instead of being skipped.</span></span>
+            <span><b>Summarise team calls</b><span className="block text-xs text-gray-500">Calls between a team member and an admin are summarised (rates, decisions, to-dos) on the Team Calls page. Calls between two team members are never summarised.</span></span>
           </label>
           <label className="flex items-start gap-2 text-sm">
             <input type="checkbox" className="mt-1" checked={cfg.auto_delete !== false} disabled={saving}
