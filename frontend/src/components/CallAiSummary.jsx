@@ -101,6 +101,11 @@ export function CallAiSettingsPanel() {
               onChange={(e) => save({ include_admins: e.target.checked })} data-testid="call-ai-include-admins" />
             <span><b>Admins too</b><span className="block text-xs text-gray-500">Also summarise calls made from phones logged in as admin. Off = admins' calls are left alone (not uploaded, not deleted).</span></span>
           </label>
+          <label className="flex items-start gap-2 text-sm">
+            <input type="checkbox" className="mt-1" checked={cfg.auto_delete !== false} disabled={saving}
+              onChange={(e) => save({ auto_delete: e.target.checked })} data-testid="call-ai-auto-delete" />
+            <span><b>Auto-delete recordings from phones</b><span className="block text-xs text-gray-500">After a recording is safely uploaded the phone deletes its copy. Off = recordings stay on the phones. (The server always deletes its copy once the summary is made.)</span></span>
+          </label>
           <label className="block">
             <span className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Skip calls shorter than (seconds)</span>
             <input type="number" min={0} max={600} defaultValue={cfg.min_seconds} key={cfg.min_seconds}

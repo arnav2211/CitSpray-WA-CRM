@@ -49,6 +49,7 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
         private const val GIVE_UP_AFTER_MS = 20 * 60 * 1000L     // recording never appeared
         private const val MAX_BYTES = 40L * 1024 * 1024
         private const val UPLOAD_URL = "https://crm.mangalamagro.in/api/calls/recording"
+        private const val CONFIG_URL = "https://crm.mangalamagro.in/api/calls/recording-config"
 
         // Folders the common Indian phone brands' built-in recorders write to
         private val KNOWN_DIRS = listOf(
@@ -95,6 +96,16 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
         if (ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.READ_CALL_LOG)
             != PackageManager.PERMISSION_GRANTED) return Result.success()
 
+        // Ask the CRM first: summaries off for this user (or for admins) -> touch nothing
+        val cfg = fetchConfig(token) ?: return Result.retry()
+        if (!cfg.optBoolean("enabled", false)) {
+            // keep the mark at "now" so switching it on later never uploads a backlog
+            prefs.edit().putLong(PREF_MARK, System.currentTimeMillis()).apply()
+            return Result.success()
+        }
+        val minSeconds = cfg.optInt("min_seconds", MIN_SECONDS)
+        val autoDelete = cfg.optBoolean("auto_delete", true)
+
         var mark = prefs.getLong(PREF_MARK, 0L)
         if (mark == 0L) {
             // First run: only calls from now on (never upload an old backlog)
@@ -102,7 +113,7 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
             return Result.success()
         }
         val now = System.currentTimeMillis()
-        for (call in callsSince(mark)) {
+        for (call in callsSince(mark, minSeconds)) {
             val end = call.date + call.duration * 1000L
             if (now < end + 15_000L) break                      // recorder may still be writing
             val rec = findRecording(call)
@@ -112,7 +123,7 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
             } else {
                 when (val res = upload(token, call, rec)) {
                     null -> return Result.retry()               // network / server error - keep mark
-                    else -> if (res) deleteLocal(rec)
+                    else -> if (res && autoDelete) deleteLocal(rec)
                 }
             }
             mark = call.date
@@ -121,13 +132,20 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
         return Result.success()
     }
 
-    private fun callsSince(mark: Long): List<CallEntry> {
+    private fun fetchConfig(token: String): JSONObject? = try {
+        http.newCall(Request.Builder().url(CONFIG_URL).addHeader("Authorization", "Bearer $token").build())
+            .execute().use { r -> if (r.isSuccessful) JSONObject(r.body?.string() ?: "{}") else null }
+    } catch (e: Exception) {
+        Log.w(TAG, "config fetch failed: ${e.message}"); null
+    }
+
+    private fun callsSince(mark: Long, minSeconds: Int): List<CallEntry> {
         val out = mutableListOf<CallEntry>()
         val cursor = applicationContext.contentResolver.query(
             CallLog.Calls.CONTENT_URI,
             arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.DATE, CallLog.Calls.DURATION, CallLog.Calls.TYPE),
             "${CallLog.Calls.DATE} > ? AND ${CallLog.Calls.DURATION} >= ?",
-            arrayOf(mark.toString(), MIN_SECONDS.toString()),
+            arrayOf(mark.toString(), maxOf(1, minSeconds).toString()),
             "${CallLog.Calls.DATE} ASC"
         ) ?: return out
         cursor.use {

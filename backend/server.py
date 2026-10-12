@@ -14620,7 +14620,8 @@ async def ai_status(user: dict = Depends(get_current_user)):
 # (users' receiver_numbers + an extra list in Settings) to save Gemini credits.
 CALL_REC_DIR = UPLOAD_DIR / "call_recordings"
 CALL_REC_DIR.mkdir(exist_ok=True)
-CALL_AI_DEFAULTS = {"enabled": True, "min_seconds": 20, "internal_numbers": [], "include_admins": True}
+CALL_AI_DEFAULTS = {"enabled": True, "min_seconds": 20, "internal_numbers": [], "include_admins": True,
+                    "auto_delete": True}   # auto_delete = phones delete their copy after upload
 CALL_REC_MAX_BYTES = 40 * 1024 * 1024
 CALL_AI_INTEREST = ("hot", "warm", "cold", "not_interested", "unclear")
 
@@ -14647,6 +14648,24 @@ async def _internal_phone_keys(cfg: Optional[dict] = None) -> set:
         keys.update(_phone_key(n) for n in (u.get("receiver_numbers") or []))
     keys.discard("")
     return keys
+
+
+def _call_ai_on_for(user: dict, cfg: dict) -> bool:
+    if not cfg.get("enabled"):
+        return False
+    if user.get("role") == "admin" and not cfg.get("include_admins", True):
+        return False
+    return user.get("role") != "data_entry"
+
+
+@api.get("/calls/recording-config")
+async def call_recording_config(user: dict = Depends(get_current_user)):
+    """Asked by the phone app BEFORE it touches any recording: when summaries are off
+    for this user (switched off, or an admin with 'Admins too' off) the app neither
+    uploads nor deletes anything."""
+    cfg = await _call_ai_cfg()
+    return {"enabled": _call_ai_on_for(user, cfg), "min_seconds": int(cfg.get("min_seconds") or 0),
+            "auto_delete": bool(cfg.get("auto_delete", True))}
 
 
 @api.post("/calls/recording")
@@ -14682,7 +14701,7 @@ async def upload_call_recording(
     async for r in db.call_recordings.find({"user_id": user["id"], "phone": norm}, {"_id": 0, "id": 1, "call_start_at": 1}).sort("created_at", -1).limit(20):
         rs = _parse_call_dt(r.get("call_start_at"))
         if rs and abs((rs - start).total_seconds()) <= _CALL_SAME_TOL:
-            return {"ok": True, "duplicate": True, "id": r["id"], "delete_local": True}
+            return {"ok": True, "duplicate": True, "id": r["id"], "delete_local": bool(cfg.get("auto_delete", True))}
     rid = str(uuid.uuid4())
     ext = (Path(file.filename or "").suffix or ".m4a").lower()[:6]
     dest = CALL_REC_DIR / f"{rid}{ext}"
@@ -14708,7 +14727,7 @@ async def upload_call_recording(
         "direction": direction, "file": dest.name, "size": size, "status": "pending", "attempts": 0,
         "next_try_at": now, "created_at": now,
     })
-    return {"ok": True, "id": rid, "delete_local": True}
+    return {"ok": True, "id": rid, "delete_local": bool(cfg.get("auto_delete", True))}
 
 
 _CALL_AI_PROMPT = """You are listening to a recorded phone call of CitSpray Aroma Sciences (Mangalam Agro), an Indian
@@ -14870,6 +14889,7 @@ class CallAiSettingsInput(BaseModel):
     min_seconds: Optional[int] = None
     internal_numbers: Optional[List[str]] = None
     include_admins: Optional[bool] = None
+    auto_delete: Optional[bool] = None
 
 
 @api.get("/settings/call-ai")
@@ -14894,6 +14914,8 @@ async def put_call_ai_settings(body: CallAiSettingsInput, admin: dict = Depends(
         upd["min_seconds"] = max(0, min(600, int(body.min_seconds)))
     if body.include_admins is not None:
         upd["include_admins"] = bool(body.include_admins)
+    if body.auto_delete is not None:
+        upd["auto_delete"] = bool(body.auto_delete)
     if body.internal_numbers is not None:
         upd["internal_numbers"] = _normalize_receiver_list(body.internal_numbers)
     if upd:
