@@ -409,7 +409,7 @@ export default function CallLogs() {
                       ) : (
                         !log.ai_summary && <span className="text-[10px] text-gray-400 italic">No notes logged</span>
                       )}
-                      <CallAiSummary ai={log.ai_summary} />
+                      <CallAiSummary ai={log.ai_summary} leadId={log.lead_id} />
                     </td>
                   </tr>
                 ))}

@@ -6053,7 +6053,7 @@ def _slim_enquiry_history(ld: dict, limit: int = 10) -> List[Dict[str, Any]]:
 
 # Lead fields the chat panel shows for reference (enquiry type, GST, labels...).
 _CHAT_EXTRA_FIELDS = ["enquiry_type", "gst_no", "emails", "tags", "country", "company", "aliases",
-                      "international", "intl_channel",
+                      "international", "intl_channel", "ai_profile",
                       "last_enquiry_at", "last_enquiry_source", "justdial_profile_url",
                       "last_call_at", "last_call_outcome",
                       # website COD verification state, shown in the /chat details panel
@@ -13629,6 +13629,9 @@ async def seed_data():
     await db.call_recordings.create_index([("user_id", 1), ("phone", 1), ("created_at", -1)])
     await db.internal_calls.create_index([("participants", 1), ("call_start_at", -1)])
     await db.internal_calls.create_index([("call_start_at", -1)])
+    await db.call_promises.create_index([("status", 1), ("due_at", 1)])
+    await db.call_promises.create_index([("created_at", -1)])
+    await db.ai_reports.create_index("key", unique=True)
     # International team: per-day equal-share counts + the waiting queue
     await db.leads.create_index([("intl_channel", 1), ("intl_assigned_at", 1)], name="intl_assign_counts",
                                 partialFilterExpression={"international": True})
@@ -13843,6 +13846,8 @@ async def on_startup():
     # TradeIndia pull: ticks every minute, each company pulls on its own interval
     scheduler.add_job(tradeindia_pull_task, "interval", seconds=60, id="tradeindia_pull", max_instances=1, coalesce=True)
     scheduler.add_job(call_ai_task, "interval", seconds=20, id="call_ai", max_instances=1, coalesce=True)
+    scheduler.add_job(promise_tracker_task, "interval", minutes=5, id="promise_tracker", max_instances=1, coalesce=True)
+    scheduler.add_job(ai_reports_task, "interval", minutes=10, id="ai_reports", max_instances=1, coalesce=True)
     # 03:30 IST daily — purge attendance/leave/salary records of ex-employees 12 months after they left
     scheduler.add_job(former_records_retention_task, "cron", hour=3, minute=30, timezone="Asia/Kolkata", id="former_retention", max_instances=1, coalesce=True)
     try:
@@ -14773,7 +14778,20 @@ Reply ONLY with JSON:
    'Monday', 'tomorrow', 'next week' relative to the call date; empty if no time was mentioned",
  "follow_up_time": "HH:MM (24 h) if a time was said, else empty",
  "interest": "hot | warm | cold | not_interested | unclear",
- "language": "main language spoken"}}
+ "language": "main language spoken",
+ "customer_name": "the customer's own name if said, else empty",
+ "customer_company": "the customer's business name if said, else empty",
+ "customer_city": "the customer's city / location if said, else empty",
+ "promise": {{"made": true or false (did OUR executive promise to send something?),
+              "what": "what was promised (quotation, price list, sample photos, catalogue...)",
+              "channel": "whatsapp | email | courier | call | other"}},
+ "whatsapp_draft": "a short friendly WhatsApp message (max 500 characters) our executive can send right after this
+   call: thank them, recap the products / quantity discussed and the next step. English. Mention a price ONLY if
+   that exact price was told on the call. Empty if there was no real conversation or the customer is not interested.",
+ "coaching": {{"score": 0-10 (how well our executive handled the call),
+               "asked_quantity": true or false, "asked_purpose": true or false (asked what it is for / application),
+               "explained_product": true or false, "asked_for_order": true or false (tried to close / get a commitment),
+               "tip": "one short, specific tip for our executive for next time"}}}}
 If the recording has no real conversation (voicemail, ringing, silence, wrong number), set summary to a short
 note saying so and interest to "unclear". Never invent details that were not said."""
 
@@ -14853,6 +14871,26 @@ def _call_ai_parse(text: str) -> dict:
     }
     if out["interest"] not in CALL_AI_INTEREST:
         out["interest"] = "unclear"
+    out["customer_name"] = _ai_txt(data.get("customer_name"), 80)
+    out["customer_company"] = _ai_txt(data.get("customer_company"), 120)
+    out["customer_city"] = _ai_txt(data.get("customer_city"), 80)
+    pr = data.get("promise") if isinstance(data.get("promise"), dict) else {}
+    made = pr.get("made")
+    made = made.strip().lower() in ("true", "yes", "1") if isinstance(made, str) else bool(made)
+    out["promise"] = {"made": made and bool(_ai_txt(pr.get("what"), 300)), "what": _ai_txt(pr.get("what"), 300),
+                      "channel": (_ai_txt(pr.get("channel"), 20) or "other").lower()}
+    out["whatsapp_draft"] = _ai_txt(data.get("whatsapp_draft"), 700)
+    co = data.get("coaching") if isinstance(data.get("coaching"), dict) else {}
+
+    def _b(v):
+        return v.strip().lower() in ("true", "yes", "1") if isinstance(v, str) else bool(v)
+    try:
+        score = max(0, min(10, int(round(float(co.get("score"))))))
+    except Exception:
+        score = None
+    out["coaching"] = {"score": score, "asked_quantity": _b(co.get("asked_quantity")), "asked_purpose": _b(co.get("asked_purpose")),
+                       "explained_product": _b(co.get("explained_product")), "asked_for_order": _b(co.get("asked_for_order")),
+                       "tip": _ai_txt(co.get("tip"), 300)}
     return out
 
 
@@ -14934,7 +14972,7 @@ async def _process_one_call_recording() -> bool:
         prompt = _CALL_AI_PROMPT.format(exec_name=doc.get("user_name") or "the executive", cust=cust, when=when)
     try:
         audio = base64.b64encode(ogg.read_bytes()).decode()
-        text = await _gemini_generate(prompt, temperature=0.2, max_output_tokens=1200, json_mode=True,
+        text = await _gemini_generate(prompt, temperature=0.2, max_output_tokens=2400, json_mode=True,
                                       per_model_timeout=60.0,
                                       parts=[{"inline_data": {"mime_type": "audio/ogg", "data": audio}}])
         ai = _call_ai_parse_internal(text) if is_internal else _call_ai_parse(text)
@@ -14966,6 +15004,16 @@ async def _process_one_call_recording() -> bool:
                 ai["followup_id"], ai["followup_due_at"] = fu["id"], fu["due_at"]
         except Exception as e:
             logger.warning(f"call-ai auto follow-up failed: {e}")
+        try:
+            await _call_ai_apply_to_lead(ai, lead)
+        except Exception as e:
+            logger.warning(f"call-ai lead auto-fill failed: {e}")
+        try:
+            pr = await _call_ai_track_promise(ai, lead, doc, call)
+            if pr:
+                ai["promise_id"], ai["promise_due_at"] = pr["id"], pr["due_at"]
+        except Exception as e:
+            logger.warning(f"call-ai promise tracking failed: {e}")
     if is_internal:
         pass
     elif call:
@@ -15029,6 +15077,312 @@ async def _call_ai_auto_followup(ai: dict, lead: Optional[dict], doc: dict, call
     await db.followups.insert_one(fu.copy())
     await log_activity(None, "followup_created", lead["id"], {"due_at": fu["due_at"], "by": "ai_call_summary"})
     return fu
+
+
+_PLACEHOLDER_NAME_RX = re.compile(
+    r"^(new call lead|gmaps|user|justdial user|justdial lead|indiamart buyer|unknown|customer|buyer|lead)\b", re.I)
+
+
+async def _call_ai_apply_to_lead(ai: dict, lead: Optional[dict]) -> None:
+    """Fill the lead from what was said: products / quantity / company / city as an
+    'ai_profile', empty requirement / city and placeholder names filled in, and a
+    Hot call moves a New/Contacted lead to Qualified."""
+    if not lead:
+        return
+    full = await db.leads.find_one({"id": lead["id"]}, {"_id": 0, "customer_name": 1, "requirement": 1, "city": 1, "status": 1})
+    if not full:
+        return
+    upd: Dict[str, Any] = {}
+    prof = {k: ai.get(k) for k in ("products", "quantity", "customer_company", "customer_city") if ai.get(k)}
+    if prof:
+        prof["updated_at"] = ai.get("at")
+        upd["ai_profile"] = prof
+    req = ", ".join(ai.get("products") or [])
+    if ai.get("quantity"):
+        req = (req + " - " if req else "") + ai["quantity"]
+    if req and not (full.get("requirement") or "").strip():
+        upd["requirement"] = req[:300]
+    if ai.get("customer_city") and not (full.get("city") or "").strip():
+        upd["city"] = ai["customer_city"]
+    nm = (full.get("customer_name") or "").strip()
+    if ai.get("customer_name") and (not nm or _PLACEHOLDER_NAME_RX.match(nm) or re.fullmatch(r"[+\d\s-]+", nm)):
+        upd["customer_name"] = ai["customer_name"]
+    if ai.get("interest") == "hot" and full.get("status") in ("new", "contacted"):
+        upd["status"] = "qualified"
+    if upd:
+        await db.leads.update_one({"id": lead["id"]}, {"$set": upd})
+        await log_activity(None, "lead_updated", lead["id"], {"fields": sorted(upd), "by": "ai_call_summary"})
+
+
+def _office_time(due: datetime) -> datetime:
+    """Push a deadline that falls outside office hours (10:00-19:30 IST, Mon-Sat) to 11:30 next office morning."""
+    ist = due + timedelta(hours=5, minutes=30)
+    mins = ist.hour * 60 + ist.minute
+    if 600 <= mins <= 1170 and ist.weekday() != 6:
+        return due
+    nxt = ist if mins < 600 else ist + timedelta(days=1)
+    nxt = nxt.replace(hour=11, minute=30, second=0, microsecond=0)
+    if nxt.weekday() == 6:
+        nxt += timedelta(days=1)
+    return nxt - timedelta(hours=5, minutes=30)
+
+
+async def _call_ai_track_promise(ai: dict, lead: Optional[dict], doc: dict, call: Optional[dict]) -> Optional[dict]:
+    """'I'll send the quotation on WhatsApp' -> tracked: reminder after ~3 h if nothing
+    was sent to the customer, admin alert ~3 h after that."""
+    p = ai.get("promise") or {}
+    if not lead or not p.get("made") or p.get("channel") != "whatsapp":
+        return None
+    start = _parse_call_dt(doc.get("call_start_at")) or now_utc()
+    end = start + timedelta(seconds=int(doc.get("duration_seconds") or 0))
+    due = _office_time(end + timedelta(hours=3))
+    owner = await db.leads.find_one({"id": lead["id"]}, {"_id": 0, "assigned_to": 1, "customer_name": 1})
+    pr = {"id": str(uuid.uuid4()), "lead_id": lead["id"], "lead_name": (owner or {}).get("customer_name") or lead.get("customer_name"),
+          "call_log_id": (call or {}).get("id"), "exec_id": doc["user_id"], "exec_name": doc.get("user_name"),
+          "owner_id": (owner or {}).get("assigned_to") or doc["user_id"], "what": p["what"], "channel": "whatsapp",
+          "call_end_at": iso(end), "due_at": iso(due), "status": "open", "created_at": iso(now_utc())}
+    await db.call_promises.insert_one(pr.copy())
+    return pr
+
+
+async def promise_tracker_task():
+    """Every 5 min: a promise is KEPT as soon as a person sends anything to that lead on
+    WhatsApp after the call; past the deadline the executive gets a follow-up reminder,
+    3 h later still nothing -> admin alert. Conditional updates make it safe across workers."""
+    try:
+        now = now_utc()
+        async for pr in db.call_promises.find({"status": {"$in": ["open", "reminded"]}}, {"_id": 0}).limit(300):
+            sent = await db.messages.find_one({"lead_id": pr["lead_id"], "direction": "out", "by_user_id": {"$nin": [None, ""]},
+                                               "at": {"$gt": pr["call_end_at"]}}, {"_id": 0, "at": 1})
+            if sent:
+                await db.call_promises.update_one({"id": pr["id"], "status": pr["status"]},
+                                                  {"$set": {"status": "kept", "kept_at": sent.get("at")}})
+                continue
+            due = _parse_call_dt(pr["due_at"]) or now
+            if pr["status"] == "open" and now >= due:
+                res = await db.call_promises.update_one({"id": pr["id"], "status": "open"},
+                                                        {"$set": {"status": "reminded", "reminded_at": iso(now)}})
+                if res.modified_count:
+                    await db.followups.insert_one({
+                        "id": str(uuid.uuid4()), "lead_id": pr["lead_id"], "executive_id": pr.get("owner_id") or pr["exec_id"],
+                        "created_by": None, "due_at": iso(now), "status": "pending", "created_at": iso(now), "completed_at": None,
+                        "note": f"Promised on the call: {pr['what']} - not sent on WhatsApp yet",
+                        "meta": {"type": "ai_promise", "promise_id": pr["id"]}})
+            elif pr["status"] == "reminded" and now >= due + timedelta(hours=3):
+                res = await db.call_promises.update_one({"id": pr["id"], "status": "reminded"},
+                                                        {"$set": {"status": "missed", "escalated_at": iso(now)}})
+                if res.modified_count:
+                    hrs = int((now - (_parse_call_dt(pr["call_end_at"]) or now)).total_seconds() // 3600)
+                    await create_system_alert(
+                        "ai_promise_missed", f"Promise not kept: {pr.get('lead_name') or 'customer'}",
+                        f"{pr.get('exec_name')} promised \"{pr['what']}\" on WhatsApp - still not sent {hrs} h after the call.",
+                        dedup_key=f"promise:{pr['id']}")
+    except Exception as e:
+        logger.warning(f"promise_tracker_task failed: {e}")
+
+
+# ---- AI reports (daily / weekly / monthly) ----
+def _report_period(period: str, date_str: Optional[str]):
+    from datetime import date as _date
+    d = _date.fromisoformat(date_str) if date_str else _ist_now().date()
+    if period == "weekly":
+        s = d - timedelta(days=d.weekday()); e = s + timedelta(days=7)
+        label = f"Week {s.strftime('%d %b')} - {(e - timedelta(days=1)).strftime('%d %b %Y')}"
+    elif period == "monthly":
+        s = d.replace(day=1); e = (s + timedelta(days=32)).replace(day=1)
+        label = s.strftime("%B %Y")
+    else:
+        period = "daily"; s = d; e = d + timedelta(days=1)
+        label = s.strftime("%A %d %B %Y")
+    to_utc = lambda x: datetime(x.year, x.month, x.day, tzinfo=timezone.utc) - timedelta(hours=5, minutes=30)
+    return period, s.isoformat(), to_utc(s), to_utc(e), label
+
+
+async def _ai_report_data(start: datetime, end: datetime, only_user: Optional[str] = None) -> dict:
+    S, E = iso(start), iso(end)
+    names = {u["id"]: u.get("name") async for u in db.users.find({}, {"_id": 0, "id": 1, "name": 1})}
+    staff = [u["id"] async for u in db.users.find({"active": True, "role": {"$in": ["executive", "admin"]}}, {"_id": 0, "id": 1})]
+    per: Dict[str, dict] = {}
+
+    def P(uid):
+        if uid not in per:
+            per[uid] = {"user_id": uid, "name": names.get(uid, "?"), "calls": 0, "connected": 0, "talk_seconds": 0, "summarised": 0,
+                        "hot": 0, "warm": 0, "cold": 0, "not_interested": 0, "scores": [], "checks": {"asked_quantity": 0, "asked_purpose": 0,
+                        "explained_product": 0, "asked_for_order": 0}, "coached": 0, "tips": [],
+                        "fu_ai_created": 0, "fu_due": 0, "fu_done": 0, "fu_missed": 0, "fu_pending": 0,
+                        "promises": 0, "promises_kept": 0, "promises_missed": 0, "promises_open": 0, "team_calls": 0}
+        return per[uid]
+    for uid in staff:
+        if not only_user or uid == only_user:
+            P(uid)
+    products: Dict[str, int] = {}
+    hot_list: List[dict] = []
+    q: Dict[str, Any] = {"at": {"$gte": S, "$lt": E}}
+    if only_user:
+        q["by_user_id"] = only_user
+    async for c in db.call_logs.find(q, {"_id": 0, "by_user_id": 1, "duration_seconds": 1, "ai_summary": 1, "lead_id": 1, "at": 1}):
+        p = P(c.get("by_user_id"))
+        p["calls"] += 1
+        d = int(c.get("duration_seconds") or 0)
+        if d > 0:
+            p["connected"] += 1; p["talk_seconds"] += d
+        ai = c.get("ai_summary") or {}
+        if not ai:
+            continue
+        p["summarised"] += 1
+        if ai.get("interest") in ("hot", "warm", "cold", "not_interested"):
+            p[ai["interest"]] += 1
+        for pr in ai.get("products") or []:
+            k = pr.strip().lower()
+            products[k] = products.get(k, 0) + 1
+        co = ai.get("coaching") or {}
+        if co.get("score") is not None:
+            p["scores"].append(co["score"]); p["coached"] += 1
+            for k in p["checks"]:
+                p["checks"][k] += 1 if co.get(k) else 0
+            if co.get("tip"):
+                p["tips"].append(co["tip"])
+        if ai.get("interest") == "hot":
+            hot_list.append({"lead_id": c.get("lead_id"), "exec": p["name"], "at": c.get("at"), "summary": ai.get("summary"),
+                             "products": ai.get("products") or [], "quantity": ai.get("quantity")})
+    fq: Dict[str, Any] = {"due_at": {"$gte": S, "$lt": E}}
+    if only_user:
+        fq["executive_id"] = only_user
+    async for f in db.followups.find(fq, {"_id": 0, "executive_id": 1, "status": 1}):
+        p = P(f.get("executive_id")); p["fu_due"] += 1
+        st = f.get("status")
+        p["fu_done" if st == "done" else "fu_missed" if st == "missed" else "fu_pending"] += 1
+    aq: Dict[str, Any] = {"meta.type": "ai_call", "created_at": {"$gte": S, "$lt": E}}
+    if only_user:
+        aq["executive_id"] = only_user
+    async for f in db.followups.find(aq, {"_id": 0, "executive_id": 1}):
+        P(f.get("executive_id"))["fu_ai_created"] += 1
+    pq: Dict[str, Any] = {"created_at": {"$gte": S, "$lt": E}}
+    if only_user:
+        pq["exec_id"] = only_user
+    async for pr in db.call_promises.find(pq, {"_id": 0, "exec_id": 1, "status": 1}):
+        p = P(pr.get("exec_id")); p["promises"] += 1
+        st = pr.get("status")
+        p["promises_kept" if st == "kept" else "promises_missed" if st == "missed" else "promises_open"] += 1
+    tq: Dict[str, Any] = {"created_at": {"$gte": S, "$lt": E}}
+    if only_user:
+        tq["participants"] = only_user
+    async for t in db.internal_calls.find(tq, {"_id": 0, "participants": 1}):
+        for uid in t.get("participants") or []:
+            if not only_user or uid == only_user:
+                P(uid)["team_calls"] += 1
+    lead_names = {}
+    ids = [h["lead_id"] for h in hot_list if h.get("lead_id")]
+    if ids:
+        lead_names = {l["id"]: l.get("customer_name") async for l in db.leads.find({"id": {"$in": ids}}, {"_id": 0, "id": 1, "customer_name": 1})}
+    for h in hot_list:
+        h["lead_name"] = lead_names.get(h.get("lead_id"), "")
+    rows = []
+    for p in per.values():
+        n = p["coached"]
+        p["avg_score"] = round(sum(p["scores"]) / n, 1) if n else None
+        p["check_pct"] = {k: (round(100 * v / n) if n else None) for k, v in p["checks"].items()}
+        seen, tips = set(), []
+        for t in reversed(p["tips"]):
+            if t.lower() not in seen:
+                seen.add(t.lower()); tips.append(t)
+        p["tips"] = tips[:6]
+        p.pop("scores", None); p.pop("checks", None)
+        if p["calls"] or p["fu_due"] or p["promises"] or p["team_calls"] or p["user_id"] in staff:
+            rows.append(p)
+    rows.sort(key=lambda r: (-r["calls"], r["name"] or ""))
+    tot = {k: sum(r[k] for r in rows) for k in ("calls", "connected", "talk_seconds", "summarised", "hot", "warm", "cold",
+                                               "not_interested", "fu_due", "fu_done", "fu_missed", "fu_ai_created",
+                                               "promises", "promises_kept", "promises_missed", "team_calls")}
+    hot_list.sort(key=lambda h: h.get("at") or "", reverse=True)
+    return {"executives": rows, "totals": tot, "hot_leads": hot_list[:40],
+            "top_products": sorted(products.items(), key=lambda kv: -kv[1])[:15]}
+
+
+async def _ai_report_narrative(label: str, period: str, data: dict) -> Optional[str]:
+    slim = {"period": label, "totals": data["totals"], "top_products": data["top_products"][:10],
+            "hot_leads": [{k: h.get(k) for k in ("lead_name", "exec", "products", "quantity")} for h in data["hot_leads"][:12]],
+            "executives": [{k: r.get(k) for k in ("name", "calls", "connected", "talk_seconds", "hot", "warm", "cold", "fu_due",
+                                                  "fu_done", "fu_missed", "promises", "promises_kept", "promises_missed",
+                                                  "avg_score", "check_pct", "tips")} for r in data["executives"]]}
+    prompt = (
+        "You are the sales manager's assistant at CitSpray Aroma Sciences (fragrances, essential oils, aroma chemicals). "
+        f"Write the owner's {period} report for {label} from these CRM numbers (calls are phone calls by the telecalling team, "
+        "'hot/warm/cold' come from AI call summaries, 'fu' = follow-ups, 'promises' = things executives promised to send on WhatsApp, "
+        "'check_pct' = % of calls where the executive asked quantity / purpose, explained the product, asked for the order).\n"
+        "Plain text, English, short bullet points, max 220 words, in this order: 1) Headline numbers. 2) Best news / hot leads "
+        "to chase. 3) Problems (missed follow-ups, missed promises, people with few calls). 4) Coaching: one or two specific "
+        "tips per executive based on their numbers and tips. Do not invent anything that is not in the data.\n\n"
+        + json.dumps(slim, ensure_ascii=False))
+    try:
+        return (await _gemini_generate(prompt, temperature=0.3, max_output_tokens=1500, json_mode=False, per_model_timeout=40.0)).strip()
+    except Exception as e:
+        logger.warning(f"ai report narrative failed: {e}")
+        return None
+
+
+async def _build_ai_report(period: str, date_str: Optional[str], force: bool = False) -> dict:
+    period, sdate, start, end, label = _report_period(period, date_str)
+    key = f"{period}:{sdate}"
+    cached = await db.ai_reports.find_one({"key": key}, {"_id": 0})
+    complete = now_utc() >= end
+    fresh = cached and cached.get("data") and (
+        complete and cached.get("complete") or
+        (_parse_call_dt(cached.get("generated_at")) or now_utc()) > now_utc() - timedelta(minutes=30))
+    if fresh and not force:
+        return cached
+    data = await _ai_report_data(start, end)
+    narrative = await _ai_report_narrative(label, period, data)
+    doc = {"key": key, "period": period, "start_date": sdate, "label": label, "data": data,
+           "narrative": narrative or (cached or {}).get("narrative"), "generated_at": iso(now_utc()), "complete": complete}
+    await db.ai_reports.update_one({"key": key}, {"$set": doc}, upsert=True)
+    return doc
+
+
+@api.get("/ai-reports")
+async def get_ai_report(period: str = "daily", date: Optional[str] = None, refresh: bool = False,
+                        user: dict = Depends(get_current_user)):
+    """Admin: everyone + an AI-written summary. Executive: only their own numbers and coaching tips."""
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
+    try:
+        period_n, sdate, start, end, label = _report_period(period, date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    if user["role"] != "admin":
+        data = await _ai_report_data(start, end, only_user=user["id"])
+        return {"period": period_n, "start_date": sdate, "label": label, "data": data, "narrative": None,
+                "generated_at": iso(now_utc())}
+    return await _build_ai_report(period_n, sdate, force=refresh)
+
+
+async def ai_reports_task():
+    """Every 10 min: daily report after 19:30 IST (Mon-Sat), weekly on Saturday after 19:45,
+    monthly report of the previous month on the 1st after 09:00 - each built once and
+    announced to admins with a bell alert."""
+    try:
+        now = _ist_now()
+        mins = now.hour * 60 + now.minute
+        jobs = []
+        if now.weekday() != 6 and mins >= 19 * 60 + 30:
+            jobs.append(("daily", now.date().isoformat()))
+        if now.weekday() == 5 and mins >= 19 * 60 + 45:
+            jobs.append(("weekly", now.date().isoformat()))
+        if now.day == 1 and mins >= 9 * 60:
+            jobs.append(("monthly", (now.date() - timedelta(days=1)).isoformat()))
+        for period, d in jobs:
+            p, sdate, _s, _e, label = _report_period(period, d)
+            claim = await db.ai_reports.find_one_and_update(
+                {"key": f"announce:{p}:{sdate}"}, {"$setOnInsert": {"key": f"announce:{p}:{sdate}", "at": iso(now_utc())}},
+                upsert=True, return_document=False)
+            if claim is not None:
+                continue            # already built + announced (by this or another worker)
+            await _build_ai_report(p, sdate, force=True)
+            await create_system_alert("ai_report", f"{p.capitalize()} report ready - {label}",
+                                      "Open AI Reports to see calls, hot leads, promises, follow-ups and coaching tips.",
+                                      dedup_key=f"ai_report:{p}:{sdate}")
+    except Exception as e:
+        logger.warning(f"ai_reports_task failed: {e}")
 
 
 @api.get("/team-calls")

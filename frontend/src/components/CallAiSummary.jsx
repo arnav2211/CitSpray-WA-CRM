@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
-import { Sparkle } from "@phosphor-icons/react";
+import { Sparkle, WhatsappLogo, PaperPlaneRight } from "@phosphor-icons/react";
+import { useAuth } from "@/context/AuthContext";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
 import { fmtSmartLong } from "@/lib/format";
@@ -14,7 +15,55 @@ const INTEREST = {
   not_interested: ["Not interested", "bg-gray-100 text-gray-600 border-gray-300"],
 };
 
-export default function CallAiSummary({ ai, compact = false }) {
+function WhatsAppDraft({ text, leadId }) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState(text);
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState(false);
+  const send = async () => {
+    if (!draft.trim()) return;
+    setSending(true);
+    try {
+      await api.post("/whatsapp/send", { lead_id: leadId, body: draft.trim() });
+      toast.success("Sent on WhatsApp");
+      setSent(true); setOpen(false);
+    } catch (e) {
+      toast.error(errMsg(e, "Could not send") + " — if it's outside the 24-hour window, send a template first");
+    } finally { setSending(false); }
+  };
+  if (sent) return <div className="mt-1.5 text-[11px] font-semibold text-[#008A00]">✓ WhatsApp follow-up sent</div>;
+  return (
+    <div className="mt-1.5 border-t border-[#DDD6FE] pt-1.5" data-testid="call-ai-wa-draft">
+      {!open ? (
+        <button onClick={() => setOpen(true)} className="text-[11px] font-semibold text-[#128C7E] flex items-center gap-1 hover:underline">
+          <WhatsappLogo size={13} weight="fill" /> WhatsApp follow-up ready — review &amp; send
+        </button>
+      ) : (
+        <div className="space-y-1.5">
+          <textarea value={draft} onChange={(e) => setDraft(e.target.value)} rows={4}
+            className="w-full border border-gray-300 bg-white p-1.5 text-xs outline-none focus:border-[#128C7E]" data-testid="call-ai-wa-text" />
+          <div className="flex gap-1.5">
+            {leadId && (
+              <button onClick={send} disabled={sending} data-testid="call-ai-wa-send"
+                className="bg-[#25D366] hover:bg-[#1da851] text-white px-2.5 py-1 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50 flex items-center gap-1">
+                <PaperPlaneRight size={11} weight="fill" /> {sending ? "Sending…" : "Send"}
+              </button>
+            )}
+            <button onClick={() => { navigator.clipboard?.writeText(draft); toast.success("Copied"); }}
+              className="border border-gray-300 bg-white px-2.5 py-1 text-[10px] uppercase tracking-widest font-bold">Copy</button>
+            <button onClick={() => setOpen(false)} className="px-2 py-1 text-[10px] uppercase tracking-widest font-bold text-gray-500">Close</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const CHECKS = [["asked_quantity", "Asked quantity"], ["asked_purpose", "Asked purpose"],
+  ["explained_product", "Explained product"], ["asked_for_order", "Asked for order"]];
+
+export default function CallAiSummary({ ai, compact = false, leadId = null }) {
+  const { user } = useAuth();
   if (!ai || !ai.summary) return null;
   const facts = [
     ai.products?.length ? ["Products", ai.products.join(", ")] : null,
@@ -22,8 +71,11 @@ export default function CallAiSummary({ ai, compact = false }) {
     ai.price_discussed ? ["Price", ai.price_discussed] : null,
     ai.next_step ? ["Next step", ai.next_step] : null,
     ai.follow_up ? ["Follow up", ai.follow_up] : null,
+    ai.customer_company ? ["Company", ai.customer_company] : null,
+    ai.customer_city ? ["City", ai.customer_city] : null,
   ].filter(Boolean);
   const it = INTEREST[ai.interest];
+  const co = ai.coaching;
   return (
     <div className="mt-2 border border-[#DDD6FE] bg-[#F5F3FF] p-2 text-xs" data-testid="call-ai-summary">
       <div className="flex items-center gap-1.5 flex-wrap">
@@ -31,11 +83,21 @@ export default function CallAiSummary({ ai, compact = false }) {
           <Sparkle size={11} weight="fill" /> AI call summary
         </span>
         {it && <span className={`border px-1.5 py-0.5 text-[9px] uppercase tracking-widest font-bold ${it[1]}`}>{it[0]}</span>}
+        {user?.role === "admin" && co?.score != null && (
+          <span className="border border-gray-300 bg-white px-1.5 py-0.5 text-[9px] uppercase tracking-widest font-bold text-gray-700" title="Call handling score">
+            Score {co.score}/10
+          </span>
+        )}
       </div>
       <div className="text-gray-800 mt-1 leading-relaxed whitespace-pre-wrap">{ai.summary}</div>
       {ai.followup_due_at && (
         <div className="mt-1 text-[11px] font-semibold text-[#002FA7]" data-testid="call-ai-followup">
           Follow-up set automatically for {fmtSmartLong(ai.followup_due_at)}
+        </div>
+      )}
+      {ai.promise?.made && ai.promise?.channel === "whatsapp" && (
+        <div className="mt-1 text-[11px] font-semibold text-[#B85F00]" data-testid="call-ai-promise">
+          Promised on WhatsApp: {ai.promise.what}{ai.promise_due_at ? ` — reminder if not sent by ${fmtSmartLong(ai.promise_due_at)}` : ""}
         </div>
       )}
       {!compact && facts.length > 0 && (
@@ -48,6 +110,17 @@ export default function CallAiSummary({ ai, compact = false }) {
           ))}
         </div>
       )}
+      {!compact && user?.role === "admin" && co && (co.tip || co.score != null) && (
+        <div className="mt-1.5 border-t border-[#DDD6FE] pt-1.5" data-testid="call-ai-coaching">
+          <div className="flex flex-wrap gap-1">
+            {CHECKS.map(([k, label]) => (
+              <span key={k} className={`px-1.5 py-0.5 text-[9px] uppercase tracking-widest font-bold border ${co[k] ? "border-[#008A00] text-[#008A00] bg-white" : "border-gray-300 text-gray-400 bg-white line-through"}`}>{label}</span>
+            ))}
+          </div>
+          {co.tip && <div className="mt-1 text-[11px] text-gray-700"><b>Coaching tip:</b> {co.tip}</div>}
+        </div>
+      )}
+      {!compact && ai.whatsapp_draft && <WhatsAppDraft text={ai.whatsapp_draft} leadId={leadId} />}
     </div>
   );
 }

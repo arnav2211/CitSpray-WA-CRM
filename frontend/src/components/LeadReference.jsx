@@ -217,6 +217,12 @@ export default function LeadReference({ lead, calls = [], followups = [], execs 
             <span className="text-gray-400">None scheduled</span>
           )}
         </Row>
+        {lead.ai_profile && (
+          <Row k="From calls" testId="glance-ai-profile">
+            {[(lead.ai_profile.products || []).join(", "), lead.ai_profile.quantity, lead.ai_profile.customer_company, lead.ai_profile.customer_city]
+              .filter(Boolean).join(" · ")}
+          </Row>
+        )}
         {lead.gst_no && <Row k="GSTIN"><span className="font-mono">{lead.gst_no}</span></Row>}
       </Section>
 
@@ -228,7 +234,7 @@ export default function LeadReference({ lead, calls = [], followups = [], execs 
                 <span className="uppercase tracking-widest font-bold">{i === 0 ? "Latest call" : "Earlier call"}{c.by_user_name ? ` · ${c.by_user_name}` : ""}</span>
                 <span className="font-mono">{fmtSmartLong(c.at)}{dur(c.duration_seconds) ? ` · ${dur(c.duration_seconds)}` : ""}</span>
               </div>
-              <CallAiSummary ai={c.ai_summary} compact={i > 0} />
+              <CallAiSummary ai={c.ai_summary} compact={i > 0} leadId={lead.id} />
             </div>
           ))}
         </Section>

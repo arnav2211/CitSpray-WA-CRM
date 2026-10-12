@@ -2197,7 +2197,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                         </div>
                         <div className="text-[10px] text-gray-400 font-mono mt-0.5">{c.phone} · logged by {c.by_user_name}</div>
                         {c.summary && <div className="text-gray-700 mt-1 whitespace-pre-wrap leading-normal">{c.summary}</div>}
-                        <CallAiSummary ai={c.ai_summary} />
+                        <CallAiSummary ai={c.ai_summary} leadId={conv.id} />
                       </div>
                     );
                   })}

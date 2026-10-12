@@ -31,6 +31,7 @@ import CallLogs from "@/pages/CallLogs";
 import PayrollPage from "@/pages/Payroll";
 import LeavesPage from "@/pages/Leaves";
 import TeamCalls from "@/pages/TeamCalls";
+import AiReports from "@/pages/AiReports";
 
 export default function App() {
   return (
@@ -53,6 +54,7 @@ export default function App() {
               <Route path="/leads/:id" element={<ExecutiveOrAdminOnly><><Leads /><LeadDetail /></></ExecutiveOrAdminOnly>} />
               <Route path="/calls" element={<ExecutiveOrAdminOnly><CallLogs /></ExecutiveOrAdminOnly>} />
               <Route path="/team-calls" element={<ExecutiveOrAdminOnly><TeamCalls /></ExecutiveOrAdminOnly>} />
+              <Route path="/ai-reports" element={<ExecutiveOrAdminOnly><AiReports /></ExecutiveOrAdminOnly>} />
               <Route path="/followups" element={<ExecutiveOrAdminOnly><Followups /></ExecutiveOrAdminOnly>} />
               <Route path="/qa" element={<ExecutiveOrAdminOnly><InternalQA /></ExecutiveOrAdminOnly>} />
               <Route path="/transfer-requests" element={<ExecutiveOrAdminOnly><TransferRequests /></ExecutiveOrAdminOnly>} />

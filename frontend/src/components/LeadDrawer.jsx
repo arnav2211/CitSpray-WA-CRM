@@ -1018,7 +1018,7 @@ function CallLogSection({ lead, calls, canEdit, callOutcome, setCallOutcome, cal
                 <div className="text-[10px] text-gray-400 font-mono">{fmtIST(c.at)} · {c.by_user_name}</div>
               </div>
               {c.summary && <div className="text-sm mt-2 whitespace-pre-wrap">{c.summary}</div>}
-              <CallAiSummary ai={c.ai_summary} />
+              <CallAiSummary ai={c.ai_summary} leadId={lead?.id} />
             </div>
           );
         })}
