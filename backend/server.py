@@ -15312,7 +15312,9 @@ async def _ai_report_narrative(label: str, period: str, data: dict) -> Optional[
         "'check_pct' = % of calls where the executive asked quantity / purpose, explained the product, asked for the order).\n"
         "Plain text, English, short bullet points, max 220 words, in this order: 1) Headline numbers. 2) Best news / hot leads "
         "to chase. 3) Problems (missed follow-ups, missed promises, people with few calls). 4) Coaching: one or two specific "
-        "tips per executive based on their numbers and tips. Do not invent anything that is not in the data.\n\n"
+        "tips per executive based on their numbers and tips. Write in plain words for a business owner - never use "
+        "data field names (say 'asked the quantity in 40% of calls', not check_pct). Do not invent anything that is "
+        "not in the data.\n\n"
         + json.dumps(slim, ensure_ascii=False))
     try:
         return (await _gemini_generate(prompt, temperature=0.3, max_output_tokens=1500, json_mode=False, per_model_timeout=40.0)).strip()
