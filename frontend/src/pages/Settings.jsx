@@ -165,6 +165,7 @@ export default function Settings() {
             <>
               <BuyleadsRoutingPanel />
               <CallRoutingPanel />
+              <PnsNumbersPanel />
             </>
           )}
           {section === "calls" && <CallAiSettingsPanel />}
@@ -332,6 +333,53 @@ function WebhooksPanel({ hooks }) {
   );
 }
 
+
+function PnsNumbersPanel() {
+  const [d, setD] = useState(null);
+  const [txt, setTxt] = useState("");
+  const [busy, setBusy] = useState(false);
+  const load = async () => {
+    try { const { data } = await api.get("/settings/indiamart-pns"); setD(data); setTxt((data.numbers || []).join("\n")); }
+    catch (e) { toast.error(errMsg(e)); }
+  };
+  useEffect(() => { load(); }, []);
+  const save = async () => {
+    setBusy(true);
+    try {
+      const { data } = await api.put("/settings/indiamart-pns", { numbers: txt.split(/[\n,]+/).map((x) => x.trim()).filter(Boolean) });
+      setD(data); toast.success("Saved");
+    } catch (e) { toast.error(errMsg(e)); }
+    finally { setBusy(false); }
+  };
+  if (!d) return null;
+  const s = d.stats || {};
+  return (
+    <div className="border border-gray-200 bg-white" data-testid="pns-numbers-panel">
+      <div className="px-5 py-4 border-b border-gray-200">
+        <h2 className="font-chivo font-bold text-lg flex items-center gap-2"><Phone size={18} weight="bold" /> IndiaMART call (PNS) numbers</h2>
+        <p className="text-xs text-gray-500 mt-1 leading-relaxed">
+          Buyers calling through IndiaMART show up on your phones as IndiaMART's number, not their own. Calls from these
+          numbers are matched to the right buyer using IndiaMART's call details (call time and length); a call-back made
+          through the same number is matched to the buyer who called in the hour before (marked “probable”).
+        </p>
+      </div>
+      <div className="p-5 grid md:grid-cols-2 gap-5 text-sm">
+        <div className="space-y-2">
+          <textarea value={txt} onChange={(e) => setTxt(e.target.value)} rows={3} className="w-full border border-gray-300 px-2 py-1.5 text-xs font-mono"
+            placeholder="One number per line" data-testid="pns-numbers-input" />
+          <button disabled={busy} onClick={save} className="bg-[#002FA7] text-white px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50">Save numbers</button>
+        </div>
+        <div className="text-xs space-y-1">
+          <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Calls on these numbers</div>
+          <div><b>{s.exact || 0}</b> matched to the buyer</div>
+          <div><b>{s.callback || 0}</b> call-backs matched (probable)</div>
+          <div><b>{s.none || 0}</b> could not be matched</div>
+          <div><b>{s.waiting || 0}</b> waiting for IndiaMART's details</div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function CallRoutingPanel() {
   const [rows, setRows] = useState([]);

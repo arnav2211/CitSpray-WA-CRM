@@ -2677,6 +2677,11 @@ function CallTimelineItem({ c, leadId }) {
           <span className="font-bold text-gray-800 flex items-center gap-1">
             <PhoneCall size={12} weight="fill" className="text-[#6D28D9]" />
             {incoming ? "Incoming call" : "Outgoing call"} · {dur}{c.by_user_name ? ` · ${c.by_user_name}` : ""}
+            {c.pns_match && c.pns_match !== "none" && (
+              <span className="ml-1 px-1 border border-[#002FA7] text-[#002FA7] text-[9px] uppercase tracking-widest" title="Matched from IndiaMART's call details">
+                via IndiaMART{c.pns_match === "callback" ? " · probable" : ""}
+              </span>
+            )}
           </span>
           <span className="text-gray-400 font-mono">{fmtTime12(c.at)}</span>
         </div>

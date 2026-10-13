@@ -1014,6 +1014,11 @@ function CallLogSection({ lead, calls, canEdit, callOutcome, setCallOutcome, cal
                     </span>
                   )}
                   <span className="text-xs font-mono text-gray-500">{c.phone}</span>
+                  {c.pns_match && c.pns_match !== "none" && (
+                    <span className="text-[9px] uppercase font-bold px-1.5 py-0.5 border border-[#002FA7] text-[#002FA7]" title="IndiaMART call - matched to this buyer from IndiaMART's call details">
+                      via IndiaMART{c.pns_match === "callback" ? " · probable" : ""}
+                    </span>
+                  )}
                 </div>
                 <div className="text-[10px] text-gray-400 font-mono">{fmtIST(c.at)} · {c.by_user_name}</div>
               </div>

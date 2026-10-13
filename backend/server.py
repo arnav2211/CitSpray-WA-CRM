@@ -13632,6 +13632,10 @@ async def seed_data():
     await db.call_promises.create_index([("status", 1), ("due_at", 1)])
     await db.call_promises.create_index([("created_at", -1)])
     await db.ai_reports.create_index("key", unique=True)
+    # IndiaMART PNS call matching looks enquiries up by their call time
+    await db.leads.create_index("source_data.QUERY_TIME", sparse=True)
+    await db.leads.create_index("enquiries.source_data.QUERY_TIME", sparse=True)
+    await db.call_logs.create_index([("phone", 1), ("pns_checked", 1)])
     # International team: per-day equal-share counts + the waiting queue
     await db.leads.create_index([("intl_channel", 1), ("intl_assigned_at", 1)], name="intl_assign_counts",
                                 partialFilterExpression={"international": True})
@@ -13848,6 +13852,7 @@ async def on_startup():
     scheduler.add_job(call_ai_task, "interval", seconds=20, id="call_ai", max_instances=1, coalesce=True)
     scheduler.add_job(promise_tracker_task, "interval", minutes=5, id="promise_tracker", max_instances=1, coalesce=True)
     scheduler.add_job(ai_reports_task, "interval", minutes=10, id="ai_reports", max_instances=1, coalesce=True)
+    scheduler.add_job(pns_mapper_task, "interval", minutes=2, id="pns_mapper", max_instances=1, coalesce=True)
     # 03:30 IST daily — purge attendance/leave/salary records of ex-employees 12 months after they left
     scheduler.add_job(former_records_retention_task, "cron", hour=3, minute=30, timezone="Asia/Kolkata", id="former_retention", max_instances=1, coalesce=True)
     try:
@@ -15028,9 +15033,14 @@ async def _process_one_call_recording() -> bool:
         if not call and age_min < 30:
             await db.call_recordings.update_one({"id": rid}, {"$set": {"status": "pending", "next_try_at": iso(now + timedelta(minutes=2))}})
             return True
-        if call and call.get("lead_id"):
+        is_pns = doc["phone"] in await _pns_numbers()
+        if call and is_pns and not call.get("pns_checked") and age_min < 45:
+            # IndiaMART sends the buyer's details a few minutes after the call - wait for the match
+            await db.call_recordings.update_one({"id": rid}, {"$set": {"status": "pending", "next_try_at": iso(now + timedelta(minutes=3))}})
+            return True
+        if call and call.get("lead_id") and not (is_pns and call.get("pns_match") in (None, "none")):
             lead = await db.leads.find_one({"id": call["lead_id"]}, {"_id": 0, "id": 1, "customer_name": 1, "requirement": 1})
-        if not lead:
+        if not lead and not is_pns:
             lead = await _find_lead_by_phone(doc["phone"], company=doc.get("company"))
     # Compress: mono 16 kHz Opus ~130 KB/min (a 10-min call is ~1.3 MB to Gemini)
     ogg = CALL_REC_DIR / f"{rid}.ogg"
@@ -15476,6 +15486,132 @@ async def ai_reports_task():
                                       dedup_key=f"ai_report:{p}:{sdate}")
     except Exception as e:
         logger.warning(f"ai_reports_task failed: {e}")
+
+
+# ---- IndiaMART PNS calls -> the real buyer --------------------------------------
+# Buyers who call IndiaMART's virtual number (PNS) show up on our phones as that
+# number, not their own, so every such call used to land on one "New Call Lead
+# 7942554266". IndiaMART sends each PNS call as an enquiry (QUERY_TYPE P) with the
+# buyer, QUERY_TIME (IST) and CALL_DURATION, so a phone call is matched to its buyer
+# by start time + length; an answered call with no exact match is matched as a
+# CALL-BACK when exactly one buyer called through IndiaMART in the hour before.
+INDIAMART_PNS_DEFAULT = ["7942554266"]
+
+
+async def _pns_numbers() -> List[str]:
+    doc = await db.system_settings.find_one({"key": "indiamart_pns"}, {"_id": 0, "numbers": 1}) or {}
+    nums = doc.get("numbers") if doc.get("numbers") is not None else INDIAMART_PNS_DEFAULT
+    return [n for n in (normalize_phone_display(x) for x in nums) if n]
+
+
+def _call_start(c: dict) -> Optional[datetime]:
+    s, e = _call_anchors(c)
+    if s:
+        return s
+    if e:
+        return e - timedelta(seconds=int(c.get("duration_seconds") or 0))
+    return None
+
+
+async def _pns_enquiries_between(lo: datetime, hi: datetime) -> List[dict]:
+    fmt = lambda d: (d + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+    L, H = fmt(lo), fmt(hi)
+    out, seen = [], set()
+    async for l in db.leads.find({"$or": [{"source_data.QUERY_TIME": {"$gte": L, "$lte": H}},
+                                          {"enquiries.source_data.QUERY_TIME": {"$gte": L, "$lte": H}}]},
+                                 {"_id": 0, "id": 1, "customer_name": 1, "phone": 1, "company": 1,
+                                  "source_data": 1, "enquiries.source_data": 1}).limit(300):
+        for sd in [l.get("source_data") or {}] + [(e or {}).get("source_data") or {} for e in (l.get("enquiries") or [])]:
+            qt = str(sd.get("QUERY_TIME") or "")
+            if str(sd.get("QUERY_TYPE")) != "P" or not (L <= qt <= H):
+                continue
+            key = (l["id"], sd.get("UNIQUE_QUERY_ID") or qt)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                t = datetime.strptime(qt, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc) - timedelta(hours=5, minutes=30)
+                dur = int(float(sd.get("CALL_DURATION") or 0))
+            except Exception:
+                continue
+            out.append({"lead_id": l["id"], "name": l.get("customer_name"), "phone": l.get("phone"),
+                        "company": normalize_company(l.get("company")), "t": t, "dur": dur, "qid": sd.get("UNIQUE_QUERY_ID")})
+    return out
+
+
+async def _pns_match_call(c: dict, company: str, final: bool) -> Optional[dict]:
+    start = _call_start(c)
+    if not start:
+        return None
+    dur = int(c.get("duration_seconds") or 0)
+    best = None
+    for p in await _pns_enquiries_between(start - timedelta(minutes=5), start + timedelta(minutes=5)):
+        if p["company"] != company:
+            continue
+        dt = abs((p["t"] - start).total_seconds())
+        dd = abs(p["dur"] - dur)
+        if dt <= 240 and dd <= max(12, 0.25 * max(dur, p["dur"])):
+            score = dt + 3 * dd
+            if best is None or score < best[0]:
+                best = (score, p)
+    if best:
+        return {**best[1], "match": "exact"}
+    if final and dur > 0:
+        prev = {p["lead_id"]: p for p in await _pns_enquiries_between(start - timedelta(minutes=60), start)
+                if p["company"] == company}
+        if len(prev) == 1:
+            return {**next(iter(prev.values())), "match": "callback"}
+    return None
+
+
+async def pns_mapper_task():
+    """Every 2 min: link calls on IndiaMART PNS numbers to the buyer (live calls wait up
+    to 30 min for IndiaMART's enquiry; older unmatched calls are left where they are)."""
+    try:
+        nums = await _pns_numbers()
+        if not nums:
+            return
+        companies = {u["id"]: normalize_company(u.get("company")) async for u in db.users.find({}, {"_id": 0, "id": 1, "company": 1})}
+        now = now_utc()
+        async for c in db.call_logs.find({"phone": {"$in": nums}, "pns_checked": {"$ne": True}}, {"_id": 0}).sort("at", -1).limit(150):
+            start = _call_start(c)
+            age_min = (now - start).total_seconds() / 60 if start else 99999
+            final = age_min >= 30
+            m = await _pns_match_call(c, companies.get(c.get("by_user_id"), DEFAULT_COMPANY), final)
+            if m:
+                res = await db.call_logs.update_one({"id": c["id"], "pns_checked": {"$ne": True}}, {"$set": {
+                    "lead_id": m["lead_id"], "pns_checked": True, "pns_match": m["match"], "pns_buyer_name": m["name"],
+                    "pns_buyer_phone": m["phone"], "pns_query_id": m.get("qid"), "pns_lead_before": c.get("lead_id")}})
+                if res.modified_count and age_min < 24 * 60 and int(c.get("duration_seconds") or 0) > 0:
+                    lead = await db.leads.find_one({"id": m["lead_id"]}, {"_id": 0})
+                    if lead:
+                        await _call_bump_lead(lead, c["id"], c.get("outcome") or "connected")
+            elif final:
+                await db.call_logs.update_one({"id": c["id"]}, {"$set": {"pns_checked": True, "pns_match": "none"}})
+    except Exception as e:
+        logger.warning(f"pns_mapper_task failed: {e}")
+
+
+class PnsNumbersInput(BaseModel):
+    numbers: List[str]
+
+
+@api.get("/settings/indiamart-pns")
+async def get_indiamart_pns(admin: dict = Depends(require_admin)):
+    nums = await _pns_numbers()
+    stats = {}
+    for m in ("exact", "callback", "none"):
+        stats[m] = await db.call_logs.count_documents({"phone": {"$in": nums}, "pns_match": m})
+    stats["waiting"] = await db.call_logs.count_documents({"phone": {"$in": nums}, "pns_checked": {"$ne": True}})
+    return {"numbers": nums, "stats": stats}
+
+
+@api.put("/settings/indiamart-pns")
+async def put_indiamart_pns(body: PnsNumbersInput, admin: dict = Depends(require_admin)):
+    nums = [n for n in (normalize_phone_display(x) for x in body.numbers) if n]
+    await db.system_settings.update_one({"key": "indiamart_pns"}, {"$set": {"key": "indiamart_pns", "numbers": nums}}, upsert=True)
+    await log_activity(admin["id"], "indiamart_pns_numbers_updated", None, {"numbers": nums})
+    return await get_indiamart_pns(admin=admin)
 
 
 @api.get("/team-calls")
