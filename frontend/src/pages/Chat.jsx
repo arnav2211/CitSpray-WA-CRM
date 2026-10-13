@@ -1149,9 +1149,19 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   // Group messages by IST day key — used to render sticky day separators
   // (#2 WhatsApp-style). Memoized so we don't re-walk the array on each render.
   const messageGroups = useMemo(() => {
+    // Calls appear in the timeline between the messages (internal only, never sent).
+    // Only calls inside the loaded message window, so older calls don't pile up at
+    // the top before older messages are scrolled in.
+    const oldest = messages.length ? getEpoch(messages[0].at) : 0;
+    const callItems = (calls || [])
+      .filter((c) => c.outcome !== "initiated" && c.at && getEpoch(c.at) >= oldest - 60000)
+      .map((c) => ({ id: `call-${c.id}`, at: c.at, __call: c }));
+    const timeline = callItems.length
+      ? [...messages, ...callItems].sort((a, b) => getEpoch(a.at) - getEpoch(b.at))
+      : messages;
     const groups = [];
     let lastKey = "";
-    for (const m of messages) {
+    for (const m of timeline) {
       const k = istDayKey(m.at);
       if (k !== lastKey) {
         groups.push({ dayKey: k, items: [] });
@@ -1160,7 +1170,14 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
       groups[groups.length - 1].items.push(m);
     }
     return groups;
-  }, [messages]);
+  }, [messages, calls]);
+
+  // Keep the calls in the timeline fresh while the chat is open (summaries arrive
+  // a minute or two after a call ends).
+  useEffect(() => {
+    const id = setInterval(() => { loadCallsAndFollowups(); }, 60000);
+    return () => clearInterval(id);
+  }, [loadCallsAndFollowups]);
 
   // Compute in-chat search hits (#4). Empty query → no hits.
   // Filtering is purely client-side over what's already rendered.
@@ -1805,6 +1822,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                 onReact={reactFn}
                 onAskAdmin={askAdminFn}
                 onJumpTo={jumpToMessage}
+                leadId={conv.id}
               />
             ))}
           </div>
@@ -2632,13 +2650,59 @@ function InfoRow({ label, children }) {
   );
 }
 
+// A phone call shown inside the chat timeline (internal note for the team, never sent
+// to the customer): who called, how long, and the AI summary of what was said.
+function CallTimelineItem({ c, leadId }) {
+  const [open, setOpen] = useState(false);
+  const answered = (c.duration_seconds || 0) > 0;
+  const incoming = c.direction === "incoming";
+  const d = Math.round(c.duration_seconds || 0);
+  const dur = d >= 60 ? `${Math.floor(d / 60)}m ${d % 60}s` : `${d}s`;
+  const note = (c.summary || "").trim();
+  const autoNote = !note || /Auto-logged via app|Synced via Android App|Call ended\./.test(note);
+  if (!answered) {
+    return (
+      <div className="flex justify-center" data-testid={`timeline-call-${c.id}`}>
+        <span className="text-[11px] text-gray-500 bg-white/70 border border-gray-200 rounded-full px-3 py-0.5">
+          <PhoneCall size={11} className="inline mr-1 -mt-0.5" />
+          {incoming ? "Missed incoming call" : "Call not answered"} · {fmtTime12(c.at)}{c.by_user_name ? ` · ${c.by_user_name}` : ""}
+        </span>
+      </div>
+    );
+  }
+  return (
+    <div className="flex justify-center" data-testid={`timeline-call-${c.id}`}>
+      <div className="w-full max-w-[85%] bg-white border border-[#DDD6FE] rounded-lg shadow-sm px-3 py-2">
+        <div className="flex items-center justify-between gap-2 text-[11px]">
+          <span className="font-bold text-gray-800 flex items-center gap-1">
+            <PhoneCall size={12} weight="fill" className="text-[#6D28D9]" />
+            {incoming ? "Incoming call" : "Outgoing call"} · {dur}{c.by_user_name ? ` · ${c.by_user_name}` : ""}
+          </span>
+          <span className="text-gray-400 font-mono">{fmtTime12(c.at)}</span>
+        </div>
+        {!autoNote && <div className="text-xs text-gray-700 mt-1 whitespace-pre-wrap"><b>Note:</b> {note}</div>}
+        {c.ai_summary ? (
+          <>
+            <CallAiSummary ai={c.ai_summary} compact={!open} leadId={leadId} />
+            <button onClick={() => setOpen((v) => !v)} className="mt-1 text-[10px] uppercase tracking-widest font-bold text-[#6D28D9] hover:underline">
+              {open ? "Less" : "Details"}
+            </button>
+          </>
+        ) : (
+          <div className="text-[11px] text-gray-400 mt-1">No AI summary (no recording from this phone)</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // DayGroup renders a sticky date separator + the bubbles for that calendar day.
 // `position: sticky` + `top: 0` makes the separator pin to the top while scrolling
 // through the day's messages — matching WhatsApp's behavior.
 const DayGroup = React.memo(function DayGroup({
   group, allMessages, userMap, canMessage, currentUserId,
   onReply, onResend, onReact, onAskAdmin, onJumpTo,
-  searchQuery, focusedHitId, searchHitsSet,
+  searchQuery, focusedHitId, searchHitsSet, leadId,
 }) {
   const hitsSet = useMemo(
     () => (searchHitsSet && searchHitsSet.length ? new Set(searchHitsSet) : null),
@@ -2657,7 +2721,9 @@ const DayGroup = React.memo(function DayGroup({
           {fmtDaySeparator(group.dayKey)}
         </span>
       </div>
-      {group.items.map((m) => (
+      {group.items.map((m) => m.__call ? (
+        <CallTimelineItem key={m.id} c={m.__call} leadId={leadId} />
+      ) : (
         <Bubble
           key={m.id}
           m={m}
