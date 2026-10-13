@@ -15273,25 +15273,90 @@ async def _call_ai_track_promise(ai: dict, lead: Optional[dict], doc: dict, call
     pr = {"id": str(uuid.uuid4()), "lead_id": lead["id"], "lead_name": (owner or {}).get("customer_name") or lead.get("customer_name"),
           "call_log_id": (call or {}).get("id"), "exec_id": doc["user_id"], "exec_name": doc.get("user_name"),
           "owner_id": (owner or {}).get("assigned_to") or doc["user_id"], "what": p["what"], "channel": "whatsapp",
-          "call_end_at": iso(end), "due_at": iso(due), "status": "open", "created_at": iso(now_utc())}
+          "call_start_at": iso(start), "call_end_at": iso(end), "due_at": iso(due), "status": "open", "created_at": iso(now_utc())}
     await db.call_promises.insert_one(pr.copy())
     return pr
 
 
+_PROMISE_CLOCK_SKEW = timedelta(minutes=2)      # phone clock vs server clock
+_PROMISE_GIVE_UP_DAYS = 7
+
+
+async def _promise_sent(pr: dict) -> Optional[dict]:
+    """A person sent this lead something on WhatsApp from the START of the call on
+    (executives often send the location / catalogue while still talking)."""
+    start = _parse_call_dt(pr.get("call_start_at"))
+    if not start and pr.get("call_log_id"):
+        cl = await db.call_logs.find_one({"id": pr["call_log_id"]}, {"_id": 0, "call_start_at": 1, "at": 1})
+        start = _parse_call_dt((cl or {}).get("call_start_at") or (cl or {}).get("at"))
+    end = _parse_call_dt(pr["call_end_at"]) or now_utc()
+    since = (start or (end - timedelta(minutes=10))) - _PROMISE_CLOCK_SKEW
+    return await db.messages.find_one({"lead_id": pr["lead_id"], "direction": "out", "by_user_id": {"$nin": [None, ""]},
+                                       "at": {"$gt": iso(since)}}, {"_id": 0, "at": 1})
+
+
+async def _promise_clock(pr: dict, now: datetime) -> Optional[datetime]:
+    """When the promise could first be kept: the call end if the customer's 24-hour
+    WhatsApp window was open then, else the customer's next message. None = it cannot
+    be sent right now (window closed) -> no reminder, no alert, wait for the customer."""
+    end = _parse_call_dt(pr["call_end_at"]) or now
+    last_in = await db.messages.find_one({"lead_id": pr["lead_id"], "direction": "in"}, {"_id": 0, "at": 1}, sort=[("at", -1)])
+    last_dt = _parse_call_dt((last_in or {}).get("at"))
+    if not last_dt or now - last_dt >= timedelta(hours=24):
+        return None                        # window closed now: free text impossible
+    before = await db.messages.find_one({"lead_id": pr["lead_id"], "direction": "in", "at": {"$lte": iso(end)}},
+                                        {"_id": 0, "at": 1}, sort=[("at", -1)])
+    b_dt = _parse_call_dt((before or {}).get("at"))
+    if b_dt and end - b_dt < timedelta(hours=24):
+        return end
+    after = await db.messages.find_one({"lead_id": pr["lead_id"], "direction": "in", "at": {"$gt": iso(end)}},
+                                       {"_id": 0, "at": 1}, sort=[("at", 1)])
+    return _parse_call_dt((after or {}).get("at")) or end
+
+
+async def _promise_close_followups(pr: dict, now: datetime) -> None:
+    await db.followups.update_many({"meta.promise_id": pr["id"], "status": "pending"},
+                                   {"$set": {"status": "done", "completed_at": iso(now), "auto_closed": "promise_resolved"}})
+
+
 async def promise_tracker_task():
-    """Every 5 min: a promise is KEPT as soon as a person sends anything to that lead on
-    WhatsApp after the call; past the deadline the executive gets a follow-up reminder,
-    3 h later still nothing -> admin alert. Conditional updates make it safe across workers."""
+    """Every 5 min: a promise is KEPT once a person sends anything to that lead on
+    WhatsApp from the start of the call on; if not, the executive gets a reminder 3 h
+    after they COULD send (call end, or the customer's next message when the 24-hour
+    window was closed) and 3 h later the admin is alerted. While the window is closed
+    nothing can be sent, so the promise waits ('no_window') instead of alerting.
+    Conditional updates make it safe across workers."""
     try:
         now = now_utc()
-        async for pr in db.call_promises.find({"status": {"$in": ["open", "reminded"]}}, {"_id": 0}).limit(300):
-            sent = await db.messages.find_one({"lead_id": pr["lead_id"], "direction": "out", "by_user_id": {"$nin": [None, ""]},
-                                               "at": {"$gt": pr["call_end_at"]}}, {"_id": 0, "at": 1})
+        async for pr in db.call_promises.find({"status": {"$in": ["open", "reminded", "no_window"]}}, {"_id": 0}).limit(300):
+            sent = await _promise_sent(pr)
             if sent:
-                await db.call_promises.update_one({"id": pr["id"], "status": pr["status"]},
-                                                  {"$set": {"status": "kept", "kept_at": sent.get("at")}})
+                res = await db.call_promises.update_one({"id": pr["id"], "status": pr["status"]},
+                                                        {"$set": {"status": "kept", "kept_at": sent.get("at")}})
+                if res.modified_count:
+                    await _promise_close_followups(pr, now)
                 continue
-            due = _parse_call_dt(pr["due_at"]) or now
+            clock = await _promise_clock(pr, now)
+            if clock is None:
+                end = _parse_call_dt(pr["call_end_at"]) or now
+                if now - end > timedelta(days=_PROMISE_GIVE_UP_DAYS):
+                    new = "expired"
+                else:
+                    new = "no_window"
+                if pr["status"] != new:
+                    res = await db.call_promises.update_one({"id": pr["id"], "status": pr["status"]},
+                                                            {"$set": {"status": new, "no_window_at": iso(now)}})
+                    if res.modified_count:
+                        await _promise_close_followups(pr, now)
+                continue
+            due = _office_time(clock + timedelta(hours=3))
+            if pr["status"] == "no_window":
+                # the customer wrote: the window is open again, the 3 h clock starts now
+                await db.call_promises.update_one({"id": pr["id"], "status": "no_window"},
+                                                  {"$set": {"status": "open", "due_at": iso(due)}})
+                continue
+            if iso(due) != pr.get("due_at") and pr["status"] == "open":
+                await db.call_promises.update_one({"id": pr["id"], "status": "open"}, {"$set": {"due_at": iso(due)}})
             if pr["status"] == "open" and now >= due:
                 res = await db.call_promises.update_one({"id": pr["id"], "status": "open"},
                                                         {"$set": {"status": "reminded", "reminded_at": iso(now)}})
