@@ -6082,6 +6082,7 @@ _CHAT_EXTRA_FIELDS = ["enquiry_type", "gst_no", "emails", "tags", "country", "co
                       "international", "intl_channel", "ai_profile",
                       "last_enquiry_at", "last_enquiry_source", "justdial_profile_url",
                       "last_call_at", "last_call_outcome",
+                      "wa_blocked", "wa_block_pending", "wa_blocked_by_name",
                       # website COD verification state, shown in the /chat details panel
                       "cod_status", "cod_asked_at", "cod_responded_at", "cod_resolved_via", "oms_order_number"]
 
@@ -10783,6 +10784,10 @@ async def _handle_wa_webhook(request: Request, company: str):
                                 logger.warning(f"wa-call status failed: {e}")
                     continue
                 for _m in (value.get("messages") or []):
+                    try:
+                        await _wa_block_pending_retry(company, _m.get("from") or "")
+                    except Exception as e:
+                        logger.warning(f"wa-block retry failed: {e}")
                     _ia = _m.get("interactive") or {}
                     if _m.get("type") == "interactive" and _ia.get("type") == "call_permission_reply":
                         try:
@@ -13685,6 +13690,7 @@ async def seed_data():
     await db.wa_calls.create_index("id", unique=True)
     await db.wa_calls.create_index([("status", 1), ("created_at", -1)])
     await db.ws_outbox.create_index("ts", expireAfterSeconds=300)
+    await db.wa_blocks.create_index([("company", 1), ("phone", 1)], unique=True)
     await db.wa_call_requests.create_index([("requested_by", 1), ("lead_id", 1), ("status", 1)])
     await db.wa_call_requests.create_index([("status", 1), ("created_at", -1)])
     await db.wa_call_perm_requests.create_index([("company", 1), ("phone", 1), ("created_at", -1)])
@@ -15841,6 +15847,8 @@ async def _wa_call_targets(company: str, lead: Optional[dict], stage: str) -> Li
     owner = (lead or {}).get("assigned_to")
     if stage == "first" and owner and owner in avail:
         return [owner]
+    if stage == "first" and owner and await db.users.find_one({"id": owner, "role": "admin", "active": True}, {"_id": 1}):
+        return [owner]                    # an admin's own customer rings the admin first (admins have no attendance)
     return avail
 
 
@@ -15882,6 +15890,13 @@ async def _wa_call_event(company: str, wc: dict, phone_number_id: Optional[str],
                 await _wa_call_graph(company, {"call_id": call_id, "action": "reject"})
             except Exception as e:
                 logger.warning(f"wa-call reject (calling off) failed: {e}")
+            return
+        if frm and await _wa_is_blocked(company, frm):
+            try:
+                await _wa_call_graph(company, {"call_id": call_id, "action": "reject"})
+            except Exception as e:
+                logger.warning(f"wa-call reject (blocked) failed: {e}")
+            logger.info(f"wa-call: rejected blocked caller {frm} ({company})")
             return
         lead = await _find_lead_by_phone(frm, company=company) if frm else None
         if not lead and frm:
@@ -16173,6 +16188,87 @@ async def _wa_call_status(st: dict) -> None:
     elif s == "REJECTED":
         await db.wa_calls.update_one({"id": st.get("id"), "status": {"$in": ["dialing", "ringing_remote"]}},
                                      {"$set": {"status": "rejected", "end_status": "REJECTED"}})
+
+
+# ---- Block a customer on WhatsApp (no messages, no calls) ------------------------
+# WhatsApp only lets us block someone who messaged in the last 24 hours. The CRM
+# keeps its own list (wa_blocks): their WhatsApp calls are rejected at once, and if
+# WhatsApp refused the block (window closed) it is applied the next time they write.
+class WaBlockInput(BaseModel):
+    lead_id: str
+    block: bool = True
+
+
+async def _wa_block_api(company: str, phone: str, block: bool) -> dict:
+    cfg = await get_wa_config(company)
+    url = f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['phone_number_id']}/block_users"
+    body = {"messaging_product": "whatsapp", "block_users": [{"user": _wa_recipient(phone)}]}
+    try:
+        async with httpx.AsyncClient(timeout=20) as hc:
+            r = await hc.request("POST" if block else "DELETE", url, json=body,
+                                 headers={"Authorization": f"Bearer {cfg['access_token']}"})
+        data = r.json() if r.content else {}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    failed = ((data.get("block_users") or {}).get("failed_users") or [])
+    if r.status_code >= 400 or failed:
+        err = data.get("error") or {}
+        if failed and not err:
+            err = (failed[0].get("errors") or [{}])[0]
+        return {"ok": False, "code": err.get("code"), "error": (err.get("error_data") or {}).get("details") or err.get("message") or r.text[:200]}
+    return {"ok": True}
+
+
+async def _wa_is_blocked(company: str, phone: str) -> bool:
+    norm = normalize_phone_display(phone)
+    return bool(norm and await db.wa_blocks.find_one({"company": company, "phone": norm}, {"_id": 1}))
+
+
+async def _wa_block_pending_retry(company: str, frm: str) -> None:
+    if not frm:
+        return
+    b = await db.wa_blocks.find_one({"company": company, "phone": normalize_phone_display(frm), "meta_blocked": False}, {"_id": 0})
+    if not b:
+        return
+    res = await _wa_block_api(company, b["phone"], True)
+    if res.get("ok"):
+        await db.wa_blocks.update_one({"company": company, "phone": b["phone"]}, {"$set": {"meta_blocked": True, "meta_blocked_at": iso(now_utc())}})
+        if b.get("lead_id"):
+            await db.leads.update_one({"id": b["lead_id"]}, {"$set": {"wa_block_pending": False}})
+        logger.info(f"wa-block: applied pending block for {b['phone']} ({company})")
+
+
+@api.post("/whatsapp/block")
+async def whatsapp_block(body: WaBlockInput, user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": body.lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] != "admin" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Only an admin or this lead's owner can block it")
+    company = normalize_company(lead.get("company"))
+    phone = normalize_phone_display(lead.get("active_wa_phone") or lead.get("phone") or "")
+    if not phone:
+        raise HTTPException(status_code=400, detail="This lead has no phone number")
+    now = iso(now_utc())
+    if body.block:
+        res = await _wa_block_api(company, phone, True)
+        await db.wa_blocks.update_one({"company": company, "phone": phone}, {"$set": {
+            "company": company, "phone": phone, "lead_id": lead["id"], "by_user_id": user["id"], "by_name": user.get("name"),
+            "at": now, "meta_blocked": bool(res.get("ok")), "meta_error": res.get("error")}}, upsert=True)
+        await db.leads.update_one({"id": lead["id"]}, {"$set": {"wa_blocked": True, "wa_blocked_at": now,
+                                                               "wa_blocked_by_name": user.get("name"),
+                                                               "wa_block_pending": not res.get("ok")}})
+        await log_activity(user["id"], "whatsapp_blocked", lead["id"], {"phone": phone, "meta": res})
+        note = ("Blocked on WhatsApp: they can't message or call this number any more." if res.get("ok") else
+                "Their WhatsApp calls are now rejected. WhatsApp only blocks messages from someone who wrote in the last "
+                "24 hours, so the full block is applied automatically the next time they message.")
+        return {"ok": True, "meta_blocked": bool(res.get("ok")), "note": note, "meta_error": res.get("error")}
+    res = await _wa_block_api(company, phone, False)
+    await db.wa_blocks.delete_one({"company": company, "phone": phone})
+    await db.leads.update_one({"id": lead["id"]}, {"$set": {"wa_blocked": False, "wa_block_pending": False},
+                                                   "$unset": {"wa_blocked_at": "", "wa_blocked_by_name": ""}})
+    await log_activity(user["id"], "whatsapp_unblocked", lead["id"], {"phone": phone, "meta": res})
+    return {"ok": True, "note": "Unblocked: they can message and call again."}
 
 
 @api.get("/wa-calls/ringing")

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
-import { PhoneOutgoing, Clock, Check, X } from "@phosphor-icons/react";
+import { PhoneOutgoing, Clock, Check, X, DotsThreeVertical, Prohibit } from "@phosphor-icons/react";
 import { api, errMsg } from "@/lib/api";
 import { fmtSmartLong } from "@/lib/format";
 
@@ -102,6 +102,63 @@ export function WaCallButton({ leadId }) {
             <button type="button" onClick={() => setOpen(false)} className="text-gray-400"><X size={12} /></button>
           </div>
           {body}
+        </div>
+      )}
+    </span>
+  );
+}
+
+/* Block on WhatsApp - deliberately tucked into a small "⋮" menu, two confirmations. */
+export function WaBlockMenu({ conv, onChanged }) {
+  const [open, setOpen] = useState(false);
+  const [blocked, setBlocked] = useState(!!conv.wa_blocked);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { setBlocked(!!conv.wa_blocked); setOpen(false); }, [conv.id, conv.wa_blocked]);
+  const who = conv.customer_name || conv.phone;
+
+  const doBlock = async () => {
+    setOpen(false);
+    if (!window.confirm(`Block ${who} (${conv.phone}) on WhatsApp?\n\nThey will NOT be able to message or call this WhatsApp number, and we won't be able to message them.`)) return;
+    if (!window.confirm(`Are you sure? Please confirm again to block ${who}.`)) return;
+    setBusy(true);
+    try {
+      const { data } = await api.post("/whatsapp/block", { lead_id: conv.id, block: true });
+      setBlocked(true);
+      toast.success(data.note || "Blocked", { duration: 8000 });
+      onChanged?.();
+    } catch (e) { toast.error(errMsg(e)); } finally { setBusy(false); }
+  };
+  const doUnblock = async () => {
+    setOpen(false);
+    if (!window.confirm(`Unblock ${who}? They will be able to message and call again.`)) return;
+    setBusy(true);
+    try {
+      const { data } = await api.post("/whatsapp/block", { lead_id: conv.id, block: false });
+      setBlocked(false);
+      toast.success(data.note || "Unblocked");
+      onChanged?.();
+    } catch (e) { toast.error(errMsg(e)); } finally { setBusy(false); }
+  };
+
+  return (
+    <span className="relative flex items-center gap-1">
+      {blocked && (
+        <span className="text-[10px] font-bold uppercase tracking-widest bg-red-600 text-white px-1.5 py-0.5"
+          title={conv.wa_block_pending ? "Calls are rejected; the WhatsApp message block applies when they next write" : `Blocked by ${conv.wa_blocked_by_name || "admin"}`}>
+          Blocked{conv.wa_block_pending ? "*" : ""}
+        </span>
+      )}
+      <button type="button" onClick={() => setOpen((o) => !o)} disabled={busy} title="More" data-testid="chat-more-menu"
+        className="text-gray-400 hover:text-gray-700 p-0.5"><DotsThreeVertical size={14} weight="bold" /></button>
+      {open && (
+        <div className="absolute z-50 top-full mt-1 right-0 bg-white border border-gray-300 shadow-lg w-48 py-1">
+          {blocked ? (
+            <button type="button" onClick={doUnblock} className="w-full text-left px-3 py-2 text-xs hover:bg-gray-50">Unblock on WhatsApp</button>
+          ) : (
+            <button type="button" onClick={doBlock} className="w-full text-left px-3 py-2 text-xs text-red-600 hover:bg-red-50 flex items-center gap-1" data-testid="chat-block">
+              <Prohibit size={12} /> Block on WhatsApp…
+            </button>
+          )}
         </div>
       )}
     </span>
