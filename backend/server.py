@@ -14354,7 +14354,8 @@ def _gemini_key_order() -> List[str]:
 
 async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
                            max_output_tokens: int = 1500, json_mode: bool = True,
-                           per_model_timeout: float = 14.0, parts: Optional[List[dict]] = None) -> str:
+                           per_model_timeout: float = 14.0, parts: Optional[List[dict]] = None,
+                           models_override: Optional[List[str]] = None) -> str:
     """Call Gemini, transparently rotating through the configured keys.
 
     A key that is out of quota (429) or rejected (400/403 invalid key) is benched
@@ -14371,7 +14372,7 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
     # (23 Sep: 3 of 5 models were 503 and every translate call took 15 s).
     _now = time.time()
     _bench = await _gemini_model_bench()
-    _all = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
+    _all = list(models_override) if models_override else [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
     models = [m for m in _all if _bench.get(_gemini_bench_key(m), 0.0) <= _now] +              sorted([m for m in _all if _bench.get(_gemini_bench_key(m), 0.0) > _now],
                     key=lambda m: _bench.get(_gemini_bench_key(m), 0.0))
     gen_cfg: Dict[str, Any] = {"temperature": temperature, "maxOutputTokens": max_output_tokens}
@@ -14422,6 +14423,11 @@ async def _gemini_generate(prompt: str, *, temperature: float = 0.7,
             if resp.status_code == 429:
                 # Per-minute limits recover in seconds; per-day quota is gone until
                 # Google's reset — bench accordingly instead of hammering the key.
+                if models_override:
+                    # Out of quota on this (premium) model only - try the next model,
+                    # don't bench the key for everyone else.
+                    model_overloaded = True
+                    break
                 per_day = "per day" in msg.lower() or "perday" in msg.lower().replace(" ", "")
                 _gemini_bench(key, 6 * 3600 if per_day else 90, "quota exhausted")
                 continue
@@ -14632,6 +14638,9 @@ CALL_AI_DEFAULTS = {"enabled": True, "min_seconds": 10, "internal_numbers": [], 
                     "auto_followup": True}       # follow-up created from what the customer said
 CALL_REC_MAX_BYTES = 40 * 1024 * 1024
 CALL_AI_INTEREST = ("hot", "warm", "cold", "not_interested", "unclear")
+# Call summaries try the full Flash models first (better at Hindi/Marathi audio and exact numbers)
+CALL_AI_MODELS = [m.strip() for m in (os.environ.get("CALL_AI_MODELS") or
+                  "gemini-flash-latest,gemini-3.6-flash,gemini-2.5-flash").split(",") if m.strip()]
 
 
 async def _call_ai_cfg() -> dict:
@@ -14825,8 +14834,17 @@ async def upload_call_recording(
 _CALL_AI_PROMPT = """You are listening to a recorded phone call of CitSpray Aroma Sciences (Mangalam Agro), an Indian
 manufacturer and exporter of fragrances, essential oils, aroma chemicals, menthol and camphor. Our executive {exec_name}
 talks to a customer{cust}. The call took place on {when}. It may be in Hindi, Marathi, English or a mix.
+Listen to the WHOLE recording carefully. Be exact with numbers, product names, grades, prices, quantities and dates -
+these notes replace listening to the call again, so nothing important may be missing.
 Reply ONLY with JSON:
-{{"summary": "2-4 short sentences in English: what the customer wants and what was agreed",
+{{"summary": "3-6 sentences in English covering the whole call: who the customer is, what they need, what was
+   discussed, and what was agreed / what happens next",
+ "key_points": ["EVERY specific fact said, one per bullet, in English: each product with grade / spec / packing,
+   each quantity, every price or rate mentioned (ours, the customer's target, competitors'), delivery place and
+   timing, payment terms, samples, the customer's business and how they use the product, objections or doubts,
+   questions the customer asked and our answers, what we promised and by when. Up to 15 bullets."],
+ "transcript": "the whole conversation in English, one line per turn starting 'Executive:' or 'Customer:'
+   (translate Hindi / Marathi). Keep every fact; leave out only greetings and filler words.",
  "products": ["product names discussed"],
  "quantity": "quantity / frequency mentioned, or empty",
  "price_discussed": "prices or budget mentioned, or empty",
@@ -14860,7 +14878,10 @@ _CALL_AI_INTERNAL_PROMPT = """This is a recorded INTERNAL phone call between two
 {a} and {b}, on {when}. It may be in Hindi, Marathi, English or a mix. Write notes they can look back at later
 (for example to remember a rate or an instruction).
 Reply ONLY with JSON:
-{{"summary": "2-4 short sentences in English",
+{{"summary": "3-6 sentences in English covering the whole call",
+ "key_points": ["every specific fact said (products, rates, quantities, customers, dates, instructions), one per bullet"],
+ "transcript": "the whole conversation in English, one line per turn starting with the speaker's name (translate Hindi /
+   Marathi); keep every fact, leave out greetings and filler",
  "decisions": ["what was decided / instructed"],
  "rates": [{{"item": "product", "rate": "price with unit", "for": "customer or context, or empty"}}],
  "action_items": [{{"who": "person", "task": "what to do", "when": "deadline or empty"}}],
@@ -14902,6 +14923,8 @@ def _call_ai_parse_internal(text: str) -> dict:
         "decisions": [x for x in (_ai_txt(d, 300) for d in (data.get("decisions") or [])[:20]) if x],
         "rates": rates, "action_items": actions,
         "customers": [x for x in (_ai_txt(c, 80) for c in (data.get("customers") or [])[:20]) if x],
+        "key_points": [x for x in (_ai_txt(k, 400) for k in (data.get("key_points") or [])[:25]) if x],
+        "transcript": _ai_txt(data.get("transcript"), 15000),
     }
 
 
@@ -14939,6 +14962,8 @@ def _call_ai_parse(text: str) -> dict:
     out["promise"] = {"made": made and bool(_ai_txt(pr.get("what"), 300)), "what": _ai_txt(pr.get("what"), 300),
                       "channel": (_ai_txt(pr.get("channel"), 20) or "other").lower()}
     out["whatsapp_draft"] = _ai_txt(data.get("whatsapp_draft"), 700)
+    out["key_points"] = [x for x in (_ai_txt(k, 400) for k in (data.get("key_points") or [])[:25]) if x]
+    out["transcript"] = _ai_txt(data.get("transcript"), 15000)
     co = data.get("coaching") if isinstance(data.get("coaching"), dict) else {}
 
     def _b(v):
@@ -15031,9 +15056,16 @@ async def _process_one_call_recording() -> bool:
         prompt = _CALL_AI_PROMPT.format(exec_name=doc.get("user_name") or "the executive", cust=cust, when=when)
     try:
         audio = base64.b64encode(ogg.read_bytes()).decode()
-        text = await _gemini_generate(prompt, temperature=0.2, max_output_tokens=2400, json_mode=True,
-                                      per_model_timeout=60.0,
-                                      parts=[{"inline_data": {"mime_type": "audio/ogg", "data": audio}}])
+        parts = [{"inline_data": {"mime_type": "audio/ogg", "data": audio}}]
+        try:
+            # full Flash models listen more accurately than Lite; Lite chain is the fallback
+            text = await _gemini_generate(prompt, temperature=0.1, max_output_tokens=8192, json_mode=True,
+                                          per_model_timeout=90.0, parts=parts,
+                                          models_override=CALL_AI_MODELS)
+        except Exception as e1:
+            logger.info(f"call-ai: premium models unavailable ({getattr(e1, 'detail', e1)}); using default chain")
+            text = await _gemini_generate(prompt, temperature=0.1, max_output_tokens=8192, json_mode=True,
+                                          per_model_timeout=90.0, parts=parts)
         ai = _call_ai_parse_internal(text) if is_internal else _call_ai_parse(text)
         if not ai["summary"]:
             raise ValueError("empty summary")

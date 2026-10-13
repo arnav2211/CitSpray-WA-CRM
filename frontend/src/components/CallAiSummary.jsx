@@ -64,6 +64,7 @@ const CHECKS = [["asked_quantity", "Asked quantity"], ["asked_purpose", "Asked p
 
 export default function CallAiSummary({ ai, compact = false, leadId = null }) {
   const { user } = useAuth();
+  const [showTx, setShowTx] = useState(false);
   if (!ai || !ai.summary) return null;
   const facts = [
     ai.products?.length ? ["Products", ai.products.join(", ")] : null,
@@ -108,6 +109,24 @@ export default function CallAiSummary({ ai, compact = false, leadId = null }) {
               <span className="text-gray-800 break-words">{v}</span>
             </div>
           ))}
+        </div>
+      )}
+      {!compact && ai.key_points?.length > 0 && (
+        <div className="mt-1.5 border-t border-[#DDD6FE] pt-1.5" data-testid="call-ai-key-points">
+          <div className="text-[9px] uppercase tracking-widest font-bold text-gray-500">Everything said</div>
+          <ul className="list-disc pl-4 mt-0.5 space-y-0.5 text-gray-800">{ai.key_points.map((k, i) => <li key={i}>{k}</li>)}</ul>
+        </div>
+      )}
+      {!compact && ai.transcript && (
+        <div className="mt-1.5">
+          <button onClick={() => setShowTx((v) => !v)} className="text-[10px] uppercase tracking-widest font-bold text-[#6D28D9] hover:underline" data-testid="call-ai-transcript-toggle">
+            {showTx ? "Hide full conversation" : "Full conversation"}
+          </button>
+          {showTx && (
+            <div className="mt-1 bg-white border border-gray-200 p-2 text-[11px] text-gray-800 whitespace-pre-wrap leading-relaxed max-h-80 overflow-y-auto" data-testid="call-ai-transcript">
+              {ai.transcript}
+            </div>
+          )}
         </div>
       )}
       {!compact && user?.role === "admin" && co && (co.tip || co.score != null) && (

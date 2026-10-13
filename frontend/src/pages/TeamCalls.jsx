@@ -17,6 +17,7 @@ function dur(s) {
 
 function TeamCallCard({ c, meId }) {
   const ai = c.ai || {};
+  const [showTx, setShowTx] = useState(false);
   const outgoing = c.direction !== "incoming";
   // Show it from the reader's side: "You -> Anmol" / "Ankita -> You"
   const left = c.uploader_id === meId ? "You" : c.uploader_name;
@@ -58,6 +59,20 @@ function TeamCallCard({ c, meId }) {
               <li key={i}>{a.who ? <b>{a.who}: </b> : null}{a.task}{a.when ? <span className="text-gray-500"> — {a.when}</span> : null}</li>
             ))}
           </ul>
+        </div>
+      )}
+      {ai.key_points?.length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-widest font-bold text-gray-500">Everything said</div>
+          <ul className="list-disc pl-5 text-sm text-gray-800">{ai.key_points.map((k, i) => <li key={i}>{k}</li>)}</ul>
+        </div>
+      )}
+      {ai.transcript && (
+        <div>
+          <button onClick={() => setShowTx((v) => !v)} className="text-[10px] uppercase tracking-widest font-bold text-[#6D28D9] hover:underline">
+            {showTx ? "Hide full conversation" : "Full conversation"}
+          </button>
+          {showTx && <div className="mt-1 bg-gray-50 border border-gray-200 p-2 text-xs whitespace-pre-wrap max-h-96 overflow-y-auto">{ai.transcript}</div>}
         </div>
       )}
       {ai.customers?.length > 0 && (
