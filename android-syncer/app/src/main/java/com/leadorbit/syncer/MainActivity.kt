@@ -14,7 +14,17 @@ import android.os.Looper
 import android.provider.Settings
 import android.util.Log
 import android.view.View
+import android.annotation.SuppressLint
+import android.app.NotificationManager
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
+import android.media.AudioManager
+import android.os.PowerManager
+import android.view.WindowManager
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.PermissionRequest
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -62,6 +72,24 @@ class MainActivity : AppCompatActivity() {
         if (hasRequiredPermissions()) setupAppFlow() else showPermissionRequestUI()
     }
 
+    // WhatsApp calls: the microphone (asked separately so the app never blocks on it)
+    private var pendingMicRequest: PermissionRequest? = null
+    private val micPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        pendingMicRequest?.let { req ->
+            if (granted) req.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) else req.deny()
+        }
+        pendingMicRequest = null
+    }
+    private var proximityLock: PowerManager.WakeLock? = null
+    private var appSetUp = false
+    private val hangupReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            webView.evaluateJavascript("window.__waCallHangup && window.__waCallHangup()", null)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -73,6 +101,9 @@ class MainActivity : AppCompatActivity() {
         findViewById<View>(R.id.activeCallBanner)?.visibility = View.GONE
 
         grantButton.setOnClickListener { checkAndRequestPermissions() }
+        ContextCompat.registerReceiver(this, hangupReceiver, IntentFilter(OngoingCallService.HANGUP_BROADCAST),
+            ContextCompat.RECEIVER_NOT_EXPORTED)
+        prepareForCall(intent)
 
         if (hasRequiredPermissions()) setupAppFlow() else showPermissionRequestUI()
     }
@@ -109,6 +140,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupAppFlow() {
+        if (appSetUp) { handleNavPath(intent); return }
+        appSetUp = true
         permissionOverlay.visibility = View.GONE
         webView.visibility = View.VISIBLE
 
@@ -125,9 +158,121 @@ class MainActivity : AppCompatActivity() {
         handler.postDelayed({ UpdateManager.checkForUpdate(this) }, 3000)
         // Deleting the phone's call recordings after upload needs "All files access"
         handler.postDelayed({ askAllFilesAccessOnce() }, 6000)
+        // WhatsApp calls must ring even when the app is closed / phone locked
+        handler.postDelayed({ askCallRingSetup() }, 9000)
+    }
 
-        // Process any pending deep-link navigation path
-        handleNavPath(intent)
+    /** Opened from an incoming WhatsApp call: show over the lock screen and stop the ringing here. */
+    private fun prepareForCall(i: Intent?) {
+        val callId = i?.getStringExtra("wa_call_id") ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
+        }
+        WaCallNotifier.clear(this, callId)
+        try {
+            startService(Intent(this, NotificationSyncService::class.java).apply {
+                action = NotificationSyncService.ACTION_WA_STOP_RING
+                putExtra("call_id", callId)
+            })
+        } catch (e: Exception) { }
+    }
+
+    /**
+     * Once per 12 h, until done: the three phone settings that let a WhatsApp call ring
+     * like a real call - full-screen call screen, show over other apps, and no battery
+     * restriction (so the connection stays alive when the app is closed).
+     */
+    private fun askCallRingSetup() {
+        if (isFinishing) return
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val steps = mutableListOf<Pair<String, Intent>>()
+        if (Build.VERSION.SDK_INT >= 34 && !nm.canUseFullScreenIntent()) {
+            steps.add("Allow full-screen notifications" to Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:$packageName")))
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            steps.add("Allow \"Display over other apps\"" to Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+        }
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !pm.isIgnoringBatteryOptimizations(packageName)) {
+            @SuppressLint("BatteryLife")
+            val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+            steps.add("Battery: \"Don't optimise\" / Unrestricted" to i)
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+        if (steps.isEmpty()) return
+        val last = sharedPrefs.getLong("call_setup_asked_at", 0L)
+        if (System.currentTimeMillis() - last < 12 * 3600 * 1000L) return
+        sharedPrefs.edit().putLong("call_setup_asked_at", System.currentTimeMillis()).apply()
+        val first = steps.first()
+        AlertDialog.Builder(this)
+            .setTitle("Let WhatsApp calls ring")
+            .setMessage("So customers' WhatsApp calls ring on this phone even when LeadOrbit is closed or the phone is locked, please turn on:\n\n" +
+                    steps.joinToString("\n") { "• " + it.first } + "\n\nTap Open settings for: " + first.first)
+            .setPositiveButton("Open settings") { _, _ ->
+                try { startActivity(first.second) } catch (e: Exception) {
+                    try { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))) } catch (e2: Exception) { }
+                }
+                // next missing item is offered the next time the app is opened
+                sharedPrefs.edit().putLong("call_setup_asked_at", 0L).apply()
+            }
+            .setNegativeButton("Later", null)
+            .show()
+    }
+
+    /** Called by the WhatsApp call page inside the WebView. */
+    inner class NativeBridge {
+        @JavascriptInterface
+        fun callState(state: String, name: String) {
+            runOnUiThread {
+                if (state == "active") {
+                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) setShowWhenLocked(true)
+                    OngoingCallService.start(this@MainActivity, name)
+                    try {
+                        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                        if (pm.isWakeLockLevelSupported(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK) && proximityLock == null) {
+                            proximityLock = pm.newWakeLock(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK, "LeadOrbit:waCall").apply { acquire(3 * 3600 * 1000L) }
+                        }
+                    } catch (e: Exception) { }
+                } else {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) setShowWhenLocked(false)
+                    OngoingCallService.stop(this@MainActivity)
+                    try { proximityLock?.let { if (it.isHeld) it.release() } } catch (e: Exception) { }
+                    proximityLock = null
+                    val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) am.clearCommunicationDevice()
+                    am.isSpeakerphoneOn = false
+                    am.mode = AudioManager.MODE_NORMAL
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun setSpeaker(on: Boolean) {
+            runOnUiThread {
+                val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                am.mode = AudioManager.MODE_IN_COMMUNICATION
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val type = if (on) android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER else android.media.AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+                    val dev = am.availableCommunicationDevices.firstOrNull { it.type == type }
+                    if (dev != null) am.setCommunicationDevice(dev) else am.isSpeakerphoneOn = on
+                } else {
+                    am.isSpeakerphoneOn = on
+                }
+                // speaker: no proximity screen-off
+                try {
+                    if (on) { proximityLock?.let { if (it.isHeld) it.release() } }
+                    else proximityLock?.let { if (!it.isHeld) it.acquire(3 * 3600 * 1000L) }
+                } catch (e: Exception) { }
+            }
+        }
     }
 
     /** Ask (at most once a day) for "All files access" so uploaded recordings can be deleted from the phone. */
@@ -160,6 +305,25 @@ class MainActivity : AppCompatActivity() {
         settings.loadWithOverviewMode = true
         settings.useWideViewPort = true
         settings.cacheMode = WebSettings.LOAD_DEFAULT
+        settings.mediaPlaybackRequiresUserGesture = false      // call audio plays at once
+        webView.addJavascriptInterface(NativeBridge(), "LeadOrbitNative")
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onPermissionRequest(request: PermissionRequest) {
+                runOnUiThread {
+                    val host = request.origin?.host ?: ""
+                    if (!host.endsWith("mangalamagro.in") || !request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) {
+                        request.deny()
+                        return@runOnUiThread
+                    }
+                    if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                        request.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
+                    } else {
+                        pendingMicRequest = request
+                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                }
+            }
+        }
 
         val cookieManager = CookieManager.getInstance()
         cookieManager.setAcceptCookie(true)
@@ -199,7 +363,10 @@ class MainActivity : AppCompatActivity() {
             sharedPrefs.edit().putBoolean("webview_cache_cleared_v2", true).apply()
         }
 
-        webView.loadUrl("https://crm.mangalamagro.in/chat")
+        // Opened from a notification (e.g. Answer on a WhatsApp call): go straight there
+        val navPath = intent?.getStringExtra("nav_path")
+        webView.loadUrl("https://crm.mangalamagro.in" + (if (!navPath.isNullOrEmpty()) navPath else "/chat"))
+        intent?.removeExtra("nav_path")
     }
 
     /** Calls happen in the phone's normal phone app; the call log sync picks them up. */
@@ -293,6 +460,7 @@ class MainActivity : AppCompatActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        prepareForCall(intent)
         handleNavPath(intent)
     }
 
@@ -340,5 +508,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         handler.removeCallbacks(tokenCheckRunnable)
+        try { unregisterReceiver(hangupReceiver) } catch (e: Exception) { }
+        try { proximityLock?.let { if (it.isHeld) it.release() } } catch (e: Exception) { }
     }
 }

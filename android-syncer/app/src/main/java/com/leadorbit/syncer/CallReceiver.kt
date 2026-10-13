@@ -28,6 +28,13 @@ class CallReceiver : BroadcastReceiver() {
         // Handle boot completed to ensure the periodic sync configuration remains loaded
         if (Intent.ACTION_BOOT_COMPLETED == action) {
             triggerImmediateSync(context)
+            // reconnect for WhatsApp calls / alerts right after the phone restarts
+            if (context.getSharedPreferences("CRM_PREFS", Context.MODE_PRIVATE).getString("auth_token", null) != null) {
+                try {
+                    val svc = Intent(context, NotificationSyncService::class.java).setAction(NotificationSyncService.ACTION_START)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(svc) else context.startService(svc)
+                } catch (e: Exception) { }
+            }
             return
         }
 

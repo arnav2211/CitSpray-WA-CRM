@@ -11,6 +11,7 @@ import {
   Sparkle, Camera, UploadSimple, Globe,
 } from "@phosphor-icons/react";
 import { IntlAddLeadModal } from "@/components/InternationalPanel";
+import { WaCallButton } from "@/components/WaCallButton";
 import { MediaPreviewModal, CameraModal, makeMediaItems, releaseMediaItems } from "@/components/ChatMediaComposer";
 import { fmtIST, fmtISTTime, fmtSmartShort, fmtSmartLong, fmtTime12, fmtDaySeparator, istDayKey } from "@/lib/format";
 import { StatusBadge, SourceBadge } from "@/components/Badges";
@@ -1702,6 +1703,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                 })}
               </span>
             )}
+            {conv.id && <WaCallButton leadId={conv.id} />}
             {/* Admin: reassign dropdown ; executive: read-only assignee */}
             {isAdmin ? (
               <span className="flex items-center gap-1">

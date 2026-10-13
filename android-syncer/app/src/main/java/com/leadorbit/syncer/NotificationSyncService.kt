@@ -38,6 +38,9 @@ class NotificationSyncService : Service() {
         const val ACTION_ACK_ALERT = "com.leadorbit.syncer.ACK_ALERT"
         const val ACTION_DONE_FOLLOWUP = "com.leadorbit.syncer.DONE_FOLLOWUP"
         const val ACTION_SNOOZE_FOLLOWUP = "com.leadorbit.syncer.SNOOZE_FOLLOWUP"
+        const val ACTION_WA_DECLINE = "com.leadorbit.syncer.WA_DECLINE"
+        const val ACTION_WA_STOP_RING = "com.leadorbit.syncer.WA_STOP_RING"
+        const val ACTION_WA_DECIDE = "com.leadorbit.syncer.WA_DECIDE"
 
         // Channels
         private const val CHANNEL_BG_ID = "leadorbit_sync_channel"
@@ -51,6 +54,9 @@ class NotificationSyncService : Service() {
     private var webSocket: WebSocket? = null
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS) // Keep connection alive indefinitely
+        // Heartbeat: a silently dropped connection (network switch, NAT timeout) is
+        // noticed within ~40 s and reconnected, so an incoming WhatsApp call is not missed
+        .pingInterval(20, TimeUnit.SECONDS)
         .build()
 
     // Repeating Alarm Player
@@ -71,6 +77,7 @@ class NotificationSyncService : Service() {
         super.onCreate()
         sharedPrefs = getSharedPreferences("CRM_PREFS", Context.MODE_PRIVATE)
         createNotificationChannels()
+        WaCallNotifier.ensureChannels(this)
         
         try {
             val powerManager = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
@@ -104,6 +111,24 @@ class NotificationSyncService : Service() {
                     val fuId = intent.getStringExtra("fu_id")
                     if (fuId != null) {
                         markFollowupDoneOnBackend(fuId)
+                    }
+                }
+                ACTION_WA_DECLINE -> {
+                    val callId = intent.getStringExtra("call_id")
+                    if (callId != null) {
+                        WaCallNotifier.clear(this, callId)
+                        postToBackend("/api/wa-calls/$callId/decline", JSONObject())
+                    }
+                }
+                ACTION_WA_STOP_RING -> {
+                    intent.getStringExtra("call_id")?.let { WaCallNotifier.clear(this, it) }
+                }
+                ACTION_WA_DECIDE -> {
+                    val reqId = intent.getStringExtra("request_id")
+                    if (reqId != null) {
+                        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(("wareq:$reqId").hashCode())
+                        postToBackend("/api/wa-calls/requests/$reqId/decide",
+                            JSONObject().put("approve", intent.getBooleanExtra("approve", false)))
                     }
                 }
                 ACTION_SNOOZE_FOLLOWUP -> {
@@ -169,6 +194,8 @@ class NotificationSyncService : Service() {
             override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
                 Log.i(TAG, "WebSocket connected successfully.")
                 isConnecting = false
+                // a call that started ringing while we were reconnecting still rings here
+                fetchRingingCalls()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -192,6 +219,7 @@ class NotificationSyncService : Service() {
                                 }
                             }
                         }
+                        "wa_call" -> mainHandler.post { handleWaCallEvent(action, json) }
                         "followup" -> {
                             if (action == "trigger") {
                                 val followup = json.optJSONObject("followup")
@@ -238,6 +266,93 @@ class NotificationSyncService : Service() {
             if (webSocket == null && !isConnecting) {
                 Log.d(TAG, "Retrying WebSocket connection...")
                 initializeWebSocketConnection()
+            }
+        }
+    }
+
+    // --- WhatsApp calls ---
+
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    private fun handleWaCallEvent(action: String, json: JSONObject) {
+        when (action) {
+            "ring" -> json.optJSONObject("call")?.let { WaCallNotifier.ring(this, it) }
+            "clear" -> json.optString("call_id").takeIf { it.isNotEmpty() }?.let { WaCallNotifier.clear(this, it) }
+            "request" -> json.optJSONObject("request")?.let { r ->
+                val reqId = r.optString("id")
+                fun decide(approve: Boolean) = PendingIntent.getService(this, ("wareq:$reqId:$approve").hashCode(),
+                    Intent(this, NotificationSyncService::class.java).apply {
+                        this.action = ACTION_WA_DECIDE
+                        putExtra("request_id", reqId)
+                        putExtra("approve", approve)
+                    }, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                val who = r.optString("name").ifEmpty { r.optString("phone") }
+                val reason = r.optString("reason")
+                val text = "To $who " + r.optString("phone") +
+                    (if (reason.isNotEmpty()) "\nReason: $reason" else "") +
+                    "\nOutgoing WhatsApp calls are charged per minute."
+                WaCallNotifier.info(this, ("wareq:$reqId").hashCode(),
+                    r.optString("requested_by_name") + " wants to make a WhatsApp call", text,
+                    "/team-calls", listOf("Approve" to decide(true), "Deny" to decide(false)))
+            }
+            "request_clear" -> {
+                val reqId = json.optString("request_id")
+                (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(("wareq:$reqId").hashCode())
+            }
+            "request_decided" -> json.optJSONObject("request")?.let { r ->
+                val ok = r.optString("status") == "approved"
+                val who = r.optString("name").ifEmpty { r.optString("phone") }
+                WaCallNotifier.info(this, ("wadec:" + r.optString("id")).hashCode(),
+                    if (ok) "WhatsApp call approved" else "WhatsApp call not approved",
+                    if (ok) "You can call $who once in the next 2 hours. Tap to open the chat, then WhatsApp call."
+                    else r.optString("decided_by_name") + " did not approve the call to $who.",
+                    "/chat?lead=" + r.optString("lead_id"))
+            }
+            "permission" -> {
+                val ok = json.optBoolean("allowed")
+                val who = json.optString("name")
+                WaCallNotifier.info(this, ("waperm:" + json.optString("lead_id")).hashCode(),
+                    if (ok) "$who allowed WhatsApp calls" else "$who declined WhatsApp calls",
+                    if (ok) "Tap to open the chat and call now." else "They don't want a WhatsApp call right now.",
+                    "/chat?lead=" + json.optString("lead_id"))
+            }
+        }
+    }
+
+    private fun fetchRingingCalls() {
+        val token = sharedPrefs.getString("auth_token", null) ?: return
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val request = Request.Builder()
+                    .url("https://crm.mangalamagro.in/api/wa-calls/ringing")
+                    .header("Authorization", "Bearer $token")
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) return@use
+                    val arr = org.json.JSONArray(response.body?.string() ?: "[]")
+                    for (i in 0 until arr.length()) {
+                        val c = arr.getJSONObject(i)
+                        mainHandler.post { WaCallNotifier.ring(this@NotificationSyncService, c) }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "ringing check failed: ${e.message}")
+            }
+        }
+    }
+
+    private fun postToBackend(path: String, body: JSONObject) {
+        val token = sharedPrefs.getString("auth_token", null) ?: return
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val request = Request.Builder()
+                    .url("https://crm.mangalamagro.in$path")
+                    .post(body.toString().toRequestBody("application/json".toMediaTypeOrNull()))
+                    .header("Authorization", "Bearer $token")
+                    .build()
+                client.newCall(request).execute().use { response -> Log.d(TAG, "$path -> ${response.code}") }
+            } catch (e: Exception) {
+                Log.e(TAG, "POST $path failed", e)
             }
         }
     }

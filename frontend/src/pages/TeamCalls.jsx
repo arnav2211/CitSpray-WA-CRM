@@ -4,6 +4,7 @@ import { useAuth } from "@/context/AuthContext";
 import { toast } from "sonner";
 import { MagnifyingGlass, Sparkle, UsersThree, PhoneIncoming, PhoneOutgoing } from "@phosphor-icons/react";
 import { fmtSmartLong } from "@/lib/format";
+import { WaCallRequestsPanel } from "@/components/WaCallButton";
 
 /* Team Calls: AI notes of calls between colleagues (rates agreed, instructions,
    to-dos), so nobody has to remember them. Everyone sees the calls they were part
@@ -119,6 +120,7 @@ export default function TeamCalls() {
           {isAdmin ? " You see everyone's." : " You see the calls you were part of."}
         </p>
       </div>
+      {isAdmin && <WaCallRequestsPanel />}
       <div className="flex gap-2 flex-wrap">
         <div className="relative flex-1 min-w-[220px]">
           <MagnifyingGlass className="absolute left-2 top-2.5 text-gray-400" size={14} />

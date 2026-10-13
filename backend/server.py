@@ -10742,6 +10742,27 @@ async def _handle_wa_webhook(request: Request, company: str):
         for entry in (payload.get("entry") or []):
             for change in (entry.get("changes") or []):
                 value = change.get("value") or {}
+                # ---- Incoming WhatsApp calls (Calling API, user-initiated only) ----
+                if change.get("field") == "calls" or value.get("calls"):
+                    for wc in (value.get("calls") or []):
+                        try:
+                            await _wa_call_event(company, wc, (value.get("metadata") or {}).get("phone_number_id"), value.get("contacts") or [])
+                        except Exception as e:
+                            logger.warning(f"wa-call event failed: {e}")
+                    for st in (value.get("statuses") or []):
+                        if st.get("type") == "call":
+                            try:
+                                await _wa_call_status(st)
+                            except Exception as e:
+                                logger.warning(f"wa-call status failed: {e}")
+                    continue
+                for _m in (value.get("messages") or []):
+                    _ia = _m.get("interactive") or {}
+                    if _m.get("type") == "interactive" and _ia.get("type") == "call_permission_reply":
+                        try:
+                            await _wa_call_permission_reply(company, _m.get("from") or "", _ia.get("call_permission_reply") or {})
+                        except Exception as e:
+                            logger.warning(f"wa-call permission reply failed: {e}")
                 # ---- Incoming messages ----
                 for m in (value.get("messages") or []):
                     from_phone = m.get("from")  # digits, e.g. "919876543210"
@@ -10813,6 +10834,9 @@ async def _handle_wa_webhook(request: Request, company: str):
                             body_text = f"[button] {(ia.get('button_reply') or {}).get('title','')}".strip()
                         elif ia_type == "list_reply":
                             body_text = f"[list] {(ia.get('list_reply') or {}).get('title','')}".strip()
+                        elif ia_type == "call_permission_reply":
+                            _ok = ((ia.get("call_permission_reply") or {}).get("response") == "accept")
+                            body_text = "📞 Allowed WhatsApp calls" if _ok else "📞 Declined WhatsApp calls"
                         else:
                             body_text = f"[interactive] {json.dumps(ia)[:200]}"
                     elif msg_type == "reaction":
@@ -13632,6 +13656,12 @@ async def seed_data():
     await db.call_promises.create_index([("status", 1), ("due_at", 1)])
     await db.call_promises.create_index([("created_at", -1)])
     await db.ai_reports.create_index("key", unique=True)
+    await db.wa_calls.create_index("id", unique=True)
+    await db.wa_calls.create_index([("status", 1), ("created_at", -1)])
+    await db.ws_outbox.create_index("ts", expireAfterSeconds=300)
+    await db.wa_call_requests.create_index([("requested_by", 1), ("lead_id", 1), ("status", 1)])
+    await db.wa_call_requests.create_index([("status", 1), ("created_at", -1)])
+    await db.wa_call_perm_requests.create_index([("company", 1), ("phone", 1), ("created_at", -1)])
     # IndiaMART PNS call matching looks enquiries up by their call time
     await db.leads.create_index("source_data.QUERY_TIME", sparse=True)
     await db.leads.create_index("enquiries.source_data.QUERY_TIME", sparse=True)
@@ -13910,6 +13940,7 @@ async def on_startup():
         logger.warning(f"Could not schedule ExportersIndia pull: {e}")
     logger.info("DEBUG STARTUP: starting scheduler...")
     scheduler.start()
+    asyncio.create_task(ws_outbox_relay_loop())
     logger.info(f"Startup complete; scheduler running (gmail_enabled={GMAIL_ENABLED})")
 
 @app.on_event("shutdown")
@@ -14765,6 +14796,7 @@ async def upload_call_recording(
     duration_seconds: int = Form(0),
     direction: str = Form("outgoing"),
     file: UploadFile = File(...),
+    source: str = Form("phone"),
     user: dict = Depends(get_current_user),
 ):
     """Phone app -> one call recording. `delete_local` tells the app it may delete
@@ -14776,7 +14808,7 @@ async def upload_call_recording(
     if not cfg.get("enabled"):
         return {"ok": True, "skipped": "disabled", "delete_local": False}
     # Settings switch "Admins too": an admin's own phone calls can be left out
-    if user.get("role") == "admin" and not cfg.get("include_admins", True):
+    if user.get("role") == "admin" and not cfg.get("include_admins", True) and source != "whatsapp":
         return {"ok": True, "skipped": "admin_off", "delete_local": False}
     if not norm:
         return {"ok": True, "skipped": "no_number", "delete_local": False}
@@ -15612,6 +15644,521 @@ async def put_indiamart_pns(body: PnsNumbersInput, admin: dict = Depends(require
     await db.system_settings.update_one({"key": "indiamart_pns"}, {"$set": {"key": "indiamart_pns", "numbers": nums}}, upsert=True)
     await log_activity(admin["id"], "indiamart_pns_numbers_updated", None, {"numbers": nums})
     return await get_indiamart_pns(admin=admin)
+
+
+# ---- WhatsApp calls: INCOMING ONLY, answered inside the LeadOrbit app ------------
+# Meta sends a 'connect' webhook with the caller's WebRTC offer; the CRM rings the
+# right phones (admins for Fragvansh during the pilot; owner first, then everyone
+# available for CitSpray when enabled). The app opens /wa-call/<id>, builds the WebRTC
+# answer and POSTs it here; we pre_accept + accept it with Meta. One answerer wins.
+# The call is logged on the lead, recorded inside the app and summarised by the AI
+# like phone calls. No business-initiated (outgoing) calls exist anywhere.
+WA_CALLING_DEFAULTS = {
+    "fragvansh": {"enabled": True, "ring": "admins", "outgoing": True},
+    "citspray": {"enabled": False, "ring": "owner_then_all", "outgoing": True},
+}
+WA_CALL_ESCALATE_SECONDS = 15
+
+
+async def _wa_calling_cfg(company: str) -> dict:
+    doc = await db.system_settings.find_one({"key": "wa_calling"}, {"_id": 0}) or {}
+    return {**WA_CALLING_DEFAULTS.get(company, {"enabled": False, "ring": "owner_then_all"}), **(doc.get(company) or {})}
+
+
+async def _wa_call_graph(company: str, payload: dict) -> dict:
+    cfg = await get_wa_config(company)
+    url = f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['phone_number_id']}/calls"
+    async with httpx.AsyncClient(timeout=20) as hc:
+        r = await hc.post(url, headers={"Authorization": f"Bearer {cfg['access_token']}"},
+                          json={"messaging_product": "whatsapp", **payload})
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text[:300]}
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"WhatsApp call API {r.status_code}: {json.dumps(data)[:300]}")
+    return data
+
+
+async def _wa_call_push(user_ids: List[str], message: dict) -> None:
+    """Gunicorn runs 4 workers and a phone's WebSocket lives in only one of them, so
+    call events go through a tiny Mongo outbox that every worker relays (<1 s)."""
+    now = now_utc()
+    docs = [{"id": str(uuid.uuid4()), "user_id": uid, "message": message, "ts": now} for uid in set(user_ids) if uid]
+    if docs:
+        await db.ws_outbox.insert_many(docs)
+
+
+async def ws_outbox_relay_loop() -> None:
+    delivered: Dict[str, float] = {}
+    while True:
+        try:
+            await asyncio.sleep(0.7)
+            if not manager.active_connections:
+                continue
+            since = now_utc() - timedelta(seconds=20)
+            async for d in db.ws_outbox.find({"ts": {"$gte": since}, "user_id": {"$in": list(manager.active_connections.keys())}},
+                                             {"_id": 0}):
+                if d["id"] in delivered:
+                    continue
+                delivered[d["id"]] = time.time()
+                await manager.broadcast_to_user(d["user_id"], d["message"])
+            cutoff = time.time() - 60
+            for k in [k for k, v in delivered.items() if v < cutoff]:
+                delivered.pop(k, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"ws outbox relay: {e}")
+            await asyncio.sleep(3)
+
+
+async def _wa_call_targets(company: str, lead: Optional[dict], stage: str) -> List[str]:
+    cfg = await _wa_calling_cfg(company)
+    if cfg.get("ring") == "admins":
+        return [u["id"] async for u in db.users.find({"role": "admin", "active": True}, {"_id": 0, "id": 1})]
+    execs = await db.users.find({"role": "executive", "active": True, "username": {"$ne": "test_user"}, **company_filter(company)},
+                                {"_id": 0, "password_hash": 0}).to_list(200)
+    avail = []
+    for e in execs:
+        if not await _is_user_on_leave(e["id"]) and await _is_user_available_by_attendance(e):
+            avail.append(e["id"])
+    owner = (lead or {}).get("assigned_to")
+    if stage == "first" and owner and owner in avail:
+        return [owner]
+    return avail
+
+
+def _wa_call_public(c: dict) -> dict:
+    return {k: c.get(k) for k in ("id", "company", "from", "name", "lead_id", "status", "answered_by", "answered_by_name",
+                                   "created_at", "accepted_at", "ended_at", "duration")}
+
+
+async def _wa_call_escalate(call_id: str) -> None:
+    await asyncio.sleep(WA_CALL_ESCALATE_SECONDS)
+    c = await db.wa_calls.find_one({"id": call_id}, {"_id": 0})
+    if not c or c.get("status") != "ringing":
+        return
+    lead = await db.leads.find_one({"id": c.get("lead_id")}, {"_id": 0, "assigned_to": 1}) if c.get("lead_id") else None
+    more = [u for u in await _wa_call_targets(c["company"], lead, "all") if u not in (c.get("ring_to") or [])]
+    if more:
+        await db.wa_calls.update_one({"id": call_id}, {"$addToSet": {"ring_to": {"$each": more}}})
+        await _wa_call_push(more, {"type": "wa_call", "action": "ring", "call": _wa_call_public(c)})
+
+
+async def _wa_call_event(company: str, wc: dict, phone_number_id: Optional[str], contacts: list) -> None:
+    event = (wc.get("event") or "").lower()
+    call_id = wc.get("id")
+    if not call_id:
+        return
+    if event == "connect":
+        if (wc.get("direction") or "USER_INITIATED").upper() == "BUSINESS_INITIATED":
+            await _wa_outgoing_connected(call_id, (wc.get("session") or {}).get("sdp"))
+            return
+        cfg = await _wa_calling_cfg(company)
+        frm = wc.get("from") or ""
+        norm = normalize_phone_display(frm) if frm else ""
+        name = None
+        for ct in contacts:
+            if not frm or ct.get("wa_id") == frm:
+                name = ((ct.get("profile") or {}).get("name")) or name
+        if not cfg.get("enabled"):
+            try:
+                await _wa_call_graph(company, {"call_id": call_id, "action": "reject"})
+            except Exception as e:
+                logger.warning(f"wa-call reject (calling off) failed: {e}")
+            return
+        lead = await _find_lead_by_phone(frm, company=company) if frm else None
+        if not lead and frm:
+            lead = await _create_lead_internal({"company": company, "phone": frm, "customer_name": name or f"WhatsApp +{frm}",
+                                                "source": "WhatsApp", "requirement": "Called us on WhatsApp",
+                                                "source_data": {"channel": "whatsapp_call", "call_id": call_id},
+                                                "has_whatsapp": True, "_suppress_auto_welcome": True}, by_user_id=None)
+        targets = await _wa_call_targets(company, lead, "first")
+        doc = {"id": call_id, "company": company, "from": norm or frm, "name": (lead or {}).get("customer_name") or name or norm,
+               "lead_id": (lead or {}).get("id"), "status": "ringing",
+               "offer_sdp": (wc.get("session") or {}).get("sdp"), "ring_to": targets, "dismissed_by": [],
+               "created_at": iso(now_utc())}
+        try:
+            await db.wa_calls.insert_one(doc.copy())
+        except Exception:
+            return                       # duplicate webhook delivery
+        logger.info(f"wa-call: incoming {call_id[-10:]} from {doc['from']} ({company}) ringing {len(targets)} user(s)")
+        await _wa_call_push(targets, {"type": "wa_call", "action": "ring", "call": _wa_call_public(doc)})
+        if (await _wa_calling_cfg(company)).get("ring") != "admins":
+            asyncio.create_task(_wa_call_escalate(call_id))
+        return
+    if event == "terminate":
+        c = await db.wa_calls.find_one({"id": call_id}, {"_id": 0})
+        if not c:
+            return
+        dur = int(wc.get("duration") or 0)
+        await db.wa_calls.update_one({"id": call_id}, {"$set": {
+            "status": "ended", "ended_at": iso(now_utc()), "duration": dur, "end_status": wc.get("status"),
+            "end_errors": wc.get("errors")}})
+        if c.get("call_log_id"):
+            if dur:
+                await db.call_logs.update_one({"id": c["call_log_id"]}, {"$set": {"duration_seconds": dur, "call_end_at": iso(now_utc())}})
+        elif c.get("lead_id") and c.get("direction") == "outgoing":
+            await db.call_logs.insert_one({
+                "id": str(uuid.uuid4()), "lead_id": c["lead_id"], "phone": c.get("from"), "outcome": "no_response",
+                "summary": "WhatsApp call - not answered", "by_user_id": c.get("answered_by"), "by_user_name": c.get("answered_by_name"),
+                "at": c.get("created_at"), "duration_seconds": 0, "direction": "outgoing", "channel": "whatsapp", "wa_call_id": call_id})
+        elif c.get("lead_id"):
+            # nobody answered -> a missed WhatsApp call on the lead
+            await db.call_logs.insert_one({
+                "id": str(uuid.uuid4()), "lead_id": c["lead_id"], "phone": c.get("from"), "outcome": "no_response",
+                "summary": "Missed WhatsApp call", "by_user_id": None, "by_user_name": "WhatsApp (missed)",
+                "at": c.get("created_at"), "duration_seconds": 0, "direction": "incoming", "channel": "whatsapp"})
+        await _wa_call_push(list(set((c.get("ring_to") or []) + ([c["answered_by"]] if c.get("answered_by") else []))),
+                            {"type": "wa_call", "action": "clear", "call_id": call_id, "reason": "ended"})
+
+
+# ---- Outgoing WhatsApp calls: ONLY after an admin approves (Meta charges per minute) ----
+# Executive asks -> every admin gets a ringing-style notification with Approve / Deny ->
+# the approval is good for ONE call to that lead within WA_CALL_APPROVAL_HOURS.
+# Admins call without asking. WhatsApp also needs the CUSTOMER's permission: if
+# Meta says there is none, we send WhatsApp's "allow calls" request (free inside
+# the 24-hour window) and tell the caller when the customer taps Allow.
+WA_CALL_APPROVAL_HOURS = 2
+
+
+class WaCallRequestInput(BaseModel):
+    lead_id: str
+    reason: Optional[str] = ""
+
+
+class WaCallDecisionInput(BaseModel):
+    approve: bool
+
+
+class WaOutgoingInput(BaseModel):
+    lead_id: str
+    sdp: str
+
+
+async def _wa_call_lead(lead_id: str, user: dict) -> dict:
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] != "admin" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not your lead")
+    return lead
+
+
+def _wa_call_phone(lead: dict) -> str:
+    return normalize_phone_display(lead.get("active_wa_phone") or lead.get("phone") or "")
+
+
+def _wa_req_public(r: dict) -> dict:
+    return {k: r.get(k) for k in ("id", "company", "lead_id", "phone", "name", "reason", "status", "requested_by",
+                                   "requested_by_name", "decided_by_name", "created_at", "decided_at", "expires_at")}
+
+
+async def _wa_valid_approval(user: dict, lead_id: str) -> Optional[dict]:
+    return await db.wa_call_requests.find_one(
+        {"lead_id": lead_id, "requested_by": user["id"], "status": "approved", "expires_at": {"$gt": iso(now_utc())}},
+        {"_id": 0}, sort=[("decided_at", -1)])
+
+
+async def _wa_call_permission(company: str, phone: str) -> dict:
+    cfg = await get_wa_config(company)
+    url = f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['phone_number_id']}/call_permissions"
+    try:
+        async with httpx.AsyncClient(timeout=15) as hc:
+            r = await hc.get(url, params={"user_wa_id": _wa_recipient(phone)},
+                             headers={"Authorization": f"Bearer {cfg['access_token']}"})
+        data = r.json() if r.content else {}
+    except Exception as e:
+        return {"error": str(e)}
+    if r.status_code >= 400:
+        return {"error": ((data.get("error") or {}).get("message") or r.text)[:200]}
+    perm = data.get("permission") or {}
+    acts = {a.get("action_name"): a for a in (data.get("actions") or [])}
+    return {"status": perm.get("status") or "no_permission", "expires": perm.get("expiration_time"),
+            "can_call": bool((acts.get("start_call") or {}).get("can_perform_action")),
+            "can_request": bool((acts.get("send_call_permission_request") or {}).get("can_perform_action"))}
+
+
+@api.get("/wa-calls/outgoing/status")
+async def wa_outgoing_status(lead_id: str, user: dict = Depends(get_current_user)):
+    lead = await _wa_call_lead(lead_id, user)
+    company = normalize_company(lead.get("company"))
+    cfg = await _wa_calling_cfg(company)
+    phone = _wa_call_phone(lead)
+    out = {"enabled": bool(cfg.get("enabled") and cfg.get("outgoing", True)), "company": company, "phone": phone,
+           "admin": user["role"] == "admin", "approval": None, "pending": None}
+    if user["role"] != "admin":
+        a = await _wa_valid_approval(user, lead_id)
+        out["approval"] = _wa_req_public(a) if a else None
+        p = await db.wa_call_requests.find_one({"lead_id": lead_id, "requested_by": user["id"], "status": "pending"},
+                                               {"_id": 0}, sort=[("created_at", -1)])
+        out["pending"] = _wa_req_public(p) if p else None
+    if out["enabled"] and phone and (out["admin"] or out["approval"]):
+        out["permission"] = await _wa_call_permission(company, phone)
+        out["within_24h"] = await _within_24h_for_phone(lead_id, phone)
+    return out
+
+
+@api.post("/wa-calls/requests")
+async def request_wa_call(body: WaCallRequestInput, user: dict = Depends(get_current_user)):
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
+    lead = await _wa_call_lead(body.lead_id, user)
+    company = normalize_company(lead.get("company"))
+    cfg = await _wa_calling_cfg(company)
+    if not (cfg.get("enabled") and cfg.get("outgoing", True)):
+        raise HTTPException(status_code=400, detail="WhatsApp calling is not switched on for this company yet")
+    existing = await db.wa_call_requests.find_one({"lead_id": body.lead_id, "requested_by": user["id"], "status": "pending"}, {"_id": 0})
+    if existing:
+        return _wa_req_public(existing)
+    r = {"id": str(uuid.uuid4()), "company": company, "lead_id": body.lead_id, "phone": _wa_call_phone(lead),
+         "name": lead.get("customer_name"), "reason": (body.reason or "").strip()[:300], "status": "pending",
+         "requested_by": user["id"], "requested_by_name": user.get("name"), "created_at": iso(now_utc())}
+    await db.wa_call_requests.insert_one(r.copy())
+    admins = [u["id"] async for u in db.users.find({"role": "admin", "active": True}, {"_id": 0, "id": 1})]
+    await _wa_call_push(admins, {"type": "wa_call", "action": "request", "request": _wa_req_public(r)})
+    return _wa_req_public(r)
+
+
+@api.get("/wa-calls/requests")
+async def list_wa_call_requests(status: Optional[str] = None, user: dict = Depends(get_current_user)):
+    q: Dict[str, Any] = {} if user["role"] == "admin" else {"requested_by": user["id"]}
+    if status:
+        q["status"] = status
+    rows = await db.wa_call_requests.find(q, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
+    return [_wa_req_public(r) for r in rows]
+
+
+@api.post("/wa-calls/requests/{req_id}/decide")
+async def decide_wa_call_request(req_id: str, body: WaCallDecisionInput, user: dict = Depends(require_admin)):
+    now = now_utc()
+    upd = {"status": "approved" if body.approve else "denied", "decided_by": user["id"],
+           "decided_by_name": user.get("name"), "decided_at": iso(now)}
+    if body.approve:
+        upd["expires_at"] = iso(now + timedelta(hours=WA_CALL_APPROVAL_HOURS))
+    r = await db.wa_call_requests.find_one_and_update({"id": req_id, "status": "pending"}, {"$set": upd},
+                                                     return_document=True, projection={"_id": 0})
+    if not r:
+        cur = await db.wa_call_requests.find_one({"id": req_id}, {"_id": 0})
+        if not cur:
+            raise HTTPException(status_code=404, detail="Request not found")
+        return _wa_req_public(cur)       # already decided (another admin / the phone notification)
+    admins = [u["id"] async for u in db.users.find({"role": "admin", "active": True}, {"_id": 0, "id": 1})]
+    await _wa_call_push(admins, {"type": "wa_call", "action": "request_clear", "request_id": req_id})
+    await _wa_call_push([r["requested_by"]], {"type": "wa_call", "action": "request_decided", "request": _wa_req_public(r)})
+    return _wa_req_public(r)
+
+
+@api.post("/wa-calls/permission-request")
+async def send_wa_call_permission_request(body: WaCallRequestInput, user: dict = Depends(get_current_user)):
+    """WhatsApp's own 'Allow calls?' message to the customer (free inside the 24-hour window)."""
+    lead = await _wa_call_lead(body.lead_id, user)
+    if user["role"] != "admin" and not await _wa_valid_approval(user, body.lead_id):
+        raise HTTPException(status_code=403, detail="Ask an admin to approve this call first")
+    company = normalize_company(lead.get("company"))
+    phone = _wa_call_phone(lead)
+    if not await _within_24h_for_phone(body.lead_id, phone):
+        raise HTTPException(status_code=400, detail="The customer has not messaged in the last 24 hours, so WhatsApp "
+                                                    "does not let us ask for call permission now. Ask them to send a message first.")
+    res = await _wa_send_typed(phone, {"type": "interactive", "interactive": {
+        "type": "call_permission_request", "action": {"name": "call_permission_request"},
+        "body": {"text": (body.reason or "").strip()[:500] or "We would like to call you on WhatsApp about your enquiry."}}},
+        company=company)
+    if res.get("status") != "sent":
+        raise HTTPException(status_code=502, detail=f"WhatsApp: {res.get('error') or 'could not send'}")
+    now = iso(now_utc())
+    await db.wa_call_perm_requests.insert_one({"id": str(uuid.uuid4()), "company": company, "lead_id": body.lead_id,
+                                               "phone": phone, "requested_by": user["id"], "wamid": res.get("wamid"),
+                                               "status": "sent", "created_at": now})
+    await db.messages.insert_one({
+        "id": str(uuid.uuid4()), "lead_id": body.lead_id, "direction": "out", "body": "📞 Asked to allow WhatsApp calls",
+        "wamid": res.get("wamid"), "msg_type": "interactive", "status": "sent", "at": now,
+        "by_user_id": user["id"], "by_user_name": user.get("name"), "to_phone": phone})
+    return {"ok": True}
+
+
+async def _wa_call_permission_reply(company: str, frm: str, reply: dict) -> None:
+    norm = normalize_phone_display(frm)
+    ok = reply.get("response") == "accept"
+    req = await db.wa_call_perm_requests.find_one({"company": company, "phone": norm, "status": "sent"}, {"_id": 0},
+                                                  sort=[("created_at", -1)])
+    if not req:
+        return
+    await db.wa_call_perm_requests.update_one({"id": req["id"]}, {"$set": {
+        "status": "accepted" if ok else "rejected", "answered_at": iso(now_utc()),
+        "permanent": bool(reply.get("is_permanent")), "expires": reply.get("expiration_timestamp")}})
+    lead = await db.leads.find_one({"id": req["lead_id"]}, {"_id": 0, "customer_name": 1})
+    await _wa_call_push([req["requested_by"]], {"type": "wa_call", "action": "permission", "allowed": ok,
+                                                "lead_id": req["lead_id"], "name": (lead or {}).get("customer_name") or norm})
+
+
+@api.post("/wa-calls/outgoing")
+async def start_wa_outgoing_call(body: WaOutgoingInput, user: dict = Depends(get_current_user)):
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
+    lead = await _wa_call_lead(body.lead_id, user)
+    company = normalize_company(lead.get("company"))
+    cfg = await _wa_calling_cfg(company)
+    if not (cfg.get("enabled") and cfg.get("outgoing", True)):
+        raise HTTPException(status_code=400, detail="WhatsApp calling is not switched on for this company yet")
+    approval = None
+    if user["role"] != "admin":
+        approval = await _wa_valid_approval(user, body.lead_id)
+        if not approval:
+            raise HTTPException(status_code=403, detail="Ask an admin to approve this call first")
+    phone = _wa_call_phone(lead)
+    wcfg = await get_wa_config(company)
+    url = f"{WA_BASE_URL}/{wcfg['api_version']}/{wcfg['phone_number_id']}/calls"
+    async with httpx.AsyncClient(timeout=20) as hc:
+        r = await hc.post(url, headers={"Authorization": f"Bearer {wcfg['access_token']}"}, json={
+            "messaging_product": "whatsapp", "to": _wa_recipient(phone), "action": "connect",
+            "session": {"sdp_type": "offer", "sdp": body.sdp}, "biz_opaque_callback_data": user["id"]})
+    data = r.json() if r.content else {}
+    if r.status_code >= 400:
+        err = data.get("error") or {}
+        if err.get("code") == 138006:
+            raise HTTPException(status_code=409, detail="no_permission")
+        raise HTTPException(status_code=502, detail=f"WhatsApp: {err.get('message') or r.text[:200]}")
+    call_id = ((data.get("calls") or [{}])[0]).get("id")
+    if not call_id:
+        raise HTTPException(status_code=502, detail="WhatsApp did not return a call id")
+    doc = {"id": call_id, "company": company, "direction": "outgoing", "from": phone, "name": lead.get("customer_name"),
+           "lead_id": body.lead_id, "status": "dialing", "answered_by": user["id"], "answered_by_name": user.get("name"),
+           "ring_to": [], "dismissed_by": [], "request_id": (approval or {}).get("id"), "created_at": iso(now_utc())}
+    await db.wa_calls.insert_one(doc.copy())
+    if approval:
+        await db.wa_call_requests.update_one({"id": approval["id"]}, {"$set": {"status": "used", "call_id": call_id}})
+    logger.info(f"wa-call: outgoing {call_id[-10:]} to {phone} by {user.get('name')} ({company})")
+    return {"ok": True, "call_id": call_id}
+
+
+async def _wa_outgoing_connected(call_id: str, answer_sdp: Optional[str]) -> None:
+    c = await db.wa_calls.find_one_and_update({"id": call_id, "status": {"$in": ["dialing", "ringing_remote"]}},
+                                              {"$set": {"status": "active", "answer_sdp": answer_sdp, "accepted_at": iso(now_utc())}},
+                                              return_document=True, projection={"_id": 0})
+    if not c or not c.get("lead_id"):
+        return
+    log_id = str(uuid.uuid4())
+    await db.call_logs.insert_one({
+        "id": log_id, "lead_id": c["lead_id"], "phone": c.get("from"), "outcome": "connected", "summary": "WhatsApp call",
+        "by_user_id": c.get("answered_by"), "by_user_name": c.get("answered_by_name"), "at": c["accepted_at"],
+        "call_start_at": c["accepted_at"], "duration_seconds": 0, "direction": "outgoing", "channel": "whatsapp",
+        "synced_from_app": True, "wa_call_id": call_id})
+    await db.wa_calls.update_one({"id": call_id}, {"$set": {"call_log_id": log_id}})
+    lead = await db.leads.find_one({"id": c["lead_id"]}, {"_id": 0})
+    if lead:
+        await _call_bump_lead(lead, log_id, "connected")
+
+
+async def _wa_call_status(st: dict) -> None:
+    s = (st.get("status") or "").upper()
+    if s == "RINGING":
+        await db.wa_calls.update_one({"id": st.get("id"), "status": "dialing"}, {"$set": {"status": "ringing_remote"}})
+    elif s == "REJECTED":
+        await db.wa_calls.update_one({"id": st.get("id"), "status": {"$in": ["dialing", "ringing_remote"]}},
+                                     {"$set": {"status": "rejected", "end_status": "REJECTED"}})
+
+
+@api.get("/wa-calls/ringing")
+async def my_ringing_wa_calls(user: dict = Depends(get_current_user)):
+    """Calls ringing for me right now - the app asks after (re)connecting so a ring
+    sent while the phone was offline for a moment is not lost."""
+    since = iso(now_utc() - timedelta(seconds=90))
+    out = []
+    async for c in db.wa_calls.find({"status": "ringing", "ring_to": user["id"], "dismissed_by": {"$ne": user["id"]},
+                                     "created_at": {"$gte": since}}, {"_id": 0}):
+        out.append(_wa_call_public(c))
+    return out
+
+
+@api.get("/wa-calls/{call_id}")
+async def get_wa_call(call_id: str, user: dict = Depends(get_current_user)):
+    c = await db.wa_calls.find_one({"id": call_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Call not found")
+    if user["role"] != "admin" and user["id"] not in (c.get("ring_to") or []) and c.get("answered_by") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not your call")
+    out = _wa_call_public(c)
+    out["direction"] = c.get("direction") or "incoming"
+    if c.get("status") == "ringing":
+        out["offer_sdp"] = c.get("offer_sdp")
+    if c.get("direction") == "outgoing" and c.get("answered_by") == user["id"]:
+        out["answer_sdp"] = c.get("answer_sdp")
+    return out
+
+
+class WaCallAnswerInput(BaseModel):
+    sdp: str
+
+
+@api.post("/wa-calls/{call_id}/accept")
+async def accept_wa_call(call_id: str, body: WaCallAnswerInput, user: dict = Depends(get_current_user)):
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
+    c = await db.wa_calls.find_one_and_update(
+        {"id": call_id, "status": "ringing"},
+        {"$set": {"status": "answering", "answered_by": user["id"], "answered_by_name": user.get("name")}},
+        return_document=True, projection={"_id": 0})
+    if not c:
+        cur = await db.wa_calls.find_one({"id": call_id}, {"_id": 0, "status": 1, "answered_by_name": 1})
+        raise HTTPException(status_code=409, detail=("Already answered by " + (cur or {}).get("answered_by_name", "someone"))
+                            if (cur or {}).get("answered_by_name") else "This call has ended")
+    session = {"sdp_type": "answer", "sdp": body.sdp}
+    try:
+        await _wa_call_graph(c["company"], {"call_id": call_id, "action": "pre_accept", "session": session})
+        await _wa_call_graph(c["company"], {"call_id": call_id, "action": "accept", "session": session})
+    except HTTPException as e:
+        await db.wa_calls.update_one({"id": call_id}, {"$set": {"status": "failed", "error": str(e.detail)[:300]}})
+        raise
+    now = iso(now_utc())
+    log_id = None
+    if c.get("lead_id"):
+        log_id = str(uuid.uuid4())
+        await db.call_logs.insert_one({
+            "id": log_id, "lead_id": c["lead_id"], "phone": c.get("from"), "outcome": "connected",
+            "summary": "WhatsApp call", "by_user_id": user["id"], "by_user_name": user.get("name"),
+            "at": now, "call_start_at": now, "duration_seconds": 0, "direction": "incoming",
+            "channel": "whatsapp", "synced_from_app": True, "wa_call_id": call_id})
+        lead = await db.leads.find_one({"id": c["lead_id"]}, {"_id": 0})
+        if lead:
+            await _call_bump_lead(lead, log_id, "connected")
+    await db.wa_calls.update_one({"id": call_id}, {"$set": {"status": "active", "accepted_at": now, "call_log_id": log_id}})
+    others = [u for u in (c.get("ring_to") or []) if u != user["id"]]
+    await _wa_call_push(others, {"type": "wa_call", "action": "clear", "call_id": call_id, "reason": f"answered by {user.get('name')}"})
+    return {"ok": True, "accepted_at": now, "phone": c.get("from"), "lead_id": c.get("lead_id")}
+
+
+@api.post("/wa-calls/{call_id}/hangup")
+async def hangup_wa_call(call_id: str, user: dict = Depends(get_current_user)):
+    c = await db.wa_calls.find_one({"id": call_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Call not found")
+    if c.get("status") in ("active", "answering", "dialing", "ringing_remote"):
+        try:
+            await _wa_call_graph(c["company"], {"call_id": call_id, "action": "terminate"})
+        except Exception as e:
+            logger.warning(f"wa-call terminate failed: {e}")
+    return {"ok": True}
+
+
+@api.post("/wa-calls/{call_id}/decline")
+async def decline_wa_call(call_id: str, user: dict = Depends(get_current_user)):
+    """Stop ringing on this phone; the call is rejected only when everyone it rang declined."""
+    c = await db.wa_calls.find_one_and_update({"id": call_id, "status": "ringing"},
+                                              {"$addToSet": {"dismissed_by": user["id"]}},
+                                              return_document=True, projection={"_id": 0})
+    if not c:
+        return {"ok": True}
+    await _wa_call_push([user["id"]], {"type": "wa_call", "action": "clear", "call_id": call_id, "reason": "declined"})
+    if set(c.get("ring_to") or []) <= set(c.get("dismissed_by") or []):
+        res = await db.wa_calls.update_one({"id": call_id, "status": "ringing"}, {"$set": {"status": "rejected"}})
+        if res.modified_count:
+            try:
+                await _wa_call_graph(c["company"], {"call_id": call_id, "action": "reject"})
+            except Exception as e:
+                logger.warning(f"wa-call reject failed: {e}")
+    return {"ok": True}
 
 
 @api.get("/team-calls")

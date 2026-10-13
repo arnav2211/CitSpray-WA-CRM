@@ -26,6 +26,16 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- WhatsApp calls answered in the app: microphone, ring like a phone call, keep the
+         connection alive when the app is closed, mic kept on while in another app -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
     <!-- In-app self-update: needed to hand the downloaded APK to the installer -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.READ_CONTACTS" />
@@ -59,6 +69,23 @@
         <!-- No LeadOrbit dialer: calls use the phone's normal phone app; CallReceiver +
              SyncWorker read the call log and RecordingSyncWorker uploads the phone's
              call recording for the AI summary. -->
+
+        <!-- Incoming WhatsApp call ringing screen (over the lock screen / other apps) -->
+        <activity
+            android:name=".IncomingCallActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:taskAffinity="com.leadorbit.syncer.call"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:theme="@style/Theme.AppCompat.NoActionBar" />
+
+        <!-- WhatsApp call in progress: keeps the mic on when the user leaves the app -->
+        <service
+            android:name=".OngoingCallService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
 
         <!-- Real-time notification WebSocket sync service -->
         <service

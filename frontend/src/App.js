@@ -32,6 +32,7 @@ import PayrollPage from "@/pages/Payroll";
 import LeavesPage from "@/pages/Leaves";
 import TeamCalls from "@/pages/TeamCalls";
 import AiReports from "@/pages/AiReports";
+import WaCall from "@/pages/WaCall";
 
 export default function App() {
   return (
@@ -43,6 +44,9 @@ export default function App() {
           <Routes>
             <Route path="/login" element={<Login />} />
             // AttendanceScanner route removed
+            {/* Incoming WhatsApp call screen (opened by the phone app), full screen without the sidebar */}
+            <Route path="/wa-call/:id" element={<ProtectedRoute><WaCall /></ProtectedRoute>} />
+            <Route path="/wa-call-out/:leadId" element={<ProtectedRoute><WaCall key="out" outgoing /></ProtectedRoute>} />
             <Route element={<ProtectedRoute><AppShell /></ProtectedRoute>}>
               <Route path="/" element={<Navigate to="/dashboard" replace />} />
               <Route path="/dashboard" element={<ExecutiveOrAdminOnly><Dashboard /></ExecutiveOrAdminOnly>} />
