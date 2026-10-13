@@ -1575,6 +1575,20 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
     finally { setSending(false); }
   };
 
+  const sendCallButton = async () => {
+    setShowAttach(false);
+    setSending(true);
+    try {
+      const payload = { lead_id: conv.id };
+      if (replyTo?.id) payload.reply_to_message_id = replyTo.id;
+      await api.post("/whatsapp/send-call-button", payload);
+      setReplyTo(null);
+      loadMessages(); onChanged?.();
+      toast.success("Call button sent - when they tap it, the call rings in the LeadOrbit app");
+    } catch (e) { toast.error(errMsg(e, "Failed to send call button")); }
+    finally { setSending(false); }
+  };
+
   const sendContact = async (contact) => {
     setSending(true);
     try {
@@ -1951,6 +1965,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                       <button onClick={() => { setAttachMode("location"); setShowAttach(false); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-location"><MapPin size={16} className="text-[#0891B2]" /> Location</button>
                       <button onClick={() => { setAttachMode("contact"); setShowAttach(false); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-contact"><IdentificationCard size={16} className="text-[#15803D]" /> Contact</button>
                       <button onClick={() => { setAttachMode("payment_qr"); setShowAttach(false); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-payment-qr"><QrCode size={16} className="text-[#002FA7]" /> Payment QR</button>
+                      <button onClick={sendCallButton} disabled={sending} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-call-button"><PhoneCall size={16} weight="fill" className="text-[#25D366]" /> Call button</button>
                     </div>
                   )}
                   <button onClick={() => { setShowQR(v => !v); setShowTpl(false); setShowAttach(false); }} title="Quick replies"

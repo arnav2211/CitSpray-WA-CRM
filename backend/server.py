@@ -4915,6 +4915,32 @@ async def whatsapp_send_location(body: WASendLocation, user: dict = Depends(get_
     return strip_mongo(msg)
 
 
+class WASendCallButton(WAComposerBase):
+    text: Optional[str] = None
+
+
+@api.post("/whatsapp/send-call-button")
+async def whatsapp_send_call_button(body: WASendCallButton, user: dict = Depends(get_current_user)):
+    """WhatsApp 'Call now' button: the customer taps it to call us on WhatsApp. The call
+    rings in the LeadOrbit app like any incoming WhatsApp call (and costs nothing)."""
+    ctx = await _assert_chat_permitted(user, body.lead_id)
+    company = normalize_company(ctx["lead"].get("company"))
+    if not (await _wa_calling_cfg(company)).get("enabled"):
+        raise HTTPException(status_code=400, detail="WhatsApp calling is not switched on for this company")
+    target_phone = ctx["target_phone"]
+    reply_ctx = await _resolve_reply_context(body.lead_id, body.reply_to_message_id)
+    text = (body.text or "").strip()[:1000] or "Tap the button below to call us on WhatsApp."
+    api_result = await _wa_send_typed(target_phone, {"type": "interactive", "interactive": {
+        "type": "voice_call", "body": {"text": text},
+        "action": {"name": "voice_call", "parameters": {"display_text": "Call now", "ttl_minutes": 10080}}}},
+        reply_to_wamid=reply_ctx["wamid"], company=company)
+    extra = {"msg_type": "interactive", "call_button": True}
+    msg = await _record_sent_message(body.lead_id, user["id"], target_phone, f"📞 [Call now button] {text}", api_result, extra, reply_ctx)
+    if msg["status"] == "failed":
+        raise HTTPException(status_code=400, detail=msg.get("error") or "WhatsApp call button send failed")
+    return strip_mongo(msg)
+
+
 @api.post("/whatsapp/send-contact")
 async def whatsapp_send_contact(body: WASendContact, user: dict = Depends(get_current_user)):
     ctx = await _assert_chat_permitted(user, body.lead_id)
