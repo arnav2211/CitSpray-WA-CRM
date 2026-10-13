@@ -15260,6 +15260,30 @@ def _office_time(due: datetime) -> datetime:
     return nxt - timedelta(hours=5, minutes=30)
 
 
+_OFFICE_OPEN_MIN, _OFFICE_CLOSE_MIN = 600, 1170      # 10:00 - 19:30 IST, Monday - Saturday
+
+
+def _add_office_hours(start: datetime, hours: float) -> datetime:
+    """`start` + N hours of OFFICE time only (time outside 10:00-19:30 IST and Sundays
+    doesn't count). E.g. a call at 18:00 + 3 h -> 11:00 the next office morning."""
+    ist_off = timedelta(hours=5, minutes=30)
+    t = start + ist_off
+    left = timedelta(hours=hours)
+    for _ in range(60):
+        day0 = t.replace(hour=0, minute=0, second=0, microsecond=0)
+        open_t, close_t = day0 + timedelta(minutes=_OFFICE_OPEN_MIN), day0 + timedelta(minutes=_OFFICE_CLOSE_MIN)
+        if t.weekday() == 6 or t >= close_t:
+            t = day0 + timedelta(days=1, minutes=_OFFICE_OPEN_MIN)
+            continue
+        if t < open_t:
+            t = open_t
+        if t + left <= close_t:
+            return t + left - ist_off
+        left -= close_t - t
+        t = day0 + timedelta(days=1, minutes=_OFFICE_OPEN_MIN)
+    return t - ist_off
+
+
 async def _call_ai_track_promise(ai: dict, lead: Optional[dict], doc: dict, call: Optional[dict]) -> Optional[dict]:
     """'I'll send the quotation on WhatsApp' -> tracked: reminder after ~3 h if nothing
     was sent to the customer, admin alert ~3 h after that."""
@@ -15268,7 +15292,7 @@ async def _call_ai_track_promise(ai: dict, lead: Optional[dict], doc: dict, call
         return None
     start = _parse_call_dt(doc.get("call_start_at")) or now_utc()
     end = start + timedelta(seconds=int(doc.get("duration_seconds") or 0))
-    due = _office_time(end + timedelta(hours=3))
+    due = _add_office_hours(end, 3)
     owner = await db.leads.find_one({"id": lead["id"]}, {"_id": 0, "assigned_to": 1, "customer_name": 1})
     pr = {"id": str(uuid.uuid4()), "lead_id": lead["id"], "lead_name": (owner or {}).get("customer_name") or lead.get("customer_name"),
           "call_log_id": (call or {}).get("id"), "exec_id": doc["user_id"], "exec_name": doc.get("user_name"),
@@ -15321,8 +15345,8 @@ async def _promise_close_followups(pr: dict, now: datetime) -> None:
 
 async def promise_tracker_task():
     """Every 5 min: a promise is KEPT once a person sends anything to that lead on
-    WhatsApp from the start of the call on; if not, the executive gets a reminder 3 h
-    after they COULD send (call end, or the customer's next message when the 24-hour
+    WhatsApp from the start of the call on; if not, the executive gets a reminder 3
+    OFFICE hours after they COULD send (call end, or the customer's next message when the 24-hour
     window was closed) and 3 h later the admin is alerted. While the window is closed
     nothing can be sent, so the promise waits ('no_window') instead of alerting.
     Conditional updates make it safe across workers."""
@@ -15349,7 +15373,7 @@ async def promise_tracker_task():
                     if res.modified_count:
                         await _promise_close_followups(pr, now)
                 continue
-            due = _office_time(clock + timedelta(hours=3))
+            due = _add_office_hours(clock, 3)
             if pr["status"] == "no_window":
                 # the customer wrote: the window is open again, the 3 h clock starts now
                 await db.call_promises.update_one({"id": pr["id"], "status": "no_window"},
@@ -15366,7 +15390,7 @@ async def promise_tracker_task():
                         "created_by": None, "due_at": iso(now), "status": "pending", "created_at": iso(now), "completed_at": None,
                         "note": f"Promised on the call: {pr['what']} - not sent on WhatsApp yet",
                         "meta": {"type": "ai_promise", "promise_id": pr["id"]}})
-            elif pr["status"] == "reminded" and now >= due + timedelta(hours=3):
+            elif pr["status"] == "reminded" and now >= _add_office_hours(due, 3):
                 res = await db.call_promises.update_one({"id": pr["id"], "status": "reminded"},
                                                         {"$set": {"status": "missed", "escalated_at": iso(now)}})
                 if res.modified_count:
