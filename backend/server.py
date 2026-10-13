@@ -15849,7 +15849,10 @@ async def _wa_call_targets(company: str, lead: Optional[dict], stage: str) -> Li
         return [owner]
     if stage == "first" and owner and await db.users.find_one({"id": owner, "role": "admin", "active": True}, {"_id": 1}):
         return [owner]                    # an admin's own customer rings the admin first (admins have no attendance)
-    return avail
+    # Owner rule: whenever everyone is rung (owner missed it / no owner), the System Admin
+    # is ALWAYS rung too, together with everyone available (after hours = the WFH team)
+    admins = [u["id"] async for u in db.users.find({"role": "admin", "active": True}, {"_id": 0, "id": 1})]
+    return list(dict.fromkeys(avail + admins))
 
 
 def _wa_call_public(c: dict) -> dict:
