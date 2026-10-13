@@ -8,6 +8,7 @@ import { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
 import { useCompany, COMPANIES } from "@/context/CompanyContext";
+import { RecordingSetupModal } from "@/components/CallAiSummary";
 
 const navBase = "flex items-center gap-3 px-4 py-3 md:py-2.5 text-sm border-l-2 transition-colors";
 const navActive = "bg-white border-[#002FA7] text-gray-900 font-semibold";
@@ -40,6 +41,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
   const [pendingQA, setPendingQA] = useState(0);
   // LeadOrbit Android app download (hidden inside the app's own WebView)
   const [appVer, setAppVer] = useState(null);
+  const [recHelp, setRecHelp] = useState(false);
   const inAndroidApp = typeof navigator !== "undefined" && /; wv\)/.test(navigator.userAgent || "");
   useEffect(() => {
     if (inAndroidApp) return;
@@ -225,6 +227,13 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
               the office fingerprint device, and being punched in is what grants
               CRM access in the first place. */}
 
+          {user?.role !== "data_entry" && (
+            <button onClick={() => setRecHelp(true)} data-testid="recording-setup-btn"
+              className="mt-3 w-full flex items-center justify-center gap-2 border border-[#6D28D9] text-[#6D28D9] py-2 text-xs uppercase tracking-wider font-bold hover:bg-[#F5F3FF]">
+              <PhoneCall size={14} weight="fill" /> Call recording setup
+            </button>
+          )}
+          {recHelp && <RecordingSetupModal onClose={() => setRecHelp(false)} />}
           {appVer?.apk_url && (
             <a href={appVer.apk_url} download data-testid="download-app-link"
               className="mt-3 w-full flex items-center justify-center gap-2 border border-[#3DDC84] text-[#1B7A47] py-2 text-xs uppercase tracking-wider font-bold hover:bg-[#EAFBF1]"

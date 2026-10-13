@@ -167,6 +167,38 @@ export function CallAiSettingsPanel() {
           Enabled
         </label>
       </div>
+      {cfg.phones?.length > 0 && (
+        <div className="border-b border-gray-200" data-testid="call-ai-phones">
+          <div className="px-5 pt-4 text-[10px] uppercase tracking-widest text-gray-500 font-bold">Phones — is each one recording?</div>
+          <div className="px-5 py-3 overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead className="text-[9px] uppercase tracking-widest text-gray-400">
+                <tr><th className="text-left py-1 pr-3">Person</th><th className="text-left pr-3">Status</th>
+                  <th className="text-right">Answered calls / recordings (24 h)</th></tr>
+              </thead>
+              <tbody>
+                {cfg.phones.map((p) => (
+                  <tr key={p.user_id} className="border-t border-gray-100 align-top">
+                    <td className="py-1.5 pr-3 font-semibold whitespace-nowrap">{p.name}</td>
+                    <td className="pr-3">
+                      <span className={`inline-block px-1.5 py-0.5 text-[9px] uppercase tracking-widest font-bold border ${
+                        p.state === "ok" ? "border-[#008A00] text-[#008A00]" : p.state === "unknown" ? "border-gray-300 text-gray-500" : "border-[#E60000] text-[#B00000]"}`}>
+                        {p.state === "ok" ? "OK" : p.state.replace("_", " ")}
+                      </span>
+                      <div className="text-gray-600 mt-0.5">{p.message}{p.delete_permission === false ? " · can't auto-delete (file access off)" : ""}</div>
+                    </td>
+                    <td className="text-right font-mono">{p.answered_calls_24h} / {p.recordings_24h}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div className="text-[11px] text-gray-500 mt-2">
+              Android does not let apps record calls themselves — each phone's own Phone app must have <b>automatic call recording ON for all calls</b>.
+              The <b>Call recording setup</b> button at the bottom of the menu shows the steps for each phone brand.
+            </div>
+          </div>
+        </div>
+      )}
       <div className="p-5 grid md:grid-cols-2 gap-5 text-sm">
         <div className="space-y-3">
           <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Last 24 hours</div>
@@ -213,6 +245,45 @@ export function CallAiSettingsPanel() {
             className="w-full border border-gray-300 px-2 py-1.5 text-xs font-mono" data-testid="call-ai-extra-numbers" />
           <button disabled={saving} onClick={() => save({ internal_numbers: extra.split(/[\n,]+/).map((x) => x.trim()).filter(Boolean) })}
             className="bg-[#002FA7] text-white px-3 py-1.5 text-[10px] uppercase tracking-widest font-bold disabled:opacity-50">Save numbers</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* "Call recording setup" help (menu button): Android doesn't let apps record calls,
+   so each phone's own Phone app must record every call automatically. */
+const REC_STEPS = [
+  ["Samsung", "Phone app → ⋮ (top right) → Settings → Record calls → turn ON “Auto record calls” → All calls."],
+  ["Xiaomi / Redmi / POCO", "Phone app → ⚙ or ⋮ → Settings → Call recording → turn ON “Record calls automatically” → All numbers."],
+  ["Vivo / iQOO", "Phone app → ⋮ / Settings → Call recording → turn ON automatic recording → All calls."],
+  ["Oppo / Realme / OnePlus", "Phone app → ⋮ → Settings → Call recording → Auto-record calls → All calls."],
+  ["Google Phone app (Pixel, Motorola, Nokia…)", "Its recordings are private to Google's app, so LeadOrbit can't read them. If the phone has another Phone app, make that the default and turn on auto recording there."],
+];
+
+export function RecordingSetupModal({ onClose }) {
+  return (
+    <div className="fixed inset-0 z-[60] bg-black/40 flex items-center justify-center p-4" onClick={onClose} data-testid="recording-setup-modal">
+      <div onClick={(e) => e.stopPropagation()} className="bg-white border border-gray-900 w-full max-w-lg p-5 space-y-3 max-h-[90vh] overflow-y-auto">
+        <div className="font-chivo font-black text-lg">Turn on call recording</div>
+        <p className="text-xs text-gray-600">
+          AI call summaries, automatic follow-ups and coaching need each call's recording. Android doesn't let apps record
+          calls themselves, so the phone's own <b>Phone app</b> must record <b>every call automatically</b>. Do this once on each phone:
+        </p>
+        <div className="space-y-2">
+          {REC_STEPS.map(([brand, step]) => (
+            <div key={brand} className="border border-gray-200 p-2.5">
+              <div className="text-xs font-bold">{brand}</div>
+              <div className="text-xs text-gray-700 mt-0.5">{step}</div>
+            </div>
+          ))}
+        </div>
+        <p className="text-[11px] text-gray-500">
+          Then keep using the LeadOrbit app as usual — after each call of 10 seconds or more the recording is picked up,
+          summarised, and removed from the phone.
+        </p>
+        <div className="flex justify-end">
+          <button onClick={onClose} className="bg-[#002FA7] text-white px-4 py-2 text-[10px] uppercase tracking-widest font-bold">Got it</button>
         </div>
       </div>
     </div>

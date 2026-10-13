@@ -14675,6 +14675,65 @@ def _call_ai_on_for(user: dict, cfg: dict) -> bool:
     return user.get("role") != "data_entry"
 
 
+class PhoneStatusInput(BaseModel):
+    app_version: Optional[str] = None
+    device: Optional[str] = None
+    android: Optional[str] = None
+    dialer: Optional[str] = None
+    audio_permission: Optional[bool] = None
+    delete_permission: Optional[bool] = None
+    missing_streak: Optional[int] = None
+    last_found_at: Optional[int] = None      # epoch ms on the phone, 0 = never
+
+
+@api.post("/calls/phone-status")
+async def report_phone_status(body: PhoneStatusInput, user: dict = Depends(get_current_user)):
+    """The app reports its health after each recording check (Settings -> Calls & AI -> Phones)."""
+    doc = {k: v for k, v in body.dict().items() if v is not None}
+    if body.last_found_at:
+        doc["last_found_at"] = iso(datetime.fromtimestamp(body.last_found_at / 1000, tz=timezone.utc))
+    elif "last_found_at" in doc:
+        doc["last_found_at"] = None
+    doc.update({"user_id": user["id"], "user_name": user.get("name"), "updated_at": iso(now_utc())})
+    await db.phone_status.update_one({"user_id": user["id"]}, {"$set": doc}, upsert=True)
+    return {"ok": True}
+
+
+async def _phones_overview() -> List[dict]:
+    """One row per executive/admin, worked out from their synced calls (no app update
+    needed): old in-app-dialer app still in use, or answered calls arriving from the new
+    app with no recordings (= the phone's auto call recording is off), or OK."""
+    since_old = iso(now_utc() - timedelta(days=3))[:19]
+    since = iso(now_utc() - timedelta(days=1))
+    out = []
+    old_q = {"$or": [{"call_end_at": {"$exists": True}}, {"summary": {"$regex": "Auto-logged via app"}}]}
+    new_q = {"call_end_at": {"$exists": False}, "summary": {"$not": {"$regex": "Auto-logged via app"}}}
+    async for u in db.users.find({"active": True, "role": {"$in": ["executive", "admin"]}, "username": {"$ne": "test_user"}},
+                                 {"_id": 0, "id": 1, "name": 1, "role": 1}).sort("name", 1):
+        base = {"by_user_id": u["id"], "synced_from_app": True}
+        old_calls = await db.call_logs.count_documents({**base, "at": {"$gte": since_old}, **old_q})
+        new_answered = await db.call_logs.count_documents({**base, "at": {"$gte": since[:19]}, "duration_seconds": {"$gte": 10}, **new_q})
+        recs = await db.call_recordings.count_documents({"user_id": u["id"], "created_at": {"$gte": since}})
+        st = await db.phone_status.find_one({"user_id": u["id"]}, {"_id": 0}) or {}
+        if recs:
+            state, msg = "ok", "Recordings are arriving"
+        elif new_answered >= 2:
+            state, msg = "recording_off", f"{new_answered} answered calls but no recordings - turn ON automatic call recording in this phone's Phone app"
+        elif old_calls and not new_answered:
+            state, msg = "old_app", "Still on the old LeadOrbit app (built-in dialer) - it can't send recordings; install the new app once from the sidebar link"
+        elif new_answered:
+            state, msg = "waiting", "New app in use - waiting for more answered calls to confirm recording"
+        else:
+            state, msg = "unknown", "No calls synced in the last 24 h"
+        if old_calls and new_answered:
+            msg += " (the old app is also still used on one phone)"
+        out.append({"user_id": u["id"], "name": u.get("name"), "role": u.get("role"), "state": state, "message": msg,
+                    "app_version": st.get("app_version"), "device": st.get("device"), "android": st.get("android"),
+                    "delete_permission": st.get("delete_permission"), "updated_at": st.get("updated_at"),
+                    "answered_calls_24h": new_answered, "recordings_24h": recs, "old_app_calls_3d": old_calls})
+    return out
+
+
 @api.get("/calls/recording-config")
 async def call_recording_config(user: dict = Depends(get_current_user)):
     """Asked by the phone app BEFORE it touches any recording: when summaries are off
@@ -15439,7 +15498,7 @@ async def get_call_ai_settings(admin: dict = Depends(require_admin)):
     async for u in db.users.find({"active": True, "role": {"$in": ["executive", "admin"]}},
                                  {"_id": 0, "name": 1, "receiver_numbers": 1}).sort("name", 1):
         team.append({"name": u.get("name"), "numbers": u.get("receiver_numbers") or []})
-    return {**cfg, "stats_24h": stats, "team_numbers": team}
+    return {**cfg, "stats_24h": stats, "team_numbers": team, "phones": await _phones_overview()}
 
 
 @api.put("/settings/call-ai")
