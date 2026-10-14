@@ -129,6 +129,7 @@ function pageTitle(path) {
   if (path.startsWith("/data-entry")) return "Lead Entry";
   if (path.startsWith("/team-calls")) return "Team Calls";
   if (path.startsWith("/ai-reports")) return "AI Reports";
+  if (path.startsWith("/promises")) return "Promises";
   if (path.startsWith("/international/chat")) return "International WhatsApp";
   if (path.startsWith("/international")) return "International";
   if (path.startsWith("/chatflows")) return "Chatbot Flows";

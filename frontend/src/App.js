@@ -33,6 +33,7 @@ import LeavesPage from "@/pages/Leaves";
 import TeamCalls from "@/pages/TeamCalls";
 import AiReports from "@/pages/AiReports";
 import WaCall from "@/pages/WaCall";
+import Promises from "@/pages/Promises";
 
 export default function App() {
   return (
@@ -59,6 +60,7 @@ export default function App() {
               <Route path="/calls" element={<ExecutiveOrAdminOnly><CallLogs /></ExecutiveOrAdminOnly>} />
               <Route path="/team-calls" element={<ExecutiveOrAdminOnly><TeamCalls /></ExecutiveOrAdminOnly>} />
               <Route path="/ai-reports" element={<ExecutiveOrAdminOnly><AiReports /></ExecutiveOrAdminOnly>} />
+              <Route path="/promises" element={<ExecutiveOrAdminOnly><Promises /></ExecutiveOrAdminOnly>} />
               <Route path="/followups" element={<ExecutiveOrAdminOnly><Followups /></ExecutiveOrAdminOnly>} />
               <Route path="/qa" element={<ExecutiveOrAdminOnly><InternalQA /></ExecutiveOrAdminOnly>} />
               <Route path="/transfer-requests" element={<ExecutiveOrAdminOnly><TransferRequests /></ExecutiveOrAdminOnly>} />

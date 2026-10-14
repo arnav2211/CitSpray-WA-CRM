@@ -15338,17 +15338,77 @@ _PROMISE_CLOCK_SKEW = timedelta(minutes=2)      # phone clock vs server clock
 _PROMISE_GIVE_UP_DAYS = 7
 
 
-async def _promise_sent(pr: dict) -> Optional[dict]:
-    """A person sent this lead something on WhatsApp from the START of the call on
-    (executives often send the location / catalogue while still talking)."""
+async def _promise_call_start(pr: dict) -> datetime:
     start = _parse_call_dt(pr.get("call_start_at"))
     if not start and pr.get("call_log_id"):
         cl = await db.call_logs.find_one({"id": pr["call_log_id"]}, {"_id": 0, "call_start_at": 1, "at": 1})
         start = _parse_call_dt((cl or {}).get("call_start_at") or (cl or {}).get("at"))
     end = _parse_call_dt(pr["call_end_at"]) or now_utc()
-    since = (start or (end - timedelta(minutes=10))) - _PROMISE_CLOCK_SKEW
-    return await db.messages.find_one({"lead_id": pr["lead_id"], "direction": "out", "by_user_id": {"$nin": [None, ""]},
-                                       "at": {"$gt": iso(since)}}, {"_id": 0, "at": 1})
+    return (start or (end - timedelta(minutes=10))) - _PROMISE_CLOCK_SKEW
+
+
+_PROMISE_JUDGE_PROMPT = """On a phone call our executive promised to send this customer on WhatsApp: "{what}".
+What was said on the call: {context}
+Below are ALL the WhatsApp messages our team sent to this customer since the call started (oldest first).
+Has the promise been KEPT - did the customer actually get what was promised (the price / rate, the catalogue
+or price-list file, photos, location, sample or order details, ...)?
+A greeting, "ok", "ji sir", "I'll confirm and update you", a question back, or a message about something else
+does NOT keep it. If only part of it was sent (e.g. the price but not the catalogue), the answer is "partly".
+Messages:
+{msgs}
+Reply ONLY with JSON: {{"verdict": "kept" | "partly" | "not_kept", "reason": "one short sentence in English",
+"evidence": "the message that keeps it, quoted briefly, or empty", "missing": "what is still not sent, or empty"}}"""
+
+
+async def _promise_verdict(pr: dict, now: datetime) -> Optional[dict]:
+    """Was the promise kept? None = not decided this round (AI busy / another worker
+    is judging) -> nothing changes. The AI only runs when new messages were sent."""
+    since = await _promise_call_start(pr)
+    msgs = await db.messages.find({"lead_id": pr["lead_id"], "direction": "out", "by_user_id": {"$nin": [None, ""]},
+                                   "at": {"$gt": iso(since)}}, {"_id": 0}).sort("at", 1).to_list(40)
+    if not msgs:
+        return {"verdict": "not_kept", "reason": "Nothing has been sent on WhatsApp since the call.", "missing": pr["what"]}
+    last_at = msgs[-1].get("at")
+    if pr.get("judged_upto") == last_at and pr.get("ai_verdict"):
+        return {"verdict": pr["ai_verdict"], "reason": pr.get("ai_reason"), "evidence": pr.get("ai_evidence"),
+                "missing": pr.get("ai_missing"), "cached": True}
+    # one worker judges (the tracker runs in every gunicorn worker)
+    claim = await db.call_promises.update_one(
+        {"id": pr["id"], "$or": [{"judging_until": {"$exists": False}}, {"judging_until": {"$lt": iso(now)}}]},
+        {"$set": {"judging_until": iso(now + timedelta(seconds=90))}})
+    if not claim.modified_count:
+        return None
+    ctx = ""
+    if pr.get("call_log_id"):
+        cl = await db.call_logs.find_one({"id": pr["call_log_id"]}, {"_id": 0, "ai_summary.summary": 1, "ai_summary.next_step": 1})
+        ai = (cl or {}).get("ai_summary") or {}
+        ctx = " ".join(x for x in (ai.get("summary"), ("Next step: " + ai["next_step"]) if ai.get("next_step") else "") if x)
+    lines = []
+    for m in msgs:
+        t = (_parse_call_dt(m.get("at")) or now) + timedelta(hours=5, minutes=30)
+        body = (m.get("body") or "").replace("\n", " ")
+        if m.get("caption") and m.get("caption") not in body:
+            body += f" (caption: {m['caption']})"
+        if m.get("template_name"):
+            body = f"[template {m['template_name']}] {body}"
+        lines.append(f"- {t.strftime('%d %b %H:%M')}: {body[:400]}")
+    prompt = _PROMISE_JUDGE_PROMPT.format(what=pr["what"], context=(ctx or "(no summary)")[:1500], msgs="\n".join(lines))
+    try:
+        raw = await _gemini_generate(prompt, temperature=0.1, max_output_tokens=400, json_mode=True, per_model_timeout=20.0)
+        v = _ai_json(raw)
+    except Exception as e:
+        logger.warning(f"promise judge failed: {e}")
+        await db.call_promises.update_one({"id": pr["id"]}, {"$set": {"judging_until": iso(now + timedelta(minutes=5))}})
+        return None
+    verdict = v.get("verdict") if v.get("verdict") in ("kept", "partly", "not_kept") else "not_kept"
+    out = {"verdict": verdict, "reason": _ai_txt(v.get("reason"), 300), "evidence": _ai_txt(v.get("evidence"), 300),
+           "missing": _ai_txt(v.get("missing"), 200)}
+    await db.call_promises.update_one({"id": pr["id"]}, {"$set": {
+        "ai_verdict": verdict, "ai_reason": out["reason"], "ai_evidence": out["evidence"], "ai_missing": out["missing"],
+        "judged_upto": last_at, "judged_at": iso(now), "judging_until": iso(now)}})
+    if verdict == "kept":
+        out["kept_at"] = last_at
+    return out
 
 
 async def _promise_clock(pr: dict, now: datetime) -> Optional[datetime]:
@@ -15384,14 +15444,29 @@ async def promise_tracker_task():
     Conditional updates make it safe across workers."""
     try:
         now = now_utc()
-        async for pr in db.call_promises.find({"status": {"$in": ["open", "reminded", "no_window"]}}, {"_id": 0}).limit(300):
-            sent = await _promise_sent(pr)
-            if sent:
+        q = {"$or": [{"status": {"$in": ["open", "reminded", "no_window"]}},
+                     # kept by the old "any message counts" rule: check once what was really sent
+                     {"status": "kept", "verified": {"$ne": True}, "created_at": {"$gte": iso(now - timedelta(days=3))}}]}
+        async for pr in db.call_promises.find(q, {"_id": 0}).limit(300):
+            v = await _promise_verdict(pr, now)
+            if v is None:
+                continue
+            if v["verdict"] == "kept":
+                if pr["status"] == "kept":
+                    await db.call_promises.update_one({"id": pr["id"]}, {"$set": {"verified": True}})
+                    continue
                 res = await db.call_promises.update_one({"id": pr["id"], "status": pr["status"]},
-                                                        {"$set": {"status": "kept", "kept_at": sent.get("at")}})
+                                                        {"$set": {"status": "kept", "verified": True,
+                                                                  "kept_at": v.get("kept_at") or iso(now)}})
                 if res.modified_count:
                     await _promise_close_followups(pr, now)
                 continue
+            if pr["status"] == "kept":
+                # it was NOT really kept: back into tracking
+                await db.call_promises.update_one({"id": pr["id"], "status": "kept"},
+                                                  {"$set": {"status": "open", "verified": True, "reopened_at": iso(now)},
+                                                   "$unset": {"kept_at": ""}})
+                pr["status"] = "open"
             clock = await _promise_clock(pr, now)
             if clock is None:
                 end = _parse_call_dt(pr["call_end_at"]) or now
@@ -15420,7 +15495,7 @@ async def promise_tracker_task():
                     await db.followups.insert_one({
                         "id": str(uuid.uuid4()), "lead_id": pr["lead_id"], "executive_id": pr.get("owner_id") or pr["exec_id"],
                         "created_by": None, "due_at": iso(now), "status": "pending", "created_at": iso(now), "completed_at": None,
-                        "note": f"Promised on the call: {pr['what']} - not sent on WhatsApp yet",
+                        "note": f"Promised on the call: {pr['what']} - " + (f"still missing: {v.get('missing')}" if v.get("verdict") == "partly" and v.get("missing") else "not sent on WhatsApp yet"),
                         "meta": {"type": "ai_promise", "promise_id": pr["id"]}})
             elif pr["status"] == "reminded" and now >= _add_office_hours(due, 3):
                 res = await db.call_promises.update_one({"id": pr["id"], "status": "reminded"},
@@ -15429,10 +15504,61 @@ async def promise_tracker_task():
                     hrs = int((now - (_parse_call_dt(pr["call_end_at"]) or now)).total_seconds() // 3600)
                     await create_system_alert(
                         "ai_promise_missed", f"Promise not kept: {pr.get('lead_name') or 'customer'}",
-                        f"{pr.get('exec_name')} promised \"{pr['what']}\" on WhatsApp - still not sent {hrs} h after the call.",
+                        f"{pr.get('exec_name')} promised \"{pr['what']}\" on WhatsApp - " +
+                        (f"only partly sent (missing: {v.get('missing')})" if v.get("verdict") == "partly" else "still not sent") +
+                        f" {hrs} h after the call. See Promises.",
                         dedup_key=f"promise:{pr['id']}")
     except Exception as e:
         logger.warning(f"promise_tracker_task failed: {e}")
+
+
+class PromiseResolveInput(BaseModel):
+    status: str            # "kept" | "dismissed"
+    note: Optional[str] = ""
+
+
+@api.get("/promises")
+async def list_promises(status: Optional[str] = None, exec_id: Optional[str] = None, days: int = 14,
+                        user: dict = Depends(get_current_user)):
+    """Promises made on calls ('I'll send the price on WhatsApp') and whether they were kept.
+    Admins see everyone's; executives their own."""
+    q: Dict[str, Any] = {"created_at": {"$gte": iso(now_utc() - timedelta(days=max(1, min(days, 90))))}}
+    if user["role"] != "admin":
+        q["$or"] = [{"exec_id": user["id"]}, {"owner_id": user["id"]}]
+    elif exec_id:
+        q["exec_id"] = exec_id
+    counts: Dict[str, int] = {}
+    async for r in db.call_promises.aggregate([{"$match": q}, {"$group": {"_id": "$status", "n": {"$sum": 1}}}]):
+        counts[r["_id"]] = r["n"]
+    if status:
+        q["status"] = {"$in": status.split(",")}
+    rows = await db.call_promises.find(q, {"_id": 0, "judging_until": 0}).sort("created_at", -1).limit(500).to_list(500)
+    ids = list({r["lead_id"] for r in rows})
+    leads = {l["id"]: l async for l in db.leads.find({"id": {"$in": ids}}, {"_id": 0, "id": 1, "phone": 1, "company": 1, "customer_name": 1})}
+    for r in rows:
+        l = leads.get(r["lead_id"]) or {}
+        r["phone"] = l.get("phone")
+        r["company"] = l.get("company") or "citspray"
+        r["lead_name"] = l.get("customer_name") or r.get("lead_name")
+    return {"rows": rows, "counts": counts}
+
+
+@api.post("/promises/{pid}/resolve")
+async def resolve_promise(pid: str, body: PromiseResolveInput, user: dict = Depends(get_current_user)):
+    pr = await db.call_promises.find_one({"id": pid}, {"_id": 0})
+    if not pr:
+        raise HTTPException(status_code=404, detail="Promise not found")
+    if user["role"] != "admin" and user["id"] not in (pr.get("exec_id"), pr.get("owner_id")):
+        raise HTTPException(status_code=403, detail="Not your promise")
+    if body.status not in ("kept", "dismissed"):
+        raise HTTPException(status_code=400, detail="status must be kept or dismissed")
+    now = now_utc()
+    await db.call_promises.update_one({"id": pid}, {"$set": {
+        "status": body.status, "verified": True, "resolved_by": user.get("name"), "resolved_at": iso(now),
+        "resolve_note": (body.note or "")[:300], **({"kept_at": iso(now)} if body.status == "kept" else {})}})
+    await _promise_close_followups(pr, now)
+    await db.admin_alerts.update_many({"meta.dedup_key": f"promise:{pid}"}, {"$set": {"cancelled": True}})
+    return {"ok": True}
 
 
 # ---- AI reports (daily / weekly / monthly) ----
