@@ -892,6 +892,8 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   // NOTE: /chat itself does NOT alter the lead's active_wa_phone — that's a
   // /leads-only concern. The filter here is purely a view-side restriction.
   const [phoneFilter, setPhoneFilter] = useState(initialPhone || "");
+  // the number whose thread is on screen - replies for another number are dropped
+  const phoneFilterRef = useRef(initialPhone || "");
 
   const winByPhone = conv.within_24h_by_phone || null;
 
@@ -946,8 +948,9 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
       if (phoneFilter) params.phone = phoneFilter;
       const { data } = await api.get(`/leads/${conv.id}/messages`, { params });
       
-      // Ignore if the lead has changed since the request was started
+      // Ignore if the lead - or the selected number - changed since the request was started
       if (lastConvIdRef.current !== conv.id) return;
+      if (phoneFilterRef.current !== phoneFilter) return;
 
       setMessages((prev) => {
         if (!Array.isArray(data)) return prev;
@@ -983,6 +986,18 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
     setLoadingOlder(false);
     isInitialLoadRef.current = true;
   }, [conv.id]);
+
+  // Another number selected = another conversation: start its thread from scratch
+  // (never merge it into the previous number's messages).
+  useEffect(() => {
+    if (phoneFilterRef.current === phoneFilter) return;
+    phoneFilterRef.current = phoneFilter;
+    messagesLengthRef.current = 0;
+    setMessages([]);
+    setHasOlder(true);
+    setLoadingOlder(false);
+    isInitialLoadRef.current = true;
+  }, [phoneFilter]);
 
   useEffect(() => { loadMessages(); }, [loadMessages]);
   useEffect(() => {
@@ -1061,8 +1076,9 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
         if (phoneFilter) params.phone = phoneFilter;
         const { data } = await api.get(`/leads/${conv.id}/messages`, { params });
         
-        // Ignore if the lead has changed since the request was started
+        // Ignore if the lead - or the selected number - changed since the request was started
         if (lastConvIdRef.current !== conv.id) return;
+        if (phoneFilterRef.current !== phoneFilter) return;
 
         if (Array.isArray(data)) {
           if (data.length < 10) {
