@@ -10989,6 +10989,10 @@ async def _handle_wa_webhook(request: Request, company: str):
                         msg_doc["msg_type"] = "contacts"
                         msg_doc["contacts"] = m.get("contacts") or []
                     await db.messages.insert_one(msg_doc.copy())
+                    try:
+                        await _notify_intl_inbound(lead, from_phone, body_text)
+                    except Exception as e:
+                        logger.warning(f"intl notify failed: {e}")
                     lead_set = {
                         "last_action_at": iso(now_utc()),
                         "last_user_message_at": iso(now_utc()),
@@ -16420,6 +16424,21 @@ async def whatsapp_block(body: WaBlockInput, user: dict = Depends(get_current_us
                                                    "$unset": {"wa_blocked_at": "", "wa_blocked_by_name": ""}})
     await log_activity(user["id"], "whatsapp_unblocked", lead["id"], {"phone": phone, "meta": res})
     return {"ok": True, "note": "Unblocked: they can message and call again."}
+
+
+async def _notify_intl_inbound(lead: dict, from_phone: Optional[str], body_text: Optional[str]) -> None:
+    """Owner rule: every WhatsApp message from an international customer pings the
+    admins' phones (LeadOrbit app 2.2.1+, own channel with an alert sound) - app open
+    or closed. International = an International lead or a non-+91 WhatsApp number."""
+    digits = re.sub(r"\D", "", from_phone or "")
+    if not (lead.get("international") or (digits and not digits.startswith("91"))):
+        return
+    admins = [u["id"] async for u in db.users.find({"role": "admin", "active": True}, {"_id": 0, "id": 1})]
+    name = lead.get("customer_name") or f"+{digits}"
+    await _wa_call_push(admins, {"type": "notify", "kind": "intl_wa", "id": lead["id"],
+                                 "title": f"🌍 {name}", "sub": f"+{digits}" if digits else "",
+                                 "body": (body_text or "New WhatsApp message")[:300],
+                                 "nav_path": f"/chat?lead={lead['id']}"})
 
 
 @api.get("/wa-calls/ringing")

@@ -45,6 +45,8 @@ class NotificationSyncService : Service() {
         // Channels
         private const val CHANNEL_BG_ID = "leadorbit_sync_channel"
         private const val CHANNEL_ALERT_ID = "leadorbit_alert_channel"
+        // channel sound can't change once created: bump the id if intl_alert.wav changes
+        private const val CHANNEL_INTL_ID = "leadorbit_intl_wa_v1"
         
         // Notification IDs
         private const val NOTIFICATION_BG_ID = 999
@@ -220,6 +222,7 @@ class NotificationSyncService : Service() {
                             }
                         }
                         "wa_call" -> mainHandler.post { handleWaCallEvent(action, json) }
+                        "notify" -> mainHandler.post { showIntlMessage(json) }
                         "followup" -> {
                             if (action == "trigger") {
                                 val followup = json.optJSONObject("followup")
@@ -317,6 +320,52 @@ class NotificationSyncService : Service() {
                     "/chat?lead=" + json.optString("lead_id"))
             }
         }
+    }
+
+    /** International WhatsApp message: always a heads-up notification with the alert sound. */
+    private fun showIntlMessage(json: JSONObject) {
+        ensureIntlChannel()
+        val leadId = json.optString("id")
+        val nid = ("intl:$leadId").hashCode()
+        val open = PendingIntent.getActivity(this, nid, Intent(this, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            putExtra("nav_path", json.optString("nav_path").ifEmpty { "/international/chat" })
+        }, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val title = json.optString("title").ifEmpty { "International WhatsApp" }
+        val body = json.optString("body")
+        val sub = json.optString("sub")
+        val n = NotificationCompat.Builder(this, CHANNEL_INTL_ID)
+            .setSmallIcon(R.drawable.ic_launcher)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setSubText(if (sub.isNotEmpty()) "International · $sub" else "International WhatsApp")
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setSound(android.net.Uri.parse("android.resource://$packageName/${R.raw.intl_alert}"))
+            .setVibrate(longArrayOf(0, 300, 150, 300))
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(false)
+            .setContentIntent(open)
+            .build()
+        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(nid, n)
+    }
+
+    private fun ensureIntlChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (nm.getNotificationChannel(CHANNEL_INTL_ID) != null) return
+        nm.createNotificationChannel(NotificationChannel(CHANNEL_INTL_ID, "International WhatsApp", NotificationManager.IMPORTANCE_HIGH).apply {
+            description = "Every WhatsApp message from an international customer"
+            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            enableVibration(true)
+            vibrationPattern = longArrayOf(0, 300, 150, 300)
+            enableLights(true)
+            setSound(android.net.Uri.parse("android.resource://$packageName/${R.raw.intl_alert}"),
+                AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
+        })
     }
 
     private fun fetchRingingCalls() {
