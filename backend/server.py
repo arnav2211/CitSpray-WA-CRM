@@ -15347,9 +15347,33 @@ async def _promise_call_start(pr: dict) -> datetime:
     return (start or (end - timedelta(minutes=10))) - _PROMISE_CLOCK_SKEW
 
 
+def _promise_msg_line(m: dict) -> str:
+    """One compact line per message for the AI (saves credits): automatic messages are
+    described, not pasted; documents by file name only - never their content."""
+    body = " ".join((m.get("body") or "").split())
+    fname = m.get("filename") or ""
+    is_doc = m.get("media_type") == "document" or bool(fname)
+    if not m.get("by_user_id"):
+        if is_doc:
+            kind = "our product CATALOGUE PDF" if re.search(r"catal|brochure|price.?list", fname, re.I) else f"a PDF ({fname})"
+            return f"[automatic] {kind} was sent"
+        if m.get("template_name"):
+            return f"[automatic template '{m['template_name']}'] {body[:90]}"
+        return f"[automatic] {body[:90]}"
+    if is_doc:
+        cap = " ".join((m.get("caption") or "").split())
+        return f"[document: {fname or 'file'}]" + (f" {cap[:120]}" if cap else "")
+    if m.get("media_type") in ("image", "video"):
+        cap = " ".join((m.get("caption") or "").split())
+        return f"[{m['media_type']}]" + (f" {cap[:150]}" if cap else "")
+    return body[:300]
+
+
 _PROMISE_JUDGE_PROMPT = """On a phone call our executive promised to send this customer on WhatsApp: "{what}".
 What was said on the call: {context}
-Below are ALL the WhatsApp messages our team sent to this customer since the call started (oldest first).
+Below are the WhatsApp messages we sent this customer (oldest first): everything our team sent since the call
+started, plus our AUTOMATIC messages from shortly before the call. Automatic messages count too - e.g. if our
+automatic catalogue PDF reached the customer, the catalogue part of the promise is kept.
 Has the promise been KEPT - did the customer actually get what was promised (the price / rate, the catalogue
 or price-list file, photos, location, sample or order details, ...)?
 A greeting, "ok", "ji sir", "I'll confirm and update you", a question back, or a message about something else
@@ -15364,8 +15388,12 @@ async def _promise_verdict(pr: dict, now: datetime) -> Optional[dict]:
     """Was the promise kept? None = not decided this round (AI busy / another worker
     is judging) -> nothing changes. The AI only runs when new messages were sent."""
     since = await _promise_call_start(pr)
-    msgs = await db.messages.find({"lead_id": pr["lead_id"], "direction": "out", "by_user_id": {"$nin": [None, ""]},
-                                   "at": {"$gt": iso(since)}}, {"_id": 0}).sort("at", 1).to_list(40)
+    proj = {"_id": 0, "at": 1, "body": 1, "caption": 1, "filename": 1, "media_type": 1, "template_name": 1, "by_user_id": 1, "status": 1}
+    human = await db.messages.find({"lead_id": pr["lead_id"], "direction": "out", "by_user_id": {"$nin": [None, ""]},
+                                    "at": {"$gt": iso(since)}}, proj).sort("at", 1).to_list(40)
+    auto = await db.messages.find({"lead_id": pr["lead_id"], "direction": "out", "by_user_id": {"$in": [None, ""]},
+                                   "status": {"$ne": "failed"}, "at": {"$gt": iso(since - timedelta(days=3))}}, proj).sort("at", 1).to_list(20)
+    msgs = sorted(human + auto, key=lambda m: m.get("at") or "")
     if not msgs:
         return {"verdict": "not_kept", "reason": "Nothing has been sent on WhatsApp since the call.", "missing": pr["what"]}
     last_at = msgs[-1].get("at")
@@ -15383,15 +15411,8 @@ async def _promise_verdict(pr: dict, now: datetime) -> Optional[dict]:
         cl = await db.call_logs.find_one({"id": pr["call_log_id"]}, {"_id": 0, "ai_summary.summary": 1, "ai_summary.next_step": 1})
         ai = (cl or {}).get("ai_summary") or {}
         ctx = " ".join(x for x in (ai.get("summary"), ("Next step: " + ai["next_step"]) if ai.get("next_step") else "") if x)
-    lines = []
-    for m in msgs:
-        t = (_parse_call_dt(m.get("at")) or now) + timedelta(hours=5, minutes=30)
-        body = (m.get("body") or "").replace("\n", " ")
-        if m.get("caption") and m.get("caption") not in body:
-            body += f" (caption: {m['caption']})"
-        if m.get("template_name"):
-            body = f"[template {m['template_name']}] {body}"
-        lines.append(f"- {t.strftime('%d %b %H:%M')}: {body[:400]}")
+    lines = [f"- {((_parse_call_dt(m.get('at')) or now) + timedelta(hours=5, minutes=30)).strftime('%d %b %H:%M')}: "
+             f"{_promise_msg_line(m)}" for m in msgs]
     prompt = _PROMISE_JUDGE_PROMPT.format(what=pr["what"], context=(ctx or "(no summary)")[:1500], msgs="\n".join(lines))
     try:
         raw = await _gemini_generate(prompt, temperature=0.1, max_output_tokens=400, json_mode=True, per_model_timeout=20.0)
