@@ -15518,7 +15518,8 @@ async def promise_tracker_task():
                         "created_by": None, "due_at": iso(now), "status": "pending", "created_at": iso(now), "completed_at": None,
                         "note": f"Promised on the call: {pr['what']} - " + (f"still missing: {v.get('missing')}" if v.get("verdict") == "partly" and v.get("missing") else "not sent on WhatsApp yet"),
                         "meta": {"type": "ai_promise", "promise_id": pr["id"]}})
-            elif pr["status"] == "reminded" and now >= _add_office_hours(due, 3):
+            elif pr["status"] == "reminded" and now >= max(_add_office_hours(due, 3),
+                                                           _add_office_hours(_parse_call_dt(pr.get("reminded_at")) or due, 3)):
                 res = await db.call_promises.update_one({"id": pr["id"], "status": "reminded"},
                                                         {"$set": {"status": "missed", "escalated_at": iso(now)}})
                 if res.modified_count:
