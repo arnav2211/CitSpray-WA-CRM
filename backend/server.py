@@ -2114,9 +2114,12 @@ async def _attendance_login_allowed(user: dict) -> Optional[dict]:
     return None
 
 
-async def create_system_alert(alert_type: str, title: str, message: str, dedup_key: Optional[str] = None):
+async def create_system_alert(alert_type: str, title: str, message: str, dedup_key: Optional[str] = None,
+                              silent: bool = False):
     """Raise an alert to all admins through the existing admin-alert pipeline
-    (bell + websocket toast). dedup_key prevents re-raising the same flag."""
+    (bell + websocket toast). dedup_key prevents re-raising the same flag.
+    silent=True: shown in the CRM without the alarm tone and NOT pushed to the
+    phone app (whose alert always rings)."""
     try:
         if dedup_key:
             existing = await db.admin_alerts.find_one({"meta.dedup_key": dedup_key}, {"_id": 1})
@@ -2138,10 +2141,10 @@ async def create_system_alert(alert_type: str, title: str, message: str, dedup_k
             "recipient_roles": [],
             "acknowledgements": {},
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "meta": {"type": alert_type, "dedup_key": dedup_key},
+            "meta": {"type": alert_type, "dedup_key": dedup_key, "silent": silent},
         }
         await db.admin_alerts.insert_one(alert_doc.copy())
-        for r_id in admin_ids:
+        for r_id in ([] if silent else admin_ids):
             try:
                 await manager.broadcast_to_user(r_id, {
                     "type": "admin_alert",
@@ -15571,7 +15574,7 @@ async def promise_tracker_task():
                         f"{pr.get('exec_name')} promised \"{pr['what']}\" on WhatsApp - " +
                         (f"only partly sent (missing: {v.get('missing')})" if v.get("verdict") == "partly" else "still not sent") +
                         f" {hrs} h after the call. See Promises.",
-                        dedup_key=f"promise:{pr['id']}")
+                        dedup_key=f"promise:{pr['id']}", silent=True)   # owner: no sound for these
     except Exception as e:
         logger.warning(f"promise_tracker_task failed: {e}")
 

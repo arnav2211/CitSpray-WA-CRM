@@ -81,8 +81,10 @@ export function AlertListener() {
     }
   }, []);
 
+  // Silent alerts (e.g. "Promise not kept") pop up without the alarm tone
   useEffect(() => {
-    if (alerts.length > 0) startAlarm();
+    const loud = alerts.some((a) => !(a?.meta?.silent || a?.meta?.type === "ai_promise_missed"));
+    if (loud) startAlarm();
     else stopAlarm();
     return () => stopAlarm();
   }, [alerts, startAlarm, stopAlarm]);
