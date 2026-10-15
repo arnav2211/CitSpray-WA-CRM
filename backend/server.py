@@ -15380,6 +15380,8 @@ started, plus our AUTOMATIC messages from shortly before the call. Automatic mes
 automatic catalogue PDF reached the customer, the catalogue part of the promise is kept.
 Has the promise been KEPT - did the customer actually get what was promised (the price / rate, the catalogue
 or price-list file, photos, location, sample or order details, ...)?
+Physical things (samples, goods, an order) cannot travel on WhatsApp: for those the WhatsApp promise is kept when
+their details went out - the options / price / payment request for the samples, or the dispatch / tracking details.
 A greeting, "ok", "ji sir", "I'll confirm and update you", a question back, or a message about something else
 does NOT keep it. If only part of it was sent (e.g. the price but not the catalogue), the answer is "partly".
 Messages:
