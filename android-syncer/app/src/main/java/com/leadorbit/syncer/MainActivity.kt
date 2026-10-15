@@ -18,6 +18,8 @@ import android.annotation.SuppressLint
 import android.app.NotificationManager
 import android.content.BroadcastReceiver
 import android.content.IntentFilter
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.PowerManager
 import android.view.WindowManager
@@ -83,6 +85,95 @@ class MainActivity : AppCompatActivity() {
         pendingMicRequest = null
     }
     private var proximityLock: PowerManager.WakeLock? = null
+
+    // ---- call audio routing (WhatsApp calls) ----
+    private var callRoute = "speaker"
+    private var autoRoute = true          // follow Bluetooth / wired connecting and disconnecting
+    private var inCall = false
+    private val audioDeviceCallback = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) { onRoutesChanged() }
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) { onRoutesChanged() }
+    }
+
+    private fun routeOf(type: Int): String? = when (type) {
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "bluetooth"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES, AudioDeviceInfo.TYPE_USB_HEADSET -> "wired"
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "speaker"
+        AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "earpiece"
+        else -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && type == AudioDeviceInfo.TYPE_BLE_HEADSET) "bluetooth" else null
+    }
+
+    /** Available call routes: route -> device (null device = legacy API routing). */
+    private fun availableRoutes(am: AudioManager): LinkedHashMap<String, AudioDeviceInfo?> {
+        val out = LinkedHashMap<String, AudioDeviceInfo?>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            for (d in am.availableCommunicationDevices) {
+                val r = routeOf(d.type) ?: continue
+                if (!out.containsKey(r)) out[r] = d
+            }
+        } else {
+            for (d in am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                val r = routeOf(d.type) ?: continue
+                if (!out.containsKey(r)) out[r] = null
+            }
+            out.putIfAbsent("speaker", null)
+            out.putIfAbsent("earpiece", null)
+        }
+        return out
+    }
+
+    private fun autoChoice(routes: Map<String, AudioDeviceInfo?>): String =
+        listOf("bluetooth", "wired", "speaker", "earpiece").firstOrNull { routes.containsKey(it) } ?: "speaker"
+
+    @Suppress("DEPRECATION")
+    private fun applyRoute(route: String) {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val routes = availableRoutes(am)
+        val r = if (routes.containsKey(route)) route else autoChoice(routes)
+        am.mode = AudioManager.MODE_IN_COMMUNICATION
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val dev = routes[r]
+            if (dev != null) am.setCommunicationDevice(dev)
+        } else {
+            if (r == "bluetooth") {
+                am.isSpeakerphoneOn = false
+                try { am.startBluetoothSco(); am.isBluetoothScoOn = true } catch (e: Exception) { }
+            } else {
+                try { am.stopBluetoothSco(); am.isBluetoothScoOn = false } catch (e: Exception) { }
+                am.isSpeakerphoneOn = (r == "speaker")
+            }
+        }
+        callRoute = r
+        // screen off at the ear only when the sound comes from the earpiece
+        try {
+            if (r == "earpiece") proximityLock?.let { if (!it.isHeld) it.acquire(3 * 3600 * 1000L) }
+            else proximityLock?.let { if (it.isHeld) it.release() }
+        } catch (e: Exception) { }
+        webView.evaluateJavascript("window.__waAudioRoute && window.__waAudioRoute('$r', '${routes.keys.joinToString(",")}')", null)
+    }
+
+    private fun onRoutesChanged() {
+        if (!inCall) return
+        runOnUiThread {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val routes = availableRoutes(am)
+            // like a phone app: a headset that connects takes the call; if the chosen one disappears, fall back
+            if (autoRoute || !routes.containsKey(callRoute)) applyRoute(autoChoice(routes))
+            else webView.evaluateJavascript("window.__waAudioRoute && window.__waAudioRoute('$callRoute', '${routes.keys.joinToString(",")}')", null)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun resetCallAudio() {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        try { am.unregisterAudioDeviceCallback(audioDeviceCallback) } catch (e: Exception) { }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) am.clearCommunicationDevice()
+        try { am.stopBluetoothSco(); am.isBluetoothScoOn = false } catch (e: Exception) { }
+        am.isSpeakerphoneOn = false
+        am.mode = AudioManager.MODE_NORMAL
+        inCall = false
+        autoRoute = true
+    }
     private var appSetUp = false
     private val hangupReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -246,12 +337,31 @@ class MainActivity : AppCompatActivity() {
                     OngoingCallService.stop(this@MainActivity)
                     try { proximityLock?.let { if (it.isHeld) it.release() } } catch (e: Exception) { }
                     proximityLock = null
-                    val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) am.clearCommunicationDevice()
-                    am.isSpeakerphoneOn = false
-                    am.mode = AudioManager.MODE_NORMAL
+                    resetCallAudio()
                 }
             }
+        }
+
+        /** "auto" = Bluetooth > wired > loudspeaker, following devices as they come and go. */
+        @JavascriptInterface
+        fun setAudioRoute(route: String) {
+            runOnUiThread {
+                val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                if (!inCall) {
+                    inCall = true
+                    try { am.registerAudioDeviceCallback(audioDeviceCallback, Handler(Looper.getMainLooper())) } catch (e: Exception) { }
+                }
+                autoRoute = route == "auto"
+                applyRoute(if (autoRoute) autoChoice(availableRoutes(am)) else route)
+            }
+        }
+
+        /** JSON: {"route": current, "routes": [available…]} */
+        @JavascriptInterface
+        fun audioRoutes(): String {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val routes = availableRoutes(am).keys
+            return "{\"route\":\"$callRoute\",\"routes\":[" + routes.joinToString(",") { "\"$it\"" } + "]}"
         }
 
         @JavascriptInterface
@@ -509,6 +619,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         handler.removeCallbacks(tokenCheckRunnable)
         try { unregisterReceiver(hangupReceiver) } catch (e: Exception) { }
+        if (inCall) try { resetCallAudio() } catch (e: Exception) { }
         try { proximityLock?.let { if (it.isHeld) it.release() } } catch (e: Exception) { }
     }
 }

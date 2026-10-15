@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { Phone, PhoneOff, Mic, MicOff, Volume2, Ear, MessageCircle } from "lucide-react";
+import { Phone, PhoneOff, Mic, MicOff, Volume2, Ear, MessageCircle, Bluetooth, Headphones } from "lucide-react";
 import { api, errMsg } from "@/lib/api";
 
 /**
@@ -15,6 +15,18 @@ import { api, errMsg } from "@/lib/api";
  * The conversation is recorded here and uploaded for the usual AI call summary.
  */
 const native = () => (typeof window !== "undefined" ? window.LeadOrbitNative : null);
+
+const ROUTE_LABEL = { bluetooth: "Bluetooth", wired: "Headset", speaker: "Speaker", earpiece: "Earpiece" };
+const ROUTE_ORDER = ["bluetooth", "wired", "speaker", "earpiece"];
+
+// App 2.2.2+: real audio routing (Bluetooth / headset / speaker / earpiece); older apps: speaker on/off
+function hasRouting() { return !!(native() && typeof native().setAudioRoute === "function"); }
+function startAudio() {
+  try {
+    if (hasRouting()) native().setAudioRoute("auto");
+    else native()?.setSpeaker(true);
+  } catch (e) { /* ignore */ }
+}
 
 function fmt(sec) {
   const s = Math.max(0, Math.floor(sec || 0));
@@ -67,6 +79,8 @@ export default function WaCall({ outgoing = false }) {
   const [note, setNote] = useState("");
   const [muted, setMuted] = useState(false);
   const [speaker, setSpeaker] = useState(true);
+  const [route, setRoute] = useState("speaker");
+  const [routes, setRoutes] = useState(["speaker", "earpiece"]);
   const [needTap, setNeedTap] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const pcRef = useRef(null);
@@ -267,7 +281,7 @@ export default function WaCall({ outgoing = false }) {
       setNote("");
       diagEvent("answered");
       try { native()?.callState("active", c.name || c.from || ""); } catch (e) { /* ignore */ }
-      try { native()?.setSpeaker(true); } catch (e) { /* ignore */ }
+      startAudio();
       playRemote();
       startRecording(local, remoteRef.current);
       setTimeout(() => sendDiag("8s"), 8000);
@@ -392,7 +406,7 @@ export default function WaCall({ outgoing = false }) {
             setPhase("active");
             setNote("");
             diagEvent("customer answered");
-            try { native()?.setSpeaker(true); } catch (e) { /* ignore */ }
+            startAudio();
             playRemote();
             startRecording(localRef.current, remoteRef.current);
             setTimeout(() => sendDiag("8s"), 8000);
@@ -427,6 +441,18 @@ export default function WaCall({ outgoing = false }) {
     return () => clearInterval(t);
   }, [phase, playRemote]);
 
+  // the app tells us when the audio device changes (Bluetooth connected / removed …)
+  useEffect(() => {
+    window.__waAudioRoute = (r, list) => {
+      setRoute(r);
+      setSpeaker(r === "speaker");
+      if (list) setRoutes(list.split(",").filter(Boolean));
+      diagEvent(`audio -> ${r}`);
+      playRemote();
+    };
+    return () => { delete window.__waAudioRoute; };
+  }, [playRemote]);
+
   // hang-up button on the app's "call in progress" notification
   useEffect(() => {
     window.__waCallHangup = () => hangup();
@@ -447,10 +473,18 @@ export default function WaCall({ outgoing = false }) {
     setMuted(next);
   };
   const toggleSpeaker = () => {
+    if (hasRouting()) {
+      // cycle through what is available, like a phone app's audio button
+      const avail = ROUTE_ORDER.filter((r) => routes.includes(r));
+      const next = avail[(avail.indexOf(route) + 1) % avail.length] || "speaker";
+      try { native().setAudioRoute(next); } catch (e) { /* ignore */ }
+      return;
+    }
     const next = !speaker;
     try { native()?.setSpeaker(next); } catch (e) { /* ignore */ }
     diagEvent(next ? "speaker on" : "earpiece on");
     setSpeaker(next);
+    setRoute(next ? "speaker" : "earpiece");
     playRemote();
   };
   const openChat = () => {
@@ -512,10 +546,11 @@ export default function WaCall({ outgoing = false }) {
               <span className="text-xs">{muted ? "Muted" : "Mute"}</span>
             </div>
             <div className="flex flex-col items-center gap-2">
-              <button type="button" onClick={toggleSpeaker} className={`${btn} ${speaker ? "bg-white text-[#075E54]" : "bg-white/15"}`} aria-label="Speaker">
-                {speaker ? <Volume2 className="h-6 w-6" /> : <Ear className="h-6 w-6" />}
+              <button type="button" onClick={toggleSpeaker} className={`${btn} ${route !== "earpiece" ? "bg-white text-[#075E54]" : "bg-white/15"}`} aria-label="Audio output">
+                {route === "bluetooth" ? <Bluetooth className="h-6 w-6" /> : route === "wired" ? <Headphones className="h-6 w-6" />
+                  : route === "speaker" ? <Volume2 className="h-6 w-6" /> : <Ear className="h-6 w-6" />}
               </button>
-              <span className="text-xs">{speaker ? "Speaker" : "Earpiece"}</span>
+              <span className="text-xs">{ROUTE_LABEL[route] || "Speaker"}</span>
             </div>
           </div>
           <button type="button" onClick={hangup} className={`${btn} bg-red-500`} aria-label="Hang up" data-testid="wa-call-hangup"><PhoneOff className="h-7 w-7" /></button>
