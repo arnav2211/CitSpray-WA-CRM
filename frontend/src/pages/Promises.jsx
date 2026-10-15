@@ -15,15 +15,26 @@ const STATUS = {
   missed: { label: "Not kept", cls: "bg-red-600 text-white" },
   no_window: { label: "Waiting for customer", cls: "bg-gray-200 text-gray-700" },
   kept: { label: "Kept", cls: "bg-green-100 text-green-800" },
+  kept_late: { label: "Kept late", cls: "bg-lime-200 text-lime-900" },
   dismissed: { label: "Dismissed", cls: "bg-gray-100 text-gray-500" },
   expired: { label: "Expired", cls: "bg-gray-100 text-gray-500" },
 };
 const FILTERS = [
   ["open,reminded,missed,no_window", "Pending"],
   ["missed", "Not kept"],
-  ["kept", "Kept"],
+  ["kept,kept_late", "Kept"],
+  ["kept_late", "Kept late"],
   ["", "All"],
 ];
+
+// "1 d 3 h" / "2 h 15 min" / "40 min"
+function fmtLate(min) {
+  const m = Math.max(0, Math.round(min || 0));
+  const d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60;
+  if (d) return `${d} d${h ? ` ${h} h` : ""}`;
+  if (h) return `${h} h${mm ? ` ${mm} min` : ""}`;
+  return `${mm} min`;
+}
 
 export default function Promises() {
   const { user } = useAuth();
@@ -88,7 +99,7 @@ export default function Promises() {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
         <div className="border border-gray-200 bg-white p-3"><div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Pending</div><div className="font-chivo font-black text-2xl">{pending}</div></div>
         <div className="border border-gray-200 bg-white p-3"><div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Not kept</div><div className="font-chivo font-black text-2xl text-red-600">{c.missed || 0}</div></div>
-        <div className="border border-gray-200 bg-white p-3"><div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Kept</div><div className="font-chivo font-black text-2xl text-green-700">{c.kept || 0}</div></div>
+        <div className="border border-gray-200 bg-white p-3"><div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Kept</div><div className="font-chivo font-black text-2xl text-green-700">{(c.kept || 0) + (c.kept_late || 0)}{c.kept_late ? <span className="text-xs font-bold text-lime-700 ml-2">{c.kept_late} late</span> : null}</div></div>
         <div className="border border-gray-200 bg-white p-3"><div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Waiting for customer</div><div className="font-chivo font-black text-2xl text-gray-600">{c.no_window || 0}</div></div>
       </div>
 
@@ -109,7 +120,7 @@ export default function Promises() {
         {!data.rows.length && <div className="text-sm text-gray-500 border border-dashed border-gray-300 p-6 text-center">{loading ? "Loading…" : "No promises here."}</div>}
         {data.rows.map((r) => {
           const st = STATUS[r.status] || { label: r.status, cls: "bg-gray-100" };
-          const partly = r.ai_verdict === "partly" && r.status !== "kept";
+          const partly = r.ai_verdict === "partly" && !["kept", "kept_late"].includes(r.status);
           return (
             <div key={r.id} className="border border-gray-200 bg-white p-3 space-y-1.5" data-testid={`promise-${r.id}`}>
               <div className="flex items-center justify-between gap-2 flex-wrap">
@@ -124,20 +135,28 @@ export default function Promises() {
               <div className="text-sm">Promised: <b>“{r.what}”</b> on WhatsApp</div>
               {(r.ai_reason || r.ai_missing) && (
                 <div className="text-xs text-gray-600">
-                  {r.ai_reason}{r.ai_missing && r.status !== "kept" ? <span className="text-red-600"> Missing: {r.ai_missing}</span> : null}
+                  {r.ai_reason}{r.ai_missing && !["kept", "kept_late"].includes(r.status) ? <span className="text-red-600"> Missing: {r.ai_missing}</span> : null}
                 </div>
               )}
-              {r.ai_evidence && r.status === "kept" && <div className="text-xs text-green-700">Sent: “{r.ai_evidence}”</div>}
+              {r.ai_evidence && ["kept", "kept_late"].includes(r.status) && <div className="text-xs text-green-700">Sent: “{r.ai_evidence}”</div>}
               <div className="flex items-center justify-between gap-2 flex-wrap pt-1">
                 <div className="text-[11px] text-gray-400">
-                  {r.status === "kept" && r.kept_at && <>Kept {fmtSmartLong(r.kept_at)}{r.resolved_by ? ` (marked by ${r.resolved_by})` : ""}</>}
+                  {["kept", "kept_late"].includes(r.status) && r.kept_at && (
+                    <span className={r.status === "kept_late" ? "text-lime-800 font-semibold" : ""}>
+                      {r.resolved_by ? "Marked kept" : "Sent"} {fmtSmartLong(r.kept_at)}
+                      {r.resolved_by ? ` by ${r.resolved_by}` : ""}
+                      {r.status === "kept_late"
+                        ? ` · ${fmtLate(r.late_minutes)} late (was due ${fmtSmartLong(r.due_at)})`
+                        : (!r.resolved_by ? " · on time" : "")}
+                    </span>
+                  )}
                   {["open", "reminded"].includes(r.status) && r.due_at && <>Due {fmtSmartLong(r.due_at)}</>}
                   {r.status === "missed" && r.escalated_at && <>Admin alerted {fmtSmartLong(r.escalated_at)}</>}
                   {r.status === "no_window" && <>Customer hasn't messaged in 24 h - WhatsApp doesn't allow sending until they do</>}
                 </div>
                 <div className="flex gap-1">
                   <button type="button" onClick={() => openChat(r)} className="bg-[#128C7E] text-white text-[11px] font-bold px-2 py-1 flex items-center gap-1"><ChatCircleDots size={12} /> Open chat</button>
-                  {r.status !== "kept" && r.status !== "dismissed" && (
+                  {!["kept", "kept_late", "dismissed"].includes(r.status) && (
                     <>
                       <button type="button" onClick={() => resolve(r.id, "kept")} className="border border-gray-300 text-[11px] font-bold px-2 py-1 flex items-center gap-1"><Check size={12} /> Mark kept</button>
                       {isAdmin && <button type="button" onClick={() => resolve(r.id, "dismissed")} className="border border-gray-300 text-[11px] px-2 py-1 flex items-center gap-1"><X size={12} /> Dismiss</button>}

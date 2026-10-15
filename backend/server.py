@@ -15385,7 +15385,8 @@ does NOT keep it. If only part of it was sent (e.g. the price but not the catalo
 Messages:
 {msgs}
 Reply ONLY with JSON: {{"verdict": "kept" | "partly" | "not_kept", "reason": "one short sentence in English",
-"evidence": "the message that keeps it, quoted briefly, or empty", "missing": "what is still not sent, or empty"}}"""
+"evidence": "the message that keeps it, quoted briefly, or empty", "missing": "what is still not sent, or empty",
+"kept_by": the [number] of the message that completed the promise (0 if not kept)}}"""
 
 
 async def _promise_verdict(pr: dict, now: datetime) -> Optional[dict]:
@@ -15403,7 +15404,7 @@ async def _promise_verdict(pr: dict, now: datetime) -> Optional[dict]:
     last_at = msgs[-1].get("at")
     if pr.get("judged_upto") == last_at and pr.get("ai_verdict"):
         return {"verdict": pr["ai_verdict"], "reason": pr.get("ai_reason"), "evidence": pr.get("ai_evidence"),
-                "missing": pr.get("ai_missing"), "cached": True}
+                "missing": pr.get("ai_missing"), "kept_at": pr.get("ai_kept_at") or last_at, "cached": True}
     # one worker judges (the tracker runs in every gunicorn worker)
     claim = await db.call_promises.update_one(
         {"id": pr["id"], "$or": [{"judging_until": {"$exists": False}}, {"judging_until": {"$lt": iso(now)}}]},
@@ -15415,8 +15416,8 @@ async def _promise_verdict(pr: dict, now: datetime) -> Optional[dict]:
         cl = await db.call_logs.find_one({"id": pr["call_log_id"]}, {"_id": 0, "ai_summary.summary": 1, "ai_summary.next_step": 1})
         ai = (cl or {}).get("ai_summary") or {}
         ctx = " ".join(x for x in (ai.get("summary"), ("Next step: " + ai["next_step"]) if ai.get("next_step") else "") if x)
-    lines = [f"- {((_parse_call_dt(m.get('at')) or now) + timedelta(hours=5, minutes=30)).strftime('%d %b %H:%M')}: "
-             f"{_promise_msg_line(m)}" for m in msgs]
+    lines = [f"[{i}] {((_parse_call_dt(m.get('at')) or now) + timedelta(hours=5, minutes=30)).strftime('%d %b %H:%M')}: "
+             f"{_promise_msg_line(m)}" for i, m in enumerate(msgs, 1)]
     prompt = _PROMISE_JUDGE_PROMPT.format(what=pr["what"], context=(ctx or "(no summary)")[:1500], msgs="\n".join(lines))
     try:
         raw = await _gemini_generate(prompt, temperature=0.1, max_output_tokens=400, json_mode=True, per_model_timeout=20.0)
@@ -15428,11 +15429,18 @@ async def _promise_verdict(pr: dict, now: datetime) -> Optional[dict]:
     verdict = v.get("verdict") if v.get("verdict") in ("kept", "partly", "not_kept") else "not_kept"
     out = {"verdict": verdict, "reason": _ai_txt(v.get("reason"), 300), "evidence": _ai_txt(v.get("evidence"), 300),
            "missing": _ai_txt(v.get("missing"), 200)}
+    kept_at = None
+    if verdict == "kept":
+        try:
+            idx = int(v.get("kept_by") or 0)
+        except Exception:
+            idx = 0
+        # the time of the message that actually kept it (not just the newest message)
+        kept_at = msgs[idx - 1].get("at") if 1 <= idx <= len(msgs) else last_at
+        out["kept_at"] = kept_at
     await db.call_promises.update_one({"id": pr["id"]}, {"$set": {
         "ai_verdict": verdict, "ai_reason": out["reason"], "ai_evidence": out["evidence"], "ai_missing": out["missing"],
-        "judged_upto": last_at, "judged_at": iso(now), "judging_until": iso(now)}})
-    if verdict == "kept":
-        out["kept_at"] = last_at
+        "ai_kept_at": kept_at, "judged_upto": last_at, "judged_at": iso(now), "judging_until": iso(now)}})
     return out
 
 
@@ -15470,6 +15478,8 @@ async def promise_tracker_task():
     try:
         now = now_utc()
         q = {"$or": [{"status": {"$in": ["open", "reminded", "no_window"]}},
+                     # missed ones keep being checked: sent later = "kept late"
+                     {"status": "missed", "created_at": {"$gte": iso(now - timedelta(days=14))}},
                      # kept by the old "any message counts" rule: check once what was really sent
                      {"status": "kept", "verified": {"$ne": True}, "created_at": {"$gte": iso(now - timedelta(days=3))}}]}
         async for pr in db.call_promises.find(q, {"_id": 0}).limit(300):
@@ -15480,12 +15490,21 @@ async def promise_tracker_task():
                 if pr["status"] == "kept":
                     await db.call_promises.update_one({"id": pr["id"]}, {"$set": {"verified": True}})
                     continue
+                kept_at = v.get("kept_at") or iso(now)
+                k_dt, due_dt = _parse_call_dt(kept_at), _parse_call_dt(pr.get("due_at"))
+                late_min = int((k_dt - due_dt).total_seconds() // 60) if k_dt and due_dt else 0
+                late = pr["status"] == "missed" or late_min > 0
                 res = await db.call_promises.update_one({"id": pr["id"], "status": pr["status"]},
-                                                        {"$set": {"status": "kept", "verified": True,
-                                                                  "kept_at": v.get("kept_at") or iso(now)}})
+                                                        {"$set": {"status": "kept_late" if late else "kept", "verified": True,
+                                                                  "kept_at": kept_at, "late_minutes": max(0, late_min)}})
                 if res.modified_count:
                     await _promise_close_followups(pr, now)
+                    if pr["status"] == "missed":
+                        await db.admin_alerts.update_many({"meta.dedup_key": f"promise:{pr['id']}"},
+                                                          {"$set": {"cancelled": True, "cancel_reason": "kept late"}})
                 continue
+            if pr["status"] == "missed":
+                continue                  # still not sent - nothing more to do
             if pr["status"] == "kept":
                 # it was NOT really kept: back into tracking
                 await db.call_promises.update_one({"id": pr["id"], "status": "kept"},
@@ -15669,7 +15688,7 @@ async def _ai_report_data(start: datetime, end: datetime, only_user: Optional[st
     async for pr in db.call_promises.find(pq, {"_id": 0, "exec_id": 1, "status": 1}):
         p = P(pr.get("exec_id")); p["promises"] += 1
         st = pr.get("status")
-        p["promises_kept" if st == "kept" else "promises_missed" if st == "missed" else "promises_open"] += 1
+        p["promises_kept" if st in ("kept", "kept_late") else "promises_missed" if st == "missed" else "promises_open"] += 1
     tq: Dict[str, Any] = {"created_at": {"$gte": S, "$lt": E}}
     if only_user:
         tq["participants"] = only_user
