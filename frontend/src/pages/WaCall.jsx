@@ -21,10 +21,19 @@ const ROUTE_ORDER = ["bluetooth", "wired", "speaker", "earpiece"];
 
 // App 2.2.2+: real audio routing (Bluetooth / headset / speaker / earpiece); older apps: speaker on/off
 function hasRouting() { return !!(native() && typeof native().setAudioRoute === "function"); }
+// Like a phone call: Bluetooth headset / car if connected, else wired earphones, else the EARPIECE
+function preferredRoute(list) {
+  if (list.includes("bluetooth")) return "bluetooth";
+  if (list.includes("wired")) return "wired";
+  return "earpiece";
+}
 function startAudio() {
   try {
-    if (hasRouting()) native().setAudioRoute("auto");
-    else native()?.setSpeaker(true);
+    if (hasRouting()) {
+      let list = [];
+      try { list = JSON.parse(native().audioRoutes()).routes || []; } catch (e) { /* ignore */ }
+      native().setAudioRoute(preferredRoute(list));
+    } else native()?.setSpeaker(false);
   } catch (e) { /* ignore */ }
 }
 
@@ -78,8 +87,9 @@ export default function WaCall({ outgoing = false }) {
   const [phase, setPhase] = useState("loading"); // loading | ringing | connecting | active | ended | gone | error
   const [note, setNote] = useState("");
   const [muted, setMuted] = useState(false);
-  const [speaker, setSpeaker] = useState(true);
-  const [route, setRoute] = useState("speaker");
+  const [speaker, setSpeaker] = useState(false);
+  const [route, setRoute] = useState("earpiece");
+  const userChoseRef = useRef(false);     // tapped the audio button -> stop auto-following devices
   const [routes, setRoutes] = useState(["speaker", "earpiece"]);
   const [needTap, setNeedTap] = useState(false);
   const [elapsed, setElapsed] = useState(0);
@@ -444,11 +454,17 @@ export default function WaCall({ outgoing = false }) {
   // the app tells us when the audio device changes (Bluetooth connected / removed …)
   useEffect(() => {
     window.__waAudioRoute = (r, list) => {
+      const avail = (list || "").split(",").filter(Boolean);
       setRoute(r);
       setSpeaker(r === "speaker");
-      if (list) setRoutes(list.split(",").filter(Boolean));
+      if (avail.length) setRoutes(avail);
       diagEvent(`audio -> ${r}`);
       playRemote();
+      // until the user picks an output: Bluetooth connecting takes the call, otherwise earpiece
+      if (!userChoseRef.current && avail.length) {
+        const want = preferredRoute(avail);
+        if (want !== r) { try { native().setAudioRoute(want); } catch (e) { /* ignore */ } }
+      }
     };
     return () => { delete window.__waAudioRoute; };
   }, [playRemote]);
@@ -473,6 +489,7 @@ export default function WaCall({ outgoing = false }) {
     setMuted(next);
   };
   const toggleSpeaker = () => {
+    userChoseRef.current = true;
     if (hasRouting()) {
       // cycle through what is available, like a phone app's audio button
       const avail = ROUTE_ORDER.filter((r) => routes.includes(r));
