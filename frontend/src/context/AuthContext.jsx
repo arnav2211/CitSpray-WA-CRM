@@ -4,6 +4,27 @@ import { toast } from "sonner";
 
 const AuthContext = createContext(null);
 
+// The LeadOrbit Android app reads localStorage "token" + "user" to run its background
+// connection (WhatsApp call rings, alerts, follow-ups) while the app is closed.
+// Inside the app the 12 h web login is swapped for a 45-day app login so the phone
+// keeps ringing overnight; logout still ends it.
+const IN_ANDROID_APP = typeof navigator !== "undefined" && /; wv\)/.test(navigator.userAgent || "");
+
+async function syncAppSession(u) {
+  if (!u || !u.id) return;
+  try { localStorage.setItem("user", JSON.stringify({ id: u.id, name: u.name || "" })); } catch (e) { /* ignore */ }
+  if (!IN_ANDROID_APP) return;
+  try {
+    const t = localStorage.getItem("token");
+    if (!t) return;
+    const part = t.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const exp = (JSON.parse(atob(part)).exp || 0) * 1000;
+    if (exp - Date.now() > 7 * 24 * 3600 * 1000) return;   // already a long app login
+    const { data } = await api.post("/auth/app-token");
+    if (data?.token) localStorage.setItem("token", data.token);
+  } catch (e) { /* keep the normal login */ }
+}
+
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null); // null = loading, false = anon
   const [error, setError] = useState("");
@@ -14,6 +35,7 @@ export function AuthProvider({ children }) {
     try {
       const { data } = await api.get("/auth/me");
       setUser(data);
+      syncAppSession(data);
       setAttendanceLocked(false);
     } catch {
       setUser(false);
@@ -75,6 +97,7 @@ export function AuthProvider({ children }) {
       const { data } = await api.post("/auth/login", { username, password });
       localStorage.setItem("token", data.token);
       setUser(data.user);
+      syncAppSession(data.user);
       setAttendanceLocked(false);
       return true;
     } catch (e) {
@@ -94,6 +117,7 @@ export function AuthProvider({ children }) {
   const logout = async () => {
     try { await api.post("/auth/logout"); } catch { /* ignore */ }
     localStorage.removeItem("token");
+    localStorage.removeItem("user");
     setUser(false);
     setAttendanceLocked(false);
   };

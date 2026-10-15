@@ -821,6 +821,23 @@ async def logout(response: Response):
 async def me(user: dict = Depends(get_current_user)):
     return user
 
+
+APP_TOKEN_DAYS = 45
+
+
+@api.post("/auth/app-token")
+async def app_token(request: Request, user: dict = Depends(get_current_user)):
+    """Long-lived login for the LeadOrbit Android app (its WebView), so the app's
+    background connection keeps receiving WhatsApp call rings / alerts while the app
+    is closed for days. Logout and 'log out all devices' (token_version) still end it."""
+    ua = request.headers.get("user-agent", "")
+    if "; wv)" not in ua and "LeadOrbit" not in ua:
+        raise HTTPException(status_code=403, detail="Only for the LeadOrbit app")
+    payload = {"sub": user["id"], "username": user.get("username"), "role": user.get("role"),
+               "exp": now_utc() + timedelta(days=APP_TOKEN_DAYS), "type": "access", "app": True,
+               "token_version": user.get("token_version", 0)}
+    return {"token": jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM), "days": APP_TOKEN_DAYS}
+
 # ------------- Users management -------------
 @api.get("/users")
 async def list_users(user: dict = Depends(get_current_user), include_former: bool = False):
