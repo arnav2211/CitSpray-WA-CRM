@@ -16122,6 +16122,14 @@ async def _wa_call_event(company: str, wc: dict, phone_number_id: Optional[str],
         if c.get("call_log_id"):
             if dur:
                 await db.call_logs.update_one({"id": c["call_log_id"]}, {"$set": {"duration_seconds": dur, "call_end_at": iso(now_utc())}})
+        elif c.get("lead_id") and c.get("direction") == "outgoing" and dur:
+            start = iso(now_utc() - timedelta(seconds=dur))
+            log_id = str(uuid.uuid4())
+            await db.call_logs.insert_one({
+                "id": log_id, "lead_id": c["lead_id"], "phone": c.get("from"), "outcome": "connected", "summary": "WhatsApp call",
+                "by_user_id": c.get("answered_by"), "by_user_name": c.get("answered_by_name"), "at": start, "call_start_at": start,
+                "duration_seconds": dur, "direction": "outgoing", "channel": "whatsapp", "synced_from_app": True, "wa_call_id": call_id})
+            await db.wa_calls.update_one({"id": call_id}, {"$set": {"call_log_id": log_id}})
         elif c.get("lead_id") and c.get("direction") == "outgoing":
             await db.call_logs.insert_one({
                 "id": str(uuid.uuid4()), "lead_id": c["lead_id"], "phone": c.get("from"), "outcome": "no_response",
@@ -16357,11 +16365,20 @@ async def start_wa_outgoing_call(body: WaOutgoingInput, user: dict = Depends(get
 
 
 async def _wa_outgoing_connected(call_id: str, answer_sdp: Optional[str]) -> None:
+    """Meta's connect webhook for OUR call = the media path is ready (answer SDP); the
+    customer's phone may still be ringing. Answered = the ACCEPTED status."""
+    await db.wa_calls.update_one({"id": call_id}, {"$set": {"answer_sdp": answer_sdp, "media_ready_at": iso(now_utc())}})
+    await db.wa_calls.update_one({"id": call_id, "status": "dialing"}, {"$set": {"status": "ringing_remote"}})
+    logger.info(f"wa-call: outgoing {call_id[-10:]} media ready")
+
+
+async def _wa_outgoing_answered(call_id: str, how: str) -> None:
     c = await db.wa_calls.find_one_and_update({"id": call_id, "status": {"$in": ["dialing", "ringing_remote"]}},
-                                              {"$set": {"status": "active", "answer_sdp": answer_sdp, "accepted_at": iso(now_utc())}},
+                                              {"$set": {"status": "active", "accepted_at": iso(now_utc()), "answered_how": how}},
                                               return_document=True, projection={"_id": 0})
     if not c or not c.get("lead_id"):
         return
+    logger.info(f"wa-call: outgoing {call_id[-10:]} answered ({how})")
     log_id = str(uuid.uuid4())
     await db.call_logs.insert_one({
         "id": log_id, "lead_id": c["lead_id"], "phone": c.get("from"), "outcome": "connected", "summary": "WhatsApp call",
@@ -16376,6 +16393,11 @@ async def _wa_outgoing_connected(call_id: str, answer_sdp: Optional[str]) -> Non
 
 async def _wa_call_status(st: dict) -> None:
     s = (st.get("status") or "").upper()
+    logger.info(f"wa-call: status {s} for {str(st.get('id'))[-10:]}")
+    await db.wa_calls.update_one({"id": st.get("id")}, {"$push": {"status_log": {"status": s, "at": iso(now_utc())}}})
+    if s == "ACCEPTED":
+        await _wa_outgoing_answered(st.get("id"), "accepted")
+        return
     if s == "RINGING":
         await db.wa_calls.update_one({"id": st.get("id"), "status": "dialing"}, {"$set": {"status": "ringing_remote"}})
     elif s == "REJECTED":
@@ -16546,6 +16568,28 @@ async def accept_wa_call(call_id: str, body: WaCallAnswerInput, user: dict = Dep
     others = [u for u in (c.get("ring_to") or []) if u != user["id"]]
     await _wa_call_push(others, {"type": "wa_call", "action": "clear", "call_id": call_id, "reason": f"answered by {user.get('name')}"})
     return {"ok": True, "accepted_at": now, "phone": c.get("from"), "lead_id": c.get("lead_id")}
+
+
+@api.post("/wa-calls/{call_id}/client-answered")
+async def wa_call_client_answered(call_id: str, user: dict = Depends(get_current_user)):
+    """The caller's app hears the customer's voice before Meta's ACCEPTED arrived."""
+    c = await db.wa_calls.find_one({"id": call_id}, {"_id": 0, "answered_by": 1, "direction": 1})
+    if not c or c.get("direction") != "outgoing" or c.get("answered_by") != user["id"]:
+        raise HTTPException(status_code=404, detail="Call not found")
+    await _wa_outgoing_answered(call_id, "voice")
+    return {"ok": True}
+
+
+@api.post("/wa-calls/{call_id}/diag")
+async def wa_call_diag(call_id: str, body: dict, user: dict = Depends(get_current_user)):
+    """What audio the app actually sent / received during the call (for checking problems)."""
+    body = {k: v for k, v in (body or {}).items() if k in (
+        "label", "at", "phase", "speaker", "muted", "audio_paused", "play_errors", "events", "ua", "connection", "ice",
+        "in_bytes", "in_packets", "in_lost", "in_energy", "in_level", "out_bytes", "out_packets", "mic_energy", "mic_level",
+        "pair_state", "rtt", "stats_error")}
+    body["user"] = user.get("name")
+    await db.wa_calls.update_one({"id": call_id}, {"$push": {"diag": {"$each": [body], "$slice": -10}}})
+    return {"ok": True}
 
 
 @api.post("/wa-calls/{call_id}/hangup")

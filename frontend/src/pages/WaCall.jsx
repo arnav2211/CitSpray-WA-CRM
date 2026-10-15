@@ -4,17 +4,58 @@ import { Phone, PhoneOff, Mic, MicOff, Volume2, Ear, MessageCircle } from "lucid
 import { api, errMsg } from "@/lib/api";
 
 /**
- * Incoming WhatsApp call (Cloud API Calling) answered inside the LeadOrbit app.
- * Meta sends the caller's WebRTC offer; this page builds the answer, the server
- * accepts it with Meta, and the voice flows browser <-> WhatsApp directly.
+ * WhatsApp call (Cloud API Calling) inside the LeadOrbit app.
+ * Incoming: Meta sends the caller's WebRTC offer; this page answers it.
+ * Outgoing (admin-approved): we send an offer; Meta returns the answer at once (media
+ * path ready) but the customer has only ANSWERED when the ACCEPTED status arrives -
+ * until then the screen says "Ringing…" with a ringback tone and no timer.
+ * Audio plays on the loudspeaker by default (Earpiece button to switch); if the phone
+ * blocks playback a big "Tap to hear" button appears. Every call reports what audio was
+ * sent / received (diagnostics) so problems can be checked afterwards.
  * The conversation is recorded here and uploaded for the usual AI call summary.
- * Incoming only: there is no way to place a WhatsApp call from the CRM.
  */
 const native = () => (typeof window !== "undefined" ? window.LeadOrbitNative : null);
 
 function fmt(sec) {
   const s = Math.max(0, Math.floor(sec || 0));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+// Indian ringback: 400 Hz, 0.4 s on / 0.2 s off / 0.4 s on / 2 s off
+function makeRingback() {
+  let ctx = null;
+  let timer = null;
+  const beep = (at, len) => {
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.frequency.value = 400;
+    g.gain.setValueAtTime(0.0001, at);
+    g.gain.exponentialRampToValueAtTime(0.18, at + 0.02);
+    g.gain.setValueAtTime(0.18, at + len - 0.03);
+    g.gain.exponentialRampToValueAtTime(0.0001, at + len);
+    o.connect(g).connect(ctx.destination);
+    o.start(at);
+    o.stop(at + len + 0.02);
+  };
+  return {
+    start() {
+      if (timer) return;
+      try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        ctx = ctx || new Ctx();
+        ctx.resume?.();
+        const cycle = () => { const t = ctx.currentTime + 0.05; beep(t, 0.4); beep(t + 0.6, 0.4); };
+        cycle();
+        timer = setInterval(cycle, 3000);
+      } catch (e) { /* no tone - not critical */ }
+    },
+    stop() {
+      if (timer) clearInterval(timer);
+      timer = null;
+      try { ctx && ctx.close(); } catch (e) { /* ignore */ }
+      ctx = null;
+    },
+  };
 }
 
 export default function WaCall({ outgoing = false }) {
@@ -25,7 +66,8 @@ export default function WaCall({ outgoing = false }) {
   const [phase, setPhase] = useState("loading"); // loading | ringing | connecting | active | ended | gone | error
   const [note, setNote] = useState("");
   const [muted, setMuted] = useState(false);
-  const [speaker, setSpeaker] = useState(false);
+  const [speaker, setSpeaker] = useState(true);
+  const [needTap, setNeedTap] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const pcRef = useRef(null);
   const localRef = useRef(null);
@@ -36,7 +78,68 @@ export default function WaCall({ outgoing = false }) {
   const startedMsRef = useRef(0);
   const phaseRef = useRef(phase);
   const autoTried = useRef(false);
+  const ringbackRef = useRef(null);
+  const diagRef = useRef({ playErrors: [], events: [] });
+  const idRef = useRef(id);
   phaseRef.current = phase;
+  idRef.current = id;
+
+  const diagEvent = (e) => { diagRef.current.events.push(`${new Date().toISOString().slice(11, 19)} ${e}`); };
+
+  const playRemote = useCallback(() => {
+    const el = audioRef.current;
+    if (!el || !remoteRef.current) return;
+    if (el.srcObject !== remoteRef.current) el.srcObject = remoteRef.current;
+    el.muted = false;
+    el.volume = 1;
+    const p = el.play();
+    if (p && p.then) {
+      p.then(() => setNeedTap(false)).catch((err) => {
+        diagRef.current.playErrors.push(String(err?.name || err));
+        setNeedTap(true);
+      });
+    }
+  }, []);
+
+  // what audio actually flowed - sent to the server for checking problems later
+  const collectStats = useCallback(async () => {
+    const pc = pcRef.current;
+    const out = {
+      at: new Date().toISOString(), phase: phaseRef.current, speaker, muted,
+      audio_paused: audioRef.current ? audioRef.current.paused : null,
+      play_errors: diagRef.current.playErrors.slice(-3), events: diagRef.current.events.slice(-12),
+      ua: navigator.userAgent.slice(0, 160),
+    };
+    if (pc) {
+      out.connection = pc.connectionState;
+      out.ice = pc.iceConnectionState;
+      try {
+        const stats = await pc.getStats();
+        stats.forEach((r) => {
+          if (r.type === "inbound-rtp" && (r.kind === "audio" || r.mediaType === "audio")) {
+            out.in_bytes = r.bytesReceived; out.in_packets = r.packetsReceived; out.in_lost = r.packetsLost;
+            out.in_energy = r.totalAudioEnergy; out.in_level = r.audioLevel;
+          }
+          if (r.type === "outbound-rtp" && (r.kind === "audio" || r.mediaType === "audio")) {
+            out.out_bytes = r.bytesSent; out.out_packets = r.packetsSent;
+          }
+          if (r.type === "media-source" && r.kind === "audio") { out.mic_energy = r.totalAudioEnergy; out.mic_level = r.audioLevel; }
+          if (r.type === "candidate-pair" && r.nominated) { out.pair_state = r.state; out.rtt = r.currentRoundTripTime; }
+        });
+      } catch (e) { out.stats_error = String(e); }
+    }
+    return out;
+  }, [speaker, muted]);
+
+  const sendDiag = useCallback(async (label) => {
+    const cid = idRef.current;
+    if (!cid) return;
+    try {
+      const d = await collectStats();
+      d.label = label;
+      await api.post(`/wa-calls/${cid}/diag`, d);
+    } catch (e) { /* diagnostics are best-effort */ }
+  }, [collectStats]);
 
   const load = useCallback(async () => {
     if (!id) return null;
@@ -69,6 +172,9 @@ export default function WaCall({ outgoing = false }) {
 
   const cleanup = useCallback((reason) => {
     if (phaseRef.current === "ended" || phaseRef.current === "gone") return;
+    ringbackRef.current?.stop();
+    diagEvent(`end: ${reason || ""}`);
+    sendDiag("end");
     const seconds = startedMsRef.current ? (Date.now() - startedMsRef.current) / 1000 : 0;
     const r = recRef.current;
     const c = call;
@@ -80,13 +186,16 @@ export default function WaCall({ outgoing = false }) {
       };
       try { r.recorder.stop(); } catch (e) { /* ignore */ }
     }
-    try { pcRef.current && pcRef.current.close(); } catch (e) { /* ignore */ }
+    setTimeout(() => {
+      try { pcRef.current && pcRef.current.close(); } catch (e) { /* ignore */ }
+      pcRef.current = null;
+    }, 400);   // let the final diagnostics read the stats first
     try { localRef.current && localRef.current.getTracks().forEach((t) => t.stop()); } catch (e) { /* ignore */ }
-    pcRef.current = null;
     try { native()?.callState("ended", ""); } catch (e) { /* ignore */ }
     setPhase(startedMsRef.current ? "ended" : "gone");
+    setNeedTap(false);
     if (reason) setNote(reason);
-  }, [call, uploadRecording]);
+  }, [call, uploadRecording, sendDiag]);
 
   const startRecording = (local, remote) => {
     try {
@@ -105,6 +214,36 @@ export default function WaCall({ outgoing = false }) {
     }
   };
 
+  const newPeer = (local) => {
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+    pcRef.current = pc;
+    local.getTracks().forEach((t) => pc.addTrack(t, local));
+    const remote = new MediaStream();
+    remoteRef.current = remote;
+    pc.ontrack = (ev) => {
+      ev.streams[0] ? ev.streams[0].getTracks().forEach((t) => remote.addTrack(t)) : remote.addTrack(ev.track);
+      diagEvent("remote track");
+      playRemote();
+    };
+    pc.onconnectionstatechange = () => {
+      diagEvent(`connection ${pc.connectionState}`);
+      if (pc.connectionState === "connected") playRemote();
+      if (["failed", "closed"].includes(pc.connectionState) && phaseRef.current === "active") {
+        if (idRef.current) api.post(`/wa-calls/${idRef.current}/hangup`).catch(() => {});
+        cleanup("Connection lost");
+      }
+    };
+    return pc;
+  };
+
+  const gatherIce = (pc) => new Promise((resolve) => {
+    if (pc.iceGatheringState === "complete") return resolve();
+    const t = setTimeout(resolve, 2500);
+    pc.onicegatheringstatechange = () => {
+      if (pc.iceGatheringState === "complete") { clearTimeout(t); resolve(); }
+    };
+  });
+
   const answer = useCallback(async () => {
     if (phaseRef.current !== "ringing") return;
     const c = call;
@@ -116,41 +255,22 @@ export default function WaCall({ outgoing = false }) {
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
       localRef.current = local;
-      const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
-      pcRef.current = pc;
-      local.getTracks().forEach((t) => pc.addTrack(t, local));
-      const remote = new MediaStream();
-      pc.ontrack = (ev) => {
-        ev.streams[0] ? ev.streams[0].getTracks().forEach((t) => remote.addTrack(t)) : remote.addTrack(ev.track);
-        if (audioRef.current) {
-          audioRef.current.srcObject = remote;
-          audioRef.current.play().catch(() => {});
-        }
-      };
-      pc.onconnectionstatechange = () => {
-        if (["failed", "closed"].includes(pc.connectionState) && phaseRef.current === "active") {
-          api.post(`/wa-calls/${id}/hangup`).catch(() => {});
-          cleanup("Connection lost");
-        }
-      };
+      const pc = newPeer(local);
       await pc.setRemoteDescription({ type: "offer", sdp: c.offer_sdp });
       const ans = await pc.createAnswer();
       await pc.setLocalDescription(ans);
-      await new Promise((resolve) => {
-        if (pc.iceGatheringState === "complete") return resolve();
-        const t = setTimeout(resolve, 2500);
-        pc.onicegatheringstatechange = () => {
-          if (pc.iceGatheringState === "complete") { clearTimeout(t); resolve(); }
-        };
-      });
+      await gatherIce(pc);
       const { data } = await api.post(`/wa-calls/${id}/accept`, { sdp: pc.localDescription.sdp });
       acceptedAtRef.current = data.accepted_at;
       startedMsRef.current = Date.now();
       setPhase("active");
       setNote("");
+      diagEvent("answered");
       try { native()?.callState("active", c.name || c.from || ""); } catch (e) { /* ignore */ }
-      try { native()?.setSpeaker(false); } catch (e) { /* ignore */ }
-      startRecording(local, remote);
+      try { native()?.setSpeaker(true); } catch (e) { /* ignore */ }
+      playRemote();
+      startRecording(local, remoteRef.current);
+      setTimeout(() => sendDiag("8s"), 8000);
     } catch (e) {
       try { pcRef.current && pcRef.current.close(); } catch (er) { /* ignore */ }
       try { localRef.current && localRef.current.getTracks().forEach((t) => t.stop()); } catch (er) { /* ignore */ }
@@ -159,6 +279,7 @@ export default function WaCall({ outgoing = false }) {
       setNote(msg);
       try { native()?.callState("ended", ""); } catch (er) { /* ignore */ }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [call, id, cleanup]);
 
   // OUTGOING (admin-approved): our offer -> Meta rings the customer -> their answer arrives by webhook
@@ -173,32 +294,20 @@ export default function WaCall({ outgoing = false }) {
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
       localRef.current = local;
-      const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
-      pcRef.current = pc;
-      local.getTracks().forEach((t) => pc.addTrack(t, local));
-      const remote = new MediaStream();
-      remoteRef.current = remote;
-      pc.ontrack = (ev) => {
-        ev.streams[0] ? ev.streams[0].getTracks().forEach((t) => remote.addTrack(t)) : remote.addTrack(ev.track);
-        if (audioRef.current) {
-          audioRef.current.srcObject = remote;
-          audioRef.current.play().catch(() => {});
-        }
-      };
+      const pc = newPeer(local);
       const offer = await pc.createOffer({ offerToReceiveAudio: true });
       await pc.setLocalDescription(offer);
-      await new Promise((resolve) => {
-        if (pc.iceGatheringState === "complete") return resolve();
-        const t = setTimeout(resolve, 2500);
-        pc.onicegatheringstatechange = () => {
-          if (pc.iceGatheringState === "complete") { clearTimeout(t); resolve(); }
-        };
-      });
+      await gatherIce(pc);
       const { data } = await api.post("/wa-calls/outgoing", { lead_id: leadId, sdp: pc.localDescription.sdp });
       setId(data.call_id);
+      idRef.current = data.call_id;
+      diagEvent("dialled");
+      setNote("Ringing…");
+      if (!ringbackRef.current) ringbackRef.current = makeRingback();
+      ringbackRef.current.start();
       try { native()?.callState("active", base.name || base.from || ""); } catch (e) { /* ignore */ }
-      try { native()?.setSpeaker(false); } catch (e) { /* ignore */ }
     } catch (e) {
+      ringbackRef.current?.stop();
       try { pcRef.current && pcRef.current.close(); } catch (er) { /* ignore */ }
       try { localRef.current && localRef.current.getTracks().forEach((t) => t.stop()); } catch (er) { /* ignore */ }
       const d = e?.response?.data?.detail;
@@ -209,6 +318,7 @@ export default function WaCall({ outgoing = false }) {
       setNote(msg);
       try { native()?.callState("ended", ""); } catch (er) { /* ignore */ }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [leadId]);
 
   const hangup = useCallback(() => {
@@ -249,27 +359,51 @@ export default function WaCall({ outgoing = false }) {
     }
   }, [phase, params, answer, outgoing]);
 
-  // follow the call's status (caller hung up, someone else answered, …)
+  // follow the call's status (caller hung up, someone else answered, customer picked up, …)
   useEffect(() => {
     if (!id || !["ringing", "connecting", "active"].includes(phase)) return undefined;
     const t = setInterval(async () => {
       try {
         const { data } = await api.get(`/wa-calls/${id}`);
         if (outgoing && phaseRef.current === "connecting") {
-          if (data.status === "ringing_remote") setNote("Ringing…");
-          if (data.status === "active" && data.answer_sdp && pcRef.current && !pcRef.current.remoteDescription) {
+          // Meta's answer = the media path; apply it at once so audio flows the moment they pick up
+          if (data.answer_sdp && pcRef.current && !pcRef.current.remoteDescription) {
             await pcRef.current.setRemoteDescription({ type: "answer", sdp: data.answer_sdp });
-            acceptedAtRef.current = data.accepted_at;
+            diagEvent("answer sdp applied");
+          }
+          // fallback if Meta's ACCEPTED is late: the customer's voice is actually arriving
+          let voice = false;
+          if (pcRef.current && pcRef.current.remoteDescription && data.status !== "active") {
+            try {
+              const st = await pcRef.current.getStats();
+              st.forEach((r) => {
+                if (r.type === "inbound-rtp" && (r.kind === "audio" || r.mediaType === "audio") && (r.totalAudioEnergy || 0) > 0.02) voice = true;
+              });
+            } catch (e) { /* ignore */ }
+            if (voice) {
+              diagEvent("voice detected before ACCEPTED");
+              api.post(`/wa-calls/${id}/client-answered`).catch(() => {});
+            }
+          }
+          if (data.status === "active" || voice) {  // ACCEPTED (or their voice): the customer really answered
+            ringbackRef.current?.stop();
+            acceptedAtRef.current = data.accepted_at || new Date().toISOString();
             startedMsRef.current = Date.now();
             setPhase("active");
             setNote("");
+            diagEvent("customer answered");
+            try { native()?.setSpeaker(true); } catch (e) { /* ignore */ }
+            playRemote();
             startRecording(localRef.current, remoteRef.current);
+            setTimeout(() => sendDiag("8s"), 8000);
             return;
           }
           if (data.status === "rejected") { cleanup("Customer declined the call"); return; }
           if (data.status === "ended" || data.status === "failed") { cleanup("Not answered"); return; }
           return;
         }
+        // the server's answer time (matches the call log, so the recording's AI summary attaches to it)
+        if (data.accepted_at) acceptedAtRef.current = data.accepted_at;
         if (data.status === "ended" || data.status === "rejected" || data.status === "failed") {
           if (phaseRef.current === "ringing") { setPhase("gone"); setNote("Caller hung up"); }
           else cleanup("Call ended");
@@ -283,12 +417,15 @@ export default function WaCall({ outgoing = false }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase, id, cleanup, outgoing]);
 
-  // timer
+  // timer + make sure the customer's audio keeps playing
   useEffect(() => {
     if (phase !== "active") return undefined;
-    const t = setInterval(() => setElapsed((Date.now() - startedMsRef.current) / 1000), 500);
+    const t = setInterval(() => {
+      setElapsed((Date.now() - startedMsRef.current) / 1000);
+      if (audioRef.current && remoteRef.current && audioRef.current.paused) playRemote();
+    }, 1000);
     return () => clearInterval(t);
-  }, [phase]);
+  }, [phase, playRemote]);
 
   // hang-up button on the app's "call in progress" notification
   useEffect(() => {
@@ -298,6 +435,7 @@ export default function WaCall({ outgoing = false }) {
 
   // leaving the page ends the call
   useEffect(() => () => {
+    ringbackRef.current?.stop();
     if (id && (phaseRef.current === "active" || phaseRef.current === "connecting")) {
       api.post(`/wa-calls/${id}/hangup`).catch(() => {});
     }
@@ -311,7 +449,9 @@ export default function WaCall({ outgoing = false }) {
   const toggleSpeaker = () => {
     const next = !speaker;
     try { native()?.setSpeaker(next); } catch (e) { /* ignore */ }
+    diagEvent(next ? "speaker on" : "earpiece on");
     setSpeaker(next);
+    playRemote();
   };
   const openChat = () => {
     if (!call?.lead_id) return;
@@ -341,6 +481,12 @@ export default function WaCall({ outgoing = false }) {
           {(phase === "ended" || phase === "gone" || phase === "error") && (note || "Call ended")}
           {phase === "loading" && "Loading…"}
         </div>
+        {needTap && phase === "active" && (
+          <button type="button" onClick={playRemote} data-testid="wa-call-tap-to-hear"
+            className="mt-4 rounded-full bg-yellow-400 text-black font-bold px-6 py-3 shadow-lg animate-pulse">
+            🔊 Tap to hear the customer
+          </button>
+        )}
       </div>
 
       {phase === "ringing" && (
