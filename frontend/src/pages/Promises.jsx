@@ -59,13 +59,13 @@ export default function Promises() {
       load();
     } catch (e) { toast.error(errMsg(e)); }
   };
+  // Opens the chat in a NEW TAB so the Promises list stays where it was
+  // (inside the phone app it opens in the app itself)
   const openChat = (r) => {
     if (r.company && localStorage.getItem("active_company") !== r.company && isAdmin) {
-      localStorage.setItem("active_company", r.company);
-      window.location.href = `/chat?lead=${r.lead_id}`;
-      return;
+      localStorage.setItem("active_company", r.company);   // the new tab opens in the lead's company
     }
-    window.location.href = `/chat?lead=${r.lead_id}`;
+    window.open(`/chat?lead=${r.lead_id}`, "_blank", "noopener");
   };
 
   const c = data.counts || {};
