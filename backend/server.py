@@ -14967,6 +14967,17 @@ manufacturer and exporter of fragrances, essential oils, aroma chemicals, mentho
 talks to a customer{cust}. The call took place on {when}. It may be in Hindi, Marathi, English or a mix.
 Listen to the WHOLE recording carefully. Be exact with numbers, product names, grades, prices, quantities and dates -
 these notes replace listening to the call again, so nothing important may be missing.
+WHO SAID WHAT - get this right, the team relies on it:
+- The EXECUTIVE works for CitSpray: introduces CitSpray, explains OUR products, quotes OUR prices, asks the customer's
+  quantity / purpose, asks for the order or payment, and says what CitSpray will send or do.
+- The CUSTOMER is the buyer: says what they need and what it is for, asks for prices / samples, bargains, says yes or
+  no to buying, gives their address / GST.
+- Decide who said each sentence from its MEANING and these roles - not from voice, loudness or order of speaking.
+  Never put the customer's words in the executive's mouth or the other way round.
+- Write that the customer is "not interested" / "doesn't need it" ONLY if the CUSTOMER clearly said so about buying.
+  If the EXECUTIVE says something is "not required" (e.g. no advance needed, a document not needed), report it as the
+  executive's statement - it does not mean the customer refused.
+- If you cannot tell who said something, write it neutrally ("it was mentioned that ...") - do not guess.
 Reply ONLY with JSON:
 {{"summary": "3-6 sentences in English covering the whole call: who the customer is, what they need, what was
    discussed, and what was agreed / what happens next",
@@ -14990,8 +15001,13 @@ Reply ONLY with JSON:
  "customer_name": "the customer's own name if said, else empty",
  "customer_company": "the customer's business name if said, else empty",
  "customer_city": "the customer's city / location if said, else empty",
- "promise": {{"made": true or false (did OUR executive promise to send something?),
-              "what": "what was promised (quotation, price list, sample photos, catalogue...)",
+ "promise": {{"made": true ONLY if OUR executive committed to SEND the customer specific information or a file
+              SOON (today / within a day): price / rate / quotation / proforma invoice, catalogue / price list, product
+              photos or videos, sample options, payment QR / bank details, company details, location / address,
+              COA / MSDS / specs. FALSE for: things that depend on a later event (after payment arrives, after
+              dispatch - dispatch slip / tracking / LR copy), processing / packing / dispatching the order itself,
+              calling back later, physical samples by courier, or things the CUSTOMER must send us,
+              "what": "exactly what was promised, in a few words",
               "channel": "whatsapp | email | courier | call | other"}},
  "whatsapp_draft": "a short friendly WhatsApp message (max 500 characters) our executive can send right after this
    call: thank them, recap the products / quantity discussed and the next step. English. Mention a price ONLY if
@@ -15415,6 +15431,8 @@ def _promise_msg_line(m: dict) -> str:
     body = " ".join((m.get("body") or "").split())
     fname = m.get("filename") or ""
     is_doc = m.get("media_type") == "document" or bool(fname)
+    if m.get("direction") == "in":
+        return "CUSTOMER: " + (f"[document: {fname}]" if is_doc else body[:160])
     if not m.get("by_user_id"):
         if is_doc:
             kind = "our product CATALOGUE PDF" if re.search(r"catal|brochure|price.?list", fname, re.I) else f"a PDF ({fname})"
@@ -15424,11 +15442,11 @@ def _promise_msg_line(m: dict) -> str:
         return f"[automatic] {body[:90]}"
     if is_doc:
         cap = " ".join((m.get("caption") or "").split())
-        return f"[document: {fname or 'file'}]" + (f" {cap[:120]}" if cap else "")
+        return f"US: [document: {fname or 'file'}]" + (f" {cap[:120]}" if cap else "")
     if m.get("media_type") in ("image", "video"):
         cap = " ".join((m.get("caption") or "").split())
-        return f"[{m['media_type']}]" + (f" {cap[:150]}" if cap else "")
-    return body[:300]
+        return f"US: [{m['media_type']}]" + (f" {cap[:150]}" if cap else "")
+    return "US: " + body[:300]
 
 
 _PROMISE_JUDGE_PROMPT = """On a phone call our executive promised to send this customer on WhatsApp: "{what}".
@@ -15440,11 +15458,19 @@ Has the promise been KEPT - did the customer actually get what was promised (the
 or price-list file, photos, location, sample or order details, ...)?
 Physical things (samples, goods, an order) cannot travel on WhatsApp: for those the WhatsApp promise is kept when
 their details went out - the options / price / payment request for the samples, or the dispatch / tracking details.
+Judge the SUBSTANCE, not the exact words or the file type: prices typed as text keep a "quotation / PI / price"
+promise (unless a document was specifically required); a payment QR or bank details keep a "payment details / QR"
+promise; an order confirmation keeps a "confirm the order" promise; our catalogue PDF (sent by us or automatically)
+keeps a "catalogue" promise. Lines starting "CUSTOMER:" are the customer's replies - use them as context (e.g. they
+say they received it, or they changed what they want).
 A greeting, "ok", "ji sir", "I'll confirm and update you", a question back, or a message about something else
 does NOT keep it. If only part of it was sent (e.g. the price but not the catalogue), the answer is "partly".
+Answer "not_applicable" if this is not really something to send on WhatsApp now: it depends on a later event
+(payment arriving, dispatch / tracking / LR), it is about processing or shipping the order, a call-back, physical
+goods, or something the customer had to send us.
 Messages:
 {msgs}
-Reply ONLY with JSON: {{"verdict": "kept" | "partly" | "not_kept", "reason": "one short sentence in English",
+Reply ONLY with JSON: {{"verdict": "kept" | "partly" | "not_kept" | "not_applicable", "reason": "one short sentence in English",
 "evidence": "the message that keeps it, quoted briefly, or empty", "missing": "what is still not sent, or empty",
 "kept_by": the [number] of the message that completed the promise (0 if not kept)}}"""
 
@@ -15453,13 +15479,18 @@ async def _promise_verdict(pr: dict, now: datetime) -> Optional[dict]:
     """Was the promise kept? None = not decided this round (AI busy / another worker
     is judging) -> nothing changes. The AI only runs when new messages were sent."""
     since = await _promise_call_start(pr)
-    proj = {"_id": 0, "at": 1, "body": 1, "caption": 1, "filename": 1, "media_type": 1, "template_name": 1, "by_user_id": 1, "status": 1}
+    proj = {"_id": 0, "at": 1, "body": 1, "caption": 1, "filename": 1, "media_type": 1, "template_name": 1, "by_user_id": 1,
+            "status": 1, "direction": 1}
     human = await db.messages.find({"lead_id": pr["lead_id"], "direction": "out", "by_user_id": {"$nin": [None, ""]},
                                     "at": {"$gt": iso(since)}}, proj).sort("at", 1).to_list(40)
     auto = await db.messages.find({"lead_id": pr["lead_id"], "direction": "out", "by_user_id": {"$in": [None, ""]},
                                    "status": {"$ne": "failed"}, "at": {"$gt": iso(since - timedelta(days=3))}}, proj).sort("at", 1).to_list(20)
-    msgs = sorted(human + auto, key=lambda m: m.get("at") or "")
-    if not msgs:
+    cust = await db.messages.find({"lead_id": pr["lead_id"], "direction": "in", "at": {"$gt": iso(since)}},
+                                  proj).sort("at", 1).to_list(20)
+    for c_ in cust:
+        c_["direction"] = "in"
+    msgs = sorted(human + auto + cust, key=lambda m: m.get("at") or "")
+    if not human and not auto:
         return {"verdict": "not_kept", "reason": "Nothing has been sent on WhatsApp since the call.", "missing": pr["what"]}
     last_at = msgs[-1].get("at")
     if pr.get("judged_upto") == last_at and pr.get("ai_verdict"):
@@ -15480,13 +15511,18 @@ async def _promise_verdict(pr: dict, now: datetime) -> Optional[dict]:
              f"{_promise_msg_line(m)}" for i, m in enumerate(msgs, 1)]
     prompt = _PROMISE_JUDGE_PROMPT.format(what=pr["what"], context=(ctx or "(no summary)")[:1500], msgs="\n".join(lines))
     try:
-        raw = await _gemini_generate(prompt, temperature=0.1, max_output_tokens=400, json_mode=True, per_model_timeout=20.0)
+        try:
+            raw = await _gemini_generate(prompt, temperature=0.1, max_output_tokens=500, json_mode=True,
+                                         per_model_timeout=25.0, models_override=CALL_AI_MODELS)
+        except Exception as e1:
+            logger.info(f"promise judge: full models unavailable ({getattr(e1, 'detail', e1)}); using default chain")
+            raw = await _gemini_generate(prompt, temperature=0.1, max_output_tokens=500, json_mode=True, per_model_timeout=20.0)
         v = _ai_json(raw)
     except Exception as e:
         logger.warning(f"promise judge failed: {e}")
         await db.call_promises.update_one({"id": pr["id"]}, {"$set": {"judging_until": iso(now + timedelta(minutes=5))}})
         return None
-    verdict = v.get("verdict") if v.get("verdict") in ("kept", "partly", "not_kept") else "not_kept"
+    verdict = v.get("verdict") if v.get("verdict") in ("kept", "partly", "not_kept", "not_applicable") else "not_kept"
     out = {"verdict": verdict, "reason": _ai_txt(v.get("reason"), 300), "evidence": _ai_txt(v.get("evidence"), 300),
            "missing": _ai_txt(v.get("missing"), 200)}
     kept_at = None
@@ -15545,6 +15581,14 @@ async def promise_tracker_task():
         async for pr in db.call_promises.find(q, {"_id": 0}).limit(300):
             v = await _promise_verdict(pr, now)
             if v is None:
+                continue
+            if v["verdict"] == "not_applicable":
+                res = await db.call_promises.update_one({"id": pr["id"], "status": pr["status"]}, {"$set": {
+                    "status": "dismissed", "verified": True, "resolved_by": "AI", "resolved_at": iso(now),
+                    "resolve_note": v.get("reason") or "Not something to send on WhatsApp now"}})
+                if res.modified_count:
+                    await _promise_close_followups(pr, now)
+                    await db.admin_alerts.update_many({"meta.dedup_key": f"promise:{pr['id']}"}, {"$set": {"cancelled": True}})
                 continue
             if v["verdict"] == "kept":
                 if pr["status"] == "kept":
