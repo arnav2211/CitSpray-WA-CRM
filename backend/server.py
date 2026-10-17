@@ -192,6 +192,24 @@ def normalize_phone_display(p: Optional[str]) -> str:
     return "+" + digits
 
 
+WA_UNSUPPORTED_PAYMENT_NOTE = ("💳 The customer sent something WhatsApp doesn't share with the CRM - usually a "
+                               "WhatsApp payment (UPI). Check the bank / UPI app for the payment and ask the "
+                               "customer for a payment screenshot.")
+WA_UNSUPPORTED_ALBUM_NOTE = ("📷 The customer sent an album of photos - WhatsApp doesn't pass albums to the CRM. "
+                             "Ask them to send the photos one by one.")
+
+
+def _wa_unsupported_note(m: dict) -> str:
+    kind = ((m.get("unsupported") or {}).get("type") or "").lower()
+    if kind == "album":
+        return WA_UNSUPPORTED_ALBUM_NOTE
+    if m.get("type") == "errors" or not kind:
+        return WA_UNSUPPORTED_PAYMENT_NOTE
+    label = {"poll": "a poll", "event": "an event", "view_once": "a view-once photo/video", "ephemeral": "a disappearing message",
+             "order": "an order", "product": "a product"}.get(kind, f"a '{kind}' message")
+    return f"⚠️ The customer sent {label} - WhatsApp doesn't pass this to the CRM. Ask them to send it as a normal message or screenshot."
+
+
 def _https_base(base: str) -> str:
     """Behind nginx the request arrives as plain http, so URLs built from it said
     http:// - the phone app (https page) refuses to load http images. Our own domain
@@ -10929,6 +10947,10 @@ async def _handle_wa_webhook(request: Request, company: str):
                             else:
                                 logger.info(f"Inbound reaction for unknown wamid={target_wamid} (lead={target_lead['id'][:8]})")
                         continue  # do not fall through to create a normal msg_doc
+                    elif msg_type in ("unsupported", "errors"):
+                        # WhatsApp does not pass these to business apps at all (no content):
+                        # a WhatsApp payment, an album of photos, a poll, a view-once photo …
+                        body_text = _wa_unsupported_note(m)
                     else:
                         body_text = f"[{msg_type}]"
 

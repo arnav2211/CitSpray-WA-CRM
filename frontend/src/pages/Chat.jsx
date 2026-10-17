@@ -2888,7 +2888,7 @@ function BubbleImpl({ m, allMessages = [], senderName = null, onReply, onResend,
           )}
         </div>
       )}
-      <div data-testid="bubble-inner" className={`max-w-[75%] ${media ? "p-1.5" : "px-3 py-2"} ${isOut ? "bg-[#D9FDD3]" : "bg-white"} text-sm shadow-sm relative ${isHighlighted ? "ring-2 ring-[#FFCC00]" : ""} ${isFocused ? "ring-4 ring-[#FF8800] ring-offset-1" : ""}`}>
+      <div data-testid="bubble-inner" className={`max-w-[75%] ${media ? "p-1.5" : "px-3 py-2"} ${isOut ? "bg-[#D9FDD3]" : (m.msg_type === "unsupported" || m.msg_type === "errors") ? "bg-[#FFF8E1] border border-[#F0C36D] text-[#7A5200]" : "bg-white"} text-sm shadow-sm relative ${isHighlighted ? "ring-2 ring-[#FFCC00]" : ""} ${isFocused ? "ring-4 ring-[#FF8800] ring-offset-1" : ""}`}>
         {m.template_name && (
           <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold mb-1 px-2 pt-1">Template · {m.template_name}</div>
         )}
