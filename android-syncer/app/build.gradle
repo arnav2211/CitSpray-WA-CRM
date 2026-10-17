@@ -11,8 +11,8 @@ android {
         applicationId "com.leadorbit.syncer"
         minSdk 26
         targetSdk 34
-        versionCode 10
-        versionName "2.2.3"
+        versionCode 9
+        versionName "2.2.2"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }

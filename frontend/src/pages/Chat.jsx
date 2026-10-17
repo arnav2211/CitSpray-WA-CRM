@@ -2710,24 +2710,6 @@ function InfoRow({ label, children }) {
 // to the customer): who called, how long, and the AI summary of what was said.
 function CallTimelineItem({ c, leadId }) {
   const [open, setOpen] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [uploaded, setUploaded] = useState(false);
-  const recInputRef = useRef(null);
-  // the app could not send this call's recording -> pick the file from the phone's recorder folder
-  const onRecordingPicked = async (e) => {
-    const f = e.target.files && e.target.files[0];
-    e.target.value = "";
-    if (!f) return;
-    setUploading(true);
-    try {
-      const fd = new FormData();
-      fd.append("file", f, f.name);
-      await api.post(`/calls/${c.id}/recording-upload`, fd);
-      setUploaded(true);
-      toast.success("Recording uploaded - the AI summary appears here in 1-2 minutes");
-    } catch (err) { toast.error(errMsg(err, "Upload failed")); }
-    finally { setUploading(false); }
-  };
   const answered = (c.duration_seconds || 0) > 0;
   const incoming = c.direction === "incoming";
   const d = Math.round(c.duration_seconds || 0);
@@ -2768,20 +2750,7 @@ function CallTimelineItem({ c, leadId }) {
             </button>
           </>
         ) : (
-          <div className="text-[11px] text-gray-400 mt-1 flex items-center gap-2 flex-wrap">
-            <span>{uploaded ? "Recording received - AI summary in 1-2 minutes" : "No AI summary (no recording from this phone)"}</span>
-            {!uploaded && (
-              <>
-                <input ref={recInputRef} type="file" accept="audio/*,.m4a,.mp3,.amr,.aac,.wav,.ogg,.opus,.3gp,.awb" className="hidden"
-                  onChange={onRecordingPicked} data-testid={`upload-recording-input-${c.id}`} />
-                <button type="button" onClick={() => recInputRef.current && recInputRef.current.click()} disabled={uploading}
-                  className="text-[10px] uppercase tracking-widest font-bold text-[#6D28D9] border border-[#DDD6FE] px-2 py-0.5 hover:bg-[#F5F3FF] disabled:opacity-50"
-                  data-testid={`upload-recording-${c.id}`}>
-                  {uploading ? "Uploading…" : "Upload recording"}
-                </button>
-              </>
-            )}
-          </div>
+          <div className="text-[11px] text-gray-400 mt-1">No AI summary (no recording from this phone)</div>
         )}
       </div>
     </div>
