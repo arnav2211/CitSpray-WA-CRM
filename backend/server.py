@@ -14823,6 +14823,16 @@ class PhoneStatusInput(BaseModel):
     delete_permission: Optional[bool] = None
     missing_streak: Optional[int] = None
     last_found_at: Optional[int] = None      # epoch ms on the phone, 0 = never
+    # app 2.2.3+: what the last recording check saw on this phone
+    calllog_permission: Optional[bool] = None
+    enabled: Optional[bool] = None
+    scanned: Optional[int] = None
+    found: Optional[int] = None
+    uploaded: Optional[int] = None
+    not_found: Optional[int] = None
+    last_error: Optional[str] = None
+    recorder_folders: Optional[List[str]] = None
+    pending_delete: Optional[int] = None
 
 
 @api.post("/calls/phone-status")
@@ -14834,8 +14844,36 @@ async def report_phone_status(body: PhoneStatusInput, user: dict = Depends(get_c
     elif "last_found_at" in doc:
         doc["last_found_at"] = None
     doc.update({"user_id": user["id"], "user_name": user.get("name"), "updated_at": iso(now_utc())})
-    await db.phone_status.update_one({"user_id": user["id"]}, {"$set": doc}, upsert=True)
+    # one record per PHONE (people often have two)
+    await db.phone_status.update_one({"user_id": user["id"], "device": body.device or ""}, {"$set": doc}, upsert=True)
     return {"ok": True}
+
+
+@api.get("/calls/recordings/status")
+async def call_recordings_status(ids: str, user: dict = Depends(get_current_user)):
+    """The app deletes its copy of a recording only once its AI summary is done."""
+    want = [i for i in (ids or "").split(",") if i][:200]
+    out = {i: "" for i in want}
+    async for r in db.call_recordings.find({"id": {"$in": want}}, {"_id": 0, "id": 1, "status": 1}):
+        out[r["id"]] = r.get("status") or ""
+    return out
+
+
+def _phone_problem(st: dict) -> str:
+    """Plain-words reason a phone is not sending recordings (from its own report)."""
+    if st.get("audio_permission") is False:
+        return "Allow 'Music and audio' (storage) for LeadOrbit in the phone's app settings"
+    if st.get("calllog_permission") is False:
+        return "Allow 'Call logs' for LeadOrbit in the phone's app settings"
+    err = st.get("last_error") or ""
+    if "401" in err:
+        return "Logged out - open LeadOrbit on this phone once"
+    if (st.get("scanned") or 0) > 0 and not (st.get("found") or 0):
+        if st.get("delete_permission") is False:
+            return ("Recordings not found - turn ON 'All files access' for LeadOrbit (Settings > Apps > LeadOrbit), "
+                    "and make sure automatic call recording is ON in the Phone app")
+        return "Recordings not found - turn ON automatic call recording for all calls in this phone's Phone app"
+    return ""
 
 
 async def _phones_overview() -> List[dict]:
@@ -14845,15 +14883,21 @@ async def _phones_overview() -> List[dict]:
     since_old = iso(now_utc() - timedelta(days=3))[:19]
     since = iso(now_utc() - timedelta(days=1))
     out = []
-    old_q = {"$or": [{"call_end_at": {"$exists": True}}, {"summary": {"$regex": "Auto-logged via app"}}]}
-    new_q = {"call_end_at": {"$exists": False}, "summary": {"$not": {"$regex": "Auto-logged via app"}}}
+    # only the old in-app-dialer app reports a call's end time ("Auto-logged via app" is also
+    # written when the new app reports the same call twice, so it does not mean the old app)
+    old_q = {"call_end_at": {"$exists": True}, "channel": {"$ne": "whatsapp"}}
+    new_q = {"call_end_at": {"$exists": False}, "channel": {"$ne": "whatsapp"}}
     async for u in db.users.find({"active": True, "role": {"$in": ["executive", "admin"]}, "username": {"$ne": "test_user"}},
                                  {"_id": 0, "id": 1, "name": 1, "role": 1}).sort("name", 1):
         base = {"by_user_id": u["id"], "synced_from_app": True}
         old_calls = await db.call_logs.count_documents({**base, "at": {"$gte": since_old}, **old_q})
         new_answered = await db.call_logs.count_documents({**base, "at": {"$gte": since[:19]}, "duration_seconds": {"$gte": 10}, **new_q})
         recs = await db.call_recordings.count_documents({"user_id": u["id"], "created_at": {"$gte": since}})
-        st = await db.phone_status.find_one({"user_id": u["id"]}, {"_id": 0}) or {}
+        devices = await db.phone_status.find({"user_id": u["id"], "updated_at": {"$gte": iso(now_utc() - timedelta(days=3))}},
+                                             {"_id": 0}).sort("updated_at", -1).to_list(5)
+        for dv in devices:
+            dv["problem"] = _phone_problem(dv)
+        st = devices[0] if devices else {}
         if recs:
             state, msg = "ok", "Recordings are arriving"
         elif new_answered >= 2:
@@ -14869,7 +14913,10 @@ async def _phones_overview() -> List[dict]:
         out.append({"user_id": u["id"], "name": u.get("name"), "role": u.get("role"), "state": state, "message": msg,
                     "app_version": st.get("app_version"), "device": st.get("device"), "android": st.get("android"),
                     "delete_permission": st.get("delete_permission"), "updated_at": st.get("updated_at"),
-                    "answered_calls_24h": new_answered, "recordings_24h": recs, "old_app_calls_3d": old_calls})
+                    "answered_calls_24h": new_answered, "recordings_24h": recs, "old_app_calls_3d": old_calls,
+                    "devices": [{k: dv.get(k) for k in ("device", "app_version", "android", "audio_permission", "delete_permission",
+                                                        "calllog_permission", "scanned", "found", "uploaded", "not_found",
+                                                        "last_error", "recorder_folders", "updated_at", "problem")} for dv in devices]})
     return out
 
 

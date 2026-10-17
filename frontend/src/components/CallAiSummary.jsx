@@ -205,6 +205,17 @@ export function CallAiSettingsPanel() {
                         {p.state === "ok" ? "OK" : p.state.replace("_", " ")}
                       </span>
                       <div className="text-gray-600 mt-0.5">{p.message}{p.delete_permission === false ? " · can't auto-delete (file access off)" : ""}</div>
+                      {(p.devices || []).map((dv, i) => (
+                        <div key={i} className="mt-1 text-[11px] border-l-2 pl-2 border-gray-200" data-testid="call-ai-device">
+                          <span className="font-semibold">{dv.device || "Phone"}</span>
+                          {dv.app_version ? ` · app ${dv.app_version}` : ""}
+                          {typeof dv.scanned === "number" ? ` · last check: ${dv.found || 0} of ${dv.scanned} recordings found` : ""}
+                          {dv.problem ? <div className="text-[#B00000]">⚠ {dv.problem}</div> : <div className="text-[#008A00]">✓ working</div>}
+                          {dv.recorder_folders && dv.recorder_folders.length > 0 && (
+                            <div className="text-gray-400">Recorder saves in: {dv.recorder_folders.join(", ")}</div>
+                          )}
+                        </div>
+                      ))}
                     </td>
                     <td className="text-right font-mono">{p.answered_calls_24h} / {p.recordings_24h}</td>
                   </tr>

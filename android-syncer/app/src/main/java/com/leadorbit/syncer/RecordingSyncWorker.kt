@@ -23,6 +23,8 @@ import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
@@ -34,29 +36,37 @@ import java.util.concurrent.TimeUnit
 /**
  * AI call summaries: Android does not let apps record calls, so the phone's own
  * call recorder (Samsung / Xiaomi / Vivo / Oppo / Realme ... "auto record calls")
- * does the recording. After each call this worker finds that call's recording,
- * uploads it to the CRM (Gemini summarises it there, then the server deletes it)
- * and, once the server has it, deletes the recording from the phone too.
- * Calls shorter than MIN_SECONDS are ignored; the server additionally skips calls
- * with our own team / admin numbers.
+ * does the recording. This worker finds each call's recording and uploads it to the CRM.
+ *
+ * 2.2.3:
+ *  - catches up: every run re-checks the LAST 72 HOURS of calls and uploads any
+ *    recording not sent yet (a missed permission / reinstall no longer loses calls)
+ *  - the phone's copy is deleted only AFTER the CRM has finished the AI summary
+ *  - after every run it reports its health (model, permissions, found / not found,
+ *    where the recorder saves) to the CRM -> Settings -> Calls & AI -> Phones
  */
 class RecordingSyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
 
     companion object {
         private const val TAG = "RecordingSync"
-        private const val MIN_SECONDS = 20
-        private const val PREF_MARK = "rec_watermark"
-        private const val GIVE_UP_AFTER_MS = 20 * 60 * 1000L     // recording never appeared
+        private const val MIN_SECONDS = 10
+        private const val BACKFILL_MS = 72 * 3600 * 1000L          // re-check this far back, every run
+        private const val PREF_DONE = "rec_done_v2"                 // call dates (ms) already handled
+        private const val PREF_PENDING_DELETE = "rec_pending_delete" // uploaded, delete after the AI summary
+        private const val MAX_UPLOADS_PER_RUN = 15
         private const val MAX_BYTES = 40L * 1024 * 1024
-        private const val UPLOAD_URL = "https://crm.mangalamagro.in/api/calls/recording"
-        private const val CONFIG_URL = "https://crm.mangalamagro.in/api/calls/recording-config"
+        private const val BASE = "https://crm.mangalamagro.in/api"
+        private const val UPLOAD_URL = "$BASE/calls/recording"
+        private const val CONFIG_URL = "$BASE/calls/recording-config"
+        private const val STATUS_URL = "$BASE/calls/recordings/status"
+        private const val HEALTH_URL = "$BASE/calls/phone-status"
 
         // Folders the common Indian phone brands' built-in recorders write to
         private val KNOWN_DIRS = listOf(
             "Recordings/Call", "Recordings/Call recordings", "Recordings/Call Recordings", "Call",
             "MIUI/sound_recorder/call_rec", "Record/Call", "Recordings/Record/Call", "Record/PhoneRecord",
             "Music/Recordings/Call Recordings", "PhoneRecord", "CallRecordings", "Sounds/CallRecord",
-            "Recorder/call", "Recordings/Calls"
+            "Recorder/call", "Recordings/Calls", "Music/Call Recordings", "Recordings/Sound records/Call"
         )
 
         /** Run shortly after a call ends (and chain behind a run already in progress). */
@@ -90,66 +100,87 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
         .connectTimeout(30, TimeUnit.SECONDS).writeTimeout(180, TimeUnit.SECONDS).readTimeout(60, TimeUnit.SECONDS)
         .build()
 
+    // health report for this run
+    private val health = JSONObject()
+    private var scanned = 0
+    private var found = 0
+    private var uploaded = 0
+    private var notFound = 0
+    private var lastError = ""
+
     override suspend fun doWork(): Result {
         val token = prefs.getString("auth_token", null) ?: return Result.success()
-        if (!hasAudioReadPermission(applicationContext)) return Result.success()
-        if (ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.READ_CALL_LOG)
-            != PackageManager.PERMISSION_GRANTED) return Result.success()
+        val audioOk = hasAudioReadPermission(applicationContext)
+        val callLogOk = ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.READ_CALL_LOG) ==
+            PackageManager.PERMISSION_GRANTED
+        health.put("audio_permission", audioOk).put("calllog_permission", callLogOk)
+            .put("delete_permission", canDeleteOthersFiles(applicationContext))
+        if (!audioOk || !callLogOk) {
+            lastError = if (!audioOk) "No 'Music and audio' / storage permission" else "No call log permission"
+            report(token)
+            return Result.success()
+        }
 
         // Ask the CRM first: summaries off for this user (or for admins) -> touch nothing
-        val cfg = fetchConfig(token) ?: return Result.retry()
+        val cfg = fetchConfig(token) ?: run { report(token); return Result.retry() }
         if (!cfg.optBoolean("enabled", false)) {
-            // keep the mark at "now" so switching it on later never uploads a backlog
-            prefs.edit().putLong(PREF_MARK, System.currentTimeMillis()).apply()
+            health.put("enabled", false)
+            report(token)
             return Result.success()
         }
         val minSeconds = cfg.optInt("min_seconds", MIN_SECONDS)
         val autoDelete = cfg.optBoolean("auto_delete", true)
 
-        var mark = prefs.getLong(PREF_MARK, 0L)
-        if (mark == 0L) {
-            // First run: only calls from now on (never upload an old backlog)
-            prefs.edit().putLong(PREF_MARK, System.currentTimeMillis()).apply()
-            return Result.success()
-        }
+        // 1) delete the phone's copies whose AI summary is now finished
+        if (autoDelete) deleteSummarised(token)
+
+        // 2) every call of the last 72 h that is not handled yet
+        val done = prefs.getStringSet(PREF_DONE, emptySet())!!.toMutableSet()
         val now = System.currentTimeMillis()
-        for (call in callsSince(mark, minSeconds)) {
+        val since = now - BACKFILL_MS
+        done.removeAll { (it.toLongOrNull() ?: 0L) < since }       // forget old entries
+        for (call in callsSince(since, minSeconds)) {
+            if (uploaded >= MAX_UPLOADS_PER_RUN) break
+            if (done.contains(call.date.toString())) continue
             val end = call.date + call.duration * 1000L
-            if (now < end + 15_000L) break                      // recorder may still be writing
+            if (now < end + 15_000L) continue                       // recorder may still be writing
+            scanned++
             val rec = findRecording(call)
-            if (rec == null) {
-                if (now - end < GIVE_UP_AFTER_MS) break         // not indexed yet - try next run
-                Log.d(TAG, "no recording found for call at ${call.date}, skipping")
-            } else {
-                when (val res = upload(token, call, rec)) {
-                    null -> return Result.retry()               // network / server error - keep mark
-                    else -> if (res && autoDelete) deleteLocal(rec)
-                }
-            }
-            mark = call.date
-            prefs.edit().putLong(PREF_MARK, mark).apply()
+            if (rec == null) { notFound++; continue }                // try again next run (until 72 h old)
+            found++
+            if (!health.has("last_found_at") || health.optLong("last_found_at") < end) health.put("last_found_at", end)
+            val res = upload(token, call, rec)
+            if (res == null) { prefs.edit().putStringSet(PREF_DONE, done).apply(); report(token); return Result.retry() }
+            done.add(call.date.toString())
+            prefs.edit().putStringSet(PREF_DONE, done).apply()
+            uploaded++
+            val rid = res.optString("id")
+            val keep = res.optString("skipped").isNotEmpty() || !res.optBoolean("delete_local", false)
+            if (autoDelete && !keep && rid.isNotEmpty()) addPendingDelete(rid, rec)
         }
+        prefs.edit().putStringSet(PREF_DONE, done).apply()
+        report(token)
         return Result.success()
     }
 
     private fun fetchConfig(token: String): JSONObject? = try {
         http.newCall(Request.Builder().url(CONFIG_URL).addHeader("Authorization", "Bearer $token").build())
-            .execute().use { r -> if (r.isSuccessful) JSONObject(r.body?.string() ?: "{}") else null }
+            .execute().use { r -> if (r.isSuccessful) JSONObject(r.body?.string() ?: "{}") else { lastError = "config HTTP ${r.code}"; null } }
     } catch (e: Exception) {
-        Log.w(TAG, "config fetch failed: ${e.message}"); null
+        lastError = "config: ${e.message}"; Log.w(TAG, "config fetch failed: ${e.message}"); null
     }
 
-    private fun callsSince(mark: Long, minSeconds: Int): List<CallEntry> {
+    private fun callsSince(since: Long, minSeconds: Int): List<CallEntry> {
         val out = mutableListOf<CallEntry>()
         val cursor = applicationContext.contentResolver.query(
             CallLog.Calls.CONTENT_URI,
             arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.DATE, CallLog.Calls.DURATION, CallLog.Calls.TYPE),
             "${CallLog.Calls.DATE} > ? AND ${CallLog.Calls.DURATION} >= ?",
-            arrayOf(mark.toString(), maxOf(1, minSeconds).toString()),
-            "${CallLog.Calls.DATE} ASC"
+            arrayOf(since.toString(), maxOf(1, minSeconds).toString()),
+            "${CallLog.Calls.DATE} DESC"                            // newest first: today's calls first
         ) ?: return out
         cursor.use {
-            while (it.moveToNext() && out.size < 30) {
+            while (it.moveToNext() && out.size < 400) {
                 val number = it.getString(0) ?: continue
                 val type = it.getInt(3)
                 if (type != CallLog.Calls.INCOMING_TYPE && type != CallLog.Calls.OUTGOING_TYPE) continue
@@ -206,6 +237,7 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
                 }
             }
         } catch (e: Exception) {
+            lastError = "MediaStore: ${e.message}"
             Log.w(TAG, "MediaStore query failed: ${e.message}")
         }
         if (best != null) return best
@@ -229,15 +261,15 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
         return bestFile?.let { Recording(null, it, it.name) }
     }
 
-    /** true = server has it (delete locally), false = server skipped it, null = try again later. */
-    private fun upload(token: String, call: CallEntry, rec: Recording): Boolean? {
+    /** Server's JSON reply; null = try again later (network / server error). */
+    private fun upload(token: String, call: CallEntry, rec: Recording): JSONObject? {
         val tmp = File(applicationContext.cacheDir, "rec_upload_${call.date}")
         try {
             val input = when {
                 rec.uri != null -> applicationContext.contentResolver.openInputStream(rec.uri)
                 rec.file != null -> rec.file.inputStream()
                 else -> null
-            } ?: return false
+            } ?: return JSONObject().put("skipped", "unreadable")
             input.use { inp -> tmp.outputStream().use { inp.copyTo(it) } }
             val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
             val body = MultipartBody.Builder().setType(MultipartBody.FORM)
@@ -249,16 +281,17 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
                 .build()
             val req = Request.Builder().url(UPLOAD_URL).addHeader("Authorization", "Bearer $token").post(body).build()
             http.newCall(req).execute().use { resp ->
-                if (resp.code >= 500 || resp.code == 401) return null
+                if (resp.code >= 500 || resp.code == 401) { lastError = "upload HTTP ${resp.code}"; return null }
                 if (!resp.isSuccessful) {
-                    Log.w(TAG, "upload rejected ${resp.code}")
-                    return false
+                    lastError = "upload rejected HTTP ${resp.code}"
+                    return JSONObject().put("skipped", "http ${resp.code}")
                 }
                 val json = JSONObject(resp.body?.string() ?: "{}")
                 Log.d(TAG, "uploaded call ${call.date}: $json")
-                return json.optBoolean("delete_local", false)
+                return json
             }
         } catch (e: Exception) {
+            lastError = "upload: ${e.message}"
             Log.w(TAG, "upload failed: ${e.message}")
             return null
         } finally {
@@ -266,24 +299,95 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
         }
     }
 
-    /** Delete the phone's copy once the server has it (needs "All files access"). */
-    private fun deleteLocal(rec: Recording) {
-        if (!canDeleteOthersFiles(applicationContext)) {
-            Log.d(TAG, "no permission to delete other apps' files - keeping local recording ${rec.name}")
-            return
+    // ---- delete the phone's copy only after the CRM finished the AI summary ----
+
+    private fun pending(): JSONArray = try { JSONArray(prefs.getString(PREF_PENDING_DELETE, "[]")) } catch (e: Exception) { JSONArray() }
+
+    private fun addPendingDelete(rid: String, rec: Recording) {
+        val arr = pending()
+        arr.put(JSONObject().put("id", rid).put("uri", rec.uri?.toString() ?: "").put("path", rec.file?.absolutePath ?: "")
+            .put("name", rec.name).put("at", System.currentTimeMillis()))
+        prefs.edit().putString(PREF_PENDING_DELETE, arr.toString()).apply()
+    }
+
+    private fun deleteSummarised(token: String) {
+        val arr = pending()
+        if (arr.length() == 0) return
+        val ids = (0 until arr.length()).joinToString(",") { arr.getJSONObject(it).optString("id") }
+        val statuses = try {
+            http.newCall(Request.Builder().url("$STATUS_URL?ids=$ids").addHeader("Authorization", "Bearer $token").build())
+                .execute().use { r -> if (r.isSuccessful) JSONObject(r.body?.string() ?: "{}") else null }
+        } catch (e: Exception) { null } ?: return
+        val keep = JSONArray()
+        for (i in 0 until arr.length()) {
+            val item = arr.getJSONObject(i)
+            when (statuses.optString(item.optString("id"))) {
+                "done" -> deleteLocal(item)                            // summary finished -> remove from the phone
+                "failed", "" -> { }                                   // summary failed / unknown -> keep the file
+                else -> if (System.currentTimeMillis() - item.optLong("at") < 3 * 24 * 3600 * 1000L) keep.put(item)
+            }
         }
+        prefs.edit().putString(PREF_PENDING_DELETE, keep.toString()).apply()
+    }
+
+    private fun deleteLocal(item: JSONObject) {
+        if (!canDeleteOthersFiles(applicationContext)) return
         try {
-            var gone = false
-            if (rec.file != null && rec.file.exists()) {
-                gone = rec.file.delete()
-                if (gone) android.media.MediaScannerConnection.scanFile(applicationContext, arrayOf(rec.file.absolutePath), null, null)
+            val path = item.optString("path")
+            if (path.isNotEmpty()) {
+                val f = File(path)
+                if (f.exists() && f.delete()) android.media.MediaScannerConnection.scanFile(applicationContext, arrayOf(path), null, null)
             }
-            if (rec.uri != null) {
-                try { applicationContext.contentResolver.delete(rec.uri, null, null); gone = true } catch (_: Exception) { }
-            }
-            Log.d(TAG, "local recording ${rec.name} deleted=$gone")
+            val uri = item.optString("uri")
+            if (uri.isNotEmpty()) try { applicationContext.contentResolver.delete(Uri.parse(uri), null, null) } catch (_: Exception) { }
         } catch (e: Exception) {
-            Log.w(TAG, "could not delete ${rec.name}: ${e.message}")
+            Log.w(TAG, "could not delete ${item.optString("name")}: ${e.message}")
+        }
+    }
+
+    // ---- health report -> CRM Settings -> Calls & AI -> Phones ----
+
+    /** Where this phone's recorder saves (folders with call-like audio from the last 7 days). */
+    private fun recorderFolders(): JSONArray {
+        val counts = LinkedHashMap<String, Int>()
+        try {
+            val cols = mutableListOf(MediaStore.Audio.Media.DATA, MediaStore.Audio.Media.DISPLAY_NAME)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) cols.add(MediaStore.Audio.Media.RELATIVE_PATH)
+            val since = (System.currentTimeMillis() / 1000 - 7 * 86400).toString()
+            applicationContext.contentResolver.query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, cols.toTypedArray(),
+                "${MediaStore.Audio.Media.DATE_ADDED} > ?", arrayOf(since), null)?.use { c ->
+                while (c.moveToNext()) {
+                    val data = c.getString(0) ?: ""
+                    val rel = if (cols.size > 2) (c.getString(2) ?: "") else ""
+                    val folder = (if (rel.isNotEmpty()) rel else File(data).parent ?: "").trimEnd('/')
+                    val low = folder.lowercase()
+                    if (low.contains("whatsapp") || low.contains("leadorbit")) continue
+                    if (!(low.contains("call") || low.contains("record"))) continue
+                    counts[folder] = (counts[folder] ?: 0) + 1
+                }
+            }
+        } catch (_: Exception) { }
+        val out = JSONArray()
+        counts.entries.sortedByDescending { it.value }.take(5).forEach { out.put("${it.key} (${it.value})") }
+        return out
+    }
+
+    private fun report(token: String) {
+        try {
+            val v = try { applicationContext.packageManager.getPackageInfo(applicationContext.packageName, 0).versionName } catch (e: Exception) { "" }
+            health.put("app_version", v)
+                .put("device", "${Build.MANUFACTURER} ${Build.MODEL}")
+                .put("android", Build.VERSION.RELEASE)
+                .put("scanned", scanned).put("found", found).put("uploaded", uploaded).put("not_found", notFound)
+                .put("last_error", lastError)
+                .put("recorder_folders", recorderFolders())
+                .put("pending_delete", pending().length())
+            if (!health.has("last_found_at")) health.put("last_found_at", 0)
+            val body = health.toString().toRequestBody("application/json".toMediaTypeOrNull())
+            http.newCall(Request.Builder().url(HEALTH_URL).addHeader("Authorization", "Bearer $token").post(body).build())
+                .execute().close()
+        } catch (e: Exception) {
+            Log.w(TAG, "health report failed: ${e.message}")
         }
     }
 }
