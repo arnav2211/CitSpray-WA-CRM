@@ -75,6 +75,14 @@ function getEpoch(isoStr) {
 // `international` = the International WhatsApp inbox (sidebar → International
 // WhatsApp): only International team leads, including ones not on WhatsApp yet
 // so the team can start the conversation. The main inbox leaves them out.
+// /chat Source filter value -> API params
+function chatSourceParams(v) {
+  if (!v) return {};
+  if (v.startsWith("type:")) return { lead_type: v.slice(5) };
+  if (v.startsWith("src:")) return { source: v.slice(4) };
+  return {};
+}
+
 export default function Chat({ international = false }) {
   const { user } = useAuth();
   const navTo = useNavigate();
@@ -85,7 +93,12 @@ export default function Chat({ international = false }) {
   const [filterUnreplied, setFilterUnreplied] = useState(false);
   const [filterReplied, setFilterReplied] = useState(false);
   const [filterStarred, setFilterStarred] = useState(false);
-  const [filterBuyleads, setFilterBuyleads] = useState(false);   // IndiaMART buy leads only
+  const [filterSource, setFilterSource] = useState("");   // "" | "src:<lead source>" | "type:im_buylead" | "type:im_enquiry"
+  const [chatSources, setChatSources] = useState([]);
+  useEffect(() => {
+    if (international) return;
+    api.get("/inbox/sources", { params: { intl: "exclude" } }).then(({ data }) => setChatSources(data || [])).catch(() => {});
+  }, [international]);
   const [filterStatus, setFilterStatus] = useState("");
   const [filterAssignee, setFilterAssignee] = useState(params.get("agent") || "");
   const [execs, setExecs] = useState([]);
@@ -162,7 +175,7 @@ export default function Chat({ international = false }) {
           status: filterStatus || undefined,
           assigned_to: filterAssignee || undefined,
           starred: filterStarred ? true : undefined,
-          lead_type: filterBuyleads ? "im_buylead" : undefined,
+          ...chatSourceParams(filterSource),
           intl: international ? "all" : "exclude",
           include_all: international ? true : undefined,
           limit: PAGE_SIZE,
@@ -194,7 +207,7 @@ export default function Chat({ international = false }) {
     } finally {
       setLoadingMore(false);
     }
-  }, [search, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred, filterBuyleads, page, loadingMore, hasMore]);
+  }, [search, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred, filterSource, page, loadingMore, hasMore]);
 
   // Refresh-only fetch — re-pulls page 0 for live unread updates without
   // disrupting any further pages the user has scrolled into.
@@ -208,7 +221,7 @@ export default function Chat({ international = false }) {
           status: filterStatus || undefined,
           assigned_to: filterAssignee || undefined,
           starred: filterStarred ? true : undefined,
-          lead_type: filterBuyleads ? "im_buylead" : undefined,
+          ...chatSourceParams(filterSource),
           intl: international ? "all" : "exclude",
           include_all: international ? true : undefined,
           limit: PAGE_SIZE,
@@ -228,7 +241,7 @@ export default function Chat({ international = false }) {
         return merged;
       });
     } catch (_) { /* silent */ }
-  }, [search, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred, filterBuyleads]);
+  }, [search, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred, filterSource]);
 
   // Run global message search (debounced 250ms via the effect re-trigger)
   const runMessageSearch = useCallback(async (term) => {
@@ -265,7 +278,7 @@ export default function Chat({ international = false }) {
     setPage(0);
     fetchConvs({ reset: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred, filterBuyleads]);
+  }, [search, filterUnreplied, filterReplied, filterStatus, filterAssignee, filterStarred, filterSource]);
 
   // Live polling — refresh ONLY page 0 (keeps further pages stable while user scrolls)
   useEffect(() => {
@@ -438,7 +451,16 @@ export default function Chat({ international = false }) {
             }} testId="filter-replied">Replied</FilterChip>
             <FilterChip active={filterStarred} onClick={() => setFilterStarred(v => !v)} testId="filter-starred">Starred</FilterChip>
             {!international && (
-              <FilterChip active={filterBuyleads} onClick={() => setFilterBuyleads(v => !v)} testId="filter-im-buyleads">IM Buy leads</FilterChip>
+              <select value={filterSource} onChange={(e) => setFilterSource(e.target.value)}
+                className={`border px-2 py-1 text-xs ${filterSource ? "border-gray-900 bg-gray-900 text-white" : "border-gray-300"}`} data-testid="filter-source">
+                <option value="">All sources</option>
+                <option value="src:IndiaMART">IndiaMART - all</option>
+                <option value="type:im_enquiry">IndiaMART - enquiries</option>
+                <option value="type:im_buylead">IndiaMART - buy leads</option>
+                {chatSources.filter((s) => s.source !== "IndiaMART").map((s) => (
+                  <option key={s.source} value={`src:${s.source}`}>{s.source} ({s.count})</option>
+                ))}
+              </select>
             )}
             <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)} className="border border-gray-300 px-2 py-1 text-xs" data-testid="filter-status">
               <option value="">All status</option>

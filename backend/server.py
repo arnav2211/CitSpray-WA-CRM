@@ -1946,6 +1946,9 @@ def _is_buylead(lead_data: dict) -> bool:
 LEAD_TYPE_FILTERS: Dict[str, Dict[str, Any]] = {
     "im_buylead": {"source": "IndiaMART", "$or": [
         {"source_data.QUERY_TYPE": "B"}, {"enquiry_type": {"$in": ["B", "b"]}}]},
+    # IndiaMART enquiries = everything from IndiaMART that is not a purchased buy lead
+    "im_enquiry": {"source": "IndiaMART", "$nor": [
+        {"source_data.QUERY_TYPE": "B"}, {"enquiry_type": {"$in": ["B", "b"]}}]},
 }
 
 
@@ -6141,6 +6144,27 @@ _CHAT_EXTRA_FIELDS = ["enquiry_type", "gst_no", "emails", "tags", "country", "co
                       "cod_status", "cod_asked_at", "cod_responded_at", "cod_resolved_via", "oms_order_number"]
 
 
+@api.get("/inbox/sources")
+async def inbox_sources(user: dict = Depends(get_current_user), intl: Optional[str] = None,
+                        x_company: Optional[str] = Header(None, alias="X-Company")):
+    """Lead sources that have WhatsApp chats (for the /chat Source filter), biggest first."""
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Access denied")
+    company = _resolve_company(user, x_company)
+    match: Dict[str, Any] = {"$and": [company_filter(company), {"has_whatsapp": True}]}
+    if user["role"] == "executive":
+        match["assigned_to"] = user["id"]
+    if (intl or "").strip().lower() == "exclude":
+        match["$and"].append({"international": {"$ne": True}})
+    elif intl:
+        match["$and"].append({"international": True})
+    out = []
+    async for r in db.leads.aggregate([{"$match": match}, {"$group": {"_id": "$source", "n": {"$sum": 1}}}, {"$sort": {"n": -1}}]):
+        if r["_id"]:
+            out.append({"source": r["_id"], "count": r["n"]})
+    return out
+
+
 @api.get("/inbox/conversations")
 async def list_conversations(
     user: dict = Depends(get_current_user),
@@ -6155,6 +6179,7 @@ async def list_conversations(
     offset: int = 0,
     starred: Optional[bool] = None,
     lead_type: Optional[str] = None,  # e.g. "im_buylead" = IndiaMART buy leads only
+    source: Optional[str] = None,     # lead source, e.g. "Justdial", "India Outreach"
     intl: Optional[str] = None,       # International WhatsApp inbox: all|scraper|manual; "exclude" = main inbox
     x_company: Optional[str] = Header(None, alias="X-Company"),
 ):
@@ -6185,6 +6210,8 @@ async def list_conversations(
     _lt = _lead_type_clause(lead_type)
     if _lt:
         query["$and"].append(_lt)
+    if (source or "").strip():
+        query["$and"].append({"source": source.strip()})
     # International leads have their own WhatsApp inbox (International → WhatsApp);
     # the main inbox leaves them out.
     if (intl or "").strip().lower() == "exclude":
