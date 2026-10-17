@@ -203,8 +203,15 @@ def _wa_unsupported_note(m: dict) -> str:
     kind = ((m.get("unsupported") or {}).get("type") or "").lower()
     if kind == "album":
         return WA_UNSUPPORTED_ALBUM_NOTE
+    if kind == "revoke":
+        return "🚫 The customer deleted a message."
+    if kind == "edit":
+        return "✏️ The customer edited a message - WhatsApp doesn't share the new text with the CRM. Check with the customer if it matters."
     if m.get("type") == "errors" or not kind:
         return WA_UNSUPPORTED_PAYMENT_NOTE
+    if kind == "unknown":
+        return ("⚠️ The customer sent something WhatsApp doesn't share with the CRM (for example a WhatsApp payment, a poll "
+                "or a view-once photo). Ask them to send it again as a normal message or a screenshot.")
     label = {"poll": "a poll", "event": "an event", "view_once": "a view-once photo/video", "ephemeral": "a disappearing message",
              "order": "an order", "product": "a product"}.get(kind, f"a '{kind}' message")
     return f"⚠️ The customer sent {label} - WhatsApp doesn't pass this to the CRM. Ask them to send it as a normal message or screenshot."
