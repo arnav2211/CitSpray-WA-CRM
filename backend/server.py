@@ -14873,6 +14873,48 @@ async def _phones_overview() -> List[dict]:
     return out
 
 
+@api.post("/calls/{call_id}/recording-upload")
+async def upload_recording_for_call(call_id: str, file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    """Attach a recording file picked by hand (from the phone's recorder folder) to THIS call,
+    when the app could not find / send it - the usual AI summary then runs on it."""
+    c = await db.call_logs.find_one({"id": call_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Call not found")
+    lead = await db.leads.find_one({"id": c.get("lead_id")}, {"_id": 0, "assigned_to": 1, "company": 1}) or {}
+    if user["role"] != "admin" and user["id"] not in (c.get("by_user_id"), lead.get("assigned_to")):
+        raise HTTPException(status_code=403, detail="Not your call")
+    if not c.get("by_user_id") or not c.get("phone"):
+        raise HTTPException(status_code=400, detail="This call has no executive / number to attach a recording to")
+    start = c.get("call_start_at") or c.get("at")
+    rid = str(uuid.uuid4())
+    ext = (Path(file.filename or "").suffix or ".m4a").lower()[:6]
+    dest = CALL_REC_DIR / f"{rid}{ext}"
+    size = 0
+    with open(dest, "wb") as fh:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > CALL_REC_MAX_BYTES:
+                fh.close()
+                dest.unlink(missing_ok=True)
+                raise HTTPException(status_code=413, detail="Recording too large")
+            fh.write(chunk)
+    if size == 0:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Empty file")
+    now = iso(now_utc())
+    await db.call_recordings.insert_one({
+        "id": rid, "user_id": c["by_user_id"], "user_name": c.get("by_user_name"),
+        "company": normalize_company(lead.get("company")), "phone": c["phone"], "call_start_at": start,
+        "duration_seconds": int(c.get("duration_seconds") or 0), "direction": c.get("direction") or "outgoing",
+        "file": dest.name, "size": size, "status": "pending", "attempts": 0, "next_try_at": now, "created_at": now,
+        "kind": "customer", "manual_upload_by": user.get("name"), "call_log_id": call_id})
+    await log_activity(user["id"], "call_recording_uploaded", c.get("lead_id"), {"call_id": call_id, "size": size})
+    return {"ok": True, "id": rid}
+
+
 @api.get("/calls/recording-config")
 async def call_recording_config(user: dict = Depends(get_current_user)):
     """Asked by the phone app BEFORE it touches any recording: when summaries are off

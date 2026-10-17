@@ -27,6 +27,7 @@ import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
+import android.webkit.ValueCallback
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -72,6 +73,17 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { _ ->
         if (hasRequiredPermissions()) setupAppFlow() else showPermissionRequestUI()
+    }
+
+    // <input type="file"> in the CRM (chat attachments, "Upload recording") -> the phone's file picker
+    private var fileCallback: ValueCallback<Array<Uri>>? = null
+    private val fileChooserLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val uris = WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+            ?: result.data?.clipData?.let { cd -> Array(cd.itemCount) { i -> cd.getItemAt(i).uri } }
+        fileCallback?.onReceiveValue(uris)
+        fileCallback = null
     }
 
     // WhatsApp calls: the microphone (asked separately so the app never blocks on it)
@@ -418,6 +430,22 @@ class MainActivity : AppCompatActivity() {
         settings.mediaPlaybackRequiresUserGesture = false      // call audio plays at once
         webView.addJavascriptInterface(NativeBridge(), "LeadOrbitNative")
         webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(view: WebView?, callback: ValueCallback<Array<Uri>>?,
+                                           params: FileChooserParams?): Boolean {
+                fileCallback?.onReceiveValue(null)
+                fileCallback = callback
+                return try {
+                    val intent = params?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).setType("*/*")
+                    intent.addCategory(Intent.CATEGORY_OPENABLE)
+                    if (params?.mode == FileChooserParams.MODE_OPEN_MULTIPLE) intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                    fileChooserLauncher.launch(Intent.createChooser(intent, "Choose file"))
+                    true
+                } catch (e: Exception) {
+                    fileCallback = null
+                    false
+                }
+            }
+
             override fun onPermissionRequest(request: PermissionRequest) {
                 runOnUiThread {
                     val host = request.origin?.host ?: ""
