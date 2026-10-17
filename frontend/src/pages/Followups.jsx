@@ -28,6 +28,7 @@ function bucketOf(f, now) {
   if (f.snoozed) return "snoozed";
   if (f.kind === "reorder") return "reorder";
   const due = new Date(f.due_at).getTime();
+  if (due < now - 30 * DAY) return "old";              // long forgotten - folded away at the bottom
   if (f.status === "missed" || due < now) return "overdue";
   const k = istDayKey(f.due_at);
   if (k === addDaysKey(0)) return "today";
@@ -42,6 +43,7 @@ const SECTIONS = [
   { k: "tomorrow", label: "Tomorrow", cls: "text-[#002FA7]", dot: "bg-[#002FA7]" },
   { k: "week", label: "This week", cls: "text-gray-700", dot: "bg-gray-400" },
   { k: "later", label: "Later", cls: "text-gray-500", dot: "bg-gray-300" },
+  { k: "old", label: "Old - more than 30 days overdue", cls: "text-gray-500", dot: "bg-gray-300", collapsed: true },
 ];
 
 const TABS = [
@@ -81,6 +83,7 @@ export default function Followups() {
   const [q, setQ] = useState("");
   const [openLeadId, setOpenLeadId] = useState(null);
   const [now, setNow] = useState(Date.now());
+  const [showOld, setShowOld] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -130,9 +133,9 @@ export default function Followups() {
   }, [items, q, now]);
 
   const counts = useMemo(() => {
-    const c = { overdue: 0, today: 0, todo: 0, reorder: 0, snoozed: 0, done: 0 };
+    const c = { overdue: 0, today: 0, todo: 0, reorder: 0, snoozed: 0, done: 0, old: 0 };
     rows.forEach((f) => {
-      if (["overdue", "today", "tomorrow", "week", "later"].includes(f._b)) c.todo += 1;
+      if (["overdue", "today", "tomorrow", "week", "later", "old"].includes(f._b)) c.todo += 1;
       if (f._b in c) c[f._b] += 1;
     });
     return c;
@@ -189,15 +192,18 @@ export default function Followups() {
           {SECTIONS.map((s) => {
             const list = listFor(s.k);
             if (!list.length) return null;
+            const hidden = s.collapsed && !showOld;
             return (
               <section key={s.k}>
-                <div className={`text-[11px] uppercase tracking-widest font-bold mb-2 flex items-center gap-2 ${s.cls}`}>
+                <button type="button" onClick={() => s.collapsed && setShowOld((v) => !v)}
+                  className={`text-[11px] uppercase tracking-widest font-bold mb-2 flex items-center gap-2 ${s.cls}`}>
                   <span className={`w-2 h-2 rounded-full ${s.dot}`} /> {s.label} ({list.length})
-                </div>
-                <div className="space-y-2">
+                  {s.collapsed && <span className="normal-case tracking-normal font-normal underline">{showOld ? "hide" : "show"}</span>}
+                </button>
+                {!hidden && <div className="space-y-2">
                   {list.map((f) => <Card key={f.id} f={f} now={now} showOwner={isAdmin && !person} nav={nav}
                     onOpen={() => setOpenLeadId(f.lead_id)} onDone={() => markDone(f)} onResched={(iso, l) => reschedule(f, iso, l)} onNote={() => editNote(f)} />)}
-                </div>
+                </div>}
               </section>
             );
           })}
@@ -233,7 +239,7 @@ function Origin({ f }) {
   if (f.kind === "ai_call") return <span className={`${chip} bg-[#F5F3FF] border-[#7C3AED] text-[#6D28D9]`}><Sparkle size={10} weight="fill" /> AI · from a call</span>;
   if (f.kind === "ai_promise") return <span className={`${chip} bg-[#FFF4E5] border-[#E67E00] text-[#B85F00]`}><PushPin size={10} weight="fill" /> Promise to send</span>;
   if (f.kind === "reorder") return <span className={`${chip} bg-[#F3E8FF] border-[#7C3AED] text-[#6D28D9]`}><Package size={10} weight="bold" /> Reorder</span>;
-  return <span className={`${chip} bg-gray-50 border-gray-300 text-gray-600`}>Set by {f.created_by_name || "system"}</span>;
+  return <span className={`${chip} bg-gray-50 border-gray-300 text-gray-600`}>{f.created_by_name ? `Set by ${f.created_by_name}` : "Set automatically"}</span>;
 }
 
 function Card({ f, now, showOwner, nav, onOpen, onDone, onResched, onNote }) {
