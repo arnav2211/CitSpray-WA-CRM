@@ -704,6 +704,13 @@ function MessageHitRow({ hit, query, onClick }) {
 
 // ---------------- Chat thread ----------------
 function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initialAgentId, initialPhone, jumpToMessageId, onJumpConsumed, onToggleStar }) {
+  // phone: details row folds away; the app bar / bottom menu hide while a chat is open
+  const [showDetails, setShowDetails] = useState(false);
+  const [showTranslator, setShowTranslator] = useState(false);
+  useEffect(() => {
+    document.body.dataset.chatThread = "1";
+    return () => { delete document.body.dataset.chatThread; };
+  }, []);
   const isAdmin = user.role === "admin";
   const { isFragvansh } = useCompany();
   const canMessage = isAdmin || conv.assigned_to === user.id;
@@ -1670,14 +1677,16 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
         </div>
       )}
       {/* Top bar */}
-      <div className="shrink-0 bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-3" data-testid="chat-topbar">
+      <div className="shrink-0 bg-white border-b border-gray-200 px-2 py-2 md:px-4 md:py-3 flex items-center gap-2 md:gap-3" data-testid="chat-topbar">
         <button onClick={onClose} className="md:hidden p-1 -ml-1" data-testid="back-btn"><ArrowLeft size={18} /></button>
-        <div className="w-9 h-9 rounded-full bg-[#25D366] flex items-center justify-center text-white font-bold text-sm">
+        <div className="w-8 h-8 md:w-9 md:h-9 shrink-0 rounded-full bg-[#25D366] flex items-center justify-center text-white font-bold text-sm">
           {(conv.customer_name || "?").slice(0,1).toUpperCase()}
         </div>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <div className="font-semibold truncate">{conv.customer_name}</div>
+          <div className="flex items-center gap-1 md:gap-2 md:flex-wrap min-w-0">
+            <button type="button" onClick={() => setShowDetails((v) => !v)} className="font-semibold truncate text-left min-w-0" data-testid="chat-name-toggle">
+              {conv.customer_name}
+            </button>
             <button
               onClick={() => onToggleStar(conv.id, conv.starred)}
               className={`inline-flex items-center justify-center p-1 rounded-full hover:bg-gray-100 transition-colors ${
@@ -1694,12 +1703,21 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
               onChange={(e) => setStatus(e.target.value)}
               disabled={!canMessage || savingMeta}
               data-testid="chat-status-select"
-              className="border border-gray-300 px-1.5 py-0.5 text-[10px] uppercase tracking-widest font-bold disabled:bg-gray-100 disabled:cursor-not-allowed"
+              className={`${showDetails ? "inline-block" : "hidden"} md:inline-block border border-gray-300 px-1.5 py-0.5 text-[10px] uppercase tracking-widest font-bold disabled:bg-gray-100 disabled:cursor-not-allowed`}
             >
               {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
             </select>
           </div>
-          <div className="text-xs text-gray-500 flex items-center gap-3 flex-wrap">
+          {!showDetails && (
+            <button type="button" onClick={() => setShowDetails(true)} className="md:hidden w-full text-left text-[11px] text-gray-500 flex items-center gap-1.5 min-w-0" data-testid="chat-details-summary">
+              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${within24h ? "bg-[#25D366]" : "bg-[#E60000]"}`} />
+              <span className="font-mono truncate">{phoneFilter || conv.phone}</span>
+              <span className="shrink-0">· {conv.status || "new"}</span>
+              <span className="truncate">· {exec ? exec.name : "Unassigned"}</span>
+              <span className="shrink-0 text-[#002FA7] font-bold">▾</span>
+            </button>
+          )}
+          <div className={`${showDetails ? "flex" : "hidden"} md:flex text-xs text-gray-500 items-center gap-2 md:gap-3 flex-wrap mt-1 md:mt-0`}>
             {allNumbers.length <= 1 ? (
               conv.phone && (
                 <a href={`tel:${conv.phone}`} className="font-mono flex items-center gap-1 hover:underline hover:text-blue-600" data-testid="chat-phone-display">
@@ -1762,10 +1780,10 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
             )}
           </div>
         </div>
-        <button onClick={() => setShowInChatSearch(v => !v)} className={`p-2 ${showInChatSearch ? "bg-gray-900 text-white" : "hover:bg-gray-100"}`} title="Search in chat" data-testid="chat-search-toggle">
+        <button onClick={() => setShowInChatSearch(v => !v)} className={`p-1.5 md:p-2 shrink-0 ${showInChatSearch ? "bg-gray-900 text-white" : "hover:bg-gray-100"}`} title="Search in chat" data-testid="chat-search-toggle">
           <MagnifyingGlass size={16} weight={showInChatSearch ? "bold" : "regular"} />
         </button>
-        <button onClick={() => setShowInfo(v => !v)} className={`p-2 ${showInfo ? "bg-gray-900 text-white" : "hover:bg-gray-100"}`} title="Lead info" data-testid="chat-info-toggle">
+        <button onClick={() => setShowInfo(v => !v)} className={`p-1.5 md:p-2 shrink-0 ${showInfo ? "bg-gray-900 text-white" : "hover:bg-gray-100"}`} title="Lead info" data-testid="chat-info-toggle">
           <Info size={16} weight={showInfo ? "fill" : "regular"} />
         </button>
         {!canMessage && (
@@ -1962,10 +1980,10 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
 
           {/* Input */}
           {canMessage ? (
-            <div className="bg-[#F0F2F5] border-t border-gray-200 p-3 flex flex-col gap-2 relative" data-testid="chat-composer">
+            <div className="bg-[#F0F2F5] border-t border-gray-200 p-2 md:p-3 flex flex-col gap-1.5 md:gap-2 relative" data-testid="chat-composer" style={{ paddingBottom: "max(0.5rem, env(safe-area-inset-bottom))" }}>
               {/* Utility/Toolbar Row */}
-              <div className="flex items-center justify-between sm:justify-start gap-2 flex-wrap">
-                <div className="flex items-center gap-1.5">
+              <div className="flex items-center justify-start gap-1.5 md:gap-2 flex-wrap">
+                <div className="flex items-center gap-1 md:gap-1.5">
                   <input ref={fileInputRef} type="file" onChange={onFilePicked} className="hidden" data-testid="hidden-file-input" />
                   <button onClick={() => { setShowAttach(v => !v); setShowQR(false); setShowTpl(false); }} title="Attach"
                     className={`p-2 rounded hover:bg-gray-200 text-gray-700 ${showAttach ? "bg-gray-900 text-white" : ""}`} disabled={!within24h} data-testid="attach-toggle">
@@ -2002,9 +2020,13 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                     <Sparkle size={13} weight="fill" className={aiLoading ? "animate-pulse" : ""} />
                     {aiLoading ? "Drafting..." : "AI"}
                   </button>
+                  <button type="button" onClick={() => setShowTranslator((v) => !v)} title="Translate"
+                    className={`sm:hidden p-2 rounded ${showTranslator ? "bg-gray-900 text-white" : "hover:bg-gray-200 text-gray-700"}`} data-testid="translator-toggle">
+                    <Globe size={18} weight="bold" />
+                  </button>
                 </div>
 
-                <div className="flex items-center gap-1 border border-gray-300 px-1.5 py-1 bg-white rounded shadow-sm shrink-0" data-testid="composer-translator">
+                <div className={`${showTranslator ? "flex" : "hidden"} sm:flex items-center gap-1 border border-gray-300 px-1.5 py-1 bg-white rounded shadow-sm shrink-0`} data-testid="composer-translator">
                   <select
                     value={targetLang}
                     onChange={(e) => setTargetLang(e.target.value)}

@@ -110,15 +110,16 @@ export function AlertListener() {
 
   return (
     <div
-      className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in"
+      className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in p-3"
       data-testid="alert-popup-overlay"
     >
       <div
-        className="bg-white dark:bg-zinc-900 rounded-2xl shadow-2xl border-2 border-red-500 w-[90vw] max-w-md mx-4 overflow-hidden animate-in zoom-in-95"
+        className="bg-white dark:bg-zinc-900 rounded-2xl shadow-2xl border-2 border-red-500 w-full max-w-md overflow-hidden animate-in zoom-in-95 flex flex-col"
+        style={{ maxHeight: "calc(100dvh - 1.5rem)" }}
         data-testid="alert-popup"
       >
         {/* Header */}
-        <div className="bg-red-600 px-5 py-3 flex items-center gap-3">
+        <div className="bg-red-600 px-5 py-3 flex items-center gap-3 shrink-0">
           <AlertTriangle className="w-6 h-6 text-white animate-pulse" />
           <div className="flex-1">
             <p className="text-white font-bold text-lg leading-tight">
@@ -136,7 +137,7 @@ export function AlertListener() {
         </div>
 
         {/* Body */}
-        <div className="px-5 py-4 space-y-3">
+        <div className="px-5 py-4 space-y-3 overflow-y-auto min-h-0 flex-1">
           <h3 className="font-bold text-lg text-gray-900 dark:text-white" data-testid="alert-title">
             {current.title}
           </h3>
@@ -163,7 +164,7 @@ export function AlertListener() {
         </div>
 
         {/* Action */}
-        <div className="px-5 pb-5">
+        <div className="px-5 pb-5 pt-3 shrink-0 border-t border-gray-100" style={{ paddingBottom: "max(1.25rem, env(safe-area-inset-bottom))" }}>
           <Button
             className="w-full bg-red-600 hover:bg-red-700 text-white h-12 text-base font-bold"
             onClick={() => acknowledge(current.id)}

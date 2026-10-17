@@ -100,6 +100,7 @@ function FollowupChip({ lead }) {
 // `international` = the International section (sidebar): same list, scoped to
 // international leads, with the team panel, tabs and manual entry on top.
 export default function Leads({ international = false }) {
+  const [showMobileFilters, setShowMobileFilters] = useState(false);
   const { user } = useAuth();
   const { isFragvansh } = useCompany();
   const nav = useNavigate();
@@ -292,8 +293,8 @@ export default function Leads({ international = false }) {
         </>
       )}
 
-      {/* Filters */}
-      <div className="border border-gray-200 bg-white p-3 md:p-4 grid grid-cols-1 md:grid-cols-5 gap-2 md:gap-3">
+      {/* Filters - on a phone only the search box shows until "Filters" is tapped */}
+      <div className={`border border-gray-200 bg-white p-3 md:p-4 grid grid-cols-1 md:grid-cols-5 gap-2 md:gap-3 ${showMobileFilters ? "" : "leads-filters-collapsed"}`}>
         <div className="relative md:col-span-2">
           <MagnifyingGlass className="absolute left-2 top-2.5 text-gray-400" size={14} />
           <input
@@ -303,6 +304,11 @@ export default function Leads({ international = false }) {
             data-testid="leads-search-input"
           />
         </div>
+        <button type="button" data-filters-toggle="1" onClick={() => setShowMobileFilters((v) => !v)}
+          className="md:hidden border border-gray-300 px-3 py-2 text-xs uppercase tracking-widest font-bold text-gray-700 text-left"
+          data-testid="leads-filters-toggle">
+          {showMobileFilters ? "Hide filters ▴" : `Filters${[statusFilter, sourceFilter, assignedFilter, outcomeFilter, starredFilter].filter(Boolean).length ? ` (${[statusFilter, sourceFilter, assignedFilter, outcomeFilter, starredFilter].filter(Boolean).length} on)` : ""} ▾`}
+        </button>
         <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="border border-gray-300 px-2 py-2 text-sm" data-testid="leads-status-filter">
           <option value="">All statuses</option>
           {STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
@@ -1139,7 +1145,7 @@ function PaginationBar({ page, pageSize, total, totalPages, onPage, onPageSize }
       <div className="text-xs text-gray-500" data-testid="leads-pagination-summary">
         Showing <span className="font-mono font-bold text-gray-900">{start}–{end}</span> of <span className="font-mono font-bold text-gray-900">{total}</span>
       </div>
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
         <label className="flex items-center gap-1 text-[10px] uppercase tracking-widest text-gray-500 font-bold">
           Per page
           <select

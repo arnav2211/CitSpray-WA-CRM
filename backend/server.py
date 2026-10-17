@@ -192,6 +192,15 @@ def normalize_phone_display(p: Optional[str]) -> str:
     return "+" + digits
 
 
+def _https_base(base: str) -> str:
+    """Behind nginx the request arrives as plain http, so URLs built from it said
+    http:// - the phone app (https page) refuses to load http images. Our own domain
+    is always https."""
+    if base.startswith("http://") and not any(h in base for h in ("localhost", "127.0.0.1", "0.0.0.0")):
+        return "https://" + base[len("http://"):]
+    return base
+
+
 def phone_match_pattern(query: str) -> Optional[str]:
     """Return a regex pattern that matches stored phone fields against any of the
     common variations (with/without +, +91, 0, spaces, dashes). Indian 10-digit
@@ -6038,7 +6047,7 @@ async def generate_payment_qr(body: PaymentQRGenerate, request: Request, user: d
         fwd_proto = request.headers.get("x-forwarded-proto")
         fwd_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
         base = f"{fwd_proto or request.url.scheme}://{fwd_host}" if fwd_host else str(request.base_url).rstrip("/")
-    public_url = f"{base}/api/media/{stored_name}"
+    public_url = f"{_https_base(base)}/api/media/{stored_name}"
     caption = _format_payment_caption(account, body.amount, body.type)
     return {
         "ok": True,
@@ -9934,7 +9943,7 @@ async def _download_wa_media(media_id: str, mime_hint: Optional[str] = None, req
             base = f"{fwd_proto or request.url.scheme}://{fwd_host}"
         else:
             base = str(request.base_url).rstrip("/")
-    public_url = f"{base}/api/media/{stored_name}" if base else f"/api/media/{stored_name}"
+    public_url = f"{_https_base(base)}/api/media/{stored_name}" if base else f"/api/media/{stored_name}"
     return {"stored_name": stored_name, "url": public_url, "mime": mime_type, "size": len(content_bytes)}
 
 
@@ -10540,7 +10549,7 @@ async def upload_flow_media(
         fwd_proto = request.headers.get("x-forwarded-proto")
         fwd_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
         base = f"{fwd_proto or request.url.scheme}://{fwd_host}" if fwd_host else str(request.base_url).rstrip("/")
-    public_url = f"{base}/api/media/{stored_name}"
+    public_url = f"{_https_base(base)}/api/media/{stored_name}"
     return {
         "url": public_url,
         "filename": original,

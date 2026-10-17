@@ -31,6 +31,14 @@ h1, h2, h3, h4, h5 {
   .app-shell-viewport { height: 100dvh; }
 }
 
+/* Phone: an open WhatsApp chat gets the whole screen (like WhatsApp) - the app bar
+   and the bottom menu come back when you go back to the chat list. */
+@media (max-width: 767px) {
+  body[data-chat-thread="1"] .chat-hide { display: none !important; }
+  /* Leads page: only the search box + "Filters" button until the filters are opened */
+  .leads-filters-collapsed > *:not(:first-child):not([data-filters-toggle]) { display: none !important; }
+}
+
 .login-grid-bg {
   background-image:
     linear-gradient(#e5e7eb 1px, transparent 1px),

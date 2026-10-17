@@ -65,7 +65,7 @@ export default function AppShell() {
     <div className="h-screen app-shell-viewport flex bg-white overflow-hidden" data-testid="app-shell">
       <Sidebar mobileOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} />
       <main className="flex-1 min-w-0 flex flex-col h-full overflow-hidden">
-        <header className="shrink-0 z-20 bg-white/90 backdrop-blur-xl border-b border-gray-200 px-4 md:px-8 py-3 flex items-center justify-between gap-3">
+        <header className="chat-hide shrink-0 z-20 bg-white/90 backdrop-blur-xl border-b border-gray-200 px-4 md:px-8 py-3 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0">
             <button
               onClick={() => setSidebarOpen(true)}
@@ -91,7 +91,7 @@ export default function AppShell() {
             overlap page content like the Add Note button */}
         {user?.role !== "data_entry" && (
           <nav
-            className="md:hidden shrink-0 bg-white border-t border-gray-200 flex items-stretch justify-around h-14 shadow-[0_-2px_10px_rgba(0,0,0,0.05)]"
+            className="chat-hide md:hidden shrink-0 bg-white border-t border-gray-200 flex items-stretch justify-around h-14 shadow-[0_-2px_10px_rgba(0,0,0,0.05)]"
             style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
             data-testid="mobile-bottom-nav"
           >
@@ -144,5 +144,11 @@ function pageTitle(path) {
   if (path.startsWith("/settings")) return "Settings";
   if (path.startsWith("/reports")) return "Reports";
   if (path.startsWith("/alerts")) return "Admin Alerts";
+  if (path.startsWith("/calls")) return "Call Logs";
+  if (path.startsWith("/payroll")) return "Payroll";
+  if (path.startsWith("/leaves")) return "Leaves";
+  if (path.startsWith("/qa")) return "Internal Q&A";
+  if (path.startsWith("/transfer-requests")) return "Reassign Requests";
+  if (path.startsWith("/payment-settings")) return "Payment Settings";
   return "Dashboard";
 }
