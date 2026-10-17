@@ -5236,9 +5236,13 @@ async def list_followups(
     scope: str = "mine",
     status: Optional[str] = None,
     lead_id: Optional[str] = None,
+    view: Optional[str] = None,          # "board" = the Follow-ups page (all open incl. snoozed + recent done)
+    exec_id: Optional[str] = None,       # admin, board view: one person ("" = everyone)
     x_company: Optional[str] = Header(None, alias="X-Company"),
 ):
     company = _resolve_company(user, x_company)
+    if view == "board":
+        return await _followups_board(user, company, exec_id)
     query: Dict[str, Any] = {}
     if user["role"] == "data_entry":
         raise HTTPException(status_code=403, detail="Access denied")
@@ -5269,6 +5273,58 @@ async def list_followups(
         f["lead_phone"] = ld.get("active_wa_phone") or ld.get("phone")
         out.append(f)
     return out
+
+FU_DONE_DAYS = 14
+
+
+async def _followups_board(user: dict, company: str, exec_id: Optional[str]) -> dict:
+    """Everything for the Follow-ups page: open (incl. missed + snoozed) and done in the
+    last 14 days, each with why it exists and what it is about."""
+    base: Dict[str, Any] = {}
+    if user["role"] != "admin":
+        base["executive_id"] = user["id"]
+    elif exec_id:
+        base["executive_id"] = exec_id
+    open_rows = await db.followups.find({**base, "status": {"$in": ["pending", "missed"]}}, {"_id": 0}).sort("due_at", 1).to_list(3000)
+    done_rows = await db.followups.find({**base, "status": "done",
+                                         "completed_at": {"$gte": iso(now_utc() - timedelta(days=FU_DONE_DAYS))}},
+                                        {"_id": 0}).sort("completed_at", -1).to_list(400)
+    rows = open_rows + done_rows
+    lead_ids = list({f.get("lead_id") for f in rows if f.get("lead_id")})
+    leads = {l["id"]: l async for l in db.leads.find({"id": {"$in": lead_ids}}, {
+        "_id": 0, "id": 1, "customer_name": 1, "phone": 1, "active_wa_phone": 1, "company": 1, "status": 1,
+        "assigned_to": 1, "requirement": 1})}
+    names = {u["id"]: u.get("name") async for u in db.users.find({}, {"_id": 0, "id": 1, "name": 1})}
+    call_ids = [((f.get("meta") or {}).get("call_log_id")) for f in rows if (f.get("meta") or {}).get("call_log_id")]
+    calls = {c["id"]: c async for c in db.call_logs.find({"id": {"$in": call_ids}}, {
+        "_id": 0, "id": 1, "at": 1, "call_start_at": 1, "duration_seconds": 1, "direction": 1, "ai_summary.summary": 1})}
+    now = iso(now_utc())
+    out = []
+    for f in rows:
+        ld = leads.get(f.get("lead_id") or "") or {}
+        if ld and normalize_company(ld.get("company")) != company:
+            continue
+        meta = f.get("meta") or {}
+        kind = meta.get("type") or ("manual" if f.get("created_by") else "system")
+        f["kind"] = kind
+        f["lead_customer_name"] = ld.get("customer_name")
+        f["lead_phone"] = ld.get("active_wa_phone") or ld.get("phone")
+        f["lead_status"] = ld.get("status")
+        f["lead_requirement"] = (ld.get("requirement") or "")[:120]
+        f["owner_name"] = names.get(f.get("executive_id"))
+        f["created_by_name"] = names.get(f.get("created_by")) if f.get("created_by") else None
+        f["snoozed"] = bool(f.get("snoozed_until") and f["snoozed_until"] > now and f.get("status") != "done")
+        c = calls.get(meta.get("call_log_id") or "")
+        if c:
+            f["call"] = {"at": c.get("call_start_at") or c.get("at"), "duration_seconds": c.get("duration_seconds"),
+                         "direction": c.get("direction"), "summary": ((c.get("ai_summary") or {}).get("summary") or "")[:400]}
+        out.append(f)
+    people = []
+    if user["role"] == "admin":
+        people = [{"id": u["id"], "name": u.get("name")} async for u in db.users.find(
+            {"active": True, "role": {"$in": ["executive", "admin"]}, "username": {"$ne": "test_user"}}, {"_id": 0, "id": 1, "name": 1}).sort("name", 1)]
+    return {"items": out, "people": people, "done_days": FU_DONE_DAYS}
+
 
 @api.post("/followups")
 async def create_followup(body: FollowupCreate, user: dict = Depends(get_current_user)):
@@ -5314,16 +5370,25 @@ async def update_followup(fu_id: str, body: FollowupUpdate, user: dict = Depends
             await manager.broadcast_to_user(fu["executive_id"], clear_event)
     if body.note is not None:
         updates["note"] = body.note
+    unset: Dict[str, Any] = {}
     if body.due_at is not None:
+        # rescheduled: pending again and it rings again at the new time
         updates["due_at"] = body.due_at
+        updates["status"] = "pending"
+        updates["notified"] = False
+        unset["snoozed_until"] = ""
     if body.snooze_minutes is not None and body.snooze_minutes > 0:
         # Keep it pending but hide it (and push its due) until the snooze expires
         snooze_until = iso(now_utc() + timedelta(minutes=int(body.snooze_minutes)))
         updates["snoozed_until"] = snooze_until
         updates["due_at"] = snooze_until
         updates["status"] = "pending"
-    if updates:
-        await db.followups.update_one({"id": fu_id}, {"$set": updates})
+        updates["notified"] = False          # ring again when the snooze ends
+        unset.pop("snoozed_until", None)
+    if updates or unset:
+        await db.followups.update_one({"id": fu_id}, {"$set": updates, **({"$unset": unset} if unset else {})})
+        if updates.get("notified") is False:
+            await manager.broadcast_to_user(fu["executive_id"], {"type": "followup", "action": "clear", "fu_id": fu_id})
     fu = await db.followups.find_one({"id": fu_id}, {"_id": 0})
     return fu
 
@@ -11431,7 +11496,10 @@ async def auto_reassign_task():
         # reminders, not time-boxed alarms).
         await db.followups.update_many(
             {"status": "pending", "due_at": {"$lt": iso(now_utc() - timedelta(minutes=30))},
-             "meta.type": {"$ne": "reorder"}},
+             "meta.type": {"$ne": "reorder"},
+             # a snoozed follow-up is waiting to ring again - not missed
+             "$or": [{"snoozed_until": {"$exists": False}}, {"snoozed_until": None},
+                     {"snoozed_until": {"$lt": iso(now_utc() - timedelta(minutes=30))}}]},
             {"$set": {"status": "missed"}},
         )
 
@@ -13944,7 +14012,7 @@ async def snooze_followup(fu_id: str, user: dict = Depends(get_current_user)):
     
     await db.followups.update_one(
         {"id": fu_id},
-        {"$set": {"snoozed_until": snoozed_until, "notified": False}}
+        {"$set": {"snoozed_until": snoozed_until, "notified": False, "due_at": snoozed_until, "status": "pending"}}
     )
     
     clear_event = {
