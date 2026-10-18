@@ -14860,7 +14860,7 @@ CALL_REC_DIR.mkdir(exist_ok=True)
 CALL_AI_DEFAULTS = {"enabled": True, "min_seconds": 10, "internal_numbers": [], "include_admins": True,
                     "auto_delete": True,         # phones delete their copy after upload
                     "summarize_internal": True,  # team <-> team calls -> Team Calls page
-                    "auto_followup": True}       # follow-up created from what the customer said
+                    "auto_followup": False}      # OFF (2026-10-18): it set reminders for sellers / no-requirement calls
 CALL_REC_MAX_BYTES = 40 * 1024 * 1024
 CALL_AI_INTEREST = ("hot", "warm", "cold", "not_interested", "unclear")
 # Call summaries try the full Flash models first (better at Hindi/Marathi audio and exact numbers)
@@ -15781,12 +15781,8 @@ async def promise_tracker_task():
             if pr["status"] == "open" and now >= due:
                 res = await db.call_promises.update_one({"id": pr["id"], "status": "open"},
                                                         {"$set": {"status": "reminded", "reminded_at": iso(now)}})
-                if res.modified_count:
-                    await db.followups.insert_one({
-                        "id": str(uuid.uuid4()), "lead_id": pr["lead_id"], "executive_id": pr.get("owner_id") or pr["exec_id"],
-                        "created_by": None, "due_at": iso(now), "status": "pending", "created_at": iso(now), "completed_at": None,
-                        "note": f"Promised on the call: {pr['what']} - " + (f"still missing: {v.get('missing')}" if v.get("verdict") == "partly" and v.get("missing") else "not sent on WhatsApp yet"),
-                        "meta": {"type": "ai_promise", "promise_id": pr["id"]}})
+                # no automatic follow-up any more (2026-10-18) - the Promises page and the
+                # admin alert when it is missed are the reminder
             elif pr["status"] == "reminded" and now >= max(_add_office_hours(due, 3),
                                                            _add_office_hours(_parse_call_dt(pr.get("reminded_at")) or due, 3)):
                 res = await db.call_promises.update_one({"id": pr["id"], "status": "reminded"},
