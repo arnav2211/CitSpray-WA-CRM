@@ -116,6 +116,7 @@ export default function Leads({ international = false }) {
   const [dateFrom, setDateFrom] = useState(params.get("date_from") || "");
   const [dateTo, setDateTo] = useState(params.get("date_to") || "");
   const [starredFilter, setStarredFilter] = useState(params.get("starred") === "true");
+  const [reassignedFilter, setReassignedFilter] = useState(params.get("reassigned") === "1");
   // Tag filter (Fragvansh labels): multi-select, match-any
   const [tagFilter, setTagFilter] = useState((params.get("tags") || "").split(",").filter(Boolean));
   const [allTags, setAllTags] = useState([]);
@@ -151,6 +152,7 @@ export default function Leads({ international = false }) {
           date_from: dateFrom || undefined,
           date_to: dateTo || undefined,
           starred: starredFilter ? true : undefined,
+          reassigned: reassignedFilter ? true : undefined,
           tags: tagFilter.length ? tagFilter.join(",") : undefined,
           intl: international ? intlTab : undefined,
           country: international && countryFilter ? countryFilter : undefined,
@@ -205,9 +207,9 @@ export default function Leads({ international = false }) {
 
   // Reset to first page whenever a filter changes (so we never end up on an
   // empty page after narrowing the result set).
-  useEffect(() => { setPage(1); }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, q, pageSize, starredFilter, tagFilter, intlTab, countryFilter]);
+  useEffect(() => { setPage(1); }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, q, pageSize, starredFilter, reassignedFilter, tagFilter, intlTab, countryFilter]);
 
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, page, pageSize, starredFilter, tagFilter, intlTab, countryFilter]);
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, page, pageSize, starredFilter, reassignedFilter, tagFilter, intlTab, countryFilter]);
   useEffect(() => {
     const t = setTimeout(() => load(), 300);
     return () => clearTimeout(t);
@@ -225,6 +227,7 @@ export default function Leads({ international = false }) {
     if (dateFrom) p.date_from = dateFrom;
     if (dateTo) p.date_to = dateTo;
     if (starredFilter) p.starred = "true";
+    if (reassignedFilter) p.reassigned = "1";
     if (tagFilter.length) p.tags = tagFilter.join(",");
     if (international && intlTab !== "all") p.tab = intlTab;
     if (international && countryFilter) p.country = countryFilter;
@@ -232,7 +235,7 @@ export default function Leads({ international = false }) {
     if (page > 1) p.page = String(page);
     if (pageSize !== 25) p.size = String(pageSize);
     setParams(p, { replace: true });
-  }, [view, q, statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, starredFilter, tagFilter, openId, page, pageSize, setParams, international, intlTab, countryFilter]);
+  }, [view, q, statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, starredFilter, reassignedFilter, tagFilter, openId, page, pageSize, setParams, international, intlTab, countryFilter]);
 
   const execMap = useMemo(() => Object.fromEntries(execs.map((e) => [e.id, e])), [execs]);
   const isAdmin = user.role === "admin";
@@ -322,6 +325,12 @@ export default function Leads({ international = false }) {
             </React.Fragment>
           ))}
         </select>
+        {reassignedFilter && (
+          <button type="button" onClick={() => setReassignedFilter(false)} data-testid="leads-reassigned-chip"
+            className="border border-[#002FA7] bg-[#F0F4FF] text-[#002FA7] px-2 py-2 text-xs font-bold whitespace-nowrap" title="Remove this filter">
+            Reassigned leads only ✕
+          </button>
+        )}
         {isAdmin && (
           <select value={assignedFilter} onChange={(e) => setAssignedFilter(e.target.value)} className="border border-gray-300 px-2 py-2 text-sm" data-testid="leads-assignee-filter">
             <option value="">All executives</option>

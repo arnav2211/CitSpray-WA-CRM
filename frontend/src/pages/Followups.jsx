@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState, useCallback } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
   CheckCircle, Clock, ArrowClockwise, WhatsappLogo, ArrowSquareOut, Phone,
@@ -77,13 +77,26 @@ export default function Followups() {
   const isAdmin = user?.role === "admin";
   const [items, setItems] = useState([]);
   const [people, setPeople] = useState([]);
-  const [person, setPerson] = useState(isAdmin ? "" : null);
+  const [params, setParams] = useSearchParams();
+  const initialShow = params.get("show") || "";
+  const [person, setPerson] = useState(isAdmin ? (params.get("exec") || "") : null);
   const [loading, setLoading] = useState(false);
-  const [tab, setTab] = useState("todo");
+  const [tab, setTab] = useState(["reorder", "snoozed", "done"].includes(initialShow) ? initialShow : "todo");
+  // "overdue" / "today" = show only that part of the To-do list (dashboard links land here)
+  const [only, setOnly] = useState(["overdue", "today"].includes(initialShow) ? initialShow : "");
   const [q, setQ] = useState("");
   const [openLeadId, setOpenLeadId] = useState(null);
   const [now, setNow] = useState(Date.now());
-  const [showOld, setShowOld] = useState(false);
+  const [showOld, setShowOld] = useState(initialShow === "overdue");
+
+  // keep the address in sync so the view can be shared / reloaded
+  useEffect(() => {
+    const p = {};
+    const show = tab !== "todo" ? tab : only;
+    if (show) p.show = show;
+    if (isAdmin && person) p.exec = person;
+    setParams(p, { replace: true });
+  }, [tab, only, person, isAdmin, setParams]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -153,7 +166,13 @@ export default function Followups() {
           </div>
           <h1 className="font-chivo font-black text-2xl md:text-4xl">Follow-ups</h1>
           <p className="text-xs mt-1">
-            {counts.overdue > 0 && <span className="text-[#E60000] font-bold">{counts.overdue} overdue · </span>}
+            {(counts.overdue + counts.old) > 0 && (
+              <button type="button" onClick={() => { setTab("todo"); setOnly("overdue"); setShowOld(true); }}
+                className="text-[#E60000] font-bold hover:underline" data-testid="fu-overdue-count">
+                {counts.overdue + counts.old} overdue
+              </button>
+            )}
+            {(counts.overdue + counts.old) > 0 && <span className="text-gray-600"> · </span>}
             <span className="text-gray-600">{counts.today} due today · {counts.todo} open in total</span>
           </p>
         </div>
@@ -173,6 +192,11 @@ export default function Followups() {
             </button>
           );
         })}
+        <button type="button" onClick={() => { setTab("todo"); setOnly((v) => (v === "overdue" ? "" : "overdue")); setShowOld(true); }}
+          data-testid="fu-only-overdue"
+          className={`px-3 py-1.5 text-[11px] uppercase tracking-widest font-bold border ${only === "overdue" && tab === "todo" ? "bg-[#E60000] text-white border-[#E60000]" : "border-[#E60000]/40 text-[#B00000] bg-white hover:bg-[#FDECEC]"}`}>
+          Overdue only{(counts.overdue + counts.old) ? ` (${counts.overdue + counts.old})` : ""}
+        </button>
         {isAdmin && (
           <select value={person} onChange={(e) => setPerson(e.target.value)} className="border border-gray-300 px-2 py-1.5 text-xs" data-testid="fu-person">
             <option value="">Everyone</option>
@@ -186,10 +210,21 @@ export default function Followups() {
         </div>
       </div>
 
+      {tab === "todo" && only && (
+        <div className="flex items-center justify-between gap-2 border border-[#E60000]/30 bg-[#FDECEC] px-3 py-2 text-xs text-[#8A0000]" data-testid="fu-only-banner">
+          <span>
+            Showing only <b>{only === "overdue" ? "overdue" : "today's"}</b> follow-ups
+            {isAdmin && person ? ` of ${(people.find((p) => p.id === person) || {}).name || "this person"}` : isAdmin ? " of everyone" : ""}
+            {only === "overdue" ? " - oldest first, with whose lead it is and how late it is." : "."}
+          </span>
+          <button type="button" onClick={() => setOnly("")} className="underline font-bold whitespace-nowrap">Show all</button>
+        </div>
+      )}
       {tab === "todo" && (
         <div className="space-y-5">
           {counts.todo === 0 && <Empty loading={loading} text="Nothing to follow up - all clear." />}
-          {SECTIONS.map((s) => {
+          {only === "overdue" && counts.todo > 0 && (counts.overdue + counts.old) === 0 && <Empty loading={loading} text="No overdue follow-ups - all clear." />}
+          {SECTIONS.filter((s) => !only || (only === "overdue" ? ["overdue", "old"].includes(s.k) : s.k === only)).map((s) => {
             const list = listFor(s.k);
             if (!list.length) return null;
             const hidden = s.collapsed && !showOld;

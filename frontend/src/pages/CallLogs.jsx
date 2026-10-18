@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import {
@@ -47,13 +47,15 @@ export default function CallLogs() {
   const [executives, setExecutives] = useState([]);
   const [loading, setLoading] = useState(true);
   
-  // Filters
-  const [dateRange, setDateRange] = useState("today"); // today, yesterday, month, custom
+  // Filters (the dashboard links here with ?date=YYYY-MM-DD&exec=<id>&outcome=)
+  const [urlParams] = useSearchParams();
+  const urlDate = /^\d{4}-\d{2}-\d{2}$/.test(urlParams.get("date") || "") ? urlParams.get("date") : "";
+  const [dateRange, setDateRange] = useState(urlDate ? "custom" : "today"); // today, yesterday, month, custom
   const [selectedMonth, setSelectedMonth] = useState(""); // YYYY-MM
-  const [startDate, setStartDate] = useState("");
-  const [endDate, setEndDate] = useState("");
-  const [selectedOutcome, setSelectedOutcome] = useState("all");
-  const [selectedExec, setSelectedExec] = useState("all");
+  const [startDate, setStartDate] = useState(urlDate);
+  const [endDate, setEndDate] = useState(urlDate);
+  const [selectedOutcome, setSelectedOutcome] = useState(urlParams.get("outcome") || "all");
+  const [selectedExec, setSelectedExec] = useState(urlParams.get("exec") || "all");
   
   // Load active executives (only for admins)
   useEffect(() => {

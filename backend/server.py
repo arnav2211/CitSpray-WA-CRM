@@ -3133,6 +3133,7 @@ async def list_leads(
     lead_type: Optional[str] = None,  # e.g. "im_buylead" = IndiaMART buy leads only
     intl: Optional[str] = None,       # International page tab: all|scraper|manual|waiting
     country: Optional[str] = None,
+    reassigned: Optional[bool] = None,  # only leads that moved between people (dashboard link)
     x_company: Optional[str] = Header(None, alias="X-Company"),
 ):
     """List leads with optional filters. Backwards-compatible:
@@ -3159,6 +3160,8 @@ async def list_leads(
         query["status"] = status
     if starred:
         query["starred"] = True
+    if reassigned:
+        query["assignment_history.1"] = {"$exists": True}
     if source:
         query["source"] = source
     _lt = _lead_type_clause(lead_type)
@@ -5461,9 +5464,21 @@ async def reports_overview(
     conversion_rate = round((converted / total_non_new) * 100, 2) if total_non_new else 0
     # reassigned = count leads (in window) with > 1 assignment history entry
     reassigned = await db.leads.count_documents({**lead_q, "assignment_history.1": {"$exists": True}})
-    # missed = pending followups past due_at (always cross-window — pending reflects current state)
+    # overdue follow-ups = open (pending/missed) and past due, for THIS company's leads, not
+    # reorder nudges - the same rule as the Follow-ups page "Overdue" view (cross-window: it is
+    # the current state). Also counted per person for the Per Executive table.
     now_iso = iso(now_utc())
-    missed_followups = await db.followups.count_documents({"status": "pending", "due_at": {"$lt": now_iso}})
+    _open_overdue = [f async for f in db.followups.find(
+        {"status": {"$in": ["pending", "missed"]}, "due_at": {"$lt": now_iso}, "meta.type": {"$ne": "reorder"}},
+        {"_id": 0, "lead_id": 1, "executive_id": 1})]
+    _co_lead_ids = {l["id"] async for l in db.leads.find(
+        {"$and": [company_filter(company), {"id": {"$in": list({f.get("lead_id") for f in _open_overdue if f.get("lead_id")})}}]},
+        {"_id": 0, "id": 1})}
+    overdue_by_exec: Dict[str, int] = {}
+    for _f in _open_overdue:
+        if _f.get("lead_id") in _co_lead_ids:
+            overdue_by_exec[_f.get("executive_id") or ""] = overdue_by_exec.get(_f.get("executive_id") or "", 0) + 1
+    missed_followups = sum(overdue_by_exec.values())
     # per executive (only this company's execs)
     execs = await db.users.find({"role": "executive", **company_filter(company)}, {"_id": 0, "password_hash": 0}).to_list(500)
     per_exec = []
@@ -5551,6 +5566,7 @@ async def reports_overview(
             "lost": lost,
             "conversion_rate": round((conv / (count - new_leads)) * 100, 1) if (count - new_leads) else 0,
             "avg_response_seconds": int(avg_ms / 1000) if avg_ms else 0,
+            "overdue_followups": overdue_by_exec.get(e["id"], 0),
             "calls_total": total_calls,
             "calls_unique_numbers": unique_calls.get(e["id"], 0),
             "calls_talk_time_seconds": call_durations.get(e["id"], 0),
@@ -5935,8 +5951,9 @@ async def reports_my(user: dict = Depends(get_current_user)):
     converted = await db.leads.count_documents({"assigned_to": my_id, "status": "converted"})
     now_iso = iso(now_utc())
     pending_fu = await db.followups.count_documents({"executive_id": my_id, "status": "pending"})
-    overdue_fu = await db.followups.count_documents({
-        "executive_id": my_id, "status": "pending", "due_at": {"$lt": now_iso}
+    overdue_fu = await db.followups.count_documents({     # same rule as the Follow-ups page
+        "executive_id": my_id, "status": {"$in": ["pending", "missed"]}, "due_at": {"$lt": now_iso},
+        "meta.type": {"$ne": "reorder"},
     })
     return {
         "total_leads": total,

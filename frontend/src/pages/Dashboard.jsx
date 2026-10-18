@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer, LineChart, Line,
 } from "recharts";
@@ -9,12 +9,34 @@ import { ArrowRight, Lightning, Warning, CheckCircle, Clock } from "@phosphor-ic
 import { toast } from "sonner";
 import { fmtISTTime } from "@/lib/format";
 
-function Stat({ label, value, accent, testId }) {
-  return (
-    <div className="border border-gray-200 bg-white p-5" data-testid={testId}>
-      <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">{label}</div>
+function Stat({ label, value, accent, testId, to, hint }) {
+  const body = (
+    <>
+      <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold flex items-center justify-between gap-2">
+        <span>{label}</span>
+        {to && <ArrowRight size={12} className="text-gray-300 group-hover:text-gray-900" />}
+      </div>
       <div className={`font-chivo font-black text-4xl mt-2 ${accent || "text-gray-900"}`}>{value}</div>
-    </div>
+      {to && <div className="text-[10px] text-gray-400 mt-1 group-hover:text-[#002FA7]">{hint || "View list"}</div>}
+    </>
+  );
+  if (!to) return <div className="border border-gray-200 bg-white p-5" data-testid={testId}>{body}</div>;
+  return (
+    <Link to={to} className="group block border border-gray-200 bg-white p-5 hover:border-gray-900 transition-colors" data-testid={testId}>
+      {body}
+    </Link>
+  );
+}
+
+// a small tile that opens a list when clicked
+function MiniStat({ label, value, accent, to }) {
+  return (
+    <Link to={to} className="group block bg-gray-50 p-4 border border-gray-150 hover:border-gray-900 transition-colors">
+      <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold flex items-center justify-between">
+        <span>{label}</span><ArrowRight size={11} className="text-gray-300 group-hover:text-gray-900" />
+      </div>
+      <div className={`font-chivo font-black text-2xl mt-1 ${accent || "text-gray-900"}`}>{value}</div>
+    </Link>
   );
 }
 
@@ -31,6 +53,7 @@ function formatDuration(sec) {
 
 export default function Dashboard() {
   const { user } = useAuth();
+  const nav = useNavigate();
   const [data, setData] = useState(null);
   const [my, setMy] = useState(null);
   const [recent, setRecent] = useState([]);
@@ -76,6 +99,13 @@ export default function Dashboard() {
 
   const byStatusData = data ? Object.entries(data.by_status || {}).map(([k, v]) => ({ name: k, value: v })) : [];
   const bySourceData = data ? Object.entries(data.by_source || {}).map(([k, v]) => ({ name: k, value: v })) : [];
+  // links for the call tiles / rows (Call Logs reads ?date=&exec=&outcome=)
+  const callsLink = (extra = {}) => {
+    const p = new URLSearchParams({ date: dailyDate });
+    if (isAdmin && selectedExecId) p.set("exec", selectedExecId);
+    Object.entries(extra).forEach(([k, v]) => v && p.set(k, v));
+    return `/calls?${p.toString()}`;
+  };
 
   return (
     <div className="p-4 md:p-8 space-y-4 md:space-y-6">
@@ -96,10 +126,10 @@ export default function Dashboard() {
       {isAdmin && data && (
         <>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <Stat label="Total Leads" value={data.total_leads} testId="stat-total" />
-            <Stat label="Conversion Rate" value={`${data.conversion_rate}%`} accent="text-[#008A00]" testId="stat-conversion" />
-            <Stat label="Reassigned" value={data.reassigned_leads} accent="text-[#002FA7]" testId="stat-reassigned" />
-            <Stat label="Missed Follow-ups" value={data.missed_followups} accent="text-[#E60000]" testId="stat-missed" />
+            <Stat label="Total Leads" value={data.total_leads} testId="stat-total" to="/leads" hint="Open all leads" />
+            <Stat label="Conversion Rate" value={`${data.conversion_rate}%`} accent="text-[#008A00]" testId="stat-conversion" to="/leads?status=converted" hint="See converted leads" />
+            <Stat label="Reassigned" value={data.reassigned_leads} accent="text-[#002FA7]" testId="stat-reassigned" to="/leads?reassigned=1" hint="See reassigned leads" />
+            <Stat label="Overdue Follow-ups" value={data.missed_followups} accent="text-[#E60000]" testId="stat-missed" to="/followups?show=overdue" hint="See which leads are overdue" />
           </div>
 
           {/* Daily Call Activity Widget */}
@@ -132,20 +162,9 @@ export default function Dashboard() {
             {dailyCalls ? (
               <>
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  <div className="bg-gray-50 p-4 border border-gray-150">
-                    <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold">Call Attempts</div>
-                    <div className="font-chivo font-black text-2xl mt-1 text-gray-900">{dailyCalls.total_calls}</div>
-                  </div>
-                  <div className="bg-gray-50 p-4 border border-gray-150">
-                    <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold">Connected/Talked Calls</div>
-                    <div className="font-chivo font-black text-2xl mt-1 text-[#008A00]">{dailyCalls.talked_calls}</div>
-                  </div>
-                  <div className="bg-gray-50 p-4 border border-gray-150">
-                    <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold">Total Talk Time</div>
-                    <div className="font-chivo font-black text-2xl mt-1 text-[#002FA7]">
-                      {formatDuration(dailyCalls.total_talk_time_seconds)}
-                    </div>
-                  </div>
+                  <MiniStat label="Call Attempts" value={dailyCalls.total_calls} to={callsLink()} />
+                  <MiniStat label="Connected/Talked Calls" value={dailyCalls.talked_calls} accent="text-[#008A00]" to={callsLink({ outcome: "connected" })} />
+                  <MiniStat label="Total Talk Time" value={formatDuration(dailyCalls.total_talk_time_seconds)} accent="text-[#002FA7]" to={callsLink({ outcome: "connected" })} />
                 </div>
 
                 {!selectedExecId && dailyCalls.per_executive && dailyCalls.per_executive.length > 0 && (
@@ -163,8 +182,9 @@ export default function Dashboard() {
                         </thead>
                         <tbody className="divide-y divide-gray-150">
                           {dailyCalls.per_executive.map(e => (
-                            <tr key={e.user_id} className="hover:bg-gray-50">
-                              <td className="px-3 py-2 font-semibold text-gray-800">{e.user_name}</td>
+                            <tr key={e.user_id} className="hover:bg-gray-50 cursor-pointer" title="Open this person's calls"
+                              onClick={() => nav(`/calls?date=${dailyDate}&exec=${e.user_id}`)}>
+                              <td className="px-3 py-2 font-semibold text-gray-800 underline-offset-2 hover:underline">{e.user_name}</td>
                               <td className="px-3 py-2 text-right font-mono">{e.total_calls}</td>
                               <td className="px-3 py-2 text-right font-mono text-[#008A00]">{e.talked_calls}</td>
                               <td className="px-3 py-2 text-right font-mono text-[#002FA7]">
@@ -185,9 +205,10 @@ export default function Dashboard() {
 
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
             <div className="border border-gray-200 bg-white p-5 lg:col-span-2">
-              <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-4">Leads — Last 14 days</div>
+              <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-4">Leads — Last 14 days <span className="normal-case tracking-normal font-normal text-gray-400">· click a day to see its leads</span></div>
               <ResponsiveContainer width="100%" height={240}>
-                <LineChart data={data.leads_timeseries}>
+                <LineChart data={data.leads_timeseries} style={{ cursor: "pointer" }}
+                  onClick={(st) => st && st.activeLabel && nav(`/leads?date_from=${st.activeLabel}&date_to=${st.activeLabel}`)}>
                   <CartesianGrid stroke="#F3F4F6" vertical={false} />
                   <XAxis dataKey="date" tick={{ fontSize: 10 }} tickFormatter={(d) => d.slice(5)} />
                   <YAxis tick={{ fontSize: 10 }} allowDecimals={false} />
@@ -197,14 +218,14 @@ export default function Dashboard() {
               </ResponsiveContainer>
             </div>
             <div className="border border-gray-200 bg-white p-5">
-              <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-4">By Status</div>
+              <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-4">By Status <span className="normal-case tracking-normal font-normal text-gray-400">· click a bar</span></div>
               <ResponsiveContainer width="100%" height={240}>
                 <BarChart data={byStatusData}>
                   <CartesianGrid stroke="#F3F4F6" vertical={false} />
                   <XAxis dataKey="name" tick={{ fontSize: 10 }} />
                   <YAxis tick={{ fontSize: 10 }} allowDecimals={false} />
                   <Tooltip contentStyle={{ border: "1px solid #E5E7EB", borderRadius: 0, fontSize: 12 }} />
-                  <Bar dataKey="value" fill="#002FA7" />
+                  <Bar dataKey="value" fill="#002FA7" cursor="pointer" onClick={(d) => d && d.name && nav(`/leads?status=${encodeURIComponent(d.name)}`)} />
                 </BarChart>
               </ResponsiveContainer>
             </div>
@@ -222,6 +243,7 @@ export default function Dashboard() {
                     <th className="text-left px-5 py-2">Name</th>
                     <th className="text-right px-5 py-2">Leads</th>
                     <th className="text-right px-5 py-2">Converted</th>
+                    <th className="text-right px-5 py-2">Overdue</th>
                     <th className="text-right px-5 py-2 hidden md:table-cell">Avg Resp (s)</th>
                     <th className="text-left px-5 py-2 hidden md:table-cell">Status</th>
                   </tr>
@@ -230,11 +252,22 @@ export default function Dashboard() {
                   {data.per_executive.map((e) => (
                     <tr key={e.id} className="border-t border-gray-200 hover:bg-gray-50" data-testid={`exec-row-${e.username}`}>
                       <td className="px-5 py-3">
-                        <div className="font-semibold">{e.name}</div>
+                        <Link to={`/leads?assigned=${e.id}`} className="font-semibold hover:underline">{e.name}</Link>
                         <div className="text-xs text-gray-500">@{e.username}</div>
                       </td>
-                      <td className="px-5 py-3 text-right font-mono">{e.leads}</td>
-                      <td className="px-5 py-3 text-right font-mono text-[#008A00]">{e.converted}</td>
+                      <td className="px-5 py-3 text-right font-mono">
+                        <Link to={`/leads?assigned=${e.id}`} className="hover:underline">{e.leads}</Link>
+                      </td>
+                      <td className="px-5 py-3 text-right font-mono text-[#008A00]">
+                        <Link to={`/leads?assigned=${e.id}&status=converted`} className="hover:underline">{e.converted}</Link>
+                      </td>
+                      <td className="px-5 py-3 text-right font-mono">
+                        {e.overdue_followups ? (
+                          <Link to={`/followups?show=overdue&exec=${e.id}`} className="text-[#E60000] font-bold hover:underline" data-testid={`exec-overdue-${e.username}`}>
+                            {e.overdue_followups}
+                          </Link>
+                        ) : <span className="text-gray-300">0</span>}
+                      </td>
                       <td className="px-5 py-3 text-right font-mono hidden md:table-cell">{e.avg_response_seconds || "—"}</td>
                       <td className="px-5 py-3 hidden md:table-cell">
                         <span className={`text-[10px] uppercase tracking-widest font-bold ${e.active ? "text-[#008A00]" : "text-[#E60000]"}`}>
@@ -244,7 +277,7 @@ export default function Dashboard() {
                     </tr>
                   ))}
                   {data.per_executive.length === 0 && (
-                    <tr><td colSpan={5} className="px-5 py-6 text-center text-gray-500 text-xs uppercase tracking-widest">No executives yet</td></tr>
+                    <tr><td colSpan={6} className="px-5 py-6 text-center text-gray-500 text-xs uppercase tracking-widest">No executives yet</td></tr>
                   )}
                 </tbody>
               </table>
@@ -274,10 +307,10 @@ export default function Dashboard() {
       {!isAdmin && my && (
         <>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <Stat label="My Leads" value={my.total_leads} testId="stat-my-total" />
-            <Stat label="New" value={my.new_leads} accent="text-[#002FA7]" testId="stat-my-new" />
-            <Stat label="Converted" value={my.converted} accent="text-[#008A00]" testId="stat-my-converted" />
-            <Stat label="Overdue" value={my.overdue_followups} accent="text-[#E60000]" testId="stat-my-overdue" />
+            <Stat label="My Leads" value={my.total_leads} testId="stat-my-total" to="/leads" />
+            <Stat label="New" value={my.new_leads} accent="text-[#002FA7]" testId="stat-my-new" to="/leads?status=new" />
+            <Stat label="Converted" value={my.converted} accent="text-[#008A00]" testId="stat-my-converted" to="/leads?status=converted" />
+            <Stat label="Overdue" value={my.overdue_followups} accent="text-[#E60000]" testId="stat-my-overdue" to="/followups?show=overdue" hint="See which leads are overdue" />
           </div>
 
           {/* Daily Call Activity Widget */}
@@ -299,20 +332,9 @@ export default function Dashboard() {
 
             {dailyCalls ? (
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div className="bg-gray-50 p-4 border border-gray-150">
-                  <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold">Call Attempts</div>
-                  <div className="font-chivo font-black text-2xl mt-1 text-gray-900">{dailyCalls.total_calls}</div>
-                </div>
-                <div className="bg-gray-50 p-4 border border-gray-150">
-                  <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold">Connected/Talked Calls</div>
-                  <div className="font-chivo font-black text-2xl mt-1 text-[#008A00]">{dailyCalls.talked_calls}</div>
-                </div>
-                <div className="bg-gray-50 p-4 border border-gray-150">
-                  <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold">Total Talk Time</div>
-                  <div className="font-chivo font-black text-2xl mt-1 text-[#002FA7]">
-                    {formatDuration(dailyCalls.total_talk_time_seconds)}
-                  </div>
-                </div>
+                <MiniStat label="Call Attempts" value={dailyCalls.total_calls} to={callsLink()} />
+                <MiniStat label="Connected/Talked Calls" value={dailyCalls.talked_calls} accent="text-[#008A00]" to={callsLink({ outcome: "connected" })} />
+                <MiniStat label="Total Talk Time" value={formatDuration(dailyCalls.total_talk_time_seconds)} accent="text-[#002FA7]" to={callsLink({ outcome: "connected" })} />
               </div>
             ) : (
               <div className="text-center py-6 text-xs text-gray-400 uppercase tracking-widest">Loading metrics…</div>
