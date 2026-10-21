@@ -2062,12 +2062,17 @@ async def _present_on_latest_office_day(user_id: str, cfg: Optional[dict] = None
     if now.hour * 60 + now.minute < _hhmm_to_minutes(cfg["office_start"], 630):
         d -= timedelta(days=1)
     ds = d.strftime("%Y-%m-%d")
+    today_ds = now.strftime("%Y-%m-%d")
     for _ in range(10):
         ds = d.strftime("%Y-%m-%d")
         if d.weekday() != 6:
             hol = await db.holidays.find_one({"date": ds}, {"_id": 0, "holiday_type": 1})
             if not (hol and (hol.get("holiday_type") or "full") == "full"):
-                break
+                # A past day on which NOBODY punched in was a day off that nobody entered
+                # as a holiday (20-Oct-2026: office closed, the next morning's leads all went
+                # unassigned because no pool member was "present"). Skip it.
+                if ds == today_ds or await db.attendance_logs.find_one({"date": ds}, {"_id": 1}):
+                    break
         d -= timedelta(days=1)
     log = await db.attendance_logs.find_one({"user_id": user_id, "date": ds}, {"_id": 0, "check_in": 1})
     return bool(log and log.get("check_in"))
@@ -2346,6 +2351,29 @@ async def log_activity(actor_id: Optional[str], action: str, lead_id: Optional[s
         "at": iso(now_utc()),
     })
 
+async def _alert_unassignable(company: Optional[str]):
+    """A new lead found nobody to go to although this company HAS executives (nobody punched
+    in / everyone on leave / attendance device down). Tell the admins at once - at most one
+    alert per company per hour - instead of leads silently piling up unassigned."""
+    try:
+        comp = normalize_company(company)
+        if not await db.users.find_one({"role": "executive", "active": True, "username": {"$ne": "test_user"},
+                                        **company_filter(comp)}, {"_id": 1}):
+            return      # e.g. Fragvansh with no executives - unassigned is expected there
+        now = _ist_now()
+        n_today = await db.attendance_logs.count_documents({"date": now.strftime("%Y-%m-%d")})
+        why = ("nobody has punched in today - check the attendance device / Wi-Fi, or switch on the attendance bypass"
+               if n_today == 0 and await _office_open_now() else
+               "no executive is available right now (attendance, leave or after-hours WFH pool)")
+        await create_system_alert(
+            "leads_unassigned",
+            f"Leads are going UNASSIGNED ({comp})",
+            f"A new {comp} lead could not be assigned: {why}. Open Leads, filter 'Unassigned', and assign them.",
+            dedup_key=f"leads_unassigned:{comp}:{now.strftime('%Y-%m-%d-%H')}")
+    except Exception as e:
+        logger.warning(f"unassignable alert failed: {e}")
+
+
 async def assign_lead(lead_id: str, target_user_id: Optional[str] = None, by_user_id: Optional[str] = None) -> Optional[str]:
     if target_user_id:
         user = await db.users.find_one({"id": target_user_id, "active": True})
@@ -2363,6 +2391,7 @@ async def assign_lead(lead_id: str, target_user_id: Optional[str] = None, by_use
         lead_doc = await db.leads.find_one({"id": lead_id}, {"_id": 0, "company": 1})
         chosen = await pick_next_executive(company=(lead_doc or {}).get("company"))
         if not chosen:
+            await _alert_unassignable((lead_doc or {}).get("company"))
             return None
         chosen_id = chosen["id"]
     entry = {"user_id": chosen_id, "at": iso(now_utc()), "by": by_user_id}
