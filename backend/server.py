@@ -4624,7 +4624,8 @@ _WB_COMPANY = re.compile(r"(?i)\b(m/s|enterprises?|traders?|chemicals?|industrie
 
 def _winback_opener(l: dict, orders: List[dict], exec_name: str) -> str:
     raw = (l.get("customer_name") or "").strip()
-    is_company = bool(_WB_COMPANY.search(raw)) or not raw
+    is_company = (bool(_WB_COMPANY.search(raw)) or not raw
+                  or bool(re.search(r"(?i)^(new call lead|new lead|customer|old customer|unknown|whatsapp)|\d{6,}", raw)))
     greet = "Namaste ji" if is_company else f"Namaste {_tidy_name(raw).split(' ')[0]} ji"
     items, seen = [], set()
     for o in orders[:3]:
