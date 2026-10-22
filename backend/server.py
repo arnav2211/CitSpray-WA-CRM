@@ -4579,6 +4579,14 @@ async def winback_allocate(exec_id: Optional[str] = None) -> Dict[str, int]:
     if exec_id:
         q_users["id"] = exec_id
     for e in await db.users.find(q_users, {"_id": 0, "id": 1}).to_list(100):
+        # carry over: customers from an earlier day's list that were NOT called yet stay on the
+        # list (still theirs, still not ordered) - new names only fill the remaining slots
+        await db.leads.update_many(
+            {"winback_exec": e["id"], "assigned_to": e["id"], "winback_day": {"$lt": today_s, "$gt": ""},
+             "last_order_at": {"$lt": cut},
+             "$or": [{"winback_last_at": {"$exists": False}}, {"winback_last_at": None},
+                     {"$expr": {"$lt": ["$winback_last_at", "$winback_day"]}}]},
+            {"$set": {"winback_day": today_s}})
         have = await db.leads.count_documents({"winback_day": today_s, "winback_exec": e["id"]})
         need = int(cfg.get("per_day") or 15) - have
         if need <= 0:
