@@ -4521,6 +4521,252 @@ async def set_active_wa_phone(lead_id: str, body: ActiveWaPhoneInput, user: dict
     return await db.leads.find_one({"id": lead_id}, {"_id": 0})
 
 
+# ------------- Win-back calls (old customers who stopped ordering) -------------
+WINBACK_DEFAULTS = {"enabled": True, "per_day": 15, "min_months": 6}
+WINBACK_COMPANY = "citspray"
+WINBACK_RETRY = ("no_answer", "call_later", "interested")
+WINBACK_OUTCOMES = ("ordered", "interested", "call_later", "no_answer", "not_interested", "wrong_number")
+
+
+class WinbackOutcomeIn(BaseModel):
+    outcome: Literal["ordered", "interested", "call_later", "no_answer", "not_interested", "wrong_number"]
+    note: Optional[str] = ""
+    next_date: Optional[str] = None      # YYYY-MM-DD (IST) - when to call again
+
+
+class WinbackSettingsIn(BaseModel):
+    enabled: Optional[bool] = None
+    per_day: Optional[int] = None
+    min_months: Optional[int] = None
+
+
+async def _winback_cfg() -> dict:
+    doc = await db.system_settings.find_one({"key": "winback_calls"}, {"_id": 0}) or {}
+    cfg = dict(WINBACK_DEFAULTS)
+    for k in cfg:
+        if doc.get(k) is not None:
+            cfg[k] = doc[k]
+    return cfg
+
+
+def _winback_score(l: dict, today) -> float:
+    n = int(l.get("past_orders_count") or 0) or 1
+    spend = float(l.get("past_orders_total") or 0)
+    try:
+        days = (today - datetime.strptime(l.get("last_order_at") or "", "%Y-%m-%d").date()).days
+    except Exception:
+        days = 9999
+    s = min(n, 10) * 10 + min(spend / 1000.0, 40)
+    s += 25 if 180 <= days <= 730 else (10 if days <= 1460 else 0)
+    if l.get("winback_status") in WINBACK_RETRY:
+        s += 100     # promised call-backs first
+    return round(s, 1)
+
+
+async def winback_allocate(exec_id: Optional[str] = None) -> Dict[str, int]:
+    """Top up today's win-back list of each (or one) executive to `per_day` leads."""
+    cfg = await _winback_cfg()
+    out: Dict[str, int] = {}
+    if not cfg.get("enabled"):
+        return out
+    now = _ist_now()
+    today = now.date()
+    today_s = today.strftime("%Y-%m-%d")
+    cut = (today - timedelta(days=30 * int(cfg.get("min_months") or 6))).strftime("%Y-%m-%d")
+    recent_touch = iso(now_utc() - timedelta(days=30))
+    q_users: Dict[str, Any] = {"role": "executive", "active": True, "username": {"$ne": "test_user"},
+                               **company_filter(WINBACK_COMPANY)}
+    if exec_id:
+        q_users["id"] = exec_id
+    for e in await db.users.find(q_users, {"_id": 0, "id": 1}).to_list(100):
+        have = await db.leads.count_documents({"winback_day": today_s, "winback_exec": e["id"]})
+        need = int(cfg.get("per_day") or 15) - have
+        if need <= 0:
+            continue
+        q = {"$and": [
+            company_filter(WINBACK_COMPANY),
+            {"assigned_to": e["id"], "last_order_at": {"$lt": cut}, "international": {"$ne": True},
+             "status": {"$ne": "converted"}, "winback_day": {"$ne": today_s}},
+            {"$or": [
+                {"winback_status": {"$in": [None, ""]}},
+                {"winback_status": {"$exists": False}},
+                {"winback_status": {"$in": list(WINBACK_RETRY)}, "winback_next_at": {"$lte": today_s}},
+            ]},
+            # someone talked to them in the last 30 days anyway -> leave them
+            {"$or": [{"last_call_at": {"$exists": False}}, {"last_call_at": None}, {"last_call_at": {"$lt": recent_touch}},
+                     {"winback_status": {"$in": list(WINBACK_RETRY)}}]},
+        ]}
+        cands = await db.leads.find(q, {"_id": 0, "id": 1, "past_orders_count": 1, "past_orders_total": 1,
+                                        "last_order_at": 1, "winback_status": 1}).to_list(3000)
+        cands.sort(key=lambda l: _winback_score(l, today), reverse=True)
+        ids = [c["id"] for c in cands[:need]]
+        if ids:
+            await db.leads.update_many({"id": {"$in": ids}}, {"$set": {"winback_day": today_s, "winback_exec": e["id"]}})
+        out[e["id"]] = len(ids)
+    return out
+
+
+async def winback_daily_task():
+    try:
+        if _ist_now().weekday() == 6:
+            return
+        hol = await db.holidays.find_one({"date": _ist_now().strftime("%Y-%m-%d"), "holiday_type": {"$ne": "early_off"}}, {"_id": 1})
+        if hol:
+            return
+        await winback_allocate()
+    except Exception as e:
+        logger.warning(f"winback allocation failed: {e}")
+
+
+def _winback_opener(l: dict, orders: List[dict], exec_name: str) -> str:
+    name = _tidy_name(l.get("customer_name")).split(" ")[0] if l.get("customer_name") else ""
+    items = []
+    for o in orders[:2]:
+        for it in (o.get("items") or []):
+            t = re.sub(r"\s+", " ", it).strip()
+            if not t or re.match(r"(?i)^(total|grand|courier|shipping|freight|gst|18%|bus|transport)", t):
+                continue
+            items.append(re.split(r"[-=(@]|\s{2,}", t)[0].strip(" .:,"))
+            if len(items) >= 2:
+                break
+    what = " aur ".join(i for i in items if i) or "hamare products"
+    when = ""
+    if l.get("last_order_at"):
+        try:
+            d = datetime.strptime(l["last_order_at"], "%Y-%m-%d")
+            when = d.strftime("%B %Y")
+        except Exception:
+            pass
+    first = (exec_name or "").split(" ")[0]
+    return (f"Namaste {name} ji, main {first} bol rahi hoon CitSpray Aroma Sciences, Nagpur se. "
+            f"Aapne {('pichhli baar ' + when + ' mein ') if when else ''}humse {what} liya tha - "
+            f"kaisa raha? Kaafi samay ho gaya, kya abhi kuch requirement hai? Is mahine naye stock "
+            f"aur fresh fragrances bhi aaye hain.")
+
+
+@api.get("/winback/today")
+async def winback_today(user: dict = Depends(get_current_user), exec_id: Optional[str] = None):
+    if user["role"] not in ("executive", "admin"):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    uid = user["id"] if user["role"] == "executive" else (exec_id or "")
+    cfg = await _winback_cfg()
+    today_s = _ist_now().strftime("%Y-%m-%d")
+    names = {u["id"]: u.get("name") async for u in db.users.find({}, {"_id": 0, "id": 1, "name": 1})}
+    if uid and cfg.get("enabled"):
+        await winback_allocate(uid)          # first open of the day fills the list
+    q: Dict[str, Any] = {"winback_day": today_s}
+    if uid:
+        q["winback_exec"] = uid
+    leads = await db.leads.find(q, {"_id": 0, "raw_email_html": 0, "raw_email_text": 0, "ai_profile": 0}).to_list(500)
+    items = []
+    for l in leads:
+        orders = await db.past_orders.find({"lead_id": l["id"]}, {"_id": 0, "date": 1, "items": 1, "total": 1}).sort("date", -1).to_list(3)
+        items.append({
+            "id": l["id"], "customer_name": l.get("customer_name"), "phone": l.get("phone"), "phones": l.get("phones") or [],
+            "status": l.get("status"), "source": l.get("source"), "last_order_at": l.get("last_order_at"),
+            "past_orders_count": l.get("past_orders_count") or 0, "past_orders_total": l.get("past_orders_total") or 0,
+            "winback_status": l.get("winback_status"), "winback_last_at": l.get("winback_last_at"),
+            "winback_attempts": l.get("winback_attempts") or 0, "winback_history": (l.get("winback_history") or [])[-3:],
+            "done_today": bool(l.get("winback_last_at") and _ist_day(l["winback_last_at"]) == today_s),
+            "owner_name": names.get(l.get("assigned_to")), "recent_orders": orders,
+            "opener": _winback_opener(l, orders, names.get(l.get("winback_exec")) or user.get("name") or ""),
+            "score": _winback_score(l, _ist_now().date()),
+        })
+    items.sort(key=lambda x: (x["done_today"], -x["score"]))
+    return {"date": today_s, "items": items, "settings": cfg}
+
+
+def _ist_day(iso_s: str) -> str:
+    try:
+        return (datetime.fromisoformat(str(iso_s).replace("Z", "+00:00")) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+@api.post("/winback/{lead_id}/outcome")
+async def winback_outcome(lead_id: str, body: WinbackOutcomeIn, user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0, "id": 1, "assigned_to": 1, "winback_attempts": 1, "winback_first_at": 1})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not your lead")
+    if user["role"] not in ("executive", "admin"):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    today = _ist_now().date()
+    attempts = int(lead.get("winback_attempts") or 0) + 1
+    nxt = None
+    if body.next_date and re.fullmatch(r"\d{4}-\d{2}-\d{2}", body.next_date):
+        nxt = body.next_date
+    elif body.outcome == "no_answer":
+        nxt = (today + timedelta(days=2)).strftime("%Y-%m-%d")
+    elif body.outcome == "call_later":
+        nxt = (today + timedelta(days=7)).strftime("%Y-%m-%d")
+    elif body.outcome == "interested":
+        nxt = (today + timedelta(days=3)).strftime("%Y-%m-%d")
+    status = body.outcome
+    if body.outcome == "no_answer" and attempts >= 3:
+        status, nxt = "unreachable", None        # 3 tries without an answer - stop
+    now_s = iso(now_utc())
+    upd: Dict[str, Any] = {"winback_status": status, "winback_last_at": now_s, "winback_next_at": nxt,
+                           "winback_attempts": attempts, "last_action_at": now_s}
+    if not lead.get("winback_first_at"):
+        upd["winback_first_at"] = now_s
+    if body.outcome == "ordered":
+        upd["winback_won_at"] = now_s
+    await db.leads.update_one({"id": lead_id}, {"$set": upd, "$push": {"winback_history": {
+        "at": now_s, "by": user["id"], "by_name": user.get("name"), "outcome": body.outcome, "note": (body.note or "")[:500], "next": nxt}}})
+    if (body.note or "").strip():
+        await db.leads.update_one({"id": lead_id}, {"$push": {"notes": {
+            "id": str(uuid.uuid4()), "body": f"[Win-back call - {body.outcome.replace('_', ' ')}] {body.note.strip()}",
+            "by_user_id": user["id"], "by_name": user.get("name"), "at": now_s}}})
+    # a date the executive chose themselves becomes a normal follow-up (shows on Follow-ups)
+    if body.next_date and nxt and body.outcome in ("interested", "call_later"):
+        due = datetime.strptime(nxt, "%Y-%m-%d").replace(hour=5, minute=30, tzinfo=timezone.utc)   # 11:00 IST
+        await db.followups.insert_one({"id": str(uuid.uuid4()), "lead_id": lead_id, "executive_id": lead.get("assigned_to") or user["id"],
+                                       "created_by": user["id"], "due_at": iso(due), "note": f"Win-back: {(body.note or body.outcome).strip()[:200]}",
+                                       "status": "pending", "created_at": now_s, "completed_at": None})
+    await log_activity(user["id"], "winback_call", lead_id, {"outcome": body.outcome, "next": nxt})
+    return {"ok": True, "status": status, "next": nxt}
+
+
+@api.get("/winback/stats")
+async def winback_stats(admin: dict = Depends(require_admin)):
+    cfg = await _winback_cfg()
+    today_s = _ist_now().strftime("%Y-%m-%d")
+    cut = (_ist_now().date() - timedelta(days=30 * int(cfg.get("min_months") or 6))).strftime("%Y-%m-%d")
+    rows = []
+    for e in await db.users.find({"role": "executive", "active": True, "username": {"$ne": "test_user"},
+                                  **company_filter(WINBACK_COMPANY)}, {"_id": 0, "id": 1, "name": 1}).sort("name", 1).to_list(100):
+        base = {"assigned_to": e["id"], **company_filter(WINBACK_COMPANY)}
+        today_list = await db.leads.count_documents({"winback_day": today_s, "winback_exec": e["id"]})
+        done_today = 0
+        async for l in db.leads.find({"winback_day": today_s, "winback_exec": e["id"]}, {"_id": 0, "winback_last_at": 1}):
+            if l.get("winback_last_at") and _ist_day(l["winback_last_at"]) == today_s:
+                done_today += 1
+        oc = {o: await db.leads.count_documents({**base, "winback_status": o}) for o in WINBACK_OUTCOMES + ("unreachable",)}
+        # came back = ordered again (OMS) after the first win-back call
+        came_back = 0
+        async for l in db.leads.find({**base, "winback_first_at": {"$exists": True}}, {"_id": 0, "winback_first_at": 1, "last_order_at": 1}):
+            if (l.get("last_order_at") or "") >= _ist_day(l["winback_first_at"]):
+                came_back += 1
+        pool = await db.leads.count_documents({**base, "last_order_at": {"$lt": cut}, "international": {"$ne": True},
+                                               "$or": [{"winback_status": {"$exists": False}}, {"winback_status": {"$in": [None, ""]}}]})
+        rows.append({"id": e["id"], "name": e["name"], "today": today_list, "done_today": done_today,
+                     "outcomes": oc, "came_back": came_back, "not_called_yet": pool})
+    return {"settings": cfg, "people": rows}
+
+
+@api.put("/winback/settings")
+async def winback_settings(body: WinbackSettingsIn, admin: dict = Depends(require_admin)):
+    upd = {k: v for k, v in body.model_dump().items() if v is not None}
+    if "per_day" in upd:
+        upd["per_day"] = max(1, min(int(upd["per_day"]), 100))
+    if "min_months" in upd:
+        upd["min_months"] = max(1, min(int(upd["min_months"]), 60))
+    await db.system_settings.update_one({"key": "winback_calls"}, {"$set": upd}, upsert=True)
+    return await _winback_cfg()
+
+
 @api.get("/leads/{lead_id}/past-orders")
 async def get_lead_past_orders(lead_id: str, user: dict = Depends(get_current_user)):
     """Orders from the hand-kept order sheets (2022 - Apr 2026, before OMS), newest first."""
@@ -14174,6 +14420,7 @@ async def on_startup():
     scheduler.add_job(attendance_monitor_task, "interval", minutes=10, id="attendance_monitor", max_instances=1, coalesce=True)
     scheduler.add_job(reorder_reminder_task, "cron", hour=10, minute=45, timezone="Asia/Kolkata", id="reorder_reminder", max_instances=1, coalesce=True)
     scheduler.add_job(oms_last_order_sync_task, "interval", hours=1, id="oms_last_order_sync", max_instances=1, coalesce=True)
+    scheduler.add_job(winback_daily_task, "cron", hour=10, minute=40, timezone="Asia/Kolkata", id="winback_daily", max_instances=1, coalesce=True)
     scheduler.add_job(abandoned_checkout_task, "interval", minutes=10, id="abandoned_checkout", max_instances=1, coalesce=True)
     # 11:15 IST — after reorder_reminder_task (10:45) so the executive nudge and
     # the customer WhatsApp land the same morning. No-op until WINBACK_ENABLED=1.

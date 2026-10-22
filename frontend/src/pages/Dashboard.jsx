@@ -344,6 +344,7 @@ export default function Dashboard() {
           <div className="grid md:grid-cols-2 gap-4">
             <ActionCard icon={Lightning} title="Act on your newest lead" to="/leads?status=new" />
             <ActionCard icon={Clock} title="Today's follow-ups" to="/followups" />
+            <ActionCard icon={Lightning} title="Today's win-back calls (old customers)" to="/winback" />
           </div>
 
           <div className="border border-gray-200 bg-white">

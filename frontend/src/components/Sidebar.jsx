@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo, AndroidLogo, UsersThree, Sparkle, Handshake,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo, AndroidLogo, UsersThree, Sparkle, Handshake, Recycle,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
@@ -176,6 +176,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
                 </>
               )}
               <Item to="/followups" icon={Bell} testId="nav-followups" onNavigate={handleNavigate}>Follow-ups</Item>
+              <Item to="/winback" icon={Recycle} testId="nav-winback" onNavigate={handleNavigate}>Win-back calls</Item>
               <Item to="/qa" icon={ChatTeardropText} testId="nav-qa" onNavigate={handleNavigate}
                 badge={pendingQA} badgeClass="bg-[#E67E00] text-white" highlight={pendingQA > 0}>Internal Q&amp;A</Item>
               <Item to="/transfer-requests" icon={ArrowsLeftRight} testId="nav-transfer-requests" onNavigate={handleNavigate} badge={pendingTransfers}>Reassign Requests</Item>
