@@ -35,7 +35,6 @@ export default function WinBack() {
   const [person, setPerson] = useState("");
   const [busy, setBusy] = useState(null);
   const [notes, setNotes] = useState({});
-  const [dates, setDates] = useState({});
 
   const load = useCallback(async () => {
     try {
@@ -58,7 +57,7 @@ export default function WinBack() {
     if (o.k === "ordered" && !window.confirm(`Mark ${l.customer_name} as ORDERED? (Create the order in OMS as usual.)`)) return;
     setBusy(l.id + o.k);
     try {
-      const { data: r } = await api.post(`/winback/${l.id}/outcome`, { outcome: o.k, note: notes[l.id] || "", next_date: dates[l.id] || null });
+      const { data: r } = await api.post(`/winback/${l.id}/outcome`, { outcome: o.k, note: notes[l.id] || "" });
       toast.success(`${LABEL[r.status] || r.status}${r.next ? ` - back in your list on ${fmtD(r.next)}` : ""}`);
       setNotes((m) => ({ ...m, [l.id]: "" }));
       load();
@@ -78,8 +77,9 @@ export default function WinBack() {
         <h1 className="font-chivo font-black text-2xl md:text-4xl">Win-back calls</h1>
         <p className="text-xs text-gray-600 mt-1 max-w-3xl">
           Customers who bought from us before but have not ordered for a long time. Every working day you get a short list -
-          best customers first. Call, remind them what they took last time, and tap what happened. "No answer", "Call later" and
-          "Interested" come back automatically on the right day.
+          best customers first. Call, remind them what they took last time, and tap what happened. When the call is recorded,
+          the AI writes what the customer said and the next call date by itself (and marks the result if it is clear) -
+          "No answer", "Call later" and "Interested" come back automatically on the right day.
         </p>
       </div>
 
@@ -154,8 +154,16 @@ export default function WinBack() {
                 </div>
                 {l.winback_status && (
                   <div className="mt-1 text-[11px] text-[#002FA7]">
-                    Last call: {LABEL[l.winback_status] || l.winback_status}
-                    {l.winback_history?.length ? ` · ${l.winback_history[l.winback_history.length - 1].note || ""}` : ""}
+                    Last call: <b>{LABEL[l.winback_status] || l.winback_status}</b>
+                    {l.winback_history?.length && l.winback_history[l.winback_history.length - 1].auto ? " (marked by AI from the call)" : ""}
+                    {l.winback_next_at ? ` · next call ${fmtD(l.winback_next_at)}` : ""}
+                  </div>
+                )}
+                {l.winback_ai?.summary && (
+                  <div className="mt-2 text-xs border-l-4 border-[#7C3AED] bg-[#F5F3FF] p-2 text-gray-800" data-testid={`wb-ai-${l.id}`}>
+                    <div className="text-[10px] uppercase tracking-widest text-[#7C3AED] font-bold mb-0.5">AI notes from the call</div>
+                    {l.winback_ai.summary}
+                    {!l.winback_status && <div className="text-[10px] text-gray-500 mt-1">The result was not clear from the call - please tap it below.</div>}
                   </div>
                 )}
                 {l.recent_orders?.length > 0 && (
@@ -181,9 +189,7 @@ export default function WinBack() {
                 </div>
                 <div className="mt-3 flex flex-wrap items-center gap-2">
                   <input value={notes[l.id] || ""} onChange={(e) => setNotes((m) => ({ ...m, [l.id]: e.target.value }))}
-                    placeholder="What did they say? (optional)" className="flex-1 min-w-[160px] border border-gray-300 px-2 py-1.5 text-xs" />
-                  <input type="date" value={dates[l.id] || ""} onChange={(e) => setDates((m) => ({ ...m, [l.id]: e.target.value }))}
-                    title="Call again on (for Interested / Call later)" className="border border-gray-300 px-2 py-1 text-xs" />
+                    placeholder="Extra note (optional - the AI writes the call notes and next date itself)" className="flex-1 min-w-[160px] border border-gray-300 px-2 py-1.5 text-xs" />
                 </div>
                 <div className="mt-2 flex flex-wrap gap-1.5">
                   {OUTCOMES.map((o) => (

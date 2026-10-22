@@ -4666,6 +4666,66 @@ def _winback_opener(l: dict, orders: List[dict], exec_name: str) -> str:
             f"chahein to main rate aur details WhatsApp par bhej doon.")
 
 
+def _winback_ai_outcome(ai: dict) -> Optional[str]:
+    interest = (ai.get("interest") or "").lower()
+    if interest == "not_interested":
+        return "not_interested"
+    if interest in ("hot", "warm"):
+        return "interested"
+    if interest == "cold":
+        return "call_later" if ai.get("follow_up_needed") else None
+    return None          # unclear / no real conversation - leave it to the telecaller
+
+
+async def _winback_from_ai(ai: dict, lead: Optional[dict], doc: dict, call: Optional[dict]):
+    """A recorded call to a customer on a win-back list: write the result from the AI summary."""
+    if not lead or not (ai.get("summary") or "").strip():
+        return
+    l = await db.leads.find_one({"id": lead["id"]}, {"_id": 0, "winback_day": 1, "winback_status": 1, "winback_last_at": 1,
+                                                       "winback_attempts": 1, "winback_first_at": 1, "winback_history": 1})
+    if not l or not l.get("winback_day"):
+        return
+    today = _ist_now().date()
+    if l["winback_day"] < (today - timedelta(days=7)).strftime("%Y-%m-%d"):
+        return               # not on a current list
+    call_at = (call or {}).get("call_start_at") or (call or {}).get("at") or doc.get("created_at") or iso(now_utc())
+    note = re.sub(r"\s+", " ", ai["summary"]).strip()[:500]
+    ai_date = None
+    if ai.get("follow_up_date") and re.fullmatch(r"\d{4}-\d{2}-\d{2}", ai["follow_up_date"]):
+        if ai["follow_up_date"] > today.strftime("%Y-%m-%d"):
+            ai_date = ai["follow_up_date"]
+    now_s = iso(now_utc())
+    hist = l.get("winback_history") or []
+    # the telecaller already tapped an outcome for this call -> keep theirs, add note / date
+    if l.get("winback_last_at") and str(l["winback_last_at"]) >= str(call_at) and hist:
+        last = hist[-1]
+        sets: Dict[str, Any] = {"winback_ai": {"summary": note, "at": now_s, "call_log_id": (call or {}).get("id")}}
+        idx = len(hist) - 1
+        if not (last.get("note") or "").strip():
+            sets[f"winback_history.{idx}.note"] = note
+        if ai_date and l.get("winback_status") in ("interested", "call_later"):
+            sets["winback_next_at"] = ai_date
+            sets[f"winback_history.{idx}.next"] = ai_date
+        await db.leads.update_one({"id": lead["id"]}, {"$set": sets})
+        return
+    outcome = _winback_ai_outcome(ai)
+    sets = {"winback_ai": {"summary": note, "at": now_s, "call_log_id": (call or {}).get("id"),
+                           "suggested": outcome, "next": ai_date}}
+    if outcome:
+        nxt = None
+        if outcome in ("interested", "call_later"):
+            nxt = ai_date or (today + timedelta(days=3 if outcome == "interested" else 7)).strftime("%Y-%m-%d")
+        sets.update({"winback_status": outcome, "winback_last_at": now_s, "winback_next_at": nxt,
+                     "winback_attempts": int(l.get("winback_attempts") or 0) + 1, "last_action_at": now_s})
+        if not l.get("winback_first_at"):
+            sets["winback_first_at"] = now_s
+        await db.leads.update_one({"id": lead["id"]}, {"$set": sets, "$push": {"winback_history": {
+            "at": now_s, "by": None, "by_name": "AI (from the call)", "outcome": outcome, "note": note, "next": nxt, "auto": True}}})
+        await log_activity(None, "winback_call", lead["id"], {"outcome": outcome, "next": nxt, "by": "ai_call_summary"})
+    else:
+        await db.leads.update_one({"id": lead["id"]}, {"$set": sets})
+
+
 @api.get("/winback/today")
 async def winback_today(user: dict = Depends(get_current_user), exec_id: Optional[str] = None):
     if user["role"] not in ("executive", "admin"):
@@ -4689,6 +4749,7 @@ async def winback_today(user: dict = Depends(get_current_user), exec_id: Optiona
             "past_orders_count": l.get("past_orders_count") or 0, "past_orders_total": l.get("past_orders_total") or 0,
             "winback_status": l.get("winback_status"), "winback_last_at": l.get("winback_last_at"),
             "winback_attempts": l.get("winback_attempts") or 0, "winback_history": (l.get("winback_history") or [])[-3:],
+            "winback_next_at": l.get("winback_next_at"), "winback_ai": l.get("winback_ai"),
             "done_today": bool(l.get("winback_last_at") and _ist_day(l["winback_last_at"]) == today_s),
             "owner_name": names.get(l.get("assigned_to")), "recent_orders": orders,
             "opener": _winback_opener(l, orders, names.get(l.get("winback_exec")) or user.get("name") or ""),
@@ -15782,6 +15843,10 @@ async def _process_one_call_recording() -> bool:
                 ai["promise_id"], ai["promise_due_at"] = pr["id"], pr["due_at"]
         except Exception as e:
             logger.warning(f"call-ai promise tracking failed: {e}")
+        try:
+            await _winback_from_ai(ai, lead, doc, call)
+        except Exception as e:
+            logger.warning(f"call-ai win-back fill failed: {e}")
     if is_internal:
         pass
     elif call:
