@@ -3163,6 +3163,8 @@ async def list_leads(
     intl: Optional[str] = None,       # International page tab: all|scraper|manual|waiting
     country: Optional[str] = None,
     reassigned: Optional[bool] = None,  # only leads that moved between people (dashboard link)
+    past_customers: Optional[bool] = None,     # leads that have ordered before (old sheets or OMS)
+    last_order_before: Optional[str] = None,   # YYYY-MM-DD: last order older than this (win-back list)
     x_company: Optional[str] = Header(None, alias="X-Company"),
 ):
     """List leads with optional filters. Backwards-compatible:
@@ -3191,6 +3193,10 @@ async def list_leads(
         query["starred"] = True
     if reassigned:
         query["assignment_history.1"] = {"$exists": True}
+    if last_order_before and re.fullmatch(r"\d{4}-\d{2}-\d{2}", last_order_before):
+        query["last_order_at"] = {"$lt": last_order_before}
+    elif past_customers:
+        query["last_order_at"] = {"$exists": True, "$nin": [None, ""]}
     if source:
         query["source"] = source
     _lt = _lead_type_clause(lead_type)
@@ -4513,6 +4519,67 @@ async def set_active_wa_phone(lead_id: str, body: ActiveWaPhoneInput, user: dict
     await db.leads.update_one({"id": lead_id}, {"$set": {"active_wa_phone": matched, "last_action_at": iso(now_utc())}})
     await log_activity(user["id"], "active_wa_phone_set", lead_id, {"phone": matched})
     return await db.leads.find_one({"id": lead_id}, {"_id": 0})
+
+
+@api.get("/leads/{lead_id}/past-orders")
+async def get_lead_past_orders(lead_id: str, user: dict = Depends(get_current_user)):
+    """Orders from the hand-kept order sheets (2022 - Apr 2026, before OMS), newest first."""
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0, "id": 1, "assigned_to": 1, "last_order_at": 1,
+                                                       "past_orders_count": 1, "past_orders_total": 1})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    if user["role"] == "data_entry":
+        raise HTTPException(status_code=403, detail="Not allowed")
+    if user["role"] == "executive" and lead.get("assigned_to") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    orders = await db.past_orders.find({"lead_id": lead_id}, {"_id": 0}).sort("date", -1).to_list(300)
+    return {"orders": orders, "count": len(orders), "total": round(sum((o.get("total") or 0) for o in orders), 2),
+            "last_order_at": lead.get("last_order_at")}
+
+
+async def oms_last_order_sync_task(full: bool = False):
+    """Keep leads.last_order_at current from OMS orders (matched on the customer's phone
+    numbers, same company), so the 'not ordered in N months' list never shows someone who
+    just reordered. Hourly: orders of the last 3 days; full=True walks every OMS order."""
+    try:
+        q: Dict[str, Any] = {}
+        if not full:
+            q["created_at"] = {"$gte": iso(now_utc() - timedelta(days=3))}
+        latest: Dict[tuple, str] = {}
+        async for o in oms_db.orders.find(q, {"_id": 0, "customer_id": 1, "created_at": 1, "company": 1}):
+            if not o.get("customer_id") or not o.get("created_at"):
+                continue
+            k = (o["customer_id"], normalize_company(o.get("company")))
+            d = str(o["created_at"])[:10]
+            if d > latest.get(k, ""):
+                latest[k] = d
+        if not latest:
+            return 0
+        cust_ids = list({k[0] for k in latest})
+        phones_of: Dict[str, List[str]] = {}
+        async for c in oms_db.customers.find({"id": {"$in": cust_ids}}, {"_id": 0, "id": 1, "phone_numbers": 1}):
+            nums = c.get("phone_numbers") or []
+            if isinstance(nums, str):
+                nums = re.findall(r"\+?\d[\d\s-]{8,}", nums)
+            out = []
+            for p in nums:
+                d = re.sub(r"\D", "", str(p))
+                if len(d) >= 10:
+                    out.append(d[-10:])
+            phones_of[c["id"]] = out
+        updated = 0
+        for (cid, comp), day in latest.items():
+            ph = phones_of.get(cid) or []
+            if not ph:
+                continue
+            res = await db.leads.update_many(
+                {"$and": [company_filter(comp), {"$or": [{"phone": {"$in": ph}}, {"phones": {"$in": ph}}]}]},
+                {"$max": {"last_order_at": day}})
+            updated += res.modified_count
+        return updated
+    except Exception as e:
+        logger.warning(f"oms last-order sync failed: {e}")
+        return 0
 
 
 @api.get("/leads/{lead_id}/oms-data")
@@ -14106,6 +14173,7 @@ async def on_startup():
     scheduler.add_job(check_due_followups_task, "interval", seconds=10, id="check_due_followups", max_instances=1, coalesce=True)
     scheduler.add_job(attendance_monitor_task, "interval", minutes=10, id="attendance_monitor", max_instances=1, coalesce=True)
     scheduler.add_job(reorder_reminder_task, "cron", hour=10, minute=45, timezone="Asia/Kolkata", id="reorder_reminder", max_instances=1, coalesce=True)
+    scheduler.add_job(oms_last_order_sync_task, "interval", hours=1, id="oms_last_order_sync", max_instances=1, coalesce=True)
     scheduler.add_job(abandoned_checkout_task, "interval", minutes=10, id="abandoned_checkout", max_instances=1, coalesce=True)
     # 11:15 IST — after reorder_reminder_task (10:45) so the executive nudge and
     # the customer WhatsApp land the same morning. No-op until WINBACK_ENABLED=1.

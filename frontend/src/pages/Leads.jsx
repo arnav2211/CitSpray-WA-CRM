@@ -117,6 +117,8 @@ export default function Leads({ international = false }) {
   const [dateTo, setDateTo] = useState(params.get("date_to") || "");
   const [starredFilter, setStarredFilter] = useState(params.get("starred") === "true");
   const [reassignedFilter, setReassignedFilter] = useState(params.get("reassigned") === "1");
+  // "" | "any" (ordered before) | months since last order: "6" / "12" / "24"
+  const [lastOrderFilter, setLastOrderFilter] = useState(params.get("last_order") || "");
   // Tag filter (Fragvansh labels): multi-select, match-any
   const [tagFilter, setTagFilter] = useState((params.get("tags") || "").split(",").filter(Boolean));
   const [allTags, setAllTags] = useState([]);
@@ -153,6 +155,8 @@ export default function Leads({ international = false }) {
           date_to: dateTo || undefined,
           starred: starredFilter ? true : undefined,
           reassigned: reassignedFilter ? true : undefined,
+          past_customers: lastOrderFilter === "any" ? true : undefined,
+          last_order_before: /^\d+$/.test(lastOrderFilter) ? monthsAgoISO(Number(lastOrderFilter)) : undefined,
           tags: tagFilter.length ? tagFilter.join(",") : undefined,
           intl: international ? intlTab : undefined,
           country: international && countryFilter ? countryFilter : undefined,
@@ -207,9 +211,9 @@ export default function Leads({ international = false }) {
 
   // Reset to first page whenever a filter changes (so we never end up on an
   // empty page after narrowing the result set).
-  useEffect(() => { setPage(1); }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, q, pageSize, starredFilter, reassignedFilter, tagFilter, intlTab, countryFilter]);
+  useEffect(() => { setPage(1); }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, q, pageSize, starredFilter, reassignedFilter, lastOrderFilter, tagFilter, intlTab, countryFilter]);
 
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, page, pageSize, starredFilter, reassignedFilter, tagFilter, intlTab, countryFilter]);
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, page, pageSize, starredFilter, reassignedFilter, lastOrderFilter, tagFilter, intlTab, countryFilter]);
   useEffect(() => {
     const t = setTimeout(() => load(), 300);
     return () => clearTimeout(t);
@@ -228,6 +232,7 @@ export default function Leads({ international = false }) {
     if (dateTo) p.date_to = dateTo;
     if (starredFilter) p.starred = "true";
     if (reassignedFilter) p.reassigned = "1";
+    if (lastOrderFilter) p.last_order = lastOrderFilter;
     if (tagFilter.length) p.tags = tagFilter.join(",");
     if (international && intlTab !== "all") p.tab = intlTab;
     if (international && countryFilter) p.country = countryFilter;
@@ -235,7 +240,7 @@ export default function Leads({ international = false }) {
     if (page > 1) p.page = String(page);
     if (pageSize !== 25) p.size = String(pageSize);
     setParams(p, { replace: true });
-  }, [view, q, statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, starredFilter, reassignedFilter, tagFilter, openId, page, pageSize, setParams, international, intlTab, countryFilter]);
+  }, [view, q, statusFilter, sourceFilter, assignedFilter, outcomeFilter, dateFrom, dateTo, starredFilter, reassignedFilter, lastOrderFilter, tagFilter, openId, page, pageSize, setParams, international, intlTab, countryFilter]);
 
   const execMap = useMemo(() => Object.fromEntries(execs.map((e) => [e.id, e])), [execs]);
   const isAdmin = user.role === "admin";
@@ -352,6 +357,17 @@ export default function Leads({ international = false }) {
             {(intlInfo?.countries || []).map((c) => <option key={c} value={c}>{c}</option>)}
           </select>
         )}
+        {!international && (
+          <select value={lastOrderFilter} onChange={(e) => setLastOrderFilter(e.target.value)} data-testid="leads-last-order-filter"
+            className={`border px-2 py-2 text-sm ${lastOrderFilter ? "border-[#002FA7] bg-[#F0F4FF] text-[#002FA7] font-semibold" : "border-gray-300"}`}
+            title="Past customers by their last order (old order sheets + OMS)">
+            <option value="">Last order: any lead</option>
+            <option value="any">Past customers (ordered before)</option>
+            <option value="6">No order in 6+ months</option>
+            <option value="12">No order in 1+ year</option>
+            <option value="24">No order in 2+ years</option>
+          </select>
+        )}
         <select value={starredFilter ? "true" : ""} onChange={(e) => setStarredFilter(e.target.value === "true")} className="border border-gray-300 px-2 py-2 text-sm" data-testid="leads-starred-filter">
           <option value="">All leads</option>
           <option value="true">Starred leads only</option>
@@ -416,6 +432,7 @@ export default function Leads({ international = false }) {
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-1.5 flex-wrap">
                         <span className={`truncate ${unread ? "font-bold" : "font-semibold"}`}>{l.customer_name}</span>
+                        <LastOrderTag l={l} />
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
@@ -497,6 +514,7 @@ export default function Leads({ international = false }) {
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1.5">
                         <span className={`${unread ? "font-bold" : ""}`}>{l.customer_name}</span>
+                        <LastOrderTag l={l} />
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
@@ -1211,3 +1229,23 @@ function PaginationBar({ page, pageSize, total, totalPages, onPage, onPageSize }
   );
 }
 
+// YYYY-MM-DD of N months ago (IST is fine at day precision)
+function monthsAgoISO(n) {
+  const d = new Date();
+  d.setMonth(d.getMonth() - n);
+  return d.toISOString().slice(0, 10);
+}
+
+// small "last order" tag next to the name for past customers
+function LastOrderTag({ l }) {
+  if (!l || !l.last_order_at) return null;
+  const days = Math.floor((Date.now() - new Date(l.last_order_at + "T00:00:00").getTime()) / 86400000);
+  const label = days < 45 ? `${days}d` : days < 365 ? `${Math.round(days / 30)} mo` : `${(days / 365).toFixed(days < 730 ? 1 : 0)} yr`;
+  const cls = days > 365 ? "border-[#B00000]/30 text-[#B00000] bg-[#FDECEC]" : days > 180 ? "border-[#8A6400]/30 text-[#8A6400] bg-[#FFF6DB]" : "border-[#0A7A35]/30 text-[#0A7A35] bg-[#E7F6EC]";
+  return (
+    <span className={`text-[9px] font-bold uppercase tracking-wider border px-1 py-0.5 whitespace-nowrap ${cls}`}
+      title={`Last order ${l.last_order_at}${l.past_orders_count ? ` · ${l.past_orders_count} old-sheet orders` : ""}`} data-testid="last-order-tag">
+      Last order {label} ago
+    </span>
+  );
+}

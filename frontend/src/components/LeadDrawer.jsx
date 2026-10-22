@@ -9,6 +9,7 @@ import { useCompany } from "@/context/CompanyContext";
 import { X, Phone, EnvelopeSimple, MapPin, ArrowSquareOut, PaperPlaneRight, Clock, CalendarBlank, NotePencil, Plus, Trash, Info, PhoneCall, WhatsappLogo, Star, PencilSimple, Check, Lightning, MagnifyingGlass, GitMerge } from "@phosphor-icons/react";
 import { fmtIST, fmtISTTime, fmtTime12, fmtSmartLong, fmtDaySeparator, istDayKey, queryTypeInfo } from "@/lib/format";
 import OMSDataSection from "@/components/OMSDataSection";
+import PastOrdersSection from "@/components/PastOrdersSection";
 import TagsEditor from "@/components/TagsEditor";
 import CodVerificationCard from "@/components/CodVerificationCard";
 
@@ -680,6 +681,7 @@ export default function LeadDrawer({ leadId, onClose }) {
             )}
 
             <OMSDataSection leadId={activeLeadId} />
+            <PastOrdersSection leadId={activeLeadId} />
 
             <section>
               <div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold mb-2">Notes</div>
