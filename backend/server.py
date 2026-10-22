@@ -4618,30 +4618,43 @@ async def winback_daily_task():
         logger.warning(f"winback allocation failed: {e}")
 
 
+_WB_SKIP_ITEM = re.compile(r"(?i)^(total|grand|courier|shipping|freight|gst|18%|bus|transport|regular|new customer|amount|rate|qty|f$)|purpose|\buse\b|charges")
+_WB_COMPANY = re.compile(r"(?i)\b(m/s|enterprises?|traders?|chemicals?|industries|pvt|ltd|llp|co\.|company|agency|agencies|store|stores|mart|sales|corporation|exports?|impex|products|fragrances?|aroma|perfumes?|hub|centre|center|pharma|labs?)\b")
+
+
 def _winback_opener(l: dict, orders: List[dict], exec_name: str) -> str:
-    name = _tidy_name(l.get("customer_name")).split(" ")[0] if l.get("customer_name") else ""
-    items = []
-    for o in orders[:2]:
+    raw = (l.get("customer_name") or "").strip()
+    is_company = bool(_WB_COMPANY.search(raw)) or not raw
+    greet = "Namaste ji" if is_company else f"Namaste {_tidy_name(raw).split(' ')[0]} ji"
+    items, seen = [], set()
+    for o in orders[:3]:
         for it in (o.get("items") or []):
             t = re.sub(r"\s+", " ", it).strip()
-            if not t or re.match(r"(?i)^(total|grand|courier|shipping|freight|gst|18%|bus|transport)", t):
+            t = re.sub(r"^\(?\d+[.)]\s*", "", t)                     # "1. ", "2) "
+            t = re.split(r"[-=@(]|\s{2,}|\d+\s*(?:x|×)\s*\d", t)[0].strip(" .:,")
+            t = re.sub(r"(?i)^\d+(\.\d+)?\s*(kg|kgs|gm|gms|g|ml|lit|litre|liter|ltr|l|pcs|pc)\b\.?\s*", "", t).strip()
+            if len(t) < 3 or _WB_SKIP_ITEM.search(t) or t.isdigit():
                 continue
-            items.append(re.split(r"[-=(@]|\s{2,}", t)[0].strip(" .:,"))
+            k = t.lower()
+            if k in seen:
+                continue
+            seen.add(k); items.append(t[:40])
             if len(items) >= 2:
                 break
-    what = " aur ".join(i for i in items if i) or "hamare products"
+        if len(items) >= 2:
+            break
+    what = " aur ".join(items) if items else "hamare products"
     when = ""
     if l.get("last_order_at"):
         try:
-            d = datetime.strptime(l["last_order_at"], "%Y-%m-%d")
-            when = d.strftime("%B %Y")
+            when = datetime.strptime(l["last_order_at"], "%Y-%m-%d").strftime("%B %Y")
         except Exception:
             pass
-    first = (exec_name or "").split(" ")[0]
-    return (f"Namaste {name} ji, main {first} bol rahi hoon CitSpray Aroma Sciences, Nagpur se. "
-            f"Aapne {('pichhli baar ' + when + ' mein ') if when else ''}humse {what} liya tha - "
-            f"kaisa raha? Kaafi samay ho gaya, kya abhi kuch requirement hai? Is mahine naye stock "
-            f"aur fresh fragrances bhi aaye hain.")
+    first = (exec_name or "").split(" ")[0] or "main"
+    return (f"{greet}, main {first}, CitSpray Aroma Sciences Nagpur se. "
+            f"{('Aapne ' + when + ' mein') if when else 'Aapne pehle'} humse {what} liya tha - kaisa raha product? "
+            f"Kaafi samay ho gaya aapse order nahi aaya, kya abhi koi requirement hai? Naya fresh stock aaya hai, "
+            f"chahein to main rate aur details WhatsApp par bhej doon.")
 
 
 @api.get("/winback/today")
