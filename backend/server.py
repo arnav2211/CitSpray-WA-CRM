@@ -15550,7 +15550,7 @@ async def upload_call_recording(
 
 _CALL_AI_PROMPT = """You are listening to a recorded phone call of CitSpray Aroma Sciences (Mangalam Agro), an Indian
 manufacturer and exporter of fragrances, essential oils, aroma chemicals, menthol and camphor. Our executive {exec_name}
-talks to a customer{cust}. The call took place on {when}. It may be in Hindi, Marathi, English or a mix.
+talks to a customer{cust}. The call took place on {when}. It may be in Hindi, Marathi, English or a mix.{background}
 Listen to the WHOLE recording carefully. Be exact with numbers, product names, grades, prices, quantities and dates -
 these notes replace listening to the call again, so nothing important may be missing.
 WHO SAID WHAT - get this right, the team relies on it:
@@ -15602,8 +15602,11 @@ Reply ONLY with JSON:
                "asked_quantity": true or false, "asked_purpose": true or false (asked what it is for / application),
                "explained_product": true or false, "asked_for_order": true or false (tried to close / get a commitment),
                "tip": "one short, specific tip for our executive for next time"}}}}
-If the recording has no real conversation (voicemail, ringing, silence, wrong number), set summary to a short
-note saying so and interest to "unclear". Never invent details that were not said."""
+If the recording has no real conversation (voicemail, ringing, silence, wrong number, or only greetings /
+"hello" / testing / a few words with no business talk), set summary to a short note saying exactly that (e.g. "Short
+call - only greetings, no business was discussed"), interest to "unclear", follow_up_needed to false, promise.made to
+false, and leave products, quantity, price_discussed, next_step, whatsapp_draft empty. Never invent details that were
+not said ON THIS CALL - a product or need is only reported if someone actually says it in the recording."""
 
 
 _CALL_AI_INTERNAL_PROMPT = """This is a recorded INTERNAL phone call between two colleagues at CitSpray Aroma Sciences
@@ -15790,8 +15793,16 @@ async def _process_one_call_recording() -> bool:
     else:
         cust = ""
         if lead:
-            cust = f" ({lead.get('customer_name') or 'customer'}" + (f", enquiry: {lead.get('requirement')}" if lead.get("requirement") else "") + ")"
-        prompt = _CALL_AI_PROMPT.format(exec_name=doc.get("user_name") or "the executive", cust=cust, when=when)
+            cust = f" ({lead.get('customer_name') or 'customer'})"
+        background = ""
+        if lead and lead.get("requirement"):
+            background = ("
+BACKGROUND from our CRM (NOT from this call - it may be old or wrong): this customer earlier "
+                          f"enquired about: {str(lead.get('requirement'))[:200]}. Use it ONLY to recognise product names "
+                          "that are actually spoken. NEVER put it in the summary, key points, products or anything else "
+                          "unless it is clearly said in THIS recording.")
+        prompt = _CALL_AI_PROMPT.format(exec_name=doc.get("user_name") or "the executive", cust=cust, when=when,
+                                        background=background)
     try:
         audio = base64.b64encode(ogg.read_bytes()).decode()
         parts = [{"inline_data": {"mime_type": "audio/ogg", "data": audio}}]
