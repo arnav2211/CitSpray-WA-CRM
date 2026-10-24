@@ -15796,8 +15796,7 @@ async def _process_one_call_recording() -> bool:
             cust = f" ({lead.get('customer_name') or 'customer'})"
         background = ""
         if lead and lead.get("requirement"):
-            background = ("
-BACKGROUND from our CRM (NOT from this call - it may be old or wrong): this customer earlier "
+            background = ("\nBACKGROUND from our CRM (NOT from this call - it may be old or wrong): this customer earlier "
                           f"enquired about: {str(lead.get('requirement'))[:200]}. Use it ONLY to recognise product names "
                           "that are actually spoken. NEVER put it in the summary, key points, products or anything else "
                           "unless it is clearly said in THIS recording.")
