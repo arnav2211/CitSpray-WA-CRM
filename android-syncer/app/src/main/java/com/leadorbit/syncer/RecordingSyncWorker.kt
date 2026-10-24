@@ -246,9 +246,11 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
         val root = Environment.getExternalStorageDirectory()
         var bestFile: File? = null
         var bestDelta = Long.MAX_VALUE
-        for (d in KNOWN_DIRS) {
-            val dir = File(root, d)
-            val files = dir.listFiles() ?: continue
+        // known brand folders + any CubeCallRecorder folder (Cube ACR hides its files from
+        // MediaStore with .nomedia, so they are read straight from disk, sub-folders included)
+        val dirs = KNOWN_DIRS.map { File(root, it) } + cubeDirs(root)
+        for (dir in dirs) {
+            val files = filesUnder(dir, 3)
             for (f in files) {
                 if (!f.isFile || f.length() <= 0 || f.length() > MAX_BYTES) continue
                 val lm = f.lastModified() / 1000
@@ -347,6 +349,36 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
 
     // ---- health report -> CRM Settings -> Calls & AI -> Phones ----
 
+    /** Folders named CubeCallRecorder anywhere in the first levels of storage (not Android/). */
+    private fun cubeDirs(root: File): List<File> {
+        val out = mutableListOf<File>()
+        fun walk(d: File, depth: Int) {
+            val kids = d.listFiles() ?: return
+            for (k in kids) {
+                if (!k.isDirectory || k.name.startsWith(".")) continue
+                if (depth == 0 && k.name.equals("Android", ignoreCase = true)) continue
+                if (k.name.equals("CubeCallRecorder", ignoreCase = true)) { out.add(k); continue }
+                if (depth < 3) walk(k, depth + 1)
+            }
+        }
+        try { walk(root, 0) } catch (_: Exception) { }
+        return out
+    }
+
+    /** Audio files in a folder and its sub-folders (up to maxDepth levels). */
+    private fun filesUnder(dir: File, maxDepth: Int): List<File> {
+        val out = mutableListOf<File>()
+        fun walk(d: File, depth: Int) {
+            val kids = d.listFiles() ?: return
+            for (k in kids) {
+                if (k.isDirectory) { if (depth < maxDepth && !k.name.startsWith(".")) walk(k, depth + 1) }
+                else if (!k.name.startsWith(".")) out.add(k)
+            }
+        }
+        try { walk(dir, 0) } catch (_: Exception) { }
+        return out
+    }
+
     /** Where this phone's recorder saves (folders with call-like audio from the last 7 days). */
     private fun recorderFolders(): JSONArray {
         val counts = LinkedHashMap<String, Int>()
@@ -364,6 +396,16 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
                     if (low.contains("whatsapp") || low.contains("leadorbit")) continue
                     if (!(low.contains("call") || low.contains("record"))) continue
                     counts[folder] = (counts[folder] ?: 0) + 1
+                }
+            }
+        } catch (_: Exception) { }
+        // Cube ACR folders are hidden from MediaStore - count their recent files on disk
+        try {
+            if (canDeleteOthersFiles(applicationContext)) {
+                val sinceMs = System.currentTimeMillis() - 7L * 86400_000L
+                for (d in cubeDirs(Environment.getExternalStorageDirectory())) {
+                    val n = filesUnder(d, 3).count { it.lastModified() > sinceMs }
+                    counts["fs:" + d.absolutePath.substringAfter("/0/")] = n
                 }
             }
         } catch (_: Exception) { }
