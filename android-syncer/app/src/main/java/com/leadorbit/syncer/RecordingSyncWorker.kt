@@ -52,6 +52,7 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
         private const val MIN_SECONDS = 10
         private const val BACKFILL_MS = 72 * 3600 * 1000L          // re-check this far back, every run
         private const val PREF_DONE = "rec_done_v2"                 // call dates (ms) already handled
+        private const val PREF_USED = "rec_used_files"              // recording files already sent (never reuse one)
         private const val PREF_PENDING_DELETE = "rec_pending_delete" // uploaded, delete after the AI summary
         private const val MAX_UPLOADS_PER_RUN = 15
         private const val MAX_BYTES = 40L * 1024 * 1024
@@ -94,6 +95,33 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
 
     private data class CallEntry(val number: String, val date: Long, val duration: Int, val incoming: Boolean)
     private data class Recording(val uri: Uri?, val file: File?, val name: String)
+    private val usedFiles: MutableSet<String> by lazy { prefs.getStringSet(PREF_USED, emptySet())!!.toMutableSet() }
+
+    /** Recording start time written in the file name (Cube ACR, Samsung, Vivo ...), epoch seconds - or null.
+     *  The phone number digits are removed first so they can't be mistaken for a date. */
+    private fun nameTime(name: String, tail: String): Long? {
+        var n = name
+        if (tail.length >= 6) n = n.replace(Regex("\\+?\\d*" + tail), " ")
+        val pats = listOf(
+            Regex("(20\\d{2})[-_.]?(\\d{2})[-_.]?(\\d{2})[ _\\-T.@]?(\\d{2})[-_.:]?(\\d{2})[-_.:]?(\\d{2})") to "ymd",
+            Regex("(\\d{2})[-_.](\\d{2})[-_.](20\\d{2})[ _\\-@]?(\\d{2})[-_.:]?(\\d{2})[-_.:]?(\\d{2})") to "dmy")
+        for ((re, kind) in pats) {
+            val m = re.find(n) ?: continue
+            val g = m.groupValues.drop(1).map { it.toInt() }
+            val (y, mo, d) = if (kind == "ymd") Triple(g[0], g[1], g[2]) else Triple(g[2], g[1], g[0])
+            if (mo !in 1..12 || d !in 1..31 || g[3] > 23 || g[4] > 59 || g[5] > 59) continue
+            val cal = java.util.Calendar.getInstance()
+            cal.set(y, mo - 1, d, g[3], g[4], g[5]); cal.set(java.util.Calendar.MILLISECOND, 0)
+            return cal.timeInMillis / 1000
+        }
+        return null
+    }
+
+    /** False when the name carries a time that does not belong to this call (an old recording). */
+    private fun nameTimeFits(name: String, tail: String, startS: Long, endS: Long): Boolean {
+        val t = nameTime(name, tail) ?: return true
+        return Math.abs(t - startS) <= 180 || Math.abs(t - endS) <= 180
+    }
 
     private val prefs = context.getSharedPreferences("CRM_PREFS", Context.MODE_PRIVATE)
     private val http = OkHttpClient.Builder()
@@ -152,7 +180,9 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
             val res = upload(token, call, rec)
             if (res == null) { prefs.edit().putStringSet(PREF_DONE, done).apply(); report(token); return Result.retry() }
             done.add(call.date.toString())
-            prefs.edit().putStringSet(PREF_DONE, done).apply()
+            usedFiles.add(rec.name)
+            if (usedFiles.size > 1500) usedFiles.clear()
+            prefs.edit().putStringSet(PREF_DONE, done).putStringSet(PREF_USED, HashSet(usedFiles)).apply()
             uploaded++
             val rid = res.optString("id")
             val keep = res.optString("skipped").isNotEmpty() || !res.optBoolean("delete_local", false)
@@ -225,6 +255,8 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
                     val looksLikeCall = where.contains("call") || where.contains("record")
                     val hasNumber = tail.length >= 6 && name.filter { it.isDigit() }.contains(tail)
                     if (!looksLikeCall && !hasNumber) continue
+                    if (usedFiles.contains(name)) continue
+                    if (!nameTimeFits(name, tail, startS, endS)) continue
                     val diff = if (dur > 0) Math.abs(dur - wantMs) else if (hasNumber) 0L else 60_000L
                     val tolerance = maxOf(8_000L, wantMs * 15 / 100)
                     if (diff > tolerance && !hasNumber) continue
@@ -253,8 +285,12 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
             val files = filesUnder(dir, 3)
             for (f in files) {
                 if (!f.isFile || f.length() <= 0 || f.length() > MAX_BYTES) continue
+                if (usedFiles.contains(f.name)) continue
+                val nt = nameTime(f.name, tail)
                 val lm = f.lastModified() / 1000
-                if (lm < startS - 10 || lm > endS + 900) continue
+                if (nt != null) {
+                    if (!nameTimeFits(f.name, tail, startS, endS)) continue       // an older recording
+                } else if (lm < startS - 10 || lm > endS + 300) continue
                 val hasNumber = tail.length >= 6 && f.name.filter { it.isDigit() }.contains(tail)
                 val delta = Math.abs(lm - endS) - (if (hasNumber) 600 else 0)
                 if (delta < bestDelta) { bestDelta = delta; bestFile = f }
@@ -404,8 +440,10 @@ class RecordingSyncWorker(context: Context, params: WorkerParameters) : Coroutin
             if (canDeleteOthersFiles(applicationContext)) {
                 val sinceMs = System.currentTimeMillis() - 7L * 86400_000L
                 for (d in cubeDirs(Environment.getExternalStorageDirectory())) {
-                    val n = filesUnder(d, 3).count { it.lastModified() > sinceMs }
+                    val fs = filesUnder(d, 3)
+                    val n = fs.count { it.lastModified() > sinceMs }
                     counts["fs:" + d.absolutePath.substringAfter("/0/")] = n
+                    fs.sortedByDescending { it.lastModified() }.take(2).forEach { counts["sample:" + it.name] = 0 }
                 }
             }
         } catch (_: Exception) { }
