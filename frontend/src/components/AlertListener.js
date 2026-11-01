@@ -81,13 +81,17 @@ export function AlertListener() {
     }
   }, []);
 
-  // Silent alerts (e.g. "Promise not kept") pop up without the alarm tone
+  // Only urgent alerts (sent by a person, unassigned leads, COD problems) get the red pop-up and
+  // the tone. Reports, attendance, leave requests ... are small cards without sound.
+  const isUrgent = (a) => a?.urgent !== false && !(a?.meta?.silent || a?.meta?.type === "ai_promise_missed");
+  const urgent = alerts.filter(isUrgent);
+  const quiet = alerts.filter((a) => !isUrgent(a));
+  const loud = urgent.length > 0;
   useEffect(() => {
-    const loud = alerts.some((a) => !(a?.meta?.silent || a?.meta?.type === "ai_promise_missed"));
     if (loud) startAlarm();
     else stopAlarm();
     return () => stopAlarm();
-  }, [alerts, startAlarm, stopAlarm]);
+  }, [loud, startAlarm, stopAlarm]);
 
   const acknowledge = async (alertId) => {
     try {
@@ -96,9 +100,37 @@ export function AlertListener() {
     } catch {}
   };
 
+  const acknowledgeAll = async (list) => {
+    for (const a of list) {
+      try { await api.put(`/admin/alerts/${a.id}/acknowledge`); } catch {}
+    }
+    const ids = new Set(list.map((a) => a.id));
+    setAlerts((prev) => prev.filter((a) => !ids.has(a.id)));
+  };
+
   if (alerts.length === 0) return null;
 
-  const current = alerts[0];
+  const quietCards = quiet.length > 0 && (
+    <div className="fixed top-2 inset-x-2 md:inset-x-auto md:right-4 md:top-4 md:w-96 z-[9998] space-y-2" data-testid="alert-cards">
+      {quiet.slice(0, 3).map((a) => (
+        <div key={a.id} className="bg-white dark:bg-zinc-900 border border-gray-200 border-l-4 border-l-[#002FA7] shadow-lg rounded-md px-3 py-2 flex gap-2 items-start" data-testid="alert-card">
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-semibold text-gray-900 dark:text-white">{a.title}</div>
+            <div className="text-xs text-gray-600 dark:text-gray-300 whitespace-pre-wrap line-clamp-4">{a.message}</div>
+          </div>
+          <button onClick={() => acknowledge(a.id)} className="text-xs font-bold text-[#002FA7] px-2 py-1 hover:bg-gray-100 rounded shrink-0" data-testid="alert-card-ok">OK</button>
+        </div>
+      ))}
+      {quiet.length > 1 && (
+        <button onClick={() => acknowledgeAll(quiet)} className="w-full text-[11px] font-bold uppercase tracking-widest bg-white/95 border border-gray-200 shadow rounded-md py-1.5 text-gray-700 hover:bg-gray-50" data-testid="alert-cards-clear">
+          {quiet.length > 3 ? `+${quiet.length - 3} more · ` : ""}Clear all {quiet.length}
+        </button>
+      )}
+    </div>
+  );
+  if (urgent.length === 0) return quietCards;
+
+  const current = urgent[0];
   const ts = current.created_at
     ? new Date(current.created_at).toLocaleString("en-IN", {
         hour: "2-digit",
@@ -109,6 +141,8 @@ export function AlertListener() {
     : "";
 
   return (
+    <>
+    {quietCards}
     <div
       className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in p-3"
       data-testid="alert-popup-overlay"
@@ -129,9 +163,9 @@ export function AlertListener() {
               From: {current.sent_by} &middot; {ts}
             </p>
           </div>
-          {alerts.length > 1 && (
+          {urgent.length > 1 && (
             <span className="bg-white text-red-600 text-xs font-bold px-2 py-0.5 rounded-full">
-              {alerts.length}
+              {urgent.length}
             </span>
           )}
         </div>
@@ -175,5 +209,6 @@ export function AlertListener() {
         </div>
       </div>
     </div>
+    </>
   );
 }

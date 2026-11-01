@@ -3061,7 +3061,7 @@ function renderMedia(m) {
         <a href={url} target="_blank" rel="noreferrer" onClick={(e) => { e.preventDefault(); window.dispatchEvent(new CustomEvent("lightbox:open", { detail: { url, filename, downloadUrl, kind: "image" } })); }}>
           <img src={url} alt={filename} className="block w-full max-h-[320px] object-cover bg-gray-100 cursor-zoom-in" loading="lazy" />
         </a>
-        <a href={downloadUrl} download={filename} className="absolute top-1.5 right-1.5 bg-black/60 hover:bg-black/80 text-white p-1.5 opacity-0 group-hover/media:opacity-100 transition-opacity" title={`Download ${filename}`} data-testid={`download-${m.id}`}>
+        <a href={downloadUrl} download={filename} className="absolute top-1.5 right-1.5 bg-black/60 hover:bg-black/80 text-white p-1.5 md:opacity-0 md:group-hover/media:opacity-100 transition-opacity" title={`Download ${filename}`} data-testid={`download-${m.id}`}>
           <DownloadSimple size={14} weight="bold" />
         </a>
       </div>
@@ -3073,7 +3073,7 @@ function renderMedia(m) {
         <video controls preload="metadata" className="block w-full max-h-[320px] bg-black">
           <source src={url} />
         </video>
-        <a href={downloadUrl} download={filename} className="absolute top-1.5 right-1.5 bg-black/60 hover:bg-black/80 text-white p-1.5 opacity-0 group-hover/media:opacity-100 transition-opacity" title={`Download ${filename}`} data-testid={`download-${m.id}`}>
+        <a href={downloadUrl} download={filename} className="absolute top-1.5 right-1.5 bg-black/60 hover:bg-black/80 text-white p-1.5 md:opacity-0 md:group-hover/media:opacity-100 transition-opacity" title={`Download ${filename}`} data-testid={`download-${m.id}`}>
           <DownloadSimple size={14} weight="bold" />
         </a>
       </div>
@@ -3143,10 +3143,103 @@ function Lightbox() {
           <X size={18} weight="bold" />
         </button>
       </div>
-      <div className="max-w-[90vw] max-h-[90vh]" onClick={(e) => e.stopPropagation()}>
-        <img src={state.url} alt={state.filename} className="max-w-full max-h-[90vh] object-contain" />
-        <div className="text-center text-white text-xs mt-2 opacity-70">{state.filename}</div>
+      <ZoomableImage key={state.url} src={state.url} alt={state.filename} onClose={() => setState(null)} />
+      <div className="absolute bottom-3 inset-x-0 text-center text-white text-xs opacity-70 pointer-events-none px-4 truncate">
+        {state.filename} · pinch or double-tap to zoom
       </div>
+    </div>
+  );
+}
+
+/* Photo viewer: pinch / double-tap / mouse-wheel zoom, drag to move when zoomed. */
+function ZoomableImage({ src, alt, onClose }) {
+  const [view, setView] = useState({ s: 1, x: 0, y: 0 });
+  const viewRef = useRef(view);
+  const g = useRef({ pts: new Map(), base: null, moved: false, lastTap: 0, tapTimer: null });
+  const boxRef = useRef(null);
+
+  const apply = (v) => {
+    const s = Math.min(8, Math.max(1, v.s));
+    const nv = s <= 1.01 ? { s: 1, x: 0, y: 0 } : { s, x: v.x, y: v.y };
+    viewRef.current = nv;
+    setView(nv);
+  };
+  const center = () => {
+    const r = boxRef.current?.getBoundingClientRect();
+    return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : { x: 0, y: 0 };
+  };
+  // zoom to scale s keeping the point p (screen coords) where it is
+  const zoomAt = (p, s, from = viewRef.current) => {
+    const c = center();
+    const px = p.x - c.x, py = p.y - c.y;
+    const k = Math.min(8, Math.max(1, s)) / from.s;
+    apply({ s, x: px - (px - from.x) * k, y: py - (py - from.y) * k });
+  };
+  const begin = () => {
+    g.current.base = { v: viewRef.current, pts: [...g.current.pts.values()].map((p) => ({ ...p })) };
+  };
+  const down = (e) => {
+    e.stopPropagation();
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+    g.current.pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (g.current.pts.size === 1) { g.current.moved = false; g.current.onImg = e.target?.tagName === "IMG"; }
+    begin();
+  };
+  const move = (e) => {
+    if (!g.current.pts.has(e.pointerId)) return;
+    g.current.pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const b = g.current.base;
+    if (!b) return;
+    const pts = [...g.current.pts.values()];
+    if (pts.length >= 2 && b.pts.length >= 2) {
+      const d0 = Math.hypot(b.pts[0].x - b.pts[1].x, b.pts[0].y - b.pts[1].y) || 1;
+      const d1 = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      const c = center();
+      const c0 = { x: (b.pts[0].x + b.pts[1].x) / 2 - c.x, y: (b.pts[0].y + b.pts[1].y) / 2 - c.y };
+      const c1 = { x: (pts[0].x + pts[1].x) / 2 - c.x, y: (pts[0].y + pts[1].y) / 2 - c.y };
+      const s = Math.min(8, Math.max(1, b.v.s * d1 / d0));
+      const k = s / b.v.s;
+      apply({ s, x: c1.x - (c0.x - b.v.x) * k, y: c1.y - (c0.y - b.v.y) * k });
+      g.current.moved = true;
+    } else if (pts.length === 1 && b.pts.length >= 1) {
+      const dx = pts[0].x - b.pts[0].x, dy = pts[0].y - b.pts[0].y;
+      if (Math.abs(dx) + Math.abs(dy) > 6) g.current.moved = true;
+      if (b.v.s > 1) apply({ ...b.v, x: b.v.x + dx, y: b.v.y + dy });
+    }
+  };
+  const up = (e) => {
+    g.current.pts.delete(e.pointerId);
+    begin();                     // a finger still down carries on as a drag from here
+    if (g.current.pts.size || g.current.moved) return;
+    const now = Date.now();
+    if (now - g.current.lastTap < 300) {              // double tap
+      clearTimeout(g.current.tapTimer);
+      g.current.lastTap = 0;
+      if (viewRef.current.s > 1) apply({ s: 1, x: 0, y: 0 });
+      else zoomAt({ x: e.clientX, y: e.clientY }, 3, { s: 1, x: 0, y: 0 });
+      return;
+    }
+    g.current.lastTap = now;
+    // single tap on the dark background (not zoomed) closes the viewer
+    if (!g.current.onImg && viewRef.current.s === 1) {
+      g.current.tapTimer = setTimeout(() => onClose?.(), 300);
+    }
+  };
+  const wheel = (e) => {
+    zoomAt({ x: e.clientX, y: e.clientY }, viewRef.current.s * Math.exp(-e.deltaY * 0.0015));
+  };
+  useEffect(() => () => clearTimeout(g.current.tapTimer), []);
+
+  return (
+    <div ref={boxRef} className="absolute inset-0 flex items-center justify-center overflow-hidden select-none"
+      style={{ touchAction: "none" }}
+      onClick={(e) => e.stopPropagation()}
+      onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up} onWheel={wheel}
+      data-testid="lightbox-zoom">
+      <img src={src} alt={alt} draggable={false}
+        className="max-w-[94vw] max-h-[86vh] object-contain"
+        style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.s})`, transformOrigin: "center center",
+                 willChange: "transform", cursor: view.s > 1 ? "grab" : "zoom-in" }} />
     </div>
   );
 }

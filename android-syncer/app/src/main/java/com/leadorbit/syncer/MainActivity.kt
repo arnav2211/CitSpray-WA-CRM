@@ -1,6 +1,9 @@
 package com.leadorbit.syncer
 
 import android.Manifest
+import android.app.DownloadManager
+import android.content.ActivityNotFoundException
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -22,7 +25,19 @@ import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.PowerManager
+import android.provider.MediaStore
+import android.util.Base64
+import android.view.ViewGroup
 import android.view.WindowManager
+import android.webkit.MimeTypeMap
+import android.webkit.URLUtil
+import android.webkit.ValueCallback
+import android.widget.FrameLayout
+import android.widget.Toast
+import androidx.core.content.FileProvider
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
@@ -45,6 +60,7 @@ import androidx.work.WorkManager
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
+import java.io.File
 import java.util.concurrent.TimeUnit
 
 /**
@@ -85,6 +101,36 @@ class MainActivity : AppCompatActivity() {
         pendingMicRequest = null
     }
     private var proximityLock: PowerManager.WakeLock? = null
+
+    // Chat: attach photos / videos / documents (the page's <input type=file>)
+    private var fileCallback: ValueCallback<Array<Uri>>? = null
+    private val fileChooserLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { res ->
+        val cb = fileCallback ?: return@registerForActivityResult
+        fileCallback = null
+        val uris = mutableListOf<Uri>()
+        val data = res.data
+        if (res.resultCode == RESULT_OK && data != null) {
+            val clip = data.clipData
+            if (clip != null) for (i in 0 until clip.itemCount) clip.getItemAt(i).uri?.let { uris.add(it) }
+            else data.data?.let { uris.add(it) }
+        }
+        cb.onReceiveValue(if (uris.isEmpty()) null else uris.toTypedArray())
+    }
+
+    // Chat camera / voice notes: the page asks for camera and/or microphone
+    private var pendingWebRequest: PermissionRequest? = null
+    private val webPermLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        pendingWebRequest?.let { grantWebRequest(it, ask = false) }
+        pendingWebRequest = null
+    }
+
+    // Full-screen video
+    private var fullView: View? = null
+    private var fullCallback: WebChromeClient.CustomViewCallback? = null
 
     // ---- call audio routing (WhatsApp calls) ----
     private var callRoute = "speaker"
@@ -356,6 +402,19 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /** A file made inside the page (blob:/data: link with download=...) -> phone's Downloads. */
+        @JavascriptInterface
+        fun saveDataUrl(dataUrl: String, name: String, mime: String) {
+            try {
+                val comma = dataUrl.indexOf(',')
+                val bytes = Base64.decode(dataUrl.substring(comma + 1), Base64.DEFAULT)
+                val m = mime.ifEmpty { dataUrl.substringAfter("data:", "").substringBefore(';').ifEmpty { "application/octet-stream" } }
+                saveBytesToDownloads(name.ifEmpty { "download" }, m, bytes)
+            } catch (e: Exception) {
+                runOnUiThread { toast("Couldn't save the file") }
+            }
+        }
+
         /** JSON: {"route": current, "routes": [available…]} */
         @JavascriptInterface
         fun audioRoutes(): String {
@@ -421,18 +480,46 @@ class MainActivity : AppCompatActivity() {
             override fun onPermissionRequest(request: PermissionRequest) {
                 runOnUiThread {
                     val host = request.origin?.host ?: ""
-                    if (!host.endsWith("mangalamagro.in") || !request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) {
+                    if (!host.endsWith("mangalamagro.in")) {
                         request.deny()
                         return@runOnUiThread
                     }
-                    if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                        request.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
-                    } else {
-                        pendingMicRequest = request
-                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                    }
+                    grantWebRequest(request, ask = true)
                 }
             }
+
+            override fun onShowFileChooser(view: WebView?, callback: ValueCallback<Array<Uri>>?,
+                                           params: FileChooserParams?): Boolean {
+                fileCallback?.onReceiveValue(null)
+                fileCallback = callback
+                if (params == null || !openFileChooser(params)) {
+                    fileCallback = null
+                    return false
+                }
+                return true
+            }
+
+            override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+                if (view == null) return
+                if (fullView != null) { callback?.onCustomViewHidden(); return }
+                fullView = view
+                fullCallback = callback
+                view.setBackgroundColor(android.graphics.Color.BLACK)
+                (window.decorView as FrameLayout).addView(view, FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+                WindowInsetsControllerCompat(window, window.decorView).apply {
+                    hide(WindowInsetsCompat.Type.systemBars())
+                    systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                }
+            }
+
+            override fun onHideCustomView() { exitFullScreenVideo() }
+        }
+
+        // Download buttons (and files the WebView can't show) go to the phone's Downloads
+        webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+            if (url.startsWith("blob:") || url.startsWith("data:")) return@setDownloadListener   // handled in the page (see injectDownloadHelper)
+            downloadToPhone(url, userAgent, contentDisposition, mimeType)
         }
 
         val cookieManager = CookieManager.getInstance()
@@ -446,6 +533,7 @@ class MainActivity : AppCompatActivity() {
                     openPhoneApp(if (url.startsWith("tel:")) url.substring(4) else "")
                     return true
                 }
+                if (handleSpecialUrl(url)) return true
                 return super.shouldOverrideUrlLoading(view, request)
             }
 
@@ -455,12 +543,14 @@ class MainActivity : AppCompatActivity() {
                     openPhoneApp(if (url.startsWith("tel:")) url.substring(4) else "")
                     return true
                 }
+                if (url != null && handleSpecialUrl(url)) return true
                 @Suppress("DEPRECATION")
                 return super.shouldOverrideUrlLoading(view, url)
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
+                injectDownloadHelper()
                 handler.removeCallbacks(tokenCheckRunnable)
                 handler.post(tokenCheckRunnable)
             }
@@ -477,6 +567,214 @@ class MainActivity : AppCompatActivity() {
         val navPath = intent?.getStringExtra("nav_path")
         webView.loadUrl("https://crm.mangalamagro.in" + (if (!navPath.isNullOrEmpty()) navPath else "/chat"))
         intent?.removeExtra("nav_path")
+    }
+
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+
+    /** Grant the page the camera / microphone it asks for, asking Android first if needed. */
+    private fun grantWebRequest(request: PermissionRequest, ask: Boolean) {
+        val want = linkedMapOf(
+            PermissionRequest.RESOURCE_AUDIO_CAPTURE to Manifest.permission.RECORD_AUDIO,
+            PermissionRequest.RESOURCE_VIDEO_CAPTURE to Manifest.permission.CAMERA
+        ).filterKeys { request.resources.contains(it) }
+        if (want.isEmpty()) { request.deny(); return }
+        fun has(p: String) = ContextCompat.checkSelfPermission(this, p) == PackageManager.PERMISSION_GRANTED
+        val missing = want.values.filter { !has(it) }
+        if (missing.isNotEmpty() && ask) {
+            pendingWebRequest?.deny()
+            pendingWebRequest = request
+            webPermLauncher.launch(missing.toTypedArray())
+            return
+        }
+        val ok = want.filterValues { has(it) }.keys
+        if (ok.size < want.size) {
+            val what = want.filterValues { !has(it) }.values.joinToString(" and ") {
+                if (it == Manifest.permission.CAMERA) "Camera" else "Microphone"
+            }
+            toast("Allow $what for LeadOrbit: phone Settings > Apps > LeadOrbit > Permissions")
+        }
+        if (ok.isEmpty()) request.deny() else request.grant(ok.toTypedArray())
+    }
+
+    /** The phone's picker (gallery / files) for the page's attach buttons. */
+    private fun openFileChooser(params: WebChromeClient.FileChooserParams): Boolean {
+        val mimes = params.acceptTypes.flatMap { it.split(",") }.map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+            .map { t -> if (t.startsWith(".")) MimeTypeMap.getSingleton().getMimeTypeFromExtension(t.substring(1)) ?: "*/*" else t }
+            .distinct()
+        val pick = Intent(Intent.ACTION_GET_CONTENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            when {
+                mimes.isEmpty() || mimes.contains("*/*") -> type = "*/*"
+                mimes.size == 1 -> type = mimes[0]
+                else -> { type = "*/*"; putExtra(Intent.EXTRA_MIME_TYPES, mimes.toTypedArray()) }
+            }
+            if (params.mode == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE) putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        }
+        return try {
+            fileChooserLauncher.launch(Intent.createChooser(pick, "Choose"))
+            true
+        } catch (e: Exception) {
+            Log.e("MainActivity", "file chooser: ${e.message}")
+            false
+        }
+    }
+
+    private fun exitFullScreenVideo() {
+        val v = fullView ?: return
+        (window.decorView as FrameLayout).removeView(v)
+        fullView = null
+        fullCallback?.onCustomViewHidden()
+        fullCallback = null
+        WindowInsetsControllerCompat(window, window.decorView).show(WindowInsetsCompat.Type.systemBars())
+    }
+
+    private fun isCrmFile(uri: Uri): Boolean {
+        val host = uri.host ?: return false
+        val path = uri.path ?: return false
+        return host.endsWith("mangalamagro.in") && (path.startsWith("/api/media/") || path.startsWith("/api/uploads/"))
+    }
+
+    /** true = handled here, the WebView must not load it. */
+    private fun handleSpecialUrl(url: String): Boolean {
+        val uri = Uri.parse(url)
+        val scheme = (uri.scheme ?: "").lowercase()
+        if (scheme == "http" || scheme == "https") {
+            if (isCrmFile(uri)) {
+                // ?download=1 -> the server answers "attachment" -> DownloadListener saves it
+                if (uri.getQueryParameter("download") == "1") return false
+                openInApp(url)
+                return true
+            }
+            if ((uri.host ?: "").endsWith("mangalamagro.in")) return false
+            // other websites (maps, links in messages): the phone's browser / app
+            try { startActivity(Intent(Intent.ACTION_VIEW, uri)) } catch (e: Exception) { }
+            return true
+        }
+        if (scheme == "blob" || scheme == "data" || scheme == "javascript" || scheme == "about") return false
+        // mailto:, whatsapp:, upi:, intent: ...
+        try {
+            val i = if (scheme == "intent") Intent.parseUri(url, Intent.URI_INTENT_SCHEME) else Intent(Intent.ACTION_VIEW, uri)
+            startActivity(i)
+        } catch (e: Exception) {
+            toast("No app on this phone can open this link")
+        }
+        return true
+    }
+
+    private fun fileNameFrom(url: String, contentDisposition: String?, mime: String?): String {
+        val cd = contentDisposition ?: ""
+        Regex("filename\\*=UTF-8''([^;]+)", RegexOption.IGNORE_CASE).find(cd)?.let {
+            val n = Uri.decode(it.groupValues[1]).trim()
+            if (n.isNotEmpty()) return n.replace("/", "_")
+        }
+        return URLUtil.guessFileName(url, cd, mime).replace("/", "_")
+    }
+
+    /** Save a CRM file into the phone's Downloads (notification when done). */
+    private fun downloadToPhone(url: String, userAgent: String?, contentDisposition: String?, mimeType: String?) {
+        val name = fileNameFrom(url, contentDisposition, mimeType)
+        try {
+            val req = DownloadManager.Request(Uri.parse(url)).apply {
+                CookieManager.getInstance().getCookie(url)?.let { addRequestHeader("Cookie", it) }
+                addRequestHeader("User-Agent", userAgent ?: webView.settings.userAgentString)
+                if (!mimeType.isNullOrEmpty()) setMimeType(mimeType)
+                setTitle(name)
+                setDescription("LeadOrbit")
+                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "LeadOrbit/$name")
+            }
+            (getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(req)
+            toast("Downloading $name - it will be in Downloads > LeadOrbit")
+        } catch (e: Exception) {
+            Log.e("MainActivity", "download failed: ${e.message}")
+            toast("Download failed: ${e.message}")
+        }
+    }
+
+    private fun saveBytesToDownloads(name: String, mime: String, bytes: ByteArray) {
+        val safe = name.replace("/", "_")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, safe)
+                put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/LeadOrbit")
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: throw IllegalStateException("no uri")
+            contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+        } else {
+            @Suppress("DEPRECATION")
+            val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "LeadOrbit")
+            dir.mkdirs()
+            File(dir, safe).writeBytes(bytes)
+        }
+        runOnUiThread { toast("Saved $safe in Downloads > LeadOrbit") }
+    }
+
+    /** A document from a chat: fetch it, then open it in the phone's PDF / Word / Excel / image app. */
+    private fun openInApp(url: String) {
+        toast("Opening…")
+        Thread {
+            try {
+                val client = OkHttpClient.Builder().readTimeout(60, TimeUnit.SECONDS).build()
+                val reqB = Request.Builder().url(url)
+                CookieManager.getInstance().getCookie(url)?.let { reqB.addHeader("Cookie", it) }
+                client.newCall(reqB.build()).execute().use { resp ->
+                    if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}")
+                    val type = resp.header("Content-Type")?.substringBefore(';')?.trim()
+                    val name = fileNameFrom(url, resp.header("Content-Disposition"), type)
+                    val ext = name.substringAfterLast('.', "").lowercase()
+                    val mime = type?.takeIf { it.isNotEmpty() && it != "application/octet-stream" }
+                        ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
+                    val dir = File(cacheDir, "shared").apply { mkdirs() }
+                    dir.listFiles()?.filter { System.currentTimeMillis() - it.lastModified() > 24 * 3600 * 1000L }?.forEach { it.delete() }
+                    val f = File(dir, name)
+                    resp.body?.byteStream()?.use { input -> f.outputStream().use { input.copyTo(it) } }
+                    val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", f)
+                    runOnUiThread {
+                        val view = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(uri, mime)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        try {
+                            startActivity(Intent.createChooser(view, name).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                        } catch (e: ActivityNotFoundException) {
+                            toast("No app on this phone opens .$ext files - saving it to Downloads")
+                            downloadToPhone(url, null, resp.header("Content-Disposition"), type)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("MainActivity", "open file failed: ${e.message}")
+                runOnUiThread { toast("Couldn't open the file: ${e.message}") }
+            }
+        }.start()
+    }
+
+    /** Links that save a file made inside the page (blob:/data:) - the WebView can't download those itself. */
+    private fun injectDownloadHelper() {
+        val js = """
+            (function(){
+              if (window.__loDl || !window.LeadOrbitNative) return; window.__loDl = 1;
+              var rv = URL.revokeObjectURL;
+              URL.revokeObjectURL = function(u){ setTimeout(function(){ try { rv.call(URL, u); } catch(e){} }, 60000); };
+              function hit(a){ return a && a.href && a.hasAttribute && a.hasAttribute('download') && (a.href.indexOf('blob:') === 0 || a.href.indexOf('data:') === 0); }
+              function save(a){
+                var name = a.getAttribute('download') || 'download';
+                fetch(a.href).then(function(r){ return r.blob(); }).then(function(b){
+                  var fr = new FileReader();
+                  fr.onload = function(){ LeadOrbitNative.saveDataUrl(String(fr.result), name, b.type || ''); };
+                  fr.readAsDataURL(b);
+                });
+              }
+              var oc = HTMLAnchorElement.prototype.click;
+              HTMLAnchorElement.prototype.click = function(){ if (hit(this)) { save(this); return; } return oc.apply(this, arguments); };
+              document.addEventListener('click', function(e){
+                var a = e.target && e.target.closest ? e.target.closest('a') : null;
+                if (hit(a)) { e.preventDefault(); e.stopPropagation(); save(a); }
+              }, true);
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js, null)
     }
 
     /** Calls happen in the phone's normal phone app; the call log sync picks them up. */
@@ -544,7 +842,9 @@ class MainActivity : AppCompatActivity() {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (webView.canGoBack()) {
+        if (fullView != null) {
+            exitFullScreenVideo()
+        } else if (webView.canGoBack()) {
             webView.goBack()
         } else {
             @Suppress("DEPRECATION")

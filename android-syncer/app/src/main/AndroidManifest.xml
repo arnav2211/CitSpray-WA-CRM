@@ -29,6 +29,9 @@
     <!-- WhatsApp calls answered in the app: microphone, ring like a phone call, keep the
          connection alive when the app is closed, mic kept on while in another app -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Chat camera (take a photo / video and send it) -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <!-- Bluetooth headset / car kit for calls on Android 11 and older -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />

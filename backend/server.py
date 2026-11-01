@@ -2156,12 +2156,29 @@ async def _attendance_login_allowed(user: dict) -> Optional[dict]:
     return None
 
 
+# Automatic alerts that need someone NOW (red pop-up + alarm on the phone). Everything else
+# (reports, attendance, leave requests, salary, reorder, promises ...) is a normal notification.
+URGENT_SYSTEM_ALERTS = {"leads_unassigned", "cod_cancelled", "cod_oms_failed"}
+
+
+def _alert_is_urgent(a: dict) -> bool:
+    meta = a.get("meta") or {}
+    if not meta.get("type"):
+        return True                      # sent by a person from the Alerts page
+    if meta.get("silent"):
+        return False
+    if "urgent" in meta:
+        return bool(meta["urgent"])
+    return meta["type"] in URGENT_SYSTEM_ALERTS
+
+
 async def create_system_alert(alert_type: str, title: str, message: str, dedup_key: Optional[str] = None,
                               silent: bool = False):
     """Raise an alert to all admins through the existing admin-alert pipeline
     (bell + websocket toast). dedup_key prevents re-raising the same flag.
-    silent=True: shown in the CRM without the alarm tone and NOT pushed to the
-    phone app (whose alert always rings)."""
+    Only URGENT_SYSTEM_ALERTS ring (and never between 22:00 and 08:00 IST); the rest are
+    a normal phone notification + a small card in the CRM.
+    silent=True: shown in the CRM only, not pushed to the phone app."""
     try:
         if dedup_key:
             existing = await db.admin_alerts.find_one({"meta.dedup_key": dedup_key}, {"_id": 1})
@@ -2185,13 +2202,18 @@ async def create_system_alert(alert_type: str, title: str, message: str, dedup_k
             "created_at": datetime.now(timezone.utc).isoformat(),
             "meta": {"type": alert_type, "dedup_key": dedup_key, "silent": silent},
         }
+        h = _ist_now().hour
+        urgent = (not silent) and alert_type in URGENT_SYSTEM_ALERTS and 8 <= h < 22
+        alert_doc["meta"]["urgent"] = urgent
         await db.admin_alerts.insert_one(alert_doc.copy())
         for r_id in ([] if silent else admin_ids):
             try:
+                # "notify" = a normal notification in app 2.2.6+; older apps ignore it (no alarm)
                 await manager.broadcast_to_user(r_id, {
                     "type": "admin_alert",
-                    "action": "trigger",
-                    "alert": {"id": alert_doc["id"], "title": title, "message": message, "sent_by": "System"},
+                    "action": "trigger" if urgent else "notify",
+                    "alert": {"id": alert_doc["id"], "title": title, "message": message, "sent_by": "System",
+                              "urgent": urgent},
                 })
             except Exception:
                 pass
@@ -11220,7 +11242,7 @@ def _prepare_image_for_whatsapp(raw: bytes, suffix: str, mime: str) -> tuple:
 
 
 @api.get("/media/{stored_name}")
-async def serve_flow_media(stored_name: str, download: bool = False):
+async def serve_flow_media(stored_name: str, request: Request, download: bool = False):
     """Serve files uploaded by admins or cached from WhatsApp. Public (no auth) so Meta
     can fetch on send and so `<img>` tags work from the chat UI. Pass `?download=1` to
     force `Content-Disposition: attachment` with the original filename preserved."""
@@ -11232,14 +11254,31 @@ async def serve_flow_media(stored_name: str, download: bool = False):
     from fastapi.responses import FileResponse
     filename = (meta or {}).get("original_filename") or safe
     mime_type = (meta or {}).get("mime_type")
-    headers = {}
-    if download:
-        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
-    else:
-        # Inline preview by default
-        headers["Content-Disposition"] = f'inline; filename="{filename}"'
-    headers["Cache-Control"] = "public, max-age=86400"
-    return FileResponse(str(path), media_type=mime_type, headers=headers, filename=filename)
+    from urllib.parse import quote as _q
+    ascii_name = filename.encode("ascii", "ignore").decode().replace('"', "").strip() or safe
+    # inline preview by default; filename* keeps Hindi / other non-English names
+    headers = {"Content-Disposition": f"{'attachment' if download else 'inline'}; filename=\"{ascii_name}\"; "
+                                      f"filename*=UTF-8''{_q(filename)}",
+               "Cache-Control": "public, max-age=86400", "Accept-Ranges": "bytes"}
+    # Byte ranges: video players (phone app WebView, Safari) need them to play / seek
+    m = re.match(r"bytes=(\d*)-(\d*)$", (request.headers.get("range") or "").strip())
+    size = path.stat().st_size
+    if m and size and (m.group(1) or m.group(2)):
+        if m.group(1):
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else size - 1
+        else:
+            start, end = max(0, size - int(m.group(2))), size - 1
+        end = min(end, size - 1, start + 4 * 1024 * 1024 - 1)     # at most 4 MB per answer
+        if start >= size or start > end:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            chunk = fh.read(end - start + 1)
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        return Response(chunk, status_code=206, headers=headers,
+                        media_type=mime_type or mimetypes.guess_type(str(path))[0] or "application/octet-stream")
+    return FileResponse(str(path), media_type=mime_type, headers=headers)
 
 
 @api.delete("/chatflows/{flow_id}/nodes/{node_id}")
@@ -14748,6 +14787,8 @@ async def get_pending_alerts(user=Depends(get_current_user)):
         {"recipient_ids": uid, f"acknowledgements.{uid}": {"$exists": False}, "cancelled": {"$ne": True}},
         {"_id": 0}
     ).sort("created_at", -1).to_list(50)
+    for a in alerts:
+        a["urgent"] = _alert_is_urgent(a)
     return alerts
 
 @api.put("/admin/alerts/{alert_id}/acknowledge")

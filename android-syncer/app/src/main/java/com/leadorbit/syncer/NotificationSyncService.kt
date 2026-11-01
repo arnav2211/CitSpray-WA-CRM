@@ -41,12 +41,18 @@ class NotificationSyncService : Service() {
         const val ACTION_WA_DECLINE = "com.leadorbit.syncer.WA_DECLINE"
         const val ACTION_WA_STOP_RING = "com.leadorbit.syncer.WA_STOP_RING"
         const val ACTION_WA_DECIDE = "com.leadorbit.syncer.WA_DECIDE"
+        const val ACTION_STOP_RING = "com.leadorbit.syncer.STOP_RING"
+
+        /** Urgent alarms ring at most this long; the notification stays until acknowledged. */
+        private const val MAX_RING_MS = 2 * 60 * 1000L
 
         // Channels
         private const val CHANNEL_BG_ID = "leadorbit_sync_channel"
         private const val CHANNEL_ALERT_ID = "leadorbit_alert_channel"
         // channel sound can't change once created: bump the id if intl_alert.wav changes
         private const val CHANNEL_INTL_ID = "leadorbit_intl_wa_v1"
+        // reports, attendance, leave requests ... : a normal notification, no alarm
+        private const val CHANNEL_INFO_ID = "leadorbit_updates_v1"
         
         // Notification IDs
         private const val NOTIFICATION_BG_ID = 999
@@ -122,6 +128,7 @@ class NotificationSyncService : Service() {
                         postToBackend("/api/wa-calls/$callId/decline", JSONObject())
                     }
                 }
+                ACTION_STOP_RING -> stopAlarmSound()     // alarm notification swiped away
                 ACTION_WA_STOP_RING -> {
                     intent.getStringExtra("call_id")?.let { WaCallNotifier.clear(this, it) }
                 }
@@ -198,6 +205,8 @@ class NotificationSyncService : Service() {
                 isConnecting = false
                 // a call that started ringing while we were reconnecting still rings here
                 fetchRingingCalls()
+                // alerts acknowledged elsewhere while we were offline: stop their alarm
+                syncPendingAlerts()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -214,6 +223,8 @@ class NotificationSyncService : Service() {
                                 if (alert != null) {
                                     handleAdminAlertTrigger(alert)
                                 }
+                            } else if (action == "notify") {
+                                json.optJSONObject("alert")?.let { a -> mainHandler.post { showInfoAlert(a) } }
                             } else if (action == "clear") {
                                 val alertId = json.optString("alert_id")
                                 if (alertId.isNotEmpty()) {
@@ -413,6 +424,10 @@ class NotificationSyncService : Service() {
         val title = alert.optString("title")
         val message = alert.optString("message")
         val sentBy = alert.optString("sent_by")
+        if (!alert.optBoolean("urgent", true)) {
+            mainHandler.post { showInfoAlert(alert) }
+            return
+        }
 
         synchronized(activeAlertIds) {
             activeAlertIds.add(alertId)
@@ -445,6 +460,7 @@ class NotificationSyncService : Service() {
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setFullScreenIntent(mainPendingIntent, true)
             .addAction(R.drawable.ic_launcher, "Acknowledge", ackPendingIntent)
+            .setDeleteIntent(stopRingIntent())
             .setAutoCancel(false)
             .setOngoing(true)
             .build()
@@ -461,6 +477,69 @@ class NotificationSyncService : Service() {
         }
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.cancel(alertId.hashCode())
+        manager.cancel(("info:$alertId").hashCode())
+    }
+
+    private fun stopRingIntent(): PendingIntent = PendingIntent.getService(
+        this, "stop_ring".hashCode(),
+        Intent(this, NotificationSyncService::class.java).apply { action = ACTION_STOP_RING },
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+    )
+
+    /** Not urgent (reports, attendance, leave requests ...): one normal notification, silent at night. */
+    private fun showInfoAlert(alert: JSONObject) {
+        ensureInfoChannel()
+        val alertId = alert.optString("id")
+        val title = alert.optString("title")
+        val message = alert.optString("message")
+        val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+        val night = hour >= 22 || hour < 8
+        val nid = ("info:$alertId").hashCode()
+        val open = PendingIntent.getActivity(this, nid, Intent(this, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        }, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val n = NotificationCompat.Builder(this, CHANNEL_INFO_ID)
+            .setSmallIcon(R.drawable.ic_launcher)
+            .setContentTitle(title)
+            .setContentText(message)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(message))
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setAutoCancel(true)
+            .setSilent(night)
+            .setContentIntent(open)
+            .build()
+        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(nid, n)
+    }
+
+    private fun ensureInfoChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (nm.getNotificationChannel(CHANNEL_INFO_ID) != null) return
+        nm.createNotificationChannel(NotificationChannel(CHANNEL_INFO_ID, "LeadOrbit updates", NotificationManager.IMPORTANCE_DEFAULT).apply {
+            description = "Reports, attendance, leave requests and other non-urgent updates (no alarm)"
+        })
+    }
+
+    /** Alarms whose alert was acknowledged / cancelled while the connection was down. */
+    private fun syncPendingAlerts() {
+        val token = sharedPrefs.getString("auth_token", null) ?: return
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val request = Request.Builder()
+                    .url("https://crm.mangalamagro.in/api/admin/alerts/pending")
+                    .header("Authorization", "Bearer $token")
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) return@use
+                    val arr = org.json.JSONArray(response.body?.string() ?: "[]")
+                    val pending = (0 until arr.length()).map { arr.getJSONObject(it).optString("id") }.toSet()
+                    val stale = synchronized(activeAlertIds) { activeAlertIds.filter { it !in pending } }
+                    stale.forEach { id -> mainHandler.post { handleAdminAlertClear(id) } }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "pending alerts check failed: ${e.message}")
+            }
+        }
     }
 
     private fun acknowledgeAlertOnBackend(alertId: String) {
@@ -532,6 +611,7 @@ class NotificationSyncService : Service() {
             .setFullScreenIntent(mainPendingIntent, true)
             .addAction(R.drawable.ic_launcher, "Mark Done", donePendingIntent)
             .addAction(R.drawable.ic_launcher, "Snooze 30m", snoozePendingIntent)
+            .setDeleteIntent(stopRingIntent())
             .setAutoCancel(false)
             .setOngoing(true)
             .build()
@@ -609,13 +689,18 @@ class NotificationSyncService : Service() {
                 prepare()
                 start()
             }
+            mainHandler.removeCallbacks(ringTimeout)
+            mainHandler.postDelayed(ringTimeout, MAX_RING_MS)
             Log.i(TAG, "Alarm sound started playing.")
         } catch (e: Exception) {
             Log.e(TAG, "Error starting alarm sound", e)
         }
     }
 
+    private val ringTimeout = Runnable { stopAlarmSound() }
+
     private fun stopAlarmSound() {
+        mainHandler.removeCallbacks(ringTimeout)
         mediaPlayer?.let {
             try {
                 it.stop()
