@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
 import { Plus, Trash } from "@phosphor-icons/react";
+import { WaHeader, WaFooter, WaButtons } from "@/components/WaParts";
 
 export default function Templates() {
   const [tpl, setTpl] = useState([]);
@@ -88,7 +89,14 @@ export default function Templates() {
                 )}
               </div>
             </div>
-            <div className="mt-3 border border-gray-200 bg-gray-50 p-3 text-sm whitespace-pre-wrap">{t.body || "(no body — check components on Meta)"}</div>
+            <div className="mt-3 border border-gray-200 bg-gray-50 text-sm">
+              <div className="p-3">
+                <WaHeader parts={t} className="mb-1" />
+                <div className="whitespace-pre-wrap">{t.body || "(no body — check components on Meta)"}</div>
+                <WaFooter parts={t} className="mt-1.5" />
+              </div>
+              <WaButtons parts={t} />
+            </div>
             <div className="mt-3 flex justify-between items-center">
               {t.synced_from_meta ? (
                 <span className="text-[10px] uppercase tracking-widest text-gray-400">Synced from Meta</span>

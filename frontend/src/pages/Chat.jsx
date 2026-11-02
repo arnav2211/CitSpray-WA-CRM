@@ -19,6 +19,7 @@ import OMSDataSection from "@/components/OMSDataSection";
 import LeadReference from "@/components/LeadReference";
 import CallAiSummary from "@/components/CallAiSummary";
 import TagsEditor from "@/components/TagsEditor";
+import { WaHeader, WaFooter, WaButtons } from "@/components/WaParts";
 import { useCompany } from "@/context/CompanyContext";
 
 const POLL_MS = 4000;
@@ -1979,7 +1980,10 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                       <span className="kbd">{t.language || t.category}</span>
                     </div>
                   </div>
+                  <WaHeader parts={t} className="text-xs mt-1" />
                   {t.body && <div className="text-xs text-gray-600 mt-1 whitespace-pre-wrap">{t.body}</div>}
+                  <WaFooter parts={t} className="mt-1" />
+                  <WaButtons parts={t} className="mt-1 max-w-xs" />
                 </button>
               ))}
             </div>
@@ -2914,6 +2918,7 @@ function BubbleImpl({ m, allMessages = [], senderName = null, onReply, onResend,
         {m.template_name && (
           <div className="text-[9px] uppercase tracking-widest text-gray-500 font-bold mb-1 px-2 pt-1">Template · {m.template_name}</div>
         )}
+        {m.wa_parts && <WaHeader parts={m.wa_parts} hasMedia={!!media} className={`mb-1 ${media ? "px-2" : ""}`} />}
         {quotedPreview && (
           <button
             type="button"
@@ -2945,6 +2950,7 @@ function BubbleImpl({ m, allMessages = [], senderName = null, onReply, onResend,
         {captionText && (
           <div className={`whitespace-pre-wrap break-words ${media ? "px-2 pt-1.5" : ""}`}>{captionText}</div>
         )}
+        {m.wa_parts && <WaFooter parts={m.wa_parts} className={`mt-1 ${media ? "px-2" : ""}`} />}
         {translatedText && (
           <div className="mt-1.5 pt-1.5 border-t border-gray-200 text-xs text-gray-700 italic" data-testid={`translation-${m.id}`}>
             <span className="font-bold not-italic text-[10px] uppercase tracking-widest text-[#002FA7] mr-1 block">Translated to English:</span>
@@ -2967,6 +2973,7 @@ function BubbleImpl({ m, allMessages = [], senderName = null, onReply, onResend,
           {isOut && <span className={`text-[10px] ${tickColor(m.status)}`}>{tickFor(m.status)}</span>}
           {isOut && m.error && <span className="text-[9px] text-[#E60000] uppercase tracking-widest font-bold">{String(m.error).slice(0, 24)}</span>}
         </div>
+        {m.wa_parts && <WaButtons parts={m.wa_parts} className={`mt-1 ${media ? "" : "-mx-3 -mb-2"}`} />}
         {/* Reaction badges anchored to bottom-start of the bubble */}
         {Object.keys(reactionAgg).length > 0 && (
           <div className={`absolute -bottom-3 ${isOut ? "left-2" : "right-2"} flex items-center gap-1`} data-testid={`reactions-${m.id}`}>

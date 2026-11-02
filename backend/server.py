@@ -3949,6 +3949,10 @@ async def list_messages(
         msgs.reverse()
     else:
         msgs = await db.messages.find(query, {"_id": 0}).sort("at", 1).to_list(2000)
+    try:
+        await _attach_wa_parts(msgs, lead.get("company"))
+    except Exception as e:
+        logger.warning(f"wa_parts failed: {e}")
     return msgs
 
 
@@ -5625,10 +5629,73 @@ async def whatsapp_status(user: dict = Depends(get_current_user),
     return out
 
 
+def _wa_parts_from_components(components) -> Dict[str, Any]:
+    """Header / footer / buttons of a Meta template (what the customer sees besides the body)."""
+    out: Dict[str, Any] = {"header_format": None, "header_text": None, "footer": None, "buttons": []}
+    for c in components or []:
+        typ = (c.get("type") or "").upper()
+        if typ == "HEADER":
+            out["header_format"] = (c.get("format") or "TEXT").upper()
+            if out["header_format"] == "TEXT":
+                out["header_text"] = c.get("text") or ""
+        elif typ == "FOOTER":
+            out["footer"] = c.get("text") or ""
+        elif typ == "BUTTONS":
+            for b in c.get("buttons") or []:
+                out["buttons"].append({k: b.get(k) for k in ("type", "text", "url", "phone_number") if b.get(k)})
+    return out
+
+
+async def _attach_wa_parts(msgs: List[dict], company: Optional[str]) -> None:
+    """Give each sent template / chatbot message its header, footer and buttons (`wa_parts`)
+    so the chat shows the whole message, not only the body."""
+    todo = [m for m in msgs if m.get("direction") == "out" and not m.get("wa_parts")]
+    names = {m["template_name"] for m in todo if m.get("template_name")}
+    tpls: Dict[str, dict] = {}
+    if names:
+        async for t in db.whatsapp_templates.find(
+                {"name": {"$in": list(names)}, "$and": [company_filter(company)]},
+                {"_id": 0, "name": 1, "header_format": 1, "header_text": 1, "footer": 1, "buttons": 1}):
+            tpls.setdefault(t["name"], t)
+    node_ids = {m["flow_node_id"] for m in todo if m.get("flow_node_id")}
+    nodes: Dict[str, dict] = {}
+    opts: Dict[str, List[dict]] = {}
+    if node_ids:
+        async for n in db.chat_nodes.find({"id": {"$in": list(node_ids)}}, {"_id": 0, "id": 1, "message_type": 1, "message_content": 1}):
+            nodes[n["id"]] = n
+        async for o in db.chat_options.find({"node_id": {"$in": list(node_ids)}}, {"_id": 0, "node_id": 1, "label": 1, "position": 1}).sort("position", 1):
+            opts.setdefault(o["node_id"], []).append(o)
+    for m in todo:
+        p = None
+        t = tpls.get(m.get("template_name") or "")
+        if t and (t.get("header_format") or t.get("footer") or t.get("buttons")):
+            p = {k: t.get(k) for k in ("header_format", "header_text", "footer", "buttons")}
+        n = nodes.get(m.get("flow_node_id") or "")
+        if n and n.get("message_type") in ("button", "list", "carousel"):
+            c = n.get("message_content") or {}
+            mt = n["message_type"]
+            labels = [o.get("label") or "" for o in opts.get(n["id"], [])]
+            p = {"header_format": "TEXT" if (c.get("header") and mt != "carousel") else None,
+                 "header_text": c.get("header") if mt != "carousel" else None,
+                 "footer": c.get("footer") if mt != "carousel" else None,
+                 "buttons": [{"type": "LIST_ROW" if mt == "list" else "QUICK_REPLY", "text": l}
+                             for l in (labels if mt != "carousel" else labels[:3])]}
+            if mt == "list":
+                p["list_button"] = (c.get("button_text") or "Choose").strip()
+        if m.get("call_button"):
+            p = {"buttons": [{"type": "VOICE_CALL", "text": "Call now"}]}
+        if p:
+            m["wa_parts"] = p
+
+
 @api.post("/whatsapp/templates/sync")
 async def sync_templates(admin: dict = Depends(require_admin),
                          x_company: Optional[str] = Header(None, alias="X-Company")):
     company = _resolve_company(admin, x_company)
+    return await _sync_wa_templates(company)
+
+
+async def _sync_wa_templates(company: str) -> Dict[str, Any]:
     cfg = await get_wa_config(company)
     if not (cfg["enabled"] and cfg["waba_id"]):
         raise HTTPException(status_code=400, detail="WhatsApp not configured (need access_token + phone_number_id + waba_id)")
@@ -5665,6 +5732,8 @@ async def sync_templates(admin: dict = Depends(require_admin),
             "params_required": count_template_placeholders(body),
             "synced_from_meta": True,
             "synced_at": iso(now_utc()),
+            "components": t.get("components") or [],
+            **_wa_parts_from_components(t.get("components")),
         }
         # upsert by name+language+company (each company syncs its own WABA)
         upsert_key = {"name": doc["name"], "language": doc["language"], "$and": [company_filter(company)]}
