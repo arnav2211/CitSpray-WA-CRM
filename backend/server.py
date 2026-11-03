@@ -495,6 +495,8 @@ class UserCreate(BaseModel):
     employee_code: Optional[str] = None
     department: Optional[str] = None
     company: Literal["citspray", "fragvansh"] = "citspray"
+    no_auto_leads: bool = False      # leads only given by hand (never round-robin)
+    training: bool = False           # daily call report with AI summaries to admins
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
@@ -509,6 +511,8 @@ class UserUpdate(BaseModel):
     employee_code: Optional[str] = None
     department: Optional[str] = None
     company: Optional[Literal["citspray", "fragvansh"]] = None
+    no_auto_leads: Optional[bool] = None
+    training: Optional[bool] = None
 
 class HolidayCreate(BaseModel):
     date: str  # YYYY-MM-DD
@@ -912,6 +916,8 @@ async def create_user(body: UserCreate, admin: dict = Depends(require_admin)):
         "employee_code": body.employee_code,
         "department": body.department,
         "company": normalize_company(body.company),
+        "no_auto_leads": bool(body.no_auto_leads),
+        "training": bool(body.training),
     }
     await db.users.insert_one(doc.copy())
     if doc.get("employee_code"):
@@ -924,7 +930,8 @@ async def update_user(user_id: str, body: UserUpdate, admin: dict = Depends(requ
     if not u:
         raise HTTPException(status_code=404, detail="User not found")
     updates: Dict[str, Any] = {}
-    for f in ["name", "role", "active", "working_hours", "joining_date", "base_salary", "bypass_attendance", "employee_code", "department"]:
+    for f in ["name", "role", "active", "working_hours", "joining_date", "base_salary", "bypass_attendance", "employee_code", "department",
+              "no_auto_leads", "training"]:
         v = getattr(body, f)
         if v is not None:
             updates[f] = v
@@ -973,7 +980,7 @@ async def delete_user(
         leads = await db.leads.find({"assigned_to": user_id}).to_list(100000)
         if leads:
             active_execs = await db.users.find(
-                {"role": "executive", "active": True, "id": {"$ne": user_id}},
+                {"role": "executive", "active": True, "id": {"$ne": user_id}, "no_auto_leads": {"$ne": True}},
                 {"id": 1}
             ).to_list(500)
             active_exec_ids = [ae["id"] for ae in active_execs]
@@ -1060,7 +1067,7 @@ async def _offboard_user(u: dict, admin: dict, reason: str, note: Optional[str],
     for c in COMPANIES:
         ts = await db.users.find(
             {"role": "executive", "active": True, "id": {"$ne": uid}, "username": {"$ne": "test_user"},
-             "employment_status": {"$ne": "former"}, **company_filter(c)},
+             "employment_status": {"$ne": "former"}, "no_auto_leads": {"$ne": True}, **company_filter(c)},
             {"_id": 0, "id": 1, "username": 1, "name": 1}).to_list(500)
         ts.sort(key=lambda t: t["username"])
         targets_by_comp[c] = ts
@@ -2237,7 +2244,7 @@ async def _pick_buyleads_executive(source: str, company: Optional[str] = None) -
     eligible: List[dict] = []
     for uid in cfg["agent_ids"]:
         u = await db.users.find_one({"id": uid, "role": "executive", "active": True}, {"_id": 0, "password_hash": 0})
-        if not u:
+        if not u or u.get("no_auto_leads"):
             continue
         if normalize_company(u.get("company")) != comp:
             continue
@@ -2277,7 +2284,7 @@ async def pick_next_executive(exclude_user_id: Optional[str] = None, company: Op
     comp = normalize_company(company)
     rules = await get_routing_rules(comp)
     execs = await db.users.find(
-        {"role": "executive", "active": True, "username": {"$ne": "test_user"},
+        {"role": "executive", "active": True, "username": {"$ne": "test_user"}, "no_auto_leads": {"$ne": True},
          **company_filter(comp)}, {"_id": 0, "password_hash": 0}
     ).to_list(500)
 
@@ -4601,7 +4608,7 @@ async def winback_allocate(exec_id: Optional[str] = None) -> Dict[str, int]:
     cut = (today - timedelta(days=30 * int(cfg.get("min_months") or 6))).strftime("%Y-%m-%d")
     recent_touch = iso(now_utc() - timedelta(days=30))
     q_users: Dict[str, Any] = {"role": "executive", "active": True, "username": {"$ne": "test_user"},
-                               **company_filter(WINBACK_COMPANY)}
+                               "no_auto_leads": {"$ne": True}, **company_filter(WINBACK_COMPANY)}
     if exec_id:
         q_users["id"] = exec_id
     for e in await db.users.find(q_users, {"_id": 0, "id": 1}).to_list(100):
@@ -11827,7 +11834,7 @@ async def _redistribute_after_hours_leads():
     if not pending:
         return
     execs = await db.users.find(
-        {"role": "executive", "active": True, "username": {"$ne": "test_user"}},
+        {"role": "executive", "active": True, "username": {"$ne": "test_user"}, "no_auto_leads": {"$ne": True}},
         {"_id": 0, "password_hash": 0}).to_list(200)
     available = []
     for e in execs:
@@ -14623,6 +14630,7 @@ async def on_startup():
     scheduler.add_job(call_ai_task, "interval", seconds=20, id="call_ai", max_instances=1, coalesce=True)
     scheduler.add_job(promise_tracker_task, "interval", minutes=5, id="promise_tracker", max_instances=1, coalesce=True)
     scheduler.add_job(ai_reports_task, "interval", minutes=10, id="ai_reports", max_instances=1, coalesce=True)
+    scheduler.add_job(trainee_report_task, "cron", hour=19, minute=15, timezone="Asia/Kolkata", id="trainee_report", max_instances=1, coalesce=True)
     scheduler.add_job(pns_mapper_task, "interval", minutes=2, id="pns_mapper", max_instances=1, coalesce=True)
     # 03:30 IST daily — purge attendance/leave/salary records of ex-employees 12 months after they left
     scheduler.add_job(former_records_retention_task, "cron", hour=3, minute=30, timezone="Asia/Kolkata", id="former_retention", max_instances=1, coalesce=True)
@@ -16591,6 +16599,95 @@ async def get_ai_report(period: str = "daily", date: Optional[str] = None, refre
         return {"period": period_n, "start_date": sdate, "label": label, "data": data, "narrative": None,
                 "generated_at": iso(now_utc())}
     return await _build_ai_report(period_n, sdate, force=refresh)
+
+
+def _fmt_secs(s) -> str:
+    s = int(s or 0)
+    return f"{s // 60}m {s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+async def _trainee_call_report(u: dict, day) -> Dict[str, Any]:
+    """All of one trainee's phone calls on `day` (IST) with the AI call summaries + AI coaching."""
+    start = datetime(day.year, day.month, day.day, tzinfo=timezone(timedelta(hours=5, minutes=30))).astimezone(timezone.utc)
+    end = start + timedelta(days=1)
+    q = {"by_user_id": u["id"], "$or": [{"call_start_at": {"$gte": start.isoformat().replace("+00:00", "Z"), "$lt": end.isoformat().replace("+00:00", "Z")}},
+                                        {"call_start_at": {"$gte": start.isoformat(), "$lt": end.isoformat()}},
+                                        {"call_start_at": {"$exists": False}, "at": {"$gte": start.isoformat(), "$lt": end.isoformat()}}]}
+    calls = await db.call_logs.find(q, {"_id": 0}).to_list(1000)
+    calls.sort(key=lambda c: str(c.get("call_start_at") or c.get("at") or ""))
+    connected = [c for c in calls if int(c.get("duration_seconds") or 0) > 0]
+    talk = sum(int(c.get("duration_seconds") or 0) for c in calls)
+    rows = []
+    for c in calls:
+        dt = _parse_call_dt(c.get("call_start_at") or c.get("at"))
+        lead = await db.leads.find_one({"id": c.get("lead_id")}, {"_id": 0, "customer_name": 1}) if c.get("lead_id") else None
+        ai = c.get("ai_summary") or {}
+        rows.append({"time": (dt + timedelta(hours=5, minutes=30)).strftime("%H:%M") if dt else "",
+                     "who": (lead or {}).get("customer_name") or c.get("phone") or "", "phone": c.get("phone"),
+                     "direction": c.get("direction"), "secs": int(c.get("duration_seconds") or 0),
+                     "summary": (ai.get("summary") or "").strip(), "interest": ai.get("interest"),
+                     "next_step": ai.get("next_step"), "score": (ai.get("coaching") or {}).get("score") if isinstance(ai.get("coaching"), dict) else None})
+    coaching = None
+    summarised = [r for r in rows if r["summary"]]
+    if summarised:
+        prompt = ("You are a sales trainer at CitSpray / Fragvansh (fragrances, essential oils, aroma chemicals). "
+                  f"{u['name']} is a NEW telecaller in training. Below are today's call summaries. Write for the owner, plain "
+                  "English, max 150 words: 1) how her calls went overall, 2) what she did well, 3) the 3 most important "
+                  "things to improve tomorrow (specific: e.g. ask quantity / purpose, explain the product, ask for the order, "
+                  "send the quotation on WhatsApp). Do not invent anything not in the summaries.\n\n"
+                  + json.dumps([{k: r[k] for k in ("time", "secs", "summary", "interest", "next_step")} for r in summarised[:40]], ensure_ascii=False))
+        try:
+            coaching = (await _gemini_generate(prompt, temperature=0.3, max_output_tokens=800, json_mode=False, per_model_timeout=40.0)).strip()
+        except Exception as e:
+            logger.warning(f"trainee coaching failed: {e}")
+    return {"user": u["name"], "date": day.isoformat(), "calls": len(calls), "connected": len(connected),
+            "talk_seconds": talk, "summarised": len(summarised), "rows": rows, "coaching": coaching}
+
+
+def _trainee_report_text(r: Dict[str, Any]) -> str:
+    lines = [f"{r['calls']} calls, {r['connected']} connected, talk time {_fmt_secs(r['talk_seconds'])}, "
+             f"{r['summarised']} with an AI summary."]
+    if r["calls"] and not r["summarised"]:
+        lines.append("No call recording reached the CRM - check the LeadOrbit app and the call recorder on her phone.")
+    if r.get("coaching"):
+        lines += ["", "AI coaching:", r["coaching"]]
+    if r["rows"]:
+        lines += ["", "Calls:"]
+        for x in r["rows"][:30]:
+            s = f"- {x['time']} {x['who']} ({'in' if x['direction'] == 'incoming' else 'out'}, {_fmt_secs(x['secs'])})"
+            if x["summary"]:
+                s += f": {x['summary'][:220]}"
+            elif not x["secs"]:
+                s += ": not answered"
+            lines.append(s)
+        if len(r["rows"]) > 30:
+            lines.append(f"... and {len(r['rows']) - 30} more in Call Logs")
+    return "\n".join(lines)
+
+
+async def trainee_report_task():
+    """19:15 IST Mon-Sat: each trainee's calls of the day + AI summaries + coaching, to admins."""
+    try:
+        today = _ist_now().date()
+        if today.weekday() == 6:
+            return
+        for u in await db.users.find({"training": True, "active": True}, {"_id": 0, "password_hash": 0}).to_list(50):
+            r = await _trainee_call_report(u, today)
+            await db.trainee_reports.update_one({"user_id": u["id"], "date": r["date"]}, {"$set": {**r, "user_id": u["id"], "at": iso(now_utc())}}, upsert=True)
+            await create_system_alert("trainee_report", f"Training report - {u['name']} ({r['calls']} calls today)",
+                                      _trainee_report_text(r), dedup_key=f"trainee:{u['id']}:{r['date']}")
+    except Exception as e:
+        logger.warning(f"trainee report failed: {e}")
+
+
+@api.get("/trainee-report/{user_id}")
+async def trainee_report_ep(user_id: str, date_s: Optional[str] = Query(None, alias="date"), admin: dict = Depends(require_admin)):
+    u = await db.users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0})
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    day = datetime.strptime(date_s, "%Y-%m-%d").date() if date_s else _ist_now().date()
+    r = await _trainee_call_report(u, day)
+    return {**r, "text": _trainee_report_text(r)}
 
 
 async def ai_reports_task():

@@ -411,6 +411,8 @@ function UserModal({ user, onClose, onSaved }) {
     joining_date: user?.joining_date || new Date().toISOString().split("T")[0],
     base_salary: user?.base_salary || 0,
     bypass_attendance: user?.bypass_attendance ?? false,
+    no_auto_leads: user?.no_auto_leads ?? false,
+    training: user?.training ?? false,
     employee_code: user?.employee_code || "",
     department: user?.department || "",
     company: user?.company || "citspray",
@@ -435,6 +437,8 @@ function UserModal({ user, onClose, onSaved }) {
           joining_date: f.joining_date, 
           base_salary: Number(f.base_salary),
           bypass_attendance: f.bypass_attendance,
+          no_auto_leads: f.no_auto_leads,
+          training: f.training,
           employee_code: f.employee_code || null,
           department: f.department || null,
           company: f.company
@@ -506,6 +510,14 @@ function UserModal({ user, onClose, onSaved }) {
                   <div className="flex items-center gap-2 py-2">
                     <input type="checkbox" id="bypass_attendance" checked={f.bypass_attendance} onChange={(e) => setF({ ...f, bypass_attendance: e.target.checked })} className="rounded border-gray-300 text-[#002FA7] focus:ring-[#002FA7]" />
                     <label htmlFor="bypass_attendance" className="text-xs font-semibold text-gray-700 cursor-pointer">Bypass Attendance Check (always gets leads)</label>
+                  </div>
+                  <div className="flex items-center gap-2 py-2">
+                    <input type="checkbox" id="no_auto_leads" checked={f.no_auto_leads} onChange={(e) => setF({ ...f, no_auto_leads: e.target.checked })} className="rounded border-gray-300 text-[#002FA7] focus:ring-[#002FA7]" />
+                    <label htmlFor="no_auto_leads" className="text-xs font-semibold text-gray-700 cursor-pointer">No automatic leads (assign by hand only)</label>
+                  </div>
+                  <div className="flex items-center gap-2 py-2">
+                    <input type="checkbox" id="training" checked={f.training} onChange={(e) => setF({ ...f, training: e.target.checked })} className="rounded border-gray-300 text-[#002FA7] focus:ring-[#002FA7]" />
+                    <label htmlFor="training" className="text-xs font-semibold text-gray-700 cursor-pointer">In training (daily call report with AI summaries at 7:15 pm)</label>
                   </div>
                 </div>
                 {/* Biometric facial data registration removed */}
