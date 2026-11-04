@@ -81,9 +81,26 @@ class NotificationSyncService : Service() {
     private var userId: String? = null
     private var token: String? = null
 
+    // Call ended -> send it to the CRM. Registered here (not only in the manifest) because
+    // ASUS / Xiaomi / Oppo ... do not deliver the call broadcast to a closed app, while this
+    // service is always running; calls then reached the CRM only every 15-300 minutes.
+    private val callStateReceiver = CallReceiver()
+    private val callSyncLoop = object : Runnable {
+        override fun run() {
+            try { CallReceiver.syncNow(this@NotificationSyncService) } catch (e: Exception) { }
+            mainHandler.postDelayed(this, 5 * 60 * 1000L)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         sharedPrefs = getSharedPreferences("CRM_PREFS", Context.MODE_PRIVATE)
+        try {
+            registerReceiver(callStateReceiver, android.content.IntentFilter(android.telephony.TelephonyManager.ACTION_PHONE_STATE_CHANGED))
+        } catch (e: Exception) {
+            Log.w(TAG, "call state receiver: ${e.message}")
+        }
+        mainHandler.postDelayed(callSyncLoop, 60 * 1000L)
         createNotificationChannels()
         WaCallNotifier.ensureChannels(this)
         
@@ -754,6 +771,8 @@ class NotificationSyncService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         Log.w(TAG, "Service onDestroy called. Closing connections and alarm.")
+        try { unregisterReceiver(callStateReceiver) } catch (e: Exception) { }
+        mainHandler.removeCallbacks(callSyncLoop)
         webSocket?.close(1000, "Service destroyed")
         stopAlarmSound()
         

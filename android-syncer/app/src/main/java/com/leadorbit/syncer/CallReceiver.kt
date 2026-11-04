@@ -22,6 +22,17 @@ import androidx.work.WorkManager
 
 class CallReceiver : BroadcastReceiver() {
 
+    companion object {
+        /** Send the phone's new call-log entries to the CRM now (several triggers merge into one run). */
+        fun syncNow(context: Context) {
+            val req = OneTimeWorkRequestBuilder<SyncWorker>()
+                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+                .build()
+            WorkManager.getInstance(context.applicationContext)
+                .enqueueUniqueWork("CallSyncImmediate", ExistingWorkPolicy.REPLACE, req)
+        }
+    }
+
     override fun onReceive(context: Context, intent: Intent) {
         val action = intent.action
 
@@ -53,20 +64,5 @@ class CallReceiver : BroadcastReceiver() {
         }
     }
 
-    private fun triggerImmediateSync(context: Context) {
-        val constraints = Constraints.Builder()
-            .setRequiredNetworkType(NetworkType.CONNECTED)
-            .build()
-
-        val oneTimeWorkRequest = OneTimeWorkRequestBuilder<SyncWorker>()
-            .setConstraints(constraints)
-            .build()
-
-        // Enqueue unique work with REPLACE policy so multiple rapid calls merge into one execution
-        WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(
-            "CallSyncImmediate",
-            ExistingWorkPolicy.REPLACE,
-            oneTimeWorkRequest
-        )
-    }
+    private fun triggerImmediateSync(context: Context) = syncNow(context)
 }

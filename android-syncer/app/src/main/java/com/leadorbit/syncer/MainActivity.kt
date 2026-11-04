@@ -906,6 +906,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        // opening the app sends any calls not in the CRM yet
+        if (appSetUp) try { CallReceiver.syncNow(this) } catch (e: Exception) { }
         handler.removeCallbacks(tokenCheckRunnable)
         handler.post(tokenCheckRunnable)
     }

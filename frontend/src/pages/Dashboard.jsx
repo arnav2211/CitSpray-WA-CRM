@@ -83,7 +83,8 @@ export default function Dashboard() {
 
   useEffect(() => {
     if (user.role === "data_entry") return;
-    (async () => {
+    let quiet = false;
+    const load = async () => {
       try {
         const params = { date: dailyDate };
         if (isAdmin && selectedExecId) {
@@ -92,9 +93,14 @@ export default function Dashboard() {
         const { data: res } = await api.get("/reports/daily-calls", { params });
         setDailyCalls(res);
       } catch (e) {
-        toast.error("Failed to load daily calls: " + errMsg(e));
+        if (!quiet) toast.error("Failed to load daily calls: " + errMsg(e));
       }
-    })();
+      quiet = true;           // later refreshes fail silently
+    };
+    load();
+    // calls keep arriving from the phones all day - keep the numbers current
+    const t = setInterval(load, 60000);
+    return () => clearInterval(t);
   }, [dailyDate, selectedExecId, isAdmin, user.role]);
 
   const byStatusData = data ? Object.entries(data.by_status || {}).map(([k, v]) => ({ name: k, value: v })) : [];
