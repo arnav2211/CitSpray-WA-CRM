@@ -9228,7 +9228,7 @@ async def oms_dispatch_notify(body: OmsDispatchNotify, request: Request):
             if carrier:
                 via = f"{carrier} through {agg}"
                 via_phrase = f"by {carrier} via {agg}"
-            if ref != "-" and (not tracking_url or (agg == "Shipmozo" and "shipmozo" not in tracking_url)):
+            if ref != "-" and agg.lower() not in tracking_url.lower():
                 from urllib.parse import quote as _q
                 tracking_url = _AGGREGATOR_TRACK[agg].format(awb=_q(ref, safe=""))
     if transport:
