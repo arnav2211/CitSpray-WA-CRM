@@ -9196,14 +9196,6 @@ async def oms_dispatch_notify(body: OmsDispatchNotify, request: Request):
     if not lead:
         return {"status": "failed", "error": "could not find or create the customer in the CRM"}
 
-    if not body.force:
-        prior = await db.messages.find_one(
-            {"lead_id": lead["id"], "oms_order_id": body.oms_order_id, "oms_event": "dispatched",
-             "status": {"$in": ["sent", "delivered", "read", "sent_mock"]}},
-            {"_id": 0, "id": 1, "at": 1, "wamid": 1})
-        if prior:
-            return {"status": "already_sent", "lead_id": lead["id"], "phone": phone, "at": prior.get("at"), "wamid": prior.get("wamid")}
-
     name = _tidy_name(body.customer_name or lead.get("customer_name"))
     transport = (body.dispatch_type or "").lower() == "transport"
     via = (body.transporter if transport else body.courier) or ("the transporter" if transport else "our courier")
@@ -9245,69 +9237,95 @@ async def oms_dispatch_notify(body: OmsDispatchNotify, request: Request):
             + ("The dispatch slip is attached.\n" if slip else "")
             + "Reply to this message if you need any help.")
 
-    within = await _within_24h_for_phone(lead["id"], phone)
-    tpl_name, extra, preview = None, {}, text
-    if within:
-        if slip:
-            api_result = await wa_send_media(phone, "image", slip, caption=text, company=company)
-            extra = {"media_type": "image", "media_url": slip, "caption": text}
-            preview = f"[image] {text}"
-            channel = "image"
+    async def _send_one(lead: dict, phone: str) -> Dict[str, Any]:
+        within = await _within_24h_for_phone(lead["id"], phone)
+        tpl_name, extra, preview = None, {}, text
+        if within:
+            if slip:
+                api_result = await wa_send_media(phone, "image", slip, caption=text, company=company)
+                extra = {"media_type": "image", "media_url": slip, "caption": text}
+                preview = f"[image] {text}"
+                channel = "image"
+            else:
+                api_result = await wa_send_text(phone, text, company=company)
+                channel = "text"
         else:
-            api_result = await wa_send_text(phone, text, company=company)
-            channel = "text"
-    else:
-        cfg = await get_wa_config(company)
-        img_meta = await _resolve_template_meta(OMS_TPL_DISPATCHED_IMG, None, company) if slip else {}
-        if slip and img_meta and (img_meta.get("status") or "").upper() != "APPROVED":
-            # The cache lags Meta's review; ask Meta before giving up on the slip.
-            try:
-                async with httpx.AsyncClient(timeout=15) as cli:
-                    r = await cli.get(f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['waba_id']}/message_templates",
-                                      params={"name": OMS_TPL_DISPATCHED_IMG, "fields": "name,status,language"},
-                                      headers={"Authorization": f"Bearer {cfg['access_token']}"})
-                for t in (r.json().get("data") or []) if r.status_code < 400 else []:
-                    if t.get("name") == OMS_TPL_DISPATCHED_IMG:
-                        img_meta["status"] = t.get("status")
-                        await db.whatsapp_templates.update_one({"name": OMS_TPL_DISPATCHED_IMG, "company": company},
-                                                               {"$set": {"status": t.get("status")}})
-            except Exception as e:
-                logger.warning(f"template status refresh failed: {e}")
-        if slip and (img_meta.get("status") or "").upper() == "APPROVED":
-            # {{4}} carries the number and, for couriers, the tracking link too.
-            tpl_name, params, header, tpl_meta = OMS_TPL_DISPATCHED_IMG, [name, body.order_no, via, tpl_track], slip, img_meta
-        else:
-            tpl_meta = await _resolve_template_meta(SHOPIFY_TPL_ORDER_SHIPPED, None, company)
-            if not tpl_meta:
-                return {"status": "failed", "lead_id": lead["id"], "phone": phone, "within_24h": False,
-                        "error": f"no approved dispatch template for {company} and the 24h window is closed"}
-            tpl_name, params, header = SHOPIFY_TPL_ORDER_SHIPPED, [name, body.order_no, via, tpl_track], None
-        api_result = await wa_send_template(phone, tpl_name, tpl_meta.get("language") or cfg["default_template_lang"],
-                                            params, company=company, header_image_url=header)
-        preview = render_template_text(tpl_meta.get("body"), params) or f"[Template: {tpl_name}]"
-        if header:
-            # the chat bubble shows an image's text from `caption`, so keep it there too
-            extra = {"media_type": "image", "media_url": header, "caption": preview}
-            preview = f"[image] {preview}"
-        channel = "template"
+            cfg = await get_wa_config(company)
+            img_meta = await _resolve_template_meta(OMS_TPL_DISPATCHED_IMG, None, company) if slip else {}
+            if slip and img_meta and (img_meta.get("status") or "").upper() != "APPROVED":
+                # The cache lags Meta's review; ask Meta before giving up on the slip.
+                try:
+                    async with httpx.AsyncClient(timeout=15) as cli:
+                        r = await cli.get(f"{WA_BASE_URL}/{cfg['api_version']}/{cfg['waba_id']}/message_templates",
+                                          params={"name": OMS_TPL_DISPATCHED_IMG, "fields": "name,status,language"},
+                                          headers={"Authorization": f"Bearer {cfg['access_token']}"})
+                    for t in (r.json().get("data") or []) if r.status_code < 400 else []:
+                        if t.get("name") == OMS_TPL_DISPATCHED_IMG:
+                            img_meta["status"] = t.get("status")
+                            await db.whatsapp_templates.update_one({"name": OMS_TPL_DISPATCHED_IMG, "company": company},
+                                                                   {"$set": {"status": t.get("status")}})
+                except Exception as e:
+                    logger.warning(f"template status refresh failed: {e}")
+            if slip and (img_meta.get("status") or "").upper() == "APPROVED":
+                # {{4}} carries the number and, for couriers, the tracking link too.
+                tpl_name, params, header, tpl_meta = OMS_TPL_DISPATCHED_IMG, [name, body.order_no, via, tpl_track], slip, img_meta
+            else:
+                tpl_meta = await _resolve_template_meta(SHOPIFY_TPL_ORDER_SHIPPED, None, company)
+                if not tpl_meta:
+                    return {"status": "failed", "lead_id": lead["id"], "phone": phone, "within_24h": False,
+                            "error": f"no approved dispatch template for {company} and the 24h window is closed"}
+                tpl_name, params, header = SHOPIFY_TPL_ORDER_SHIPPED, [name, body.order_no, via, tpl_track], None
+            api_result = await wa_send_template(phone, tpl_name, tpl_meta.get("language") or cfg["default_template_lang"],
+                                                params, company=company, header_image_url=header)
+            preview = render_template_text(tpl_meta.get("body"), params) or f"[Template: {tpl_name}]"
+            if header:
+                # the chat bubble shows an image's text from `caption`, so keep it there too
+                extra = {"media_type": "image", "media_url": header, "caption": preview}
+                preview = f"[image] {preview}"
+            channel = "template"
 
-    msg = {
-        "id": str(uuid.uuid4()), "lead_id": lead["id"], "direction": "out", "body": preview, "to_phone": phone,
-        "template_name": tpl_name, "status": api_result.get("status", "failed"), "wamid": api_result.get("wamid"),
-        "error": api_result.get("error"), "error_code": api_result.get("code"), "at": iso(now_utc()), "by_user_id": None,
-        "oms_order_id": body.oms_order_id, "oms_order_no": body.order_no, "oms_event": "dispatched", **extra,
-    }
-    await db.messages.insert_one(msg.copy())
-    ok = msg["status"] in ("sent", "delivered", "read", "sent_mock")
-    if ok:
-        await db.leads.update_one({"id": lead["id"]}, {"$set": {"has_whatsapp": True, "last_message_at": msg["at"], "last_action_at": msg["at"]}})
-        await _set_wa_status(lead["id"], phone, True)
-    else:
-        logger.warning(f"OMS dispatch WA failed for {body.order_no}: {msg.get('error')}")
-    await log_activity(None, "oms_order_dispatched", lead["id"],
-                       {"order": body.order_no, "channel": channel, "template": tpl_name, "status": msg["status"], "wamid": msg["wamid"]})
-    return {"status": msg["status"], "channel": channel, "template": tpl_name, "wamid": msg["wamid"],
-            "lead_id": lead["id"], "phone": phone, "within_24h": within, "error": msg.get("error")}
+        msg = {
+            "id": str(uuid.uuid4()), "lead_id": lead["id"], "direction": "out", "body": preview, "to_phone": phone,
+            "template_name": tpl_name, "status": api_result.get("status", "failed"), "wamid": api_result.get("wamid"),
+            "error": api_result.get("error"), "error_code": api_result.get("code"), "at": iso(now_utc()), "by_user_id": None,
+            "oms_order_id": body.oms_order_id, "oms_order_no": body.order_no, "oms_event": "dispatched", **extra,
+        }
+        await db.messages.insert_one(msg.copy())
+        ok = msg["status"] in ("sent", "delivered", "read", "sent_mock")
+        if ok:
+            await db.leads.update_one({"id": lead["id"]}, {"$set": {"has_whatsapp": True, "last_message_at": msg["at"], "last_action_at": msg["at"]}})
+            await _set_wa_status(lead["id"], phone, True)
+        else:
+            logger.warning(f"OMS dispatch WA failed for {body.order_no}: {msg.get('error')}")
+        await log_activity(None, "oms_order_dispatched", lead["id"],
+                           {"order": body.order_no, "channel": channel, "template": tpl_name, "status": msg["status"], "wamid": msg["wamid"]})
+        return {"status": msg["status"], "channel": channel, "template": tpl_name, "wamid": msg["wamid"],
+                "lead_id": lead["id"], "phone": phone, "within_24h": within, "error": msg.get("error")}
+
+    # every number of the customer gets the message + slip (one number may not be on WhatsApp)
+    primary_lead = lead
+    results: List[Dict[str, Any]] = []
+    for p in [phone] + [x for x in phones if x != phone]:
+        plead = primary_lead
+        if p != phone:
+            plead = await _find_lead_by_phone(p, company=company) or primary_lead
+        if not body.force:
+            prior = await db.messages.find_one(
+                {"lead_id": plead["id"], "to_phone": p, "oms_order_id": body.oms_order_id, "oms_event": "dispatched",
+                 "status": {"$in": ["sent", "delivered", "read", "sent_mock"]}},
+                {"_id": 0, "id": 1, "at": 1, "wamid": 1})
+            if prior:
+                results.append({"status": "already_sent", "lead_id": plead["id"], "phone": p,
+                                "at": prior.get("at"), "wamid": prior.get("wamid")})
+                continue
+        try:
+            results.append(await _send_one(plead, p))
+        except Exception as e:
+            logger.warning(f"OMS dispatch WA to {p} failed: {e}")
+            results.append({"status": "failed", "lead_id": plead["id"], "phone": p, "error": str(e)[:200]})
+    good = [r for r in results if r.get("status") in ("sent", "delivered", "read", "sent_mock")]
+    main = good[0] if good else next((r for r in results if r.get("status") == "already_sent"), results[0])
+    return {**main, "results": results, "phones_sent": [r["phone"] for r in good]}
 
 
 # ── OMS website-order push (re-applied 2026-07-27; keep in sync with GitHub repo) ──
