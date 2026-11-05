@@ -9136,6 +9136,32 @@ def _tidy_name(name: Optional[str]) -> str:
     return " ".join(w.capitalize() for w in n.split()) if n.isupper() else n
 
 
+_CARRIER_NAMES = (("xpressbees", "XpressBees"), ("xpress bees", "XpressBees"), ("ekart", "Ekart"), ("amazon", "Amazon Shipping"),
+                  ("delhivery", "Delhivery"), ("shadowfax", "Shadowfax"), ("dtdc", "DTDC"), ("blue dart", "Blue Dart"),
+                  ("bluedart", "Blue Dart"), ("ecom express", "Ecom Express"), ("smartr", "Smartr"), ("dotzot", "DotZot"),
+                  ("dot zot", "DotZot"), ("india post", "India Post"), ("gati", "Gati"), ("professional", "The Professional Couriers"))
+
+
+def _carrier_display_name(raw: Optional[str]) -> Optional[str]:
+    """'XpressBees 5Kg' -> 'XpressBees', 'Ekart Flat Price' -> 'Ekart', 'Amazon ATS 2KG' -> 'Amazon Shipping'."""
+    r = (raw or "").strip()
+    if not r:
+        return None
+    low = r.lower()
+    for key, nice in _CARRIER_NAMES:
+        if key in low:
+            return nice
+    r = re.sub(r"(?i)\s*\(.*?\)", "", r)
+    r = re.sub(r"(?i)\s+(\d+(\.\d+)?\s*(kg|kgs|g|gm)|surface|air|prepaid|flat price|standard|lite)\b.*$", "", r).strip()
+    return r or None
+
+
+_AGGREGATOR_TRACK = {
+    "Shipmozo": "https://panel.shipmozo.com/track-order?awb={awb}",
+    "Shiprocket": "https://shiprocket.co/tracking/{awb}",
+}
+
+
 @api.post("/oms/dispatch-notify")
 async def oms_dispatch_notify(body: OmsDispatchNotify, request: Request):
     _require_oms_service(request)
@@ -9183,16 +9209,38 @@ async def oms_dispatch_notify(body: OmsDispatchNotify, request: Request):
     via = (body.transporter if transport else body.courier) or ("the transporter" if transport else "our courier")
     ref = (body.tracking_no or "").strip() or "-"
     brand = "FragVansh" if company == "fragvansh" else "CitSpray Aroma Sciences"
+    tracking_url = (body.tracking_url or "").strip()
+    via_phrase = f"via {via}"
+    if not transport:
+        # Booked through an aggregator: say which courier really carries it ("by XpressBees via
+        # Shipmozo") and link the aggregator's tracking page (the couriers' own sites want a captcha).
+        agg = next((a for a in _AGGREGATOR_TRACK if a.lower() in (body.courier or "").lower()), None)
+        if agg:
+            carrier = None
+            try:
+                o = await oms_db.orders.find_one({"id": body.oms_order_id}, {"_id": 0, "shipmozo_courier": 1, "shiprocket_courier": 1})
+                c = (o or {}).get("shipmozo_courier" if agg == "Shipmozo" else "shiprocket_courier") or {}
+                carrier = _carrier_display_name(c.get("name") if isinstance(c, dict) else None)
+            except Exception as e:
+                logger.warning(f"dispatch carrier lookup failed: {e}")
+            if not carrier:                      # "Delhivery Surface (via Shiprocket)"
+                carrier = _carrier_display_name(re.sub(r"(?i)\(?\s*via\s+" + agg + r"\s*\)?|" + agg, "", body.courier or ""))
+            if carrier:
+                via = f"{carrier} through {agg}"
+                via_phrase = f"by {carrier} via {agg}"
+            if ref != "-" and (not tracking_url or (agg == "Shipmozo" and "shipmozo" not in tracking_url)):
+                from urllib.parse import quote as _q
+                tracking_url = _AGGREGATOR_TRACK[agg].format(awb=_q(ref, safe=""))
     if transport:
         track_line = f"LR / Bilty no. {ref} with {via}. Please collect the parcel from the transporter's office in your city."
         tpl_track = f"LR / Bilty no. {ref} with {via}"
     else:
-        track_line = f"Tracking no.: {ref}" + (f"\nTrack it here: {body.tracking_url}" if body.tracking_url else "")
-        tpl_track = body.tracking_url or ref
+        track_line = f"Tracking no.: {ref}" + (f"\nTrack it here: {tracking_url}" if tracking_url else "")
+        tpl_track = f"{ref} - track here: {tracking_url}" if tracking_url else ref
     slip = (body.slip_image_url or "").strip()
     if not slip.lower().startswith("https://"):
         slip = ""
-    text = (f"Hello {name}, your order {body.order_no} from {brand} has been dispatched via {via}.\n\n"
+    text = (f"Hello {name}, your order {body.order_no} from {brand} has been dispatched {via_phrase}.\n\n"
             f"{track_line}\n\n"
             + ("The dispatch slip is attached.\n" if slip else "")
             + "Reply to this message if you need any help.")
@@ -9227,7 +9275,7 @@ async def oms_dispatch_notify(body: OmsDispatchNotify, request: Request):
                 logger.warning(f"template status refresh failed: {e}")
         if slip and (img_meta.get("status") or "").upper() == "APPROVED":
             # {{4}} carries the number and, for couriers, the tracking link too.
-            tpl_name, params, header, tpl_meta = OMS_TPL_DISPATCHED_IMG, [name, body.order_no, via, tpl_track if transport else (f"{ref} - {body.tracking_url}" if body.tracking_url else ref)], slip, img_meta
+            tpl_name, params, header, tpl_meta = OMS_TPL_DISPATCHED_IMG, [name, body.order_no, via, tpl_track], slip, img_meta
         else:
             tpl_meta = await _resolve_template_meta(SHOPIFY_TPL_ORDER_SHIPPED, None, company)
             if not tpl_meta:
