@@ -11828,9 +11828,12 @@ async def _handle_wa_webhook(request: Request, company: str):
                         logger.warning(f"inbound availability reassign failed: {_e}")
 
                     # ---- Auto-Reply Sequence Trigger ----
-                    # A template quick-reply tap (e.g. COD "Confirm Order") is not an
-                    # enquiry — never answer it with the welcome/catalogue sequence.
-                    if msg_type != "button" and not lead.get("auto_reply_sequence_triggered"):
+                    # A COD "Confirm Order" / "Cancel Order" tap is not an enquiry - never answer it
+                    # with the welcome/catalogue sequence. Other template buttons ("Share Details",
+                    # "Request Quotation" ...) ARE the customer asking for details, so they get it.
+                    _order_btn = msg_type == "button" and any(
+                        k in (body_text or "").lower() for k in ("confirm order", "cancel order"))
+                    if not _order_btn and not lead.get("auto_reply_sequence_triggered"):
                         # Only consume the first-time token when the sequence is actually live.
                         # This prevents permanently locking leads whose first reply predated
                         # the feature being set up — if disabled, the next inbound message
