@@ -21,7 +21,7 @@ export function AlertListener() {
       } catch {}
     };
     poll();
-    const id = setInterval(poll, 3000);
+    const id = setInterval(poll, 8000);
     return () => {
       mounted = false;
       clearInterval(id);

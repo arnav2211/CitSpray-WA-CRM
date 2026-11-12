@@ -22,7 +22,11 @@ import TagsEditor from "@/components/TagsEditor";
 import { WaHeader, WaFooter, WaButtons } from "@/components/WaParts";
 import { useCompany } from "@/context/CompanyContext";
 
-const POLL_MS = 4000;
+const POLL_MS = 4000;          // open chat's messages
+const LIST_POLL_MS = 10000;    // conversation list
+const SIDE_POLL_MS = 30000;    // calls / follow-ups / internal notes of the open chat
+// Background tabs do not poll: many open tabs x 4 s refreshes overloaded the server.
+const visible = () => typeof document === "undefined" || !document.hidden;
 const STATUSES = ["new", "contacted", "qualified", "converted", "lost"];
 
 const CALL_OUTCOMES = [
@@ -283,7 +287,7 @@ export default function Chat({ international = false }) {
 
   // Live polling — refresh ONLY page 0 (keeps further pages stable while user scrolls)
   useEffect(() => {
-    const id = setInterval(refreshFirstPage, POLL_MS);
+    const id = setInterval(() => { if (visible()) refreshFirstPage(); }, LIST_POLL_MS);
     return () => clearInterval(id);
   }, [refreshFirstPage]);
 
@@ -864,7 +868,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
 
   useEffect(() => {
     if (!conv?.id) return;
-    const id = setInterval(loadCallsAndFollowups, POLL_MS);
+    const id = setInterval(() => { if (visible()) loadCallsAndFollowups(); }, SIDE_POLL_MS);
     return () => clearInterval(id);
   }, [conv?.id, loadCallsAndFollowups]);
 
@@ -1031,7 +1035,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
 
   useEffect(() => { loadMessages(); }, [loadMessages]);
   useEffect(() => {
-    const id = setInterval(loadMessages, POLL_MS);
+    const id = setInterval(() => { if (visible()) loadMessages(); }, POLL_MS);
     return () => clearInterval(id);
   }, [loadMessages]);
 
@@ -1222,7 +1226,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   // Keep the calls in the timeline fresh while the chat is open (summaries arrive
   // a minute or two after a call ends).
   useEffect(() => {
-    const id = setInterval(() => { loadCallsAndFollowups(); }, 60000);
+    const id = setInterval(() => { if (visible()) loadCallsAndFollowups(); }, 60000);
     return () => clearInterval(id);
   }, [loadCallsAndFollowups]);
 
@@ -3463,7 +3467,7 @@ function InternalChat({ leadId, currentUser, assignedTo, execs, quote, clearQuot
 
   useEffect(() => { load(); }, [load]);
   useEffect(() => {
-    const id = setInterval(load, POLL_MS);
+    const id = setInterval(() => { if (visible()) load(); }, SIDE_POLL_MS);
     return () => clearInterval(id);
   }, [load]);
 

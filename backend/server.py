@@ -6846,19 +6846,12 @@ async def list_conversations(
         query["$or"] = ors
     
     # Retrieve WhatsApp-active leads sorted strictly by latest message timestamp
+    # Sorted on the indexed last_message_at (every WhatsApp lead with a message has it):
+    # a computed sort value made Mongo read and sort every WhatsApp lead (35k) on each
+    # 4-second refresh of every open /chat tab.
     lead_pipeline: List[Dict[str, Any]] = [
         {"$match": query},
-        {
-            "$addFields": {
-                "sort_time": {
-                    "$ifNull": [
-                        "$last_message_at",
-                        {"$ifNull": ["$last_action_at", "$created_at"]}
-                    ]
-                }
-            }
-        },
-        {"$sort": {"sort_time": -1}},
+        {"$sort": {"last_message_at": -1}},
     ]
     # Pre-filter "replied" leads (those with at least one inbound message) BEFORE
     # pagination so the $skip/$limit window is filled entirely with matching leads
@@ -14465,6 +14458,7 @@ async def seed_data():
     await db.leads.create_index("id", unique=True)
     await db.leads.create_index([("sort_at", -1), ("created_at", -1)])
     await db.leads.create_index([("last_message_at", -1), ("created_at", -1)])
+    await db.leads.create_index([("assigned_to", 1), ("has_whatsapp", 1), ("last_message_at", -1)])
     try:
         await db.leads.create_index(
             "justdial_profile_url",

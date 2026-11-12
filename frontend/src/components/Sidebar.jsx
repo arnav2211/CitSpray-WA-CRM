@@ -59,7 +59,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
       } catch { /* ignore */ }
     };
     tick();
-    const id = setInterval(tick, 20000);
+    const id = setInterval(() => { if (!document.hidden) tick(); }, 60000);
     return () => { stop = true; clearInterval(id); };
   }, [user?.id]);
 
@@ -75,7 +75,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
       } catch { /* ignore */ }
     };
     tick();
-    const id = setInterval(tick, 15000);
+    const id = setInterval(() => { if (!document.hidden) tick(); }, 30000);
     return () => { stop = true; clearInterval(id); };
   }, [user?.id]);
 
@@ -91,7 +91,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
       } catch { /* ignore */ }
     };
     tick();
-    const id = setInterval(tick, 5000);
+    const id = setInterval(() => { if (!document.hidden) tick(); }, 15000);
     return () => { stop = true; clearInterval(id); };
   }, [user?.id]);
 
