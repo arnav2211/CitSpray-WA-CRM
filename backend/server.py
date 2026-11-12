@@ -14459,6 +14459,8 @@ async def seed_data():
     await db.leads.create_index([("sort_at", -1), ("created_at", -1)])
     await db.leads.create_index([("last_message_at", -1), ("created_at", -1)])
     await db.leads.create_index([("assigned_to", 1), ("has_whatsapp", 1), ("last_message_at", -1)])
+    for _f in ("customer_name", "aliases", "requirement"):      # /chat + /leads search
+        await db.leads.create_index(_f)
     try:
         await db.leads.create_index(
             "justdial_profile_url",

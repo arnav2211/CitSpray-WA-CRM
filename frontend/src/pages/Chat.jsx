@@ -94,7 +94,13 @@ export default function Chat({ international = false }) {
   const [params, setParams] = useSearchParams();
   const [convs, setConvs] = useState([]);
   const [activeId, setActiveId] = useState(params.get("lead") || null);
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState("");          // what is searched (400 ms after typing stops)
+  const [searchInput, setSearchInput] = useState(""); // what is in the box
+  const convReqRef = useRef(0);                       // newest list request; older answers are dropped
+  useEffect(() => {
+    const t = setTimeout(() => setSearch(searchInput), searchInput ? 400 : 0);
+    return () => clearTimeout(t);
+  }, [searchInput]);
   const [filterUnreplied, setFilterUnreplied] = useState(false);
   const [filterReplied, setFilterReplied] = useState(false);
   const [filterStarred, setFilterStarred] = useState(false);
@@ -171,6 +177,7 @@ export default function Chat({ international = false }) {
     const nextOffset = reset ? 0 : page * PAGE_SIZE;
     if (!reset && (loadingMore || !hasMore)) return;
     if (!reset) setLoadingMore(true);
+    const reqNo = ++convReqRef.current;
     try {
       const { data } = await api.get("/inbox/conversations", {
         params: {
@@ -187,6 +194,7 @@ export default function Chat({ international = false }) {
           offset: nextOffset,
         },
       });
+      if (reset && reqNo !== convReqRef.current) return;   // a newer search/filter is already on its way
       const incoming = Array.isArray(data) ? data : [];
       // Merge & dedup on id; keep latest copy from this fetch (for live unread updates).
       setConvs((prev) => {
@@ -421,7 +429,7 @@ export default function Chat({ international = false }) {
         <div className="px-3 py-2 border-b border-gray-200 space-y-2">
           <div className="relative">
             <MagnifyingGlass className="absolute left-2 top-2.5 text-gray-400" size={14} />
-            <input value={search} onChange={(e) => setSearch(e.target.value)}
+            <input value={searchInput} onChange={(e) => setSearchInput(e.target.value)}
               placeholder={searchMode === "chats" ? "Search chats by name or phone…" : "Search inside messages…"}
               className="w-full border border-gray-300 pl-7 pr-3 py-2 text-sm outline-none focus:border-[#25D366] focus:ring-2 focus:ring-[#25D366]"
               data-testid="conv-search-input" />
@@ -977,7 +985,8 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
 
   const loadMessages = useCallback(async () => {
     try {
-      const currentCount = messagesLengthRef.current > 0 ? messagesLengthRef.current : 20;
+      // newest 30 are enough for the 4 s refresh; older pages stay as loaded (merged below)
+      const currentCount = Math.min(messagesLengthRef.current > 0 ? messagesLengthRef.current : 20, 30);
       const params = { limit: currentCount, offset: 0 };
       if (phoneFilter) params.phone = phoneFilter;
       const { data } = await api.get(`/leads/${conv.id}/messages`, { params });
