@@ -9737,13 +9737,43 @@ async def _cod_resolve(lead: dict, action: str, by_user_id: Optional[str] = None
     return result
 
 
-async def _handle_cod_button_reply(lead: dict, body_text: str) -> None:
-    """Customer tapped Confirm/Cancel on the cod_verification template."""
+async def _handle_cod_button_reply(lead: dict, body_text: str, from_phone: Optional[str] = None) -> None:
+    """Customer tapped Confirm/Cancel on the cod_verification template -> resolve it and
+    tell the customer straight away that the order is confirmed / cancelled."""
     t = (body_text or "").lower()
     if "confirm order" in t:
-        await _cod_resolve(lead, "confirm", via="whatsapp")
+        res = await _cod_resolve(lead, "confirm", via="whatsapp")
     elif "cancel order" in t:
-        await _cod_resolve(lead, "cancel", via="whatsapp")
+        res = await _cod_resolve(lead, "cancel", via="whatsapp")
+    else:
+        return
+    try:
+        fresh = await db.leads.find_one({"id": lead["id"]}, {"_id": 0}) or lead
+        order_no = ((fresh.get("source_data") or {}).get("order_number")) or "your order"
+        brand = "FragVansh" if normalize_company(fresh.get("company")) == "fragvansh" else "CitSpray Aroma Sciences"
+        name = _tidy_name(fresh.get("customer_name"))
+        status = (res or {}).get("cod_status") or fresh.get("cod_status")
+        if status == "confirmed":
+            body = (f"Thank you {name}! Your order {order_no} is confirmed \u2705\n\n"
+                    f"We will pack and dispatch it soon, and send you the tracking details here on WhatsApp "
+                    f"as soon as it ships. Please keep the cash ready at delivery.\n\nTeam {brand}")
+        elif status == "cancelled":
+            body = (f"Your order {order_no} has been cancelled as requested.\n\n"
+                    f"If this was a mistake or you would like to order again, just reply to this message "
+                    f"and we will help you.\n\nTeam {brand}")
+        else:
+            return
+        claim = await db.leads.find_one_and_update(
+            {"id": fresh["id"], "cod_reply_sent": {"$ne": f"{order_no}:{status}"}},
+            {"$set": {"cod_reply_sent": f"{order_no}:{status}"}})
+        if not claim:
+            return                                   # this answer was already sent
+        to = normalize_phone_display(from_phone or "") or fresh.get("phone")
+        api_result = await wa_send_text(to_phone=to, body=body, company=fresh.get("company"))
+        await _record_sent_message(fresh["id"], None, to, body, api_result, {"auto": f"cod_{status}"},
+                                   {"local_id": None, "wamid": None, "preview": None})
+    except Exception as e:
+        logger.warning(f"COD auto reply failed: {e}")
 
 
 @api.post("/leads/{lead_id}/cod/{action}")
@@ -11788,7 +11818,7 @@ async def _handle_wa_webhook(request: Request, company: str):
                     # cod_verification template. Confirm books it into OMS.
                     if msg_type == "button":
                         try:
-                            await _handle_cod_button_reply(lead, body_text)
+                            await _handle_cod_button_reply(lead, body_text, from_phone)
                         except Exception as _e:
                             logger.exception(f"COD button handling failed: {_e}")
 
@@ -11828,11 +11858,13 @@ async def _handle_wa_webhook(request: Request, company: str):
                         logger.warning(f"inbound availability reassign failed: {_e}")
 
                     # ---- Auto-Reply Sequence Trigger ----
-                    # A COD "Confirm Order" / "Cancel Order" tap is not an enquiry - never answer it
-                    # with the welcome/catalogue sequence. Other template buttons ("Share Details",
-                    # "Request Quotation" ...) ARE the customer asking for details, so they get it.
+                    # Only a COD "Confirm Order" / "Cancel Order" tap is not an enquiry. Other
+                    # template buttons ("Share Details", "Request Quotation" ...) are the customer
+                    # asking for details, so they get the welcome/catalogue sequence.
                     _order_btn = msg_type == "button" and any(
                         k in (body_text or "").lower() for k in ("confirm order", "cancel order"))
+                    # A template quick-reply tap (e.g. COD "Confirm Order") is not an
+                    # enquiry — never answer it with the welcome/catalogue sequence.
                     if not _order_btn and not lead.get("auto_reply_sequence_triggered"):
                         # Only consume the first-time token when the sequence is actually live.
                         # This prevents permanently locking leads whose first reply predated
