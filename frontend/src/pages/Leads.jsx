@@ -198,9 +198,8 @@ export default function Leads({ international = false }) {
     })();
   }, []);
 
-  // Fragvansh: distinct tags for the filter chips
+  // distinct tags for the filter (Fragvansh labels, CitSpray need tags)
   useEffect(() => {
-    if (!isFragvansh) return;
     (async () => {
       try {
         const { data } = await api.get("/leads/tags");
@@ -394,7 +393,7 @@ export default function Leads({ international = false }) {
       </div>
 
       {/* Label filter (Fragvansh) — compact searchable multi-select dropdown */}
-      {isFragvansh && allTags.length > 0 && (
+      {allTags.length > 0 && (
         <LabelFilter allTags={allTags} selected={tagFilter} onChange={setTagFilter} />
       )}
 

@@ -3341,6 +3341,13 @@ async def list_lead_tags(
     return [{"tag": r["_id"], "count": r["count"]} for r in rows]
 
 
+@api.get("/leads/tag-catalog")
+async def lead_tag_catalog(user: dict = Depends(get_current_user),
+                           x_company: Optional[str] = Header(None, alias="X-Company")):
+    """Predefined tags offered first in the tag picker (CitSpray: what the customer uses our oils for)."""
+    return NEED_TAGS_CITSPRAY if _resolve_company(user, x_company) == "citspray" else []
+
+
 @api.get("/leads/upload-template")
 async def download_upload_template(user: dict = Depends(get_current_user)):
     """Generate and return a sample Excel template for bulk lead uploading."""
@@ -3735,6 +3742,12 @@ async def update_lead(lead_id: str, body: LeadUpdate, user: dict = Depends(get_c
             updates[f] = v
     if body.tags is not None:
         updates["tags"] = _normalize_tags(body.tags)
+        # a need tag the executive removes is never put back by the automatic tagging
+        _old, _new = set(lead.get("tags") or []), set(updates["tags"])
+        _rem = set(lead.get("need_tags_removed") or [])
+        _rem2 = (_rem | ((_old - _new) & _NEED_TAG_SET)) - ((_new - _old) & _NEED_TAG_SET)
+        if _rem2 != _rem:
+            updates["need_tags_removed"] = sorted(_rem2)
     if body.requirement is not None:
         updates["requirement_updated_at"] = iso(now_utc())
     if body.assigned_to is not None and user["role"] == "admin":
@@ -4942,6 +4955,267 @@ async def oms_last_order_sync_task(full: bool = False):
     except Exception as e:
         logger.warning(f"oms last-order sync failed: {e}")
         return 0
+
+
+
+# ── CitSpray "need" tags: what the customer uses our oils for ─────────────────────────────
+NEED_TAGS_CITSPRAY: List[str] = [
+    "phenyl", "floor cleaner", "toilet cleaner", "dishwash", "detergent", "handwash",
+    "sanitizer & disinfectant", "soap", "shampoo & hair care", "hair oil", "cosmetics & skin care",
+    "perfume & attar", "deodorant & body spray", "room freshener", "car perfume",
+    "diffuser & aromatherapy", "candle", "agarbatti & incense", "pooja & havan", "cat litter",
+    "pet care", "massage & spa", "pain oil & ayurvedic", "mosquito repellent", "pesticide",
+    "bath salt & potpourri", "mehndi", "food & flavour", "paint", "resale", "personal use",
+    "research & lab",
+]
+_NEED_TAG_SET = set(NEED_TAGS_CITSPRAY)
+# Clear purpose words -> tag (used on OMS 'purpose' / remark, old order sheets and the enquiry text)
+_NEED_TAG_RULES = [(t, re.compile(rx, re.I)) for t, rx in [
+    ("phenyl", r"phen[yi]le?\b|phenol"),
+    ("floor cleaner", r"floor\s*clean|surface\s*clean"),
+    ("toilet cleaner", r"toilet|bathroom\s*clean"),
+    ("dishwash", r"dish\s*wash|utensil"),
+    ("detergent", r"detergent|washing\s*powder|laundry|fabric\s*(conditioner|softener)"),
+    ("handwash", r"hand\s*wash"),
+    ("sanitizer & disinfectant", r"saniti[sz]er|disinfectant"),
+    ("soap", r"\bsoaps?\b"),
+    ("shampoo & hair care", r"shampoo|hair\s*(care|serum|mask|conditioner)"),
+    ("hair oil", r"hair\s*oil"),
+    ("cosmetics & skin care", r"cosmetic(?!s?\s*grade)|skin\s*care|\bcreams?\b|lotion|face\s*(wash|pack)|lip\s*balm|body\s*butter"),
+    ("perfume & attar", r"(?<!agarbatti )(?<!agarbathi )(?<!dhoop )perfume\s*(making|purpose|manufactur)|\battar|\bittar|\bedp\b|perfume\s*brand"),
+    ("deodorant & body spray", r"\bdeo(dorant)?s?\b|body\s*(spray|mist)"),
+    ("room freshener", r"room\s*(freshener|spray)|air\s*freshener"),
+    ("car perfume", r"car\s*(perfume|freshener)"),
+    ("diffuser & aromatherapy", r"diffuser|aroma\s*therap"),
+    ("candle", r"candle(?!\s*(diffuser|warmer|burner|holder))"),
+    ("agarbatti & incense", r"agarbat|agarbath|\bincense|\bdhoop|\bdhup|sambrani"),
+    ("pooja & havan", r"\b(pooja|puja)\s*(purpose|samagri|use|item|material|path)|havan|hawan"),
+    ("cat litter", r"cat\s*litter|\blitter\b"),
+    ("pet care", r"\bpets?\b|\bdogs?\b"),
+    ("massage & spa", r"massage|\bspa\b"),
+    ("pain oil & ayurvedic", r"pain\s*(oil|relief|balm)|ayurved"),
+    ("mosquito repellent", r"mosquito|repellent"),
+    ("pesticide", r"pesticid|insecticid"),
+    ("bath salt & potpourri", r"bath\s*salt|potpourri"),
+    ("mehndi", r"meh[ae]?ndi|henna"),
+    ("food & flavour", r"food\s*flavou?r|flavou?ring|bakery|beverage|confection"),
+    ("paint", r"\bpaints?\b"),
+    ("resale", r"resale|resell|re-sell|trading\s*purpose|reselling"),
+    ("personal use", r"personal\s*(use|purpose)|self\s*use|own\s*use"),
+    ("research & lab", r"research|laborator"),
+]]
+
+
+def _need_tags_by_rules(text: str) -> List[str]:
+    out: List[str] = []
+    for tag, rx in _NEED_TAG_RULES:
+        if rx.search(text or "") and tag not in out:
+            out.append(tag)
+    return out
+
+
+def _last10(p: Any) -> str:
+    d = re.sub(r"\D", "", str(p or ""))
+    return d[-10:] if len(d) >= 10 else ""
+
+
+async def _need_tag_evidence(lead: dict) -> Dict[str, str]:
+    """rules = purpose-type text only (OMS purpose / remark, old order sheet lines, enquiry);
+    ai = everything we know about the customer's use (orders, calls, WhatsApp)."""
+    rules: List[str] = []
+    ai: List[str] = []
+    req = (lead.get("requirement") or "").strip()
+    if req:
+        rules.append(req[:300]); ai.append(f"Enquiry: {req[:300]}")
+    ph = [x for x in {_last10(lead.get("phone"))} | {_last10(p) for p in (lead.get("phones") or [])} if x]
+    if ph:
+        variants = [v for d in ph for v in (d, "91" + d, "+91" + d, "+91 " + d)]
+        cids = [c["id"] async for c in oms_db.customers.find({"phone_numbers": {"$in": variants}}, {"_id": 0, "id": 1})]
+        if cids:
+            async for o in oms_db.orders.find({"customer_id": {"$in": cids}, "company": {"$in": [None, "citspray"]}},
+                                              {"_id": 0, "purpose": 1, "remark": 1, "items": 1}).sort("created_at", -1).limit(8):
+                pur = " ".join(x for x in [(o.get("purpose") or "").strip(), (o.get("remark") or "").strip()] if x)
+                items = ", ".join(f"{(i.get('product_name') or '').strip()} {(i.get('description') or '').strip()}".strip()
+                                  for i in (o.get("items") or [])[:6])
+                if pur:
+                    rules.append(pur[:300])
+                ai.append(f"Order: purpose: {pur[:200] or '-'}; items: {items[:250]}")
+    async for p in db.past_orders.find({"lead_id": lead["id"]}, {"_id": 0, "items": 1, "notes": 1}).sort("date", -1).limit(6):
+        t = "; ".join([str(x) for x in (p.get("items") or [])[:6]] + [str(x) for x in (p.get("notes") or [])[:3]])
+        if t:
+            rules.append(t[:300]); ai.append(f"Old order: {t[:300]}")
+    async for c in db.call_logs.find({"lead_id": lead["id"], "ai_summary.summary": {"$exists": True}},
+                                     {"_id": 0, "ai_summary.summary": 1, "ai_summary.products": 1}).sort("at", -1).limit(4):
+        a = c.get("ai_summary") or {}
+        ai.append(f"Call: {(a.get('summary') or '')[:350]} Products: {', '.join(a.get('products') or [])[:120]}")
+    msgs = []
+    async for m in db.messages.find({"lead_id": lead["id"], "direction": "in"}, {"_id": 0, "body": 1}).sort("at", -1).limit(15):
+        b = (m.get("body") or "").strip()
+        if b and not b.startswith("["):
+            msgs.append(b[:150])
+    if msgs:
+        ai.append("Customer WhatsApp: " + " | ".join(reversed(msgs))[:700])
+    return {"rules": "\n".join(rules), "ai": "\n".join(ai)[:2200]}
+
+
+def _lenient_json(text: str) -> Any:
+    t = (text or "").strip()
+    i = t.find("{")
+    if i < 0:
+        return {}
+    try:
+        return json.JSONDecoder().raw_decode(t[i:])[0]
+    except Exception:
+        return {}
+
+
+_NEED_TAG_PROMPT = """You label customers of CitSpray Aroma Sciences (an Indian seller of essential oils, fragrance oils /
+perfumery compounds, carrier oils and aroma chemicals) by WHAT THEY USE OUR PRODUCTS FOR.
+Allowed labels - use ONLY these exact strings: {labels}
+
+For each customer pick the labels for a use / end product that the text CLEARLY states, e.g. "phenyl purpose",
+"for agarbatti", "I make candles", "soap unit", "we resell", "for my cat litter brand".
+- Product names alone ("lavender oil", "pine oil", "rose fragrance", "cosmetic grade") are NOT a stated use.
+- If it is unsure, nothing is stated, the customer said it is not required / no requirement / wrong number,
+  or the text is only our own sales message: return [] for that customer.
+- At most 3 labels per customer.
+Answer with ONLY a JSON object mapping each customer number to a list, e.g. {{"1": ["phenyl"], "2": []}}.
+
+CUSTOMERS:
+{rows}"""
+
+
+async def _need_tags_ai(rows: List[tuple]) -> Dict[str, List[str]]:
+    """rows: [(key, text)] -> {key: [tags]} (only allowed tags)."""
+    if not rows:
+        return {}
+    body = "\n".join(f"{i + 1}. {txt}".replace("\n", " / ") for i, (_, txt) in enumerate(rows))
+    text = await _gemini_generate(_NEED_TAG_PROMPT.format(labels=json.dumps(NEED_TAGS_CITSPRAY), rows=body),
+                                  temperature=0.0, max_output_tokens=2500, json_mode=True, per_model_timeout=40.0)
+    data = _lenient_json(text)
+    out: Dict[str, List[str]] = {}
+    for i, (key, _) in enumerate(rows):
+        v = data.get(str(i + 1)) if isinstance(data, dict) else None
+        out[key] = [t for t in (v or []) if isinstance(t, str) and t.strip().lower() in _NEED_TAG_SET][:3] if isinstance(v, list) else []
+        out[key] = [t.strip().lower() for t in out[key]]
+    return out
+
+
+async def _apply_need_tags(lead: dict, tags: List[str], how: str, ev_hash: Optional[str] = None) -> List[str]:
+    removed = set(lead.get("need_tags_removed") or [])
+    have = set(lead.get("tags") or [])
+    add = [t for t in tags if t in _NEED_TAG_SET and t not in removed and t not in have]
+    upd: Dict[str, Any] = {"$set": {"need_tags_at": iso(now_utc())}}
+    if ev_hash:
+        upd["$set"]["need_tags_ev"] = ev_hash
+    if add:
+        upd["$push"] = {"tags": {"$each": add}}
+        upd["$addToSet"] = {"need_tags_auto": {"$each": add}}
+        upd["$set"]["need_tags_how"] = how
+    await db.leads.update_one({"id": lead["id"]}, upd)
+    return add
+
+
+async def _need_tag_leads(leads: List[dict], use_ai: bool = True, ai_batch: int = 20,
+                          max_ai_calls: Optional[int] = None, pause: float = 0.0) -> Dict[str, int]:
+    """Rules first; AI only where the rules find nothing and the evidence changed since the last look."""
+    st = {"leads": 0, "rule_tagged": 0, "ai_asked": 0, "ai_tagged": 0, "ai_calls": 0}
+    pending: List[tuple] = []
+
+    async def flush():
+        nonlocal pending
+        if not pending:
+            return
+        if max_ai_calls is not None and st["ai_calls"] >= max_ai_calls:
+            pending = []
+            return
+        res = await _need_tags_ai([(ld["id"], ev) for ld, ev, _ in pending])
+        st["ai_calls"] += 1
+        for ld, ev, h in pending:
+            st["ai_asked"] += 1
+            if await _apply_need_tags(ld, res.get(ld["id"]) or [], "ai", h):
+                st["ai_tagged"] += 1
+        pending = []
+        if pause:
+            await asyncio.sleep(pause)
+
+    for ld in leads:
+        if normalize_company(ld.get("company")) != "citspray":
+            continue
+        st["leads"] += 1
+        ev = await _need_tag_evidence(ld)
+        rt = _need_tags_by_rules(ev["rules"])
+        if rt:
+            if await _apply_need_tags(ld, rt, "rules"):
+                st["rule_tagged"] += 1
+            continue
+        if not use_ai or len(ev["ai"]) < 25:
+            continue
+        h = hashlib.sha1(ev["ai"].encode("utf-8")).hexdigest()[:16]
+        if ld.get("need_tags_ev") == h:
+            continue                        # nothing new since the AI last looked
+        pending.append((ld, ev["ai"], h))
+        if len(pending) >= ai_batch:
+            try:
+                await flush()
+            except Exception as e:
+                logger.warning(f"need-tags AI batch failed: {getattr(e, 'detail', e)}")
+                pending = []
+                break                       # quota / outage: the next run picks them up
+    try:
+        await flush()
+    except Exception as e:
+        logger.warning(f"need-tags AI batch failed: {getattr(e, 'detail', e)}")
+    return st
+
+
+async def need_tags_task():
+    """Every 15 min: tag CitSpray leads with new evidence - OMS orders, call summaries,
+    customer WhatsApp messages, new enquiries. One worker at a time."""
+    try:
+        now = now_utc()
+        got = await db.system_settings.find_one_and_update(
+            {"key": "need_tags_lock", "$or": [{"until": {"$lt": iso(now)}}, {"until": {"$exists": False}}]},
+            {"$set": {"until": iso(now + timedelta(minutes=12))}}, upsert=False)
+        if not got:
+            if await db.system_settings.find_one({"key": "need_tags_lock"}):
+                return
+            await db.system_settings.insert_one({"key": "need_tags_lock", "until": iso(now + timedelta(minutes=12))})
+        cur = await db.system_settings.find_one({"key": "need_tags_cursor"}) or {}
+        since = cur.get("at") or iso(now - timedelta(hours=1))
+        ids: set = set()
+        async for c in db.call_logs.find({"ai_summary.at": {"$gt": since}}, {"_id": 0, "lead_id": 1}):
+            if c.get("lead_id"): ids.add(c["lead_id"])
+        async for m in db.messages.find({"direction": "in", "at": {"$gt": since}}, {"_id": 0, "lead_id": 1}):
+            if m.get("lead_id"): ids.add(m["lead_id"])
+        async for ld in db.leads.find({"created_at": {"$gt": since}, "company": "citspray"}, {"_id": 0, "id": 1}):
+            ids.add(ld["id"])
+        cust = set()
+        async for o in oms_db.orders.find({"$or": [{"created_at": {"$gt": since}}, {"updated_at": {"$gt": since}}],
+                                           "company": {"$in": [None, "citspray"]}}, {"_id": 0, "customer_id": 1}):
+            if o.get("customer_id"): cust.add(o["customer_id"])
+        if cust:
+            ph: List[str] = []
+            async for c in oms_db.customers.find({"id": {"$in": list(cust)}}, {"_id": 0, "phone_numbers": 1}):
+                ph += [x for x in (_last10(p) for p in (c.get("phone_numbers") or [])) if x]
+            if ph:
+                async for ld in db.leads.find({"company": "citspray", "$or": [{"phone": {"$in": ph}}, {"phones": {"$in": ph}}]},
+                                              {"_id": 0, "id": 1}):
+                    ids.add(ld["id"])
+        leads = await db.leads.find({"id": {"$in": list(ids)[:400]}, "company": "citspray"},
+                                    {"_id": 0, "id": 1, "company": 1, "phone": 1, "phones": 1, "requirement": 1, "tags": 1,
+                                     "need_tags_removed": 1, "need_tags_ev": 1}).to_list(400)
+        st = await _need_tag_leads(leads, max_ai_calls=10)
+        await db.system_settings.update_one({"key": "need_tags_cursor"}, {"$set": {"at": iso(now), "last": st}}, upsert=True)
+        if st["rule_tagged"] or st["ai_tagged"]:
+            logger.info(f"need-tags: {st}")
+    except Exception as e:
+        logger.warning(f"need tags task failed: {e}")
+    finally:
+        try:
+            await db.system_settings.update_one({"key": "need_tags_lock"}, {"$set": {"until": iso(now_utc())}})
+        except Exception:
+            pass
 
 
 @api.get("/leads/{lead_id}/oms-data")
@@ -14459,6 +14733,9 @@ async def seed_data():
     await db.leads.create_index([("sort_at", -1), ("created_at", -1)])
     await db.leads.create_index([("last_message_at", -1), ("created_at", -1)])
     await db.leads.create_index([("assigned_to", 1), ("has_whatsapp", 1), ("last_message_at", -1)])
+    await db.leads.create_index("tags")
+    await db.call_logs.create_index("ai_summary.at", sparse=True)
+    await db.messages.create_index([("direction", 1), ("at", 1)])
     for _f in ("customer_name", "aliases", "requirement"):      # /chat + /leads search
         await db.leads.create_index(_f)
     try:
@@ -14727,6 +15004,7 @@ async def on_startup():
     scheduler.add_job(call_ai_task, "interval", seconds=20, id="call_ai", max_instances=1, coalesce=True)
     scheduler.add_job(promise_tracker_task, "interval", minutes=5, id="promise_tracker", max_instances=1, coalesce=True)
     scheduler.add_job(ai_reports_task, "interval", minutes=10, id="ai_reports", max_instances=1, coalesce=True)
+    scheduler.add_job(need_tags_task, "interval", minutes=15, id="need_tags", max_instances=1, coalesce=True)
     scheduler.add_job(trainee_report_task, "cron", hour=19, minute=15, timezone="Asia/Kolkata", id="trainee_report", max_instances=1, coalesce=True)
     scheduler.add_job(pns_mapper_task, "interval", minutes=2, id="pns_mapper", max_instances=1, coalesce=True)
     # 03:30 IST daily — purge attendance/leave/salary records of ex-employees 12 months after they left

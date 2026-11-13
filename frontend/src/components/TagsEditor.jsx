@@ -11,6 +11,7 @@ export default function TagsEditor({ tags: initialTags, canEdit, onSave }) {
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
   const [allTags, setAllTags] = useState([]);
+  const [catalog, setCatalog] = useState([]);   // CitSpray: predefined need tags, offered first
 
   useEffect(() => { setTags(initialTags || []); }, [initialTags]);
 
@@ -18,8 +19,12 @@ export default function TagsEditor({ tags: initialTags, canEdit, onSave }) {
   useEffect(() => {
     (async () => {
       try {
-        const { data } = await api.get("/leads/tags");
+        const [{ data }, cat] = await Promise.all([
+          api.get("/leads/tags"),
+          api.get("/leads/tag-catalog").catch(() => ({ data: [] })),
+        ]);
         setAllTags((data || []).map((t) => t.tag));
+        setCatalog(cat.data || []);
       } catch { /* suggestions are best-effort */ }
     })();
   }, []);
@@ -38,10 +43,11 @@ export default function TagsEditor({ tags: initialTags, canEdit, onSave }) {
   };
 
   const q = draft.trim().toLowerCase();
-  const suggestions = allTags
+  const pool = catalog.length ? [...catalog, ...allTags.filter((t) => !catalog.includes(t))] : allTags;
+  const suggestions = pool
     .filter((t) => !tags.includes(t))
     .filter((t) => !q || t.includes(q))
-    .slice(0, 8);
+    .slice(0, catalog.length && !q ? catalog.length : 8);
 
   return (
     <div className="flex flex-col gap-1.5" data-testid="tags-editor">

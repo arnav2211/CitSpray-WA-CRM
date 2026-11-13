@@ -570,7 +570,7 @@ export default function LeadDrawer({ leadId, onClose }) {
 
             <CodVerificationCard lead={lead} onChange={() => loadAll(activeLeadId)} />
 
-            {isFragvansh && (
+            {(
               <TagsSection lead={lead} canEdit={canEdit} onSave={(tags) => update({ tags })} />
             )}
 

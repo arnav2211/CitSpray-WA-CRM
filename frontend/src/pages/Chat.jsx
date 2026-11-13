@@ -2221,8 +2221,8 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
               <InfoRow label="Requirement">
                 <div className="text-xs text-gray-700 whitespace-pre-wrap">{conv.requirement || "—"}</div>
               </InfoRow>
-              {isFragvansh && (
-                <InfoRow label="Labels">
+              {(
+                <InfoRow label={isFragvansh ? "Labels" : "Tags"}>
                   <TagsEditor
                     tags={conv.tags || []}
                     canEdit={canMessage}
