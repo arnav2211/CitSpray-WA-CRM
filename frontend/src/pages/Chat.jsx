@@ -2907,16 +2907,18 @@ function BubbleImpl({ m, allMessages = [], senderName = null, onReply, onResend,
     <div className={`group flex ${isOut ? "justify-end" : "justify-start"} relative ${isHighlighted ? "transition-all" : ""}`} data-testid={`bubble-${m.id}`}>
       {/* keep legacy testid for back-compat */}
       <span className="hidden" data-testid={`msg-${m.id}`} aria-hidden="true" />
-      {!isOut && canMessage && onReply && (
+      {!isOut && (
         <div className="opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center gap-0.5 self-center mr-1">
-          {onReact && (
+          {canMessage && onReact && (
             <button onClick={() => setPickerOpen(v => !v)} className="text-gray-500 hover:text-[#FF8800] text-sm" title="React" data-testid={`react-btn-${m.id}`}>
               😊
             </button>
           )}
-          <button onClick={() => onReply(m)} className="text-gray-500 hover:text-[#25D366] text-[10px] uppercase tracking-widest font-bold px-1" title="Reply" data-testid={`reply-btn-${m.id}`}>
-            ↩
-          </button>
+          {canMessage && onReply && (
+            <button onClick={() => onReply(m)} className="text-gray-500 hover:text-[#25D366] text-[10px] uppercase tracking-widest font-bold px-1" title="Reply" data-testid={`reply-btn-${m.id}`}>
+              ↩
+            </button>
+          )}
           <button onClick={handleTranslate} className="text-gray-500 hover:text-[#002FA7] text-sm px-1" title={translatedText ? "Show Original" : "Translate to English"} data-testid={`translate-btn-${m.id}`}>
             🌐
           </button>
