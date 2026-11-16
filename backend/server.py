@@ -14889,6 +14889,26 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str, token: Optional
         logger.warning(f"WebSocket error for user {user_id}: {e}")
         manager.disconnect(user_id, websocket)
 
+async def _followup_ring_allowed(user_id: Optional[str]) -> bool:
+    """Ring follow-up alarms only for people at work today: not on leave, and punched in
+    today (or available by the attendance rules: bypass, WFH pool after hours, gating off).
+    Admins / non-executives always ring."""
+    if not user_id:
+        return False
+    u = await db.users.find_one({"id": user_id}, {"_id": 0, "id": 1, "role": 1, "bypass_attendance": 1, "active": 1})
+    if not u:
+        return False
+    if u.get("role") != "executive":
+        return True
+    if u.get("active") is False or await _is_user_on_leave(user_id):
+        return False
+    if await _is_user_available_by_attendance(u):
+        return True
+    log = await db.attendance_logs.find_one({"user_id": user_id, "date": _ist_now().strftime("%Y-%m-%d")},
+                                            {"_id": 0, "check_in": 1})
+    return bool(log and log.get("check_in"))
+
+
 async def check_due_followups_task():
     try:
         now = datetime.now(timezone.utc)
@@ -14907,6 +14927,20 @@ async def check_due_followups_task():
             ]
         }
 
+        # Absent today (no punch-in / on leave): no alarm on their phone. Held alarms ring
+        # when they punch in later the same day; anything due 12 h+ ago is closed silently
+        # and stays on the Follow-ups page as overdue.
+        away: List[str] = []
+        for ex in await db.followups.distinct("executive_id", query):
+            if not await _followup_ring_allowed(ex):
+                away.append(ex)
+        if away:
+            stale = (now - timedelta(hours=12)).isoformat()
+            await db.followups.update_many(
+                {"$and": [query, {"executive_id": {"$in": away}, "due_at": {"$lte": stale}},
+                          {"$or": [{"snoozed_until": None}, {"snoozed_until": {"$exists": False}}, {"snoozed_until": {"$lte": stale}}]}]},
+                {"$set": {"notified": True, "ring_skipped": "away"}})
+            query = {**query, "executive_id": {"$nin": away}}
         due_followups = await db.followups.find(query).to_list(100)
         for fu in due_followups:
             lead = await db.leads.find_one({"id": fu.get("lead_id")}, {"_id": 0, "customer_name": 1, "phone": 1, "active_wa_phone": 1})
