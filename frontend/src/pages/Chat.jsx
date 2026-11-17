@@ -1062,7 +1062,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
     // Only the manual reply templates are offered in chat — the order_* / cod /
     // abandoned_checkout templates are sent automatically by the system and must
     // NOT be triggerable by hand.
-    const MANUAL_TEMPLATES = new Set(["reply_all", "reply_to_all", "fv_reply_all"]);
+    const MANUAL_TEMPLATES = new Set(["reply_all", "reply_to_all", "fv_reply_all", "enquiry_update_confirm"]);
     api.get("/whatsapp/templates")
       .then(({ data }) => setTemplates(
         data.filter(t => MANUAL_TEMPLATES.has((t.name || "").toLowerCase())
