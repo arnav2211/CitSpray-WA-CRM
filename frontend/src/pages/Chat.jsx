@@ -1816,6 +1816,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
             )}
           </div>
         </div>
+        <HeaderTags tags={conv.tags || []} label={isFragvansh ? "Labels" : "Tags"} onEdit={() => setShowInfo(true)} />
         <button onClick={() => setShowInChatSearch(v => !v)} className={`p-1.5 md:p-2 shrink-0 ${showInChatSearch ? "bg-gray-900 text-white" : "hover:bg-gray-100"}`} title="Search in chat" data-testid="chat-search-toggle">
           <MagnifyingGlass size={16} weight={showInChatSearch ? "bold" : "regular"} />
         </button>
@@ -2735,6 +2736,50 @@ function PaymentQRModal({ onClose, onSend, sending, within24h }) {
   );
 }
 
+
+// Lead tags in the chat top bar: first 2 as chips, "+N" opens the full list (hover or
+// click). Clicking a chip / "+ Tag" opens the info panel, where tags are edited.
+function HeaderTags({ tags, label, onEdit }) {
+  const [open, setOpen] = useState(false);
+  const shown = tags.slice(0, 2);
+  const more = tags.length - shown.length;
+  const chip = "inline-flex items-center gap-1 max-w-[150px] bg-[#EEF2FF] border border-[#C7D2FE] text-[#1E3A8A] text-[11px] font-semibold px-2 py-0.5 rounded-full";
+  return (
+    <div className="hidden md:flex items-center gap-1.5 shrink-0 relative" data-testid="chat-header-tags"
+         onMouseEnter={() => more > 0 && setOpen(true)} onMouseLeave={() => setOpen(false)}>
+      {tags.length === 0 ? (
+        <button type="button" onClick={onEdit} className="text-[11px] text-gray-400 hover:text-[#002FA7] border border-dashed border-gray-300 px-2 py-0.5 rounded-full flex items-center gap-1" title={`Add ${label.toLowerCase()}`}>
+          <Tag size={11} /> {label === "Labels" ? "+ Label" : "+ Tag"}
+        </button>
+      ) : (
+        <>
+          <Tag size={13} className="text-gray-400" />
+          {shown.map((t) => (
+            <button key={t} type="button" onClick={onEdit} className={chip} title={`${t} (click to edit ${label.toLowerCase()})`}>
+              <span className="truncate">{t}</span>
+            </button>
+          ))}
+          {more > 0 && (
+            <button type="button" onClick={() => setOpen((v) => !v)} className="text-[11px] font-bold text-[#002FA7] bg-white border border-[#002FA7] px-1.5 py-0.5 rounded-full" title={`All ${tags.length} ${label.toLowerCase()}`} data-testid="chat-header-tags-more">
+              +{more}
+            </button>
+          )}
+          {open && more > 0 && (
+            <div className="absolute right-0 top-full pt-1 z-40">
+              <div className="bg-white border border-gray-300 shadow-lg p-2 w-64 rounded">
+                <div className="text-[9px] uppercase tracking-widest font-bold text-gray-500 mb-1.5">All {label.toLowerCase()} ({tags.length})</div>
+                <div className="flex flex-wrap gap-1">
+                  {tags.map((t) => <span key={t} className={chip + " max-w-full"}><span className="truncate">{t}</span></span>)}
+                </div>
+                <button type="button" onClick={() => { setOpen(false); onEdit(); }} className="mt-2 text-[10px] uppercase tracking-widest font-bold text-[#002FA7] hover:underline">Edit {label.toLowerCase()}</button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
 
 function InfoRow({ label, children }) {
   return (
