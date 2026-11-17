@@ -1816,7 +1816,20 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
             )}
           </div>
         </div>
-        <HeaderTags tags={conv.tags || []} label={isFragvansh ? "Labels" : "Tags"} onEdit={() => setShowInfo(true)} />
+        <HeaderTags tags={conv.tags || []} label={isFragvansh ? "Labels" : "Tags"} onEdit={() => {
+          setShowInfo(true);
+          setPanelTab("details");
+          // after the panel renders: scroll to the Tags row and flash it
+          let tries = 0;
+          const go = () => {
+            const el = document.querySelector('[data-testid="info-tags-row"]');
+            if (!el) { if (++tries < 20) setTimeout(go, 50); return; }
+            el.scrollIntoView({ behavior: "smooth", block: "center" });
+            el.classList.add("ring-2", "ring-[#002FA7]", "bg-[#EEF2FF]");
+            setTimeout(() => el.classList.remove("ring-2", "ring-[#002FA7]", "bg-[#EEF2FF]"), 1800);
+          };
+          setTimeout(go, 50);
+        }} />
         <button onClick={() => setShowInChatSearch(v => !v)} className={`p-1.5 md:p-2 shrink-0 ${showInChatSearch ? "bg-gray-900 text-white" : "hover:bg-gray-100"}`} title="Search in chat" data-testid="chat-search-toggle">
           <MagnifyingGlass size={16} weight={showInChatSearch ? "bold" : "regular"} />
         </button>
@@ -2222,7 +2235,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
               <InfoRow label="Requirement">
                 <div className="text-xs text-gray-700 whitespace-pre-wrap">{conv.requirement || "—"}</div>
               </InfoRow>
-              {(
+              <div data-testid="info-tags-row" className="transition-colors rounded">
                 <InfoRow label={isFragvansh ? "Labels" : "Tags"}>
                   <TagsEditor
                     tags={conv.tags || []}
@@ -2232,7 +2245,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                       .catch((e) => toast.error(errMsg(e)))}
                   />
                 </InfoRow>
-              )}
+              </div>
               {(conv.city || conv.area || conv.state) && (
                 <InfoRow label="Location">
                   <div className="text-xs text-gray-700">{[conv.area, conv.city, conv.state].filter(Boolean).join(", ")}</div>
