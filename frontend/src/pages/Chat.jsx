@@ -3504,6 +3504,17 @@ function InternalChat({ leadId, currentUser, assignedTo, execs, quote, clearQuot
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const scrollRef = useRef(null);
+  const qaInputRef = useRef(null);
+
+  // Grow the Internal Q&A input with its text (up to ~8 lines, then scroll)
+  useEffect(() => {
+    const el = qaInputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const max = 192;
+    el.style.height = `${Math.min(el.scrollHeight + 2, max)}px`;
+    el.style.overflowY = el.scrollHeight > max ? "auto" : "hidden";
+  }, [draft, activeAgentId]);
 
   // Consume the preselect on mount (admin deep-link from /qa)
   useEffect(() => {
@@ -3676,6 +3687,7 @@ function InternalChat({ leadId, currentUser, assignedTo, execs, quote, clearQuot
           )}
           <div className="p-2 flex items-end gap-2">
             <textarea
+              ref={qaInputRef}
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
