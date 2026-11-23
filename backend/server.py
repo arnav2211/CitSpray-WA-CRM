@@ -533,6 +533,7 @@ class PayrollAdjustInput(BaseModel):
     user_id: str
     date: str  # YYYY-MM-DD
     status: Literal["informed", "uninformed", "present", "half_day", "leave", "paid", "wfh", "auto"]
+    note: Optional[str] = None   # reason shown next to the day in payroll
 
 
 class PunchEditInput(BaseModel):
@@ -18869,6 +18870,7 @@ async def calculate_payroll(
         adjs_list = await db.payroll_adjustments.find(
             {"user_id": uid, "date": {"$gte": lookback_date, "$lte": lookahead_date}}).to_list(1000)
         adjs_map = {ad["date"]: ad["status"] for ad in adjs_list}
+        adjs_note = {ad["date"]: ad.get("note") for ad in adjs_list if ad.get("note")}
 
         def worked_credit(d_str: str) -> float:
             """How much of a working day this date counts for (full=1, half=0.5).
@@ -19020,6 +19022,8 @@ async def calculate_payroll(
                                details="Approved Leave (Admin Override, 1 day cut)")
                     total_deductions += daily_rate
                     counts["leave_approved"] += 1
+                if adjs_note.get(d_str):
+                    day["details"] = f"{day.get('details') or ''} — {adjs_note[d_str]}".strip(" —")
                 daily_breakdown.append(day)
                 continue
 
@@ -19221,7 +19225,8 @@ async def adjust_payroll(body: PayrollAdjustInput, admin: dict = Depends(require
     else:
         await db.payroll_adjustments.update_one(
             {"user_id": body.user_id, "date": body.date},
-            {"$set": {"status": body.status, "updated_at": (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).isoformat(), "updated_by": admin["id"]}},
+            {"$set": {"status": body.status, "updated_at": (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).isoformat(), "updated_by": admin["id"],
+                      "note": (body.note or "").strip() or None}},
             upsert=True
         )
     return {"ok": True}
