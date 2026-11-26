@@ -19707,8 +19707,9 @@ async def docs_coa_suggestions(user: dict = Depends(get_docs_user)):
                     if res and res.upper() != "COMPILES":
                         results[res] = results.get(res, 0) + 1
     top = sorted(params.values(), key=lambda x: -x["count"])
-    res_list = ["Complies"] + [k for k, _ in sorted(results.items(), key=lambda x: -x[1])
-                               if k.upper() != "COMPLIES" and not re.fullmatch(r"[\d.\s%-]+", k)][:15]
+    # only word answers ("Absent", "Not detected", "Clear Solution") - not measured numbers
+    res_list = ["Complies"] + [k for k, c in sorted(results.items(), key=lambda x: -x[1])
+                               if c >= 2 and k.upper() != "COMPLIES" and re.fullmatch(r"[A-Za-z][A-Za-z .()/-]{1,30}", k)][:15]
     return {"parameters": top[:150], "results": res_list, "standard_note": await _coa_standard_note()}
 
 
