@@ -3,6 +3,7 @@ import Sidebar from "@/components/Sidebar";
 import FollowupAlerts from "@/components/FollowupAlerts";
 import { AlertListener } from "@/components/AlertListener";
 import AttendanceBanner, { PunchChip } from "@/components/AttendanceBanner";
+import DailyVideoStrip from "@/components/DailyVideo";
 import { Outlet, useLocation, useNavigate, NavLink } from "react-router-dom";
 import { List, House, ChatTeardropDots, Kanban, Phone, PhoneCall, XCircle } from "@phosphor-icons/react";
 import { useAuth } from "@/context/AuthContext";
@@ -67,6 +68,7 @@ export default function AppShell() {
       <Sidebar mobileOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} />
       <main className="flex-1 min-w-0 flex flex-col h-full overflow-hidden">
         <AttendanceBanner />
+        <DailyVideoStrip />
         <header className="chat-hide shrink-0 z-20 bg-white/90 backdrop-blur-xl border-b border-gray-200 px-4 md:px-8 py-3 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0">
             <button

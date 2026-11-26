@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo, AndroidLogo, UsersThree, Sparkle, Handshake, Recycle, Fingerprint, Files,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo, AndroidLogo, UsersThree, Sparkle, Handshake, Recycle, Fingerprint, Files, FilmStrip,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
@@ -209,6 +209,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
               <div className="px-5 pt-4 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Admin</div>
               <Item to="/users" icon={Users} testId="nav-users" onNavigate={handleNavigate}>Executives</Item>
               <Item to="/payroll" icon={Calculator} testId="nav-payroll" onNavigate={handleNavigate}>Payroll &amp; Attendance</Item>
+              <Item to="/daily-videos" icon={FilmStrip} testId="nav-daily-videos" onNavigate={handleNavigate}>Video of the Day</Item>
               <Item to="/leaves" icon={CalendarCheck} testId="nav-leave-approvals" onNavigate={handleNavigate} badge={pendingLeaves}>Leave Approvals</Item>
               <Item to="/data-entry-inspect" icon={ClipboardText} testId="nav-data-entry-inspect" onNavigate={handleNavigate}>Data Entry Stats</Item>
               <Item to="/alerts" icon={Megaphone} testId="nav-alerts" onNavigate={handleNavigate}>Admin Alerts</Item>

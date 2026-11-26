@@ -30,7 +30,7 @@ import httpx
 from bs4 import BeautifulSoup
 import pandas as pd
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Query, UploadFile, File, Form, BackgroundTasks, WebSocket, WebSocketDisconnect, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -19859,6 +19859,315 @@ async def docs_send(body: DocSendInput, user: dict = Depends(get_current_user)):
     if not sent and failed:
         raise HTTPException(status_code=400, detail=failed[0].get("error") or "Could not send")
     return {"sent": sent, "failed": failed}
+
+
+# ------------- Video of the Day (sales training) -------------
+# Admin keeps a queue of short training videos (our own MP4s or YouTube links). The first
+# executive to open the CRM on a day pulls the next queued video into "today". Watching is
+# optional - the CRM only tracks it (how much was watched + a one-question quiz) for the admin.
+DAILY_VIDEO_DIR = ROOT_DIR / "daily_videos"
+DAILY_VIDEO_DIR.mkdir(exist_ok=True)
+_DV_FORMATS = {"rewind": "Rewind", "mentor": "Ek Minute Mentor", "oil": "Oil of the Week", "over": "Objection Over",
+               "win": "Jeet ki Kahani", "quickfire": "Quick Fire", "youtube": "YouTube", "other": "Other"}
+
+
+def _yt_id(url: str) -> Optional[str]:
+    m = re.search(r"(?:youtu\.be/|v=|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})", url or "")
+    return m.group(1) if m else None
+
+
+def _dv_public(v: dict) -> dict:
+    out = {k: v.get(k) for k in ("id", "title", "format", "source", "youtube_id", "duration", "date", "order", "created_at", "notes")}
+    out["format_label"] = _DV_FORMATS.get(v.get("format") or "other", "Other")
+    q = v.get("quiz") or {}
+    out["quiz"] = {"q": q.get("q"), "options": q.get("options") or []} if q.get("q") else None
+    return out
+
+
+async def _dv_today(company: str, assign: bool = True) -> Optional[dict]:
+    today = _ist_now().strftime("%Y-%m-%d")
+    base = {"deleted": {"$ne": True}, "$and": [company_filter(company)]}
+    v = await db.daily_videos.find_one({**base, "date": today}, {"_id": 0})
+    if v or not assign:
+        return v
+    nxt = await db.daily_videos.find_one({**base, "date": None}, {"_id": 0}, sort=[("order", 1), ("created_at", 1)])
+    if not nxt:
+        return None
+    r = await db.daily_videos.update_one({"id": nxt["id"], "date": None}, {"$set": {"date": today}})
+    if r.modified_count:
+        nxt["date"] = today
+        return nxt
+    return await db.daily_videos.find_one({**base, "date": today}, {"_id": 0})
+
+
+@api.get("/daily-video/today")
+async def daily_video_today(user: dict = Depends(get_current_user), x_company: Optional[str] = Header(None, alias="X-Company")):
+    v = await _dv_today(_resolve_company(user, x_company))
+    if not v:
+        return {"video": None}
+    view = await db.daily_video_views.find_one({"video_id": v["id"], "user_id": user["id"]}, {"_id": 0}) or {}
+    out = _dv_public(v)
+    if view.get("quiz_choice") is not None:
+        out["quiz_answer"] = (v.get("quiz") or {}).get("answer")
+    return {"video": out, "view": {k: view.get(k) for k in ("max_pct", "completed", "quiz_choice", "quiz_correct", "dismissed")}}
+
+
+class DvProgress(BaseModel):
+    pct: float = 0
+    seconds: float = 0
+    dismissed: bool = False
+
+
+async def _dv_view_upsert(v: dict, user: dict, sets: dict, maxes: Optional[dict] = None):
+    upd: Dict[str, Any] = {"$set": {**sets, "updated_at": iso(now_utc())},
+                           "$setOnInsert": {"video_id": v["id"], "user_id": user["id"], "user_name": user.get("name"),
+                                            "date": v.get("date"), "first_at": iso(now_utc())}}
+    if maxes:
+        upd["$max"] = maxes
+    await db.daily_video_views.update_one({"video_id": v["id"], "user_id": user["id"]}, upd, upsert=True)
+
+
+@api.post("/daily-video/{vid}/progress")
+async def daily_video_progress(vid: str, body: DvProgress, user: dict = Depends(get_current_user)):
+    v = await db.daily_videos.find_one({"id": vid, "deleted": {"$ne": True}}, {"_id": 0})
+    if not v:
+        raise HTTPException(status_code=404, detail="Video not found")
+    pct = max(0.0, min(100.0, float(body.pct or 0)))
+    sets: Dict[str, Any] = {}
+    if body.dismissed:
+        sets["dismissed"] = True
+    if pct >= 90:
+        sets["completed"] = True
+    await _dv_view_upsert(v, user, sets, {"max_pct": round(pct, 1), "watched_seconds": round(float(body.seconds or 0), 1)})
+    return {"ok": True}
+
+
+class DvAnswer(BaseModel):
+    choice: int
+
+
+@api.post("/daily-video/{vid}/answer")
+async def daily_video_answer(vid: str, body: DvAnswer, user: dict = Depends(get_current_user)):
+    v = await db.daily_videos.find_one({"id": vid, "deleted": {"$ne": True}}, {"_id": 0})
+    if not v or not (v.get("quiz") or {}).get("q"):
+        raise HTTPException(status_code=404, detail="No question for this video")
+    prev = await db.daily_video_views.find_one({"video_id": vid, "user_id": user["id"]}, {"_id": 0, "quiz_choice": 1})
+    ans = v["quiz"].get("answer")
+    if prev and prev.get("quiz_choice") is not None:   # first answer counts
+        return {"correct": prev["quiz_choice"] == ans, "answer": ans, "choice": prev["quiz_choice"]}
+    ok = body.choice == ans
+    await _dv_view_upsert(v, user, {"quiz_choice": body.choice, "quiz_correct": ok, "answered_at": iso(now_utc())})
+    return {"correct": ok, "answer": ans, "choice": body.choice}
+
+
+@api.post("/daily-video/{vid}/link")
+async def daily_video_link(vid: str, user: dict = Depends(get_current_user)):
+    """Signed stream URL for the <video> tag (works in the app WebView without the auth header)."""
+    v = await db.daily_videos.find_one({"id": vid, "deleted": {"$ne": True}, "source": "file"}, {"_id": 0, "id": 1})
+    if not v:
+        raise HTTPException(status_code=404, detail="Not found")
+    tok = jwt.encode({"typ": "dvlink", "v": vid, "uid": user["id"], "exp": now_utc() + timedelta(hours=3)}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return {"url": f"/api/daily-video/stream/{tok}"}
+
+
+@api.get("/daily-video/stream/{tok}")
+async def daily_video_stream(tok: str, request: Request):
+    try:
+        p = jwt.decode(tok, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except Exception:
+        raise HTTPException(status_code=403, detail="Link expired - reopen the video in the CRM")
+    if p.get("typ") != "dvlink":
+        raise HTTPException(status_code=403, detail="Invalid link")
+    v = await db.daily_videos.find_one({"id": p.get("v"), "deleted": {"$ne": True}}, {"_id": 0, "file": 1})
+    path = DAILY_VIDEO_DIR / (v or {}).get("file", "-")
+    if not v or not path.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+    size = path.stat().st_size
+    start, end = 0, size - 1
+    rng = request.headers.get("range") or ""
+    m = re.match(r"bytes=(\d*)-(\d*)", rng)
+    if m and (m.group(1) or m.group(2)):
+        if m.group(1):
+            start = int(m.group(1))
+            end = min(int(m.group(2)) if m.group(2) else size - 1, size - 1)
+        else:
+            start = max(0, size - int(m.group(2)))
+        if start > end:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+
+    def chunks(a=start, b=end):
+        with open(path, "rb") as fh:
+            fh.seek(a)
+            left = b - a + 1
+            while left > 0:
+                data = fh.read(min(512 * 1024, left))
+                if not data:
+                    break
+                left -= len(data)
+                yield data
+
+    headers = {"Accept-Ranges": "bytes", "Content-Length": str(end - start + 1), "Cache-Control": "private, max-age=3600"}
+    if m and (m.group(1) or m.group(2)):
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        return StreamingResponse(chunks(), status_code=206, media_type="video/mp4", headers=headers)
+    return StreamingResponse(chunks(), media_type="video/mp4", headers=headers)
+
+
+# ---- admin: queue + report
+@api.get("/daily-videos")
+async def daily_videos_list(user: dict = Depends(require_admin), x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(user, x_company)
+    await _dv_today(company)   # so "today" is filled in when the admin looks first
+    vids = [v async for v in db.daily_videos.find({"deleted": {"$ne": True}, "$and": [company_filter(company)]}, {"_id": 0})]
+    execs = [u async for u in db.users.find({"role": "executive", "active": True, "username": {"$nin": ["test_user", "scanner"]},
+                                             "$and": [company_filter(company)]}, {"_id": 0, "id": 1, "name": 1})]
+    exec_ids = {u["id"] for u in execs}
+    stats: Dict[str, dict] = {}
+    async for w in db.daily_video_views.find({"video_id": {"$in": [v["id"] for v in vids]}}, {"_id": 0}):
+        if w["user_id"] not in exec_ids:
+            continue
+        s = stats.setdefault(w["video_id"], {"opened": 0, "watched": 0, "answered": 0, "correct": 0})
+        s["opened"] += 1
+        s["watched"] += 1 if w.get("completed") else 0
+        s["answered"] += 1 if w.get("quiz_choice") is not None else 0
+        s["correct"] += 1 if w.get("quiz_correct") else 0
+    today = _ist_now().strftime("%Y-%m-%d")
+    out = []
+    for v in vids:
+        d = _dv_public(v)
+        d["quiz_full"] = v.get("quiz")
+        d["stats"] = stats.get(v["id"], {"opened": 0, "watched": 0, "answered": 0, "correct": 0})
+        d["state"] = "queued" if not v.get("date") else ("today" if v["date"] == today else ("past" if v["date"] < today else "scheduled"))
+        out.append(d)
+    out.sort(key=lambda d: (0 if d["state"] == "today" else 1 if d["state"] in ("scheduled", "queued") else 2,
+                            d.get("date") or "9999", d.get("order") or 0, d.get("created_at") or ""))
+    past = [d for d in out if d["state"] == "past"]
+    past.sort(key=lambda d: d["date"], reverse=True)
+    out = [d for d in out if d["state"] != "past"] + past
+    return {"videos": out, "executives": len(execs), "formats": _DV_FORMATS}
+
+
+@api.get("/daily-videos/{vid}/report")
+async def daily_video_report(vid: str, user: dict = Depends(require_admin), x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(user, x_company)
+    v = await db.daily_videos.find_one({"id": vid}, {"_id": 0})
+    if not v:
+        raise HTTPException(status_code=404, detail="Not found")
+    views = {w["user_id"]: w async for w in db.daily_video_views.find({"video_id": vid}, {"_id": 0})}
+    rows = []
+    async for u in db.users.find({"role": "executive", "active": True, "username": {"$nin": ["test_user", "scanner"]},
+                                  "$and": [company_filter(company)]}, {"_id": 0, "id": 1, "name": 1}):
+        w = views.get(u["id"]) or {}
+        rows.append({"user_id": u["id"], "name": u.get("name"), "opened": bool(w), "max_pct": w.get("max_pct") or 0,
+                     "completed": bool(w.get("completed")), "quiz_choice": w.get("quiz_choice"), "quiz_correct": w.get("quiz_correct"),
+                     "first_at": w.get("first_at"), "answered_at": w.get("answered_at")})
+    rows.sort(key=lambda r: (not r["completed"], -(r["max_pct"] or 0), r["name"] or ""))
+    return {"video": {**_dv_public(v), "quiz_full": v.get("quiz")}, "rows": rows}
+
+
+def _dv_quiz(q: Optional[str], options: Optional[List[str]], answer: Optional[int]) -> Optional[dict]:
+    q = (q or "").strip()
+    opts = [str(o).strip() for o in (options or []) if str(o).strip()]
+    if not q:
+        return None
+    if len(opts) < 2:
+        raise HTTPException(status_code=400, detail="Give at least 2 answer options")
+    if answer is None or not (0 <= int(answer) < len(opts)):
+        raise HTTPException(status_code=400, detail="Mark which option is correct")
+    return {"q": q, "options": opts, "answer": int(answer)}
+
+
+@api.post("/daily-videos")
+async def daily_videos_add(title: str = Form(...), format: str = Form("other"), youtube_url: str = Form(""),
+                           quiz: str = Form(""), date: str = Form(""), notes: str = Form(""), duration: float = Form(0),
+                           file: Optional[UploadFile] = File(None), user: dict = Depends(require_admin),
+                           x_company: Optional[str] = Header(None, alias="X-Company")):
+    company = _resolve_company(user, x_company)
+    qd = json.loads(quiz) if quiz.strip() else {}
+    v: Dict[str, Any] = {"id": str(uuid.uuid4()), "company": company, "title": title.strip()[:200],
+                         "format": format if format in _DV_FORMATS else "other", "notes": notes.strip()[:500],
+                         "quiz": _dv_quiz(qd.get("q"), qd.get("options"), qd.get("answer")),
+                         "date": (date.strip() or None), "duration": round(float(duration or 0), 1),
+                         "created_by": user["id"], "created_at": iso(now_utc())}
+    if v["date"] and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", v["date"]):
+        raise HTTPException(status_code=400, detail="Date must be YYYY-MM-DD")
+    if file is not None and file.filename:
+        ext = Path(file.filename).suffix.lower()
+        if ext not in (".mp4", ".m4v", ".mov", ".webm"):
+            raise HTTPException(status_code=400, detail="Upload an MP4 video")
+        stored = f"{uuid.uuid4().hex}{ext}"
+        size = 0
+        with open(DAILY_VIDEO_DIR / stored, "wb") as fh:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > 95 * 1024 * 1024:
+                    fh.close()
+                    (DAILY_VIDEO_DIR / stored).unlink(missing_ok=True)
+                    raise HTTPException(status_code=413, detail="Video too large (max 95 MB)")
+                fh.write(chunk)
+        v.update(source="file", file=stored, size=size, filename=_safe_name(file.filename))
+    elif _yt_id(youtube_url):
+        v.update(source="youtube", youtube_id=_yt_id(youtube_url), youtube_url=youtube_url.strip())
+    else:
+        raise HTTPException(status_code=400, detail="Upload an MP4 or paste a YouTube link")
+    last = await db.daily_videos.find_one({"deleted": {"$ne": True}, "$and": [company_filter(company)]}, {"_id": 0, "order": 1}, sort=[("order", -1)])
+    v["order"] = ((last or {}).get("order") or 0) + 1
+    await db.daily_videos.insert_one(v.copy())
+    return _dv_public(v)
+
+
+class DvUpdate(BaseModel):
+    title: Optional[str] = None
+    format: Optional[str] = None
+    date: Optional[str] = None          # "" = back to the queue
+    notes: Optional[str] = None
+    quiz: Optional[Dict[str, Any]] = None
+    move: Optional[str] = None          # "up" | "down" in the queue
+
+
+@api.put("/daily-videos/{vid}")
+async def daily_videos_update(vid: str, body: DvUpdate, user: dict = Depends(require_admin)):
+    v = await db.daily_videos.find_one({"id": vid, "deleted": {"$ne": True}}, {"_id": 0})
+    if not v:
+        raise HTTPException(status_code=404, detail="Not found")
+    sets: Dict[str, Any] = {}
+    if body.title is not None:
+        sets["title"] = body.title.strip()[:200]
+    if body.format is not None and body.format in _DV_FORMATS:
+        sets["format"] = body.format
+    if body.notes is not None:
+        sets["notes"] = body.notes.strip()[:500]
+    if body.date is not None:
+        d = body.date.strip() or None
+        if d and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+            raise HTTPException(status_code=400, detail="Date must be YYYY-MM-DD")
+        sets["date"] = d
+    if body.quiz is not None:
+        sets["quiz"] = _dv_quiz(body.quiz.get("q"), body.quiz.get("options"), body.quiz.get("answer"))
+    if body.move in ("up", "down") and not v.get("date"):
+        q = [x async for x in db.daily_videos.find({"deleted": {"$ne": True}, "date": None, "$and": [company_filter(v.get("company"))]},
+                                                   {"_id": 0, "id": 1, "order": 1}).sort([("order", 1), ("created_at", 1)])]
+        i = next((k for k, x in enumerate(q) if x["id"] == vid), None)
+        j = (i - 1) if body.move == "up" else (i + 1)
+        if i is not None and 0 <= j < len(q):
+            q[i], q[j] = q[j], q[i]
+            for k, x in enumerate(q):
+                await db.daily_videos.update_one({"id": x["id"]}, {"$set": {"order": k + 1}})
+    if sets:
+        sets["updated_at"] = iso(now_utc())
+        await db.daily_videos.update_one({"id": vid}, {"$set": sets})
+    return {"ok": True}
+
+
+@api.delete("/daily-videos/{vid}")
+async def daily_videos_delete(vid: str, user: dict = Depends(require_admin)):
+    r = await db.daily_videos.update_one({"id": vid}, {"$set": {"deleted": True, "deleted_at": iso(now_utc()), "deleted_by": user["id"]}})
+    if not r.matched_count:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"ok": True}
 
 
 # Root ping for api
