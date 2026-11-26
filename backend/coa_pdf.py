@@ -39,6 +39,7 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 
 ASSETS = Path(__file__).parent / "assets" / "letterhead"
 PAGE_W, PAGE_H = letter  # the sample COA is US Letter (612 x 792 pt)
+AUTO_SWITCH_DAY = 10     # auto dates move to the new month on the 10th
 
 _FONT = None
 
@@ -102,7 +103,10 @@ def coa_dates(data: dict, today: Optional[datetime] = None) -> tuple:
     if (data.get("date_mode") or "auto") == "locked" and data.get("mfg_month"):
         y, m = (int(x) for x in str(data["mfg_month"])[:7].split("-"))
     else:
+        # auto: the month changes on the 10th - before the 10th the previous month is shown
         y, m = today.year, today.month
+        if today.day < AUTO_SWITCH_DAY:
+            y, m = _month_add(y, m, -1)
     mfg = _fmt_month(y, m)
     if (data.get("date_mode") == "locked") and data.get("exp_month"):
         ey, em = (int(x) for x in str(data["exp_month"])[:7].split("-"))

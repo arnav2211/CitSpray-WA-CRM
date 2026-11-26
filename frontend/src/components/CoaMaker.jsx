@@ -183,7 +183,7 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
                     <div><div className={lbl}>Exp. date as printed (optional)</div><input className={inp} value={coa.exp_text || ""} onChange={(e) => set({ exp_text: e.target.value })} placeholder="e.g. 01-08-2028" /></div>
                   </>
                 ) : (
-                  <div className="text-xs text-gray-500 col-span-2 self-end">Mfg. date = the month it is sent. Exp. = mfg. + shelf life.</div>
+                  <div className="text-xs text-gray-500 col-span-2 self-end">Mfg. date = the current month from the 10th (before the 10th: last month). Exp. = mfg. + shelf life.</div>
                 )}
                 <div><div className={lbl}>Shelf life (months)</div><input type="number" min="0" className={inp} value={coa.shelf_life_months ?? ""} onChange={(e) => set({ shelf_life_months: e.target.value === "" ? "" : Number(e.target.value) })} /></div>
               </div>
