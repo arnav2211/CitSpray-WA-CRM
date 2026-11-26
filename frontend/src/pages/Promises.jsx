@@ -14,14 +14,17 @@ const STATUS = {
   reminded: { label: "Reminded", cls: "bg-orange-100 text-orange-800" },
   missed: { label: "Not kept", cls: "bg-red-600 text-white" },
   no_window: { label: "Waiting for customer", cls: "bg-gray-200 text-gray-700" },
+  waiting_customer: { label: "Waiting for customer", cls: "bg-gray-200 text-gray-700" },
+  claimed: { label: "Claimed - not in chat", cls: "bg-red-100 text-red-800 border border-red-300" },
   kept: { label: "Kept", cls: "bg-green-100 text-green-800" },
   kept_late: { label: "Kept late", cls: "bg-lime-200 text-lime-900" },
   dismissed: { label: "Dismissed", cls: "bg-gray-100 text-gray-500" },
   expired: { label: "Expired", cls: "bg-gray-100 text-gray-500" },
 };
 const FILTERS = [
-  ["open,reminded,missed,no_window", "Pending"],
+  ["open,reminded,missed,no_window,waiting_customer", "Pending"],
   ["missed", "Not kept"],
+  ["claimed", "Claimed, not in chat"],
   ["kept,kept_late", "Kept"],
   ["kept_late", "Kept late"],
   ["", "All"],
@@ -65,8 +68,12 @@ export default function Promises() {
     const note = status === "dismissed" ? window.prompt("Why dismiss this promise? (optional)") : "";
     if (note === null) return;
     try {
-      await api.post(`/promises/${id}/resolve`, { status, note });
-      toast.success(status === "kept" ? "Marked as kept" : "Dismissed");
+      const { data: res } = await api.post(`/promises/${id}/resolve`, { status, note });
+      if (res?.status === "claimed") {
+        toast.warning(`Saved as "claimed" - the AI could not find it in the WhatsApp chat${res.reason ? `: ${res.reason}` : ""}. Send it on WhatsApp and it will turn green by itself.`, { duration: 9000 });
+      } else {
+        toast.success(status === "kept" ? "Marked as kept" : "Dismissed");
+      }
       load();
     } catch (e) { toast.error(errMsg(e)); }
   };
@@ -80,7 +87,8 @@ export default function Promises() {
   };
 
   const c = data.counts || {};
-  const pending = (c.open || 0) + (c.reminded || 0) + (c.no_window || 0);
+  const pending = (c.open || 0) + (c.reminded || 0);
+  const waiting = (c.no_window || 0) + (c.waiting_customer || 0);
   return (
     <div className="p-4 md:p-8 space-y-4" data-testid="promises-page">
       <div className="flex items-start justify-between gap-2 flex-wrap">
@@ -96,11 +104,12 @@ export default function Promises() {
         <button type="button" onClick={load} className="border border-gray-300 px-3 py-1.5 text-xs flex items-center gap-1"><ArrowsClockwise size={12} className={loading ? "animate-spin" : ""} /> Refresh</button>
       </div>
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
         <div className="border border-gray-200 bg-white p-3"><div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Pending</div><div className="font-chivo font-black text-2xl">{pending}</div></div>
         <div className="border border-gray-200 bg-white p-3"><div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Not kept</div><div className="font-chivo font-black text-2xl text-red-600">{c.missed || 0}</div></div>
         <div className="border border-gray-200 bg-white p-3"><div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Kept</div><div className="font-chivo font-black text-2xl text-green-700">{(c.kept || 0) + (c.kept_late || 0)}{c.kept_late ? <span className="text-xs font-bold text-lime-700 ml-2">{c.kept_late} late</span> : null}</div></div>
-        <div className="border border-gray-200 bg-white p-3"><div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Waiting for customer</div><div className="font-chivo font-black text-2xl text-gray-600">{c.no_window || 0}</div></div>
+        <div className="border border-gray-200 bg-white p-3"><div className="text-[10px] uppercase tracking-widest text-gray-500 font-bold">Waiting for customer</div><div className="font-chivo font-black text-2xl text-gray-600">{waiting}</div></div>
+        <div className="border border-red-200 bg-white p-3"><div className="text-[10px] uppercase tracking-widest text-red-700 font-bold">Claimed, not in chat</div><div className="font-chivo font-black text-2xl text-red-700">{c.claimed || 0}</div></div>
       </div>
 
       <div className="flex gap-2 flex-wrap items-center">
@@ -133,6 +142,7 @@ export default function Promises() {
                 <div className="text-[11px] text-gray-500">{r.exec_name} · call {fmtSmartLong(r.call_end_at)}</div>
               </div>
               <div className="text-sm">Promised: <b>“{r.what}”</b> on WhatsApp</div>
+              {r.said && <div className="text-[11px] text-gray-500 italic">On the call: “{r.said}”</div>}
               {(r.ai_reason || r.ai_missing) && (
                 <div className="text-xs text-gray-600">
                   {r.ai_reason}{r.ai_missing && !["kept", "kept_late"].includes(r.status) ? <span className="text-red-600"> Missing: {r.ai_missing}</span> : null}
@@ -153,10 +163,12 @@ export default function Promises() {
                   {["open", "reminded"].includes(r.status) && r.due_at && <>Due {fmtSmartLong(r.due_at)}</>}
                   {r.status === "missed" && r.escalated_at && <>Admin alerted {fmtSmartLong(r.escalated_at)}</>}
                   {r.status === "no_window" && <>Customer hasn't messaged in 24 h - WhatsApp doesn't allow sending until they do</>}
+                  {r.status === "waiting_customer" && <>Waiting for the customer{r.needs_customer ? `: ${r.needs_customer}` : ""}</>}
+                  {r.status === "claimed" && <span className="text-red-700">{r.resolved_by} marked it kept, but the AI found nothing in the chat that delivers it - still being checked</span>}
                 </div>
                 <div className="flex gap-1">
                   <button type="button" onClick={() => openChat(r)} className="bg-[#128C7E] text-white text-[11px] font-bold px-2 py-1 flex items-center gap-1"><ChatCircleDots size={12} /> Open chat</button>
-                  {!["kept", "kept_late", "dismissed"].includes(r.status) && (
+                  {!["kept", "kept_late", "dismissed", "claimed"].includes(r.status) && (
                     <>
                       <button type="button" onClick={() => resolve(r.id, "kept")} className="border border-gray-300 text-[11px] font-bold px-2 py-1 flex items-center gap-1"><Check size={12} /> Mark kept</button>
                       {isAdmin && <button type="button" onClick={() => resolve(r.id, "dismissed")} className="border border-gray-300 text-[11px] px-2 py-1 flex items-center gap-1"><X size={12} /> Dismiss</button>}

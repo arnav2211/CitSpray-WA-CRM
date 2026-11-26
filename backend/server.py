@@ -16120,8 +16120,16 @@ Reply ONLY with JSON:
               photos or videos, sample options, payment QR / bank details, company details, location / address,
               COA / MSDS / specs. FALSE for: things that depend on a later event (after payment arrives, after
               dispatch - dispatch slip / tracking / LR copy), processing / packing / dispatching the order itself,
-              calling back later, physical samples by courier, or things the CUSTOMER must send us,
-              "what": "exactly what was promised, in a few words",
+              calling back later, physical samples by courier, or things the CUSTOMER must send us.
+              ONLY the EXECUTIVE's own commitment counts: if the CUSTOMER says they will send something (their
+              address, list, quantity, GST, payment screenshot), that is NOT our promise. Also FALSE for "check your
+              WhatsApp" / "it was already sent" (nothing new promised) and for only telling the customer to reply
+              "Hi" to our template to get the catalogue automatically (no promise by the executive),
+              "what": "the concrete items promised, e.g. 'price of rose attar for 25 L + catalogue' - never vague
+                       words like 'details' or 'information' on their own",
+              "said": "the executive's own sentence that makes the promise, translated to English, word for word",
+              "needs_customer": "what the CUSTOMER must do first before we can send it (e.g. 'reply Hi on WhatsApp',
+                       'send the fragrance list', 'send the address'), or empty if we can send it right away",
               "channel": "whatsapp | email | courier | call | other"}},
  "whatsapp_draft": "a short friendly WhatsApp message (max 500 characters) our executive can send right after this
    call: thank them, recap the products / quantity discussed and the next step. English. Mention a price ONLY if
@@ -16224,6 +16232,7 @@ def _call_ai_parse(text: str) -> dict:
     made = pr.get("made")
     made = made.strip().lower() in ("true", "yes", "1") if isinstance(made, str) else bool(made)
     out["promise"] = {"made": made and bool(_ai_txt(pr.get("what"), 300)), "what": _ai_txt(pr.get("what"), 300),
+                      "said": _ai_txt(pr.get("said"), 300), "needs_customer": _ai_txt(pr.get("needs_customer"), 200),
                       "channel": (_ai_txt(pr.get("channel"), 20) or "other").lower()}
     out["whatsapp_draft"] = _ai_txt(data.get("whatsapp_draft"), 700)
     out["key_points"] = [x for x in (_ai_txt(k, 400) for k in (data.get("key_points") or [])[:25]) if x]
@@ -16535,6 +16544,7 @@ async def _call_ai_track_promise(ai: dict, lead: Optional[dict], doc: dict, call
     pr = {"id": str(uuid.uuid4()), "lead_id": lead["id"], "lead_name": (owner or {}).get("customer_name") or lead.get("customer_name"),
           "call_log_id": (call or {}).get("id"), "exec_id": doc["user_id"], "exec_name": doc.get("user_name"),
           "owner_id": (owner or {}).get("assigned_to") or doc["user_id"], "what": p["what"], "channel": "whatsapp",
+          "said": p.get("said") or "", "needs_customer": p.get("needs_customer") or "",
           "call_start_at": iso(start), "call_end_at": iso(end), "due_at": iso(due), "status": "open", "created_at": iso(now_utc())}
     await db.call_promises.insert_one(pr.copy())
     return pr
@@ -16578,6 +16588,8 @@ def _promise_msg_line(m: dict) -> str:
 
 
 _PROMISE_JUDGE_PROMPT = """On a phone call our executive promised to send this customer on WhatsApp: "{what}".
+The executive's words: {said}
+Before we can send it, the customer first had to: {needs}
 What was said on the call: {context}
 Below are the WhatsApp messages we sent this customer (oldest first): everything our team sent since the call
 started, plus our AUTOMATIC messages from shortly before the call. Automatic messages count too - e.g. if our
@@ -16596,9 +16608,15 @@ does NOT keep it. If only part of it was sent (e.g. the price but not the catalo
 Answer "not_applicable" if this is not really something to send on WhatsApp now: it depends on a later event
 (payment arriving, dispatch / tracking / LR), it is about processing or shipping the order, a call-back, physical
 goods, or something the customer had to send us.
+Answer "waiting_customer" if the promise can only be kept after the customer does something first (replies "Hi" to
+our template so the chat opens, sends their list / quantity / address) and they have NOT done it yet in the messages
+below - then it is not the executive's fault. Once the customer has done it, judge normally.
+Read EVERY message: prices typed in a later message, a PDF or photo sent after a template, all count. A template
+that only asks the customer to reply "Hi" is not the catalogue itself. For "kept", "kept_by" MUST be the [number] of
+a message from US or [automatic] that delivers it - never a CUSTOMER line; if there is no such message it is not kept.
 Messages:
 {msgs}
-Reply ONLY with JSON: {{"verdict": "kept" | "partly" | "not_kept" | "not_applicable", "reason": "one short sentence in English",
+Reply ONLY with JSON: {{"verdict": "kept" | "partly" | "not_kept" | "waiting_customer" | "not_applicable", "reason": "one short sentence in English",
 "evidence": "the message that keeps it, quoted briefly, or empty", "missing": "what is still not sent, or empty",
 "kept_by": the [number] of the message that completed the promise (0 if not kept)}}"""
 
@@ -16612,16 +16630,19 @@ async def _promise_verdict(pr: dict, now: datetime) -> Optional[dict]:
     human = await db.messages.find({"lead_id": pr["lead_id"], "direction": "out", "by_user_id": {"$nin": [None, ""]},
                                     "at": {"$gt": iso(since)}}, proj).sort("at", 1).to_list(40)
     auto = await db.messages.find({"lead_id": pr["lead_id"], "direction": "out", "by_user_id": {"$in": [None, ""]},
-                                   "status": {"$ne": "failed"}, "at": {"$gt": iso(since - timedelta(days=3))}}, proj).sort("at", 1).to_list(20)
+                                   "status": {"$ne": "failed"}, "at": {"$gt": iso(since - timedelta(hours=2))}}, proj).sort("at", 1).to_list(20)
     cust = await db.messages.find({"lead_id": pr["lead_id"], "direction": "in", "at": {"$gt": iso(since)}},
                                   proj).sort("at", 1).to_list(20)
     for c_ in cust:
         c_["direction"] = "in"
     msgs = sorted(human + auto + cust, key=lambda m: m.get("at") or "")
     if not human and not auto:
+        if pr.get("needs_customer") and not cust:
+            return {"verdict": "waiting_customer", "reason": f"Waiting for the customer: {pr['needs_customer']}.",
+                    "missing": pr["what"]}
         return {"verdict": "not_kept", "reason": "Nothing has been sent on WhatsApp since the call.", "missing": pr["what"]}
     last_at = msgs[-1].get("at")
-    if pr.get("judged_upto") == last_at and pr.get("ai_verdict"):
+    if pr.get("judged_upto") == last_at and pr.get("ai_verdict") and not pr.get("_force"):
         return {"verdict": pr["ai_verdict"], "reason": pr.get("ai_reason"), "evidence": pr.get("ai_evidence"),
                 "missing": pr.get("ai_missing"), "kept_at": pr.get("ai_kept_at") or last_at, "cached": True}
     # one worker judges (the tracker runs in every gunicorn worker)
@@ -16637,7 +16658,9 @@ async def _promise_verdict(pr: dict, now: datetime) -> Optional[dict]:
         ctx = " ".join(x for x in (ai.get("summary"), ("Next step: " + ai["next_step"]) if ai.get("next_step") else "") if x)
     lines = [f"[{i}] {((_parse_call_dt(m.get('at')) or now) + timedelta(hours=5, minutes=30)).strftime('%d %b %H:%M')}: "
              f"{_promise_msg_line(m)}" for i, m in enumerate(msgs, 1)]
-    prompt = _PROMISE_JUDGE_PROMPT.format(what=pr["what"], context=(ctx or "(no summary)")[:1500], msgs="\n".join(lines))
+    prompt = _PROMISE_JUDGE_PROMPT.format(what=pr["what"], said=(pr.get("said") or "(not recorded)")[:300],
+                                          needs=(pr.get("needs_customer") or "nothing - we could send it right away")[:200],
+                                          context=(ctx or "(no summary)")[:1500], msgs="\n".join(lines))
     try:
         try:
             raw = await _gemini_generate(prompt, temperature=0.1, max_output_tokens=500, json_mode=True,
@@ -16650,7 +16673,11 @@ async def _promise_verdict(pr: dict, now: datetime) -> Optional[dict]:
         logger.warning(f"promise judge failed: {e}")
         await db.call_promises.update_one({"id": pr["id"]}, {"$set": {"judging_until": iso(now + timedelta(minutes=5))}})
         return None
-    verdict = v.get("verdict") if v.get("verdict") in ("kept", "partly", "not_kept", "not_applicable") else "not_kept"
+    verdict = v.get("verdict") if isinstance(v, dict) else None
+    if verdict not in ("kept", "partly", "not_kept", "waiting_customer", "not_applicable"):
+        # an empty / broken AI answer is "not decided yet", never "not kept" (audit 2026-11-26)
+        await db.call_promises.update_one({"id": pr["id"]}, {"$set": {"judging_until": iso(now + timedelta(minutes=10))}})
+        return None
     out = {"verdict": verdict, "reason": _ai_txt(v.get("reason"), 300), "evidence": _ai_txt(v.get("evidence"), 300),
            "missing": _ai_txt(v.get("missing"), 200)}
     kept_at = None
@@ -16659,9 +16686,14 @@ async def _promise_verdict(pr: dict, now: datetime) -> Optional[dict]:
             idx = int(v.get("kept_by") or 0)
         except Exception:
             idx = 0
-        # the time of the message that actually kept it (not just the newest message)
-        kept_at = msgs[idx - 1].get("at") if 1 <= idx <= len(msgs) else last_at
-        out["kept_at"] = kept_at
+        # "kept" must point at a message WE sent - no evidence, no "kept" (audit: the judge said kept
+        # for chats with nothing in them)
+        if not (1 <= idx <= len(msgs)) or msgs[idx - 1].get("direction") == "in":
+            verdict = out["verdict"] = "not_kept"
+            out["reason"] = "No message from us was found that delivers it."
+        else:
+            kept_at = msgs[idx - 1].get("at")
+            out["kept_at"] = kept_at
     await db.call_promises.update_one({"id": pr["id"]}, {"$set": {
         "ai_verdict": verdict, "ai_reason": out["reason"], "ai_evidence": out["evidence"], "ai_missing": out["missing"],
         "ai_kept_at": kept_at, "judged_upto": last_at, "judged_at": iso(now), "judging_until": iso(now)}})
@@ -16701,7 +16733,9 @@ async def promise_tracker_task():
     Conditional updates make it safe across workers."""
     try:
         now = now_utc()
-        q = {"$or": [{"status": {"$in": ["open", "reminded", "no_window"]}},
+        q = {"$or": [{"status": {"$in": ["open", "reminded", "no_window", "waiting_customer"]}},
+                     # an executive said "kept" but the chat didn't show it: keep checking for a week
+                     {"status": "claimed", "created_at": {"$gte": iso(now - timedelta(days=7))}},
                      # missed ones keep being checked: sent later = "kept late"
                      {"status": "missed", "created_at": {"$gte": iso(now - timedelta(days=14))}},
                      # kept by the old "any message counts" rule: check once what was really sent
@@ -16718,7 +16752,21 @@ async def promise_tracker_task():
                     await _promise_close_followups(pr, now)
                     await db.admin_alerts.update_many({"meta.dedup_key": f"promise:{pr['id']}"}, {"$set": {"cancelled": True}})
                 continue
+            if v["verdict"] == "waiting_customer" and pr["status"] != "claimed":
+                end = _parse_call_dt(pr["call_end_at"]) or now
+                new = "expired" if now - end > timedelta(days=_PROMISE_GIVE_UP_DAYS) else "waiting_customer"
+                if pr["status"] != new:
+                    res = await db.call_promises.update_one({"id": pr["id"], "status": pr["status"]},
+                                                            {"$set": {"status": new, "waiting_since": iso(now)}})
+                    if res.modified_count:
+                        await _promise_close_followups(pr, now)
+                        await db.admin_alerts.update_many({"meta.dedup_key": f"promise:{pr['id']}"}, {"$set": {"cancelled": True}})
+                continue
             if v["verdict"] == "kept":
+                if pr["status"] == "claimed":
+                    await db.call_promises.update_one({"id": pr["id"], "status": "claimed"}, {"$set": {
+                        "status": "kept", "verified": True, "kept_at": v.get("kept_at") or iso(now), "claim_confirmed": True}})
+                    continue
                 if pr["status"] == "kept":
                     await db.call_promises.update_one({"id": pr["id"]}, {"$set": {"verified": True}})
                     continue
@@ -16735,7 +16783,7 @@ async def promise_tracker_task():
                         await db.admin_alerts.update_many({"meta.dedup_key": f"promise:{pr['id']}"},
                                                           {"$set": {"cancelled": True, "cancel_reason": "kept late"}})
                 continue
-            if pr["status"] == "missed":
+            if pr["status"] in ("missed", "claimed"):
                 continue                  # still not sent - nothing more to do
             if pr["status"] == "kept":
                 # it was NOT really kept: back into tracking
@@ -16757,9 +16805,9 @@ async def promise_tracker_task():
                         await _promise_close_followups(pr, now)
                 continue
             due = _add_office_hours(clock, 3)
-            if pr["status"] == "no_window":
-                # the customer wrote: the window is open again, the 3 h clock starts now
-                await db.call_promises.update_one({"id": pr["id"], "status": "no_window"},
+            if pr["status"] in ("no_window", "waiting_customer"):
+                # the customer wrote / did their part: the 3 h clock starts now
+                await db.call_promises.update_one({"id": pr["id"], "status": pr["status"]},
                                                   {"$set": {"status": "open", "due_at": iso(due)}})
                 continue
             if iso(due) != pr.get("due_at") and pr["status"] == "open":
@@ -16826,12 +16874,23 @@ async def resolve_promise(pid: str, body: PromiseResolveInput, user: dict = Depe
     if body.status not in ("kept", "dismissed"):
         raise HTTPException(status_code=400, detail="status must be kept or dismissed")
     now = now_utc()
+    new_status, v = body.status, None
+    if body.status == "kept" and user["role"] != "admin":
+        # audit 2026-11-26: about half of the hand-marked "kept" had nothing in the chat. An
+        # executive's "kept" is checked against the WhatsApp chat; if nothing delivers it, it is
+        # recorded as "claimed" (shown to the admin) and keeps being re-checked.
+        try:
+            v = await _promise_verdict({**pr, "_force": True, "judging_until": None}, now)
+        except Exception:
+            v = None
+        new_status = "kept" if (v or {}).get("verdict") == "kept" else "claimed"
+    extra = {"kept_at": (v or {}).get("kept_at") or iso(now)} if new_status == "kept" else {}
     await db.call_promises.update_one({"id": pid}, {"$set": {
-        "status": body.status, "verified": True, "resolved_by": user.get("name"), "resolved_at": iso(now),
-        "resolve_note": (body.note or "")[:300], **({"kept_at": iso(now)} if body.status == "kept" else {})}})
+        "status": new_status, "verified": True, "resolved_by": user.get("name"), "resolved_at": iso(now),
+        "resolve_note": (body.note or "")[:300], **extra}})
     await _promise_close_followups(pr, now)
     await db.admin_alerts.update_many({"meta.dedup_key": f"promise:{pid}"}, {"$set": {"cancelled": True}})
-    return {"ok": True}
+    return {"ok": True, "status": new_status, "reason": (v or {}).get("reason")}
 
 
 # ---- AI reports (daily / weekly / monthly) ----
@@ -16916,7 +16975,7 @@ async def _ai_report_data(start: datetime, end: datetime, only_user: Optional[st
     async for pr in db.call_promises.find(pq, {"_id": 0, "exec_id": 1, "status": 1}):
         p = P(pr.get("exec_id")); p["promises"] += 1
         st = pr.get("status")
-        p["promises_kept" if st in ("kept", "kept_late") else "promises_missed" if st == "missed" else "promises_open"] += 1
+        p["promises_kept" if st in ("kept", "kept_late") else "promises_missed" if st in ("missed", "claimed") else "promises_open"] += 1
     tq: Dict[str, Any] = {"created_at": {"$gte": S, "$lt": E}}
     if only_user:
         tq["participants"] = only_user
