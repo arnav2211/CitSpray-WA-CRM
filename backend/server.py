@@ -18064,6 +18064,92 @@ async def get_attendance_status(user: dict = Depends(get_current_user)):
         "check_out_time": log.get("check_out", {}).get("time") if log else None
     }
 
+# ---- My Attendance (self view) --------------------------------------------
+# Built from the payroll day rules so an employee sees exactly what the admin's
+# payroll sees, but ONLY attendance: no salary, rate, earning or deduction field
+# ever leaves this endpoint (whitelisted below).
+_MY_ATT_LABELS = {
+    "present": "Present", "excused_present": "Present (set by admin)", "wfh": "Work from home",
+    "paid_leave": "Paid leave / comp-off", "half_day": "Half day",
+    "missing_punch_out": "No punch-out - counted as half day",
+    "early_exit": "Left too early - counted absent",
+    "absent_informed": "Absent (informed)", "absent_uninformed": "Absent (uninformed)",
+    "leave_approved": "Leave", "weekly_off": "Sunday", "weekly_off_unpaid": "Sunday",
+    "holiday": "Holiday", "pending_today": "Not punched in yet", "future": "",
+    "not_joined": "",
+}
+_MY_ATT_COUNT_KEYS = ("present", "half_day", "leave_approved", "absent_informed", "absent_uninformed",
+                      "holiday", "late", "after_grace", "early_exit", "wfh", "missing_punch_out")
+
+
+async def _my_attendance_days(user: dict, start: str, end: str) -> dict:
+    res = await calculate_payroll(start, end, user["id"], user)
+    row = (res.get("payroll") or [None])[0] or {}
+    cfg = await get_attendance_config()
+    start_m = _hhmm_to_minutes(cfg["office_start"], 630)
+    notes = {a["date"]: a.get("note") for a in await db.payroll_adjustments.find(
+        {"user_id": user["id"], "date": {"$gte": start, "$lte": end}}, {"_id": 0, "date": 1, "note": 1}).to_list(400)}
+    hols = {h["date"]: h.get("name") for h in await db.holidays.find(
+        {"date": {"$gte": start, "$lte": end}}, {"_id": 0, "date": 1, "name": 1}).to_list(400)}
+    days = []
+    for d in row.get("daily_breakdown") or []:
+        st = d.get("status") or ""
+        if st in ("future", "not_joined"):
+            continue
+        label = _MY_ATT_LABELS.get(st, st.replace("_", " ").capitalize())
+        if st == "holiday" and hols.get(d["date"]):
+            label = f"Holiday - {hols[d['date']]}"
+        flags = [f for f in (d.get("flags") or []) if "cut" not in f.lower()]
+        pin = d.get("punch_in")
+        if pin and st not in ("weekly_off", "weekly_off_unpaid", "holiday"):
+            try:
+                if int(pin[:2]) * 60 + int(pin[3:5]) > start_m:
+                    flags.insert(0, f"Late (after {cfg['office_start']})")
+            except Exception:
+                pass
+        days.append({"date": d["date"], "weekday": d.get("weekday"), "status": st, "label": label,
+                     "punch_in": pin, "punch_out": d.get("punch_out"), "work_hours": d.get("work_hours"),
+                     "flags": flags, "admin_note": notes.get(d["date"])})
+    counts = {k: (row.get("counts") or {}).get(k, 0) for k in _MY_ATT_COUNT_KEYS}
+    return {"days": days, "counts": counts}
+
+
+@api.get("/attendance/me")
+async def my_attendance(month: Optional[str] = None, summary: bool = False, user: dict = Depends(get_current_user)):
+    """The logged-in employee's own attendance for a month (YYYY-MM, default this
+    month) + today's punch + missed punch-outs of the last 10 days. Attendance only."""
+    now = _ist_now()
+    today = now.strftime("%Y-%m-%d")
+    m = (month or now.strftime("%Y-%m"))[:7]
+    try:
+        first = datetime.strptime(m + "-01", "%Y-%m-%d")
+    except Exception:
+        raise HTTPException(status_code=400, detail="month must be YYYY-MM")
+    nxt = (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+    last = min((nxt - timedelta(days=1)).strftime("%Y-%m-%d"), today)
+    out = {"month": m, "today": today, "days": [], "counts": {}}
+    if not summary and first.strftime("%Y-%m-%d") <= today:
+        out.update(await _my_attendance_days(user, first.strftime("%Y-%m-%d"), last))
+    out["days"].sort(key=lambda d: d["date"], reverse=True)
+    log = await db.attendance_logs.find_one({"user_id": user["id"], "date": today}, {"_id": 0})
+    out["today_punch"] = {
+        "checked_in": bool(log and log.get("check_in")),
+        "check_in_time": ((log or {}).get("check_in") or {}).get("time"),
+        "checked_out": bool(log and log.get("check_out")),
+        "check_out_time": ((log or {}).get("check_out") or {}).get("time"),
+    }
+    out["office_open"] = await _office_open_now()
+    out["on_leave_today"] = bool(await _is_user_on_leave(user["id"]))
+    out["tracked"] = user.get("role") != "admin" and user.get("username") not in ("scanner", "test_user")
+    # missed punch-outs on the last 10 days (not today) that nobody has fixed yet
+    yday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    since = (now - timedelta(days=10)).strftime("%Y-%m-%d")
+    recent = await _my_attendance_days(user, since, yday) if out["tracked"] else {"days": []}
+    out["missing_punch_out"] = [{"date": d["date"], "weekday": d["weekday"], "punch_in": d["punch_in"]}
+                                for d in recent["days"] if d["status"] == "missing_punch_out"]
+    return out
+
+
 class ManualPunchInput(BaseModel):
     username: str
     password: str

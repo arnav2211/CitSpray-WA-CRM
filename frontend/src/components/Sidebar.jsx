@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo, AndroidLogo, UsersThree, Sparkle, Handshake, Recycle,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo, AndroidLogo, UsersThree, Sparkle, Handshake, Recycle, Fingerprint,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
@@ -186,7 +186,10 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
               <Item to="/ai-reports" icon={Sparkle} testId="nav-ai-reports" onNavigate={handleNavigate}>AI Reports</Item>
               <Item to="/promises" icon={Handshake} testId="nav-promises" onNavigate={handleNavigate}>Promises</Item>
               {!isAdmin && (
-                <Item to="/leaves" icon={CalendarCheck} testId="nav-leaves" onNavigate={handleNavigate}>My Leaves</Item>
+                <>
+                  <Item to="/my-attendance" icon={Fingerprint} testId="nav-my-attendance" onNavigate={handleNavigate}>My Attendance</Item>
+                  <Item to="/leaves" icon={CalendarCheck} testId="nav-leaves" onNavigate={handleNavigate}>My Leaves</Item>
+                </>
               )}
             </>
           )}
@@ -195,6 +198,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
             <>
               <div className="px-5 pt-2 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Data Entry</div>
               <Item to="/data-entry" icon={PlusCircle} testId="nav-data-entry" onNavigate={handleNavigate}>Lead Entry</Item>
+              <Item to="/my-attendance" icon={Fingerprint} testId="nav-my-attendance-de" onNavigate={handleNavigate}>My Attendance</Item>
               <Item to="/leaves" icon={CalendarCheck} testId="nav-leaves-de" onNavigate={handleNavigate}>My Leaves</Item>
             </>
           )}

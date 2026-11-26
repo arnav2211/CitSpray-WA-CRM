@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import Sidebar from "@/components/Sidebar";
 import FollowupAlerts from "@/components/FollowupAlerts";
 import { AlertListener } from "@/components/AlertListener";
+import AttendanceBanner, { PunchChip } from "@/components/AttendanceBanner";
 import { Outlet, useLocation, useNavigate, NavLink } from "react-router-dom";
 import { List, House, ChatTeardropDots, Kanban, Phone, PhoneCall, XCircle } from "@phosphor-icons/react";
 import { useAuth } from "@/context/AuthContext";
@@ -14,7 +15,7 @@ export default function AppShell() {
   const onChat = loc.pathname.startsWith("/chat") || loc.pathname.startsWith("/international/chat");
 
   useEffect(() => {
-    if (user && user.username !== "scanner" && user.role === "data_entry" && loc.pathname !== "/data-entry") {
+    if (user && user.username !== "scanner" && user.role === "data_entry" && loc.pathname !== "/data-entry" && loc.pathname !== "/my-attendance") {
       navigate("/data-entry", { replace: true });
     }
   }, [user, loc.pathname, navigate]);
@@ -65,6 +66,7 @@ export default function AppShell() {
     <div className="h-screen app-shell-viewport flex bg-white overflow-hidden" data-testid="app-shell">
       <Sidebar mobileOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} />
       <main className="flex-1 min-w-0 flex flex-col h-full overflow-hidden">
+        <AttendanceBanner />
         <header className="chat-hide shrink-0 z-20 bg-white/90 backdrop-blur-xl border-b border-gray-200 px-4 md:px-8 py-3 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0">
             <button
@@ -80,8 +82,11 @@ export default function AppShell() {
               <div className="font-chivo font-bold text-base md:text-lg leading-none truncate">{pageTitle(loc.pathname)}</div>
             </div>
           </div>
-          <div className="text-xs text-gray-500 hidden md:block">
-            <span className="kbd">v1.0</span> · Command Console
+          <div className="flex items-center gap-3">
+            <PunchChip />
+            <div className="text-xs text-gray-500 hidden md:block">
+              <span className="kbd">v1.0</span> · Command Console
+            </div>
           </div>
         </header>
         <div className={`flex-1 min-h-0 ${onChat ? "overflow-hidden" : "overflow-auto"}`}>
@@ -125,6 +130,7 @@ export default function AppShell() {
 }
 
 function pageTitle(path) {
+  if (path.startsWith("/my-attendance")) return "My Attendance";
   if (path.startsWith("/data-entry-inspect")) return "Data Entry Stats";
   if (path.startsWith("/data-entry")) return "Lead Entry";
   if (path.startsWith("/team-calls")) return "Team Calls";

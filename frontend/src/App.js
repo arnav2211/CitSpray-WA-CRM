@@ -35,6 +35,7 @@ import AiReports from "@/pages/AiReports";
 import WaCall from "@/pages/WaCall";
 import Promises from "@/pages/Promises";
 import WinBack from "@/pages/WinBack";
+import MyAttendance from "@/pages/MyAttendance";
 
 export default function App() {
   return (
@@ -76,6 +77,7 @@ export default function App() {
               <Route path="/payment-settings" element={<AdminOnly><PaymentSettings /></AdminOnly>} />
               <Route path="/payroll" element={<AdminOnly><PayrollPage /></AdminOnly>} />
               <Route path="/leaves" element={<LeavesPage />} />
+              <Route path="/my-attendance" element={<MyAttendance />} />
               <Route path="/reports" element={<ExecutiveOrAdminOnly><Reports /></ExecutiveOrAdminOnly>} />
               <Route path="/alerts" element={<AdminOnly><AdminAlerts /></AdminOnly>} />
               <Route path="/data-entry" element={<DataEntry />} />
