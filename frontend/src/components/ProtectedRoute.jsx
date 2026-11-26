@@ -32,6 +32,5 @@ export function ExecutiveOrAdminOnly({ children }) {
   }
   if (!user) return <Navigate to="/login" replace />;
   if (user.role === "data_entry") return <Navigate to="/data-entry" replace />;
-  if (user.role === "media") return <Navigate to="/documents" replace />;
   return children;
 }

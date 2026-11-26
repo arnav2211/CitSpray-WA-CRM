@@ -20,13 +20,6 @@ export default function AppShell() {
     }
   }, [user, loc.pathname, navigate]);
 
-  // The OMS media login only has Product Documents
-  useEffect(() => {
-    if (user && user.role === "media" && !loc.pathname.startsWith("/documents")) {
-      navigate("/documents", { replace: true });
-    }
-  }, [user, loc.pathname, navigate]);
-
   // Close mobile drawer on route change
   useEffect(() => { setSidebarOpen(false); }, [loc.pathname]);
 
@@ -101,7 +94,7 @@ export default function AppShell() {
         </div>
         {/* Mobile bottom nav — in normal flow (not fixed) so it can never
             overlap page content like the Add Note button */}
-        {user?.role !== "data_entry" && user?.role !== "media" && (
+        {user?.role !== "data_entry" && (
           <nav
             className="chat-hide md:hidden shrink-0 bg-white border-t border-gray-200 flex items-stretch justify-around h-14 shadow-[0_-2px_10px_rgba(0,0,0,0.05)]"
             style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
@@ -130,8 +123,8 @@ export default function AppShell() {
           </nav>
         )}
       </main>
-      {user?.role !== "media" && <FollowupAlerts />}
-      {user?.role !== "media" && <AlertListener />}
+      <FollowupAlerts />
+      <AlertListener />
     </div>
   );
 }

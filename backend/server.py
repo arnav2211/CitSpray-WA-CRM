@@ -757,11 +757,6 @@ async def get_current_user(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="User not found or inactive")
     if user.get("token_version", 0) != payload.get("token_version", 0):
         raise HTTPException(status_code=401, detail="Session expired or logged out from all devices")
-    # The OMS media login may only use Product Documents.
-    if user.get("role") == "media":
-        _p = request.url.path
-        if not (_p.startswith("/api/docs") or _p.startswith("/api/auth/") or _p == "/api/app/version"):
-            raise HTTPException(status_code=403, detail="The media login can only use Product Documents")
     # Soft-logout: if this is an executive currently on leave, force-401 so the
     # frontend's global 401 interceptor logs them out on the next poll (~4s).
     # Admins are never blocked even if they are marked on leave (edge-case safety).
@@ -815,33 +810,6 @@ def _login_record_fail(key: str):
     import time as _time
     _LOGIN_FAILS.setdefault(key, []).append(_time.time())
 
-async def _oms_media_login(uname: str, password: str, existing: Optional[dict]) -> Optional[dict]:
-    """The OMS media team signs in to the CRM with its OMS username/password. The
-    password is checked live against the OMS user (so changing it in the OMS changes
-    it here too). It maps to a CRM user with role "media" that can only use Product
-    Documents (enforced in get_current_user)."""
-    try:
-        ou = await oms_db.users.find_one({"username": {"$regex": f"^{re.escape(uname)}$", "$options": "i"},
-                                          "role": "media"}, {"_id": 0})
-    except Exception:
-        return None
-    if not ou or ou.get("active") is False or not ou.get("password_hash"):
-        return None
-    if not verify_password(password, ou["password_hash"]):
-        return None
-    if existing:
-        if existing.get("oms_user_id") != ou["id"]:
-            return None          # this username belongs to a normal CRM user
-        await db.users.update_one({"id": existing["id"]}, {"$set": {"name": ou.get("name") or existing.get("name"), "active": True}})
-        return await db.users.find_one({"id": existing["id"]})
-    doc = {"id": str(uuid.uuid4()), "username": uname, "name": ou.get("name") or "Media", "role": "media",
-           "company": DEFAULT_COMPANY, "active": True, "oms_user_id": ou["id"], "password_hash": "",
-           "created_at": iso(now_utc())}
-    await db.users.insert_one(doc.copy())
-    await log_activity(None, "oms_media_user_linked", None, {"user_id": doc["id"], "oms_user_id": ou["id"], "username": uname})
-    return await db.users.find_one({"id": doc["id"]})
-
-
 @api.post("/auth/login")
 async def login(body: LoginInput, response: Response, request: Request):
     uname = body.username.strip().lower()
@@ -849,11 +817,7 @@ async def login(body: LoginInput, response: Response, request: Request):
     if _login_blocked(throttle_key):
         raise HTTPException(status_code=429, detail="Too many failed attempts — try again in 15 minutes")
     user = await db.users.find_one({"username": uname})
-    ok = bool(user) and not user.get("oms_user_id") and verify_password(body.password, user.get("password_hash", ""))
-    if not ok and (not user or user.get("oms_user_id")):
-        user = await _oms_media_login(uname, body.password, user)   # OMS media team login
-        ok = bool(user)
-    if not ok:
+    if not user or not verify_password(body.password, user.get("password_hash", "")):
         _login_record_fail(throttle_key)
         raise HTTPException(status_code=401, detail="Invalid credentials")
     _LOGIN_FAILS.pop(throttle_key, None)
@@ -19373,7 +19337,7 @@ async def _docs_editor_ids() -> List[str]:
 
 
 async def _is_docs_editor(user: dict) -> bool:
-    return user.get("role") in ("admin", "media") or user["id"] in await _docs_editor_ids()
+    return user.get("role") in ("admin", "oms_media") or user["id"] in await _docs_editor_ids()
 
 
 async def _require_docs_editor(user: dict):
@@ -19382,7 +19346,29 @@ async def _require_docs_editor(user: dict):
 
 
 def _doc_visible_q(user: dict) -> Dict[str, Any]:
-    return {} if user.get("role") == "admin" else {"visibility": {"$ne": "admin"}}
+    if user.get("role") == "admin" or user.get("oms_role") == "admin":
+        return {}
+    return {"visibility": {"$ne": "admin"}}
+
+
+async def get_docs_user(request: Request) -> dict:
+    """Product Documents accept a CRM login OR an OMS login: the OMS media team (and
+    OMS admin) manage the library from inside the OMS. An OMS login only ever gets
+    document rights here - never any other CRM endpoint (they all use get_current_user)."""
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else ""
+    if token:
+        try:
+            pl = jwt.decode(token, os.environ.get("OMS_JWT_SECRET", "9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c"), algorithms=["HS256"])
+        except Exception:
+            pl = None
+        if pl and pl.get("user_id") and not pl.get("svc") and not pl.get("sub"):
+            ou = await oms_db.users.find_one({"id": pl["user_id"]}, {"_id": 0, "password_hash": 0})
+            if not ou or ou.get("active") is False or ou.get("role") not in ("media", "admin"):
+                raise HTTPException(status_code=403, detail="Your OMS login can't use Product Documents")
+            return {"id": f"oms:{ou['id']}", "name": ou.get("name") or ou.get("username"), "username": ou.get("username"),
+                    "role": "oms_media", "oms_role": ou.get("role"), "company": DEFAULT_COMPANY, "active": True}
+    return await get_current_user(request)
 
 
 def _safe_name(s: str) -> str:
@@ -19446,7 +19432,7 @@ class DocEditorsInput(BaseModel):
 
 
 @api.get("/docs/meta")
-async def docs_meta(user: dict = Depends(get_current_user)):
+async def docs_meta(user: dict = Depends(get_docs_user)):
     out = {"kinds": DOC_KINDS, "can_edit": await _is_docs_editor(user), "is_admin": user.get("role") == "admin"}
     if user.get("role") == "admin":
         out["editor_ids"] = await _docs_editor_ids()
@@ -19460,7 +19446,7 @@ async def docs_set_editors(body: DocEditorsInput, admin: dict = Depends(require_
 
 
 @api.get("/docs/products")
-async def docs_products(q: str = "", user: dict = Depends(get_current_user),
+async def docs_products(q: str = "", user: dict = Depends(get_docs_user),
                         x_company: Optional[str] = Header(None, alias="X-Company")):
     comp = _resolve_company(user, x_company)
     filt: Dict[str, Any] = {**company_filter(comp), "deleted": {"$ne": True}}
@@ -19482,7 +19468,7 @@ async def docs_products(q: str = "", user: dict = Depends(get_current_user),
 
 
 @api.post("/docs/products")
-async def docs_create_product(body: DocProductInput, user: dict = Depends(get_current_user),
+async def docs_create_product(body: DocProductInput, user: dict = Depends(get_docs_user),
                               x_company: Optional[str] = Header(None, alias="X-Company")):
     await _require_docs_editor(user)
     comp = _resolve_company(user, x_company)
@@ -19501,7 +19487,7 @@ async def docs_create_product(body: DocProductInput, user: dict = Depends(get_cu
 
 
 @api.put("/docs/products/{pid}")
-async def docs_update_product(pid: str, body: DocProductInput, user: dict = Depends(get_current_user)):
+async def docs_update_product(pid: str, body: DocProductInput, user: dict = Depends(get_docs_user)):
     await _require_docs_editor(user)
     await db.doc_products.update_one({"id": pid}, {"$set": {
         "name": body.name.strip(), "aliases": [a.strip() for a in body.aliases if a and a.strip()]}})
@@ -19509,7 +19495,7 @@ async def docs_update_product(pid: str, body: DocProductInput, user: dict = Depe
 
 
 @api.delete("/docs/products/{pid}")
-async def docs_delete_product(pid: str, user: dict = Depends(get_current_user)):
+async def docs_delete_product(pid: str, user: dict = Depends(get_docs_user)):
     await _require_docs_editor(user)
     if await db.doc_files.count_documents({"product_id": pid, "deleted": {"$ne": True}}):
         raise HTTPException(status_code=400, detail="Delete its documents first")
@@ -19518,7 +19504,7 @@ async def docs_delete_product(pid: str, user: dict = Depends(get_current_user)):
 
 
 @api.get("/docs/products/{pid}")
-async def docs_product(pid: str, user: dict = Depends(get_current_user)):
+async def docs_product(pid: str, user: dict = Depends(get_docs_user)):
     p = await db.doc_products.find_one({"id": pid, "deleted": {"$ne": True}}, {"_id": 0})
     if not p:
         raise HTTPException(status_code=404, detail="Not found")
@@ -19527,6 +19513,11 @@ async def docs_product(pid: str, user: dict = Depends(get_current_user)):
     docs = await db.doc_files.find({"product_id": pid, "deleted": {"$ne": True}, **_doc_visible_q(user)},
                                    {"_id": 0}).sort("created_at", -1).to_list(500)
     names = {u["id"]: u.get("name") for u in await db.users.find({}, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
+    try:
+        for ou in await oms_db.users.find({}, {"_id": 0, "id": 1, "name": 1}).to_list(500):
+            names[f"oms:{ou['id']}"] = f"{ou.get('name')} (OMS)"
+    except Exception:
+        pass
     for d in docs:
         d["created_by_name"] = names.get(d.get("created_by"))
         if d.get("source") == "coa":
@@ -19538,7 +19529,7 @@ async def docs_product(pid: str, user: dict = Depends(get_current_user)):
 @api.post("/docs/upload")
 async def docs_upload(product_id: str = Form(...), kind: str = Form("other"), title: str = Form(""),
                       visibility: str = Form("team"), file: UploadFile = File(...),
-                      user: dict = Depends(get_current_user)):
+                      user: dict = Depends(get_docs_user)):
     await _require_docs_editor(user)
     p = await db.doc_products.find_one({"id": product_id, "deleted": {"$ne": True}}, {"_id": 0})
     if not p:
@@ -19563,7 +19554,7 @@ async def docs_upload(product_id: str = Form(...), kind: str = Form("other"), ti
 
 
 @api.post("/docs/coa")
-async def docs_save_coa(body: CoaInput, user: dict = Depends(get_current_user)):
+async def docs_save_coa(body: CoaInput, user: dict = Depends(get_docs_user)):
     await _require_docs_editor(user)
     p = await db.doc_products.find_one({"id": body.product_id, "deleted": {"$ne": True}}, {"_id": 0}) if body.product_id else None
     if not p:
@@ -19578,7 +19569,7 @@ async def docs_save_coa(body: CoaInput, user: dict = Depends(get_current_user)):
 
 
 @api.post("/docs/coa/render")
-async def docs_render_coa(body: CoaInput, user: dict = Depends(get_current_user),
+async def docs_render_coa(body: CoaInput, user: dict = Depends(get_docs_user),
                           x_company: Optional[str] = Header(None, alias="X-Company")):
     """Preview / download-only: draw the COA and return the PDF. Nothing is saved."""
     await _require_docs_editor(user)
@@ -19593,7 +19584,7 @@ async def docs_render_coa(body: CoaInput, user: dict = Depends(get_current_user)
 
 
 @api.put("/docs/documents/{did}")
-async def docs_update(did: str, body: DocUpdateInput, user: dict = Depends(get_current_user)):
+async def docs_update(did: str, body: DocUpdateInput, user: dict = Depends(get_docs_user)):
     await _require_docs_editor(user)
     upd = {k: v for k, v in body.dict().items() if v is not None}
     if "kind" in upd and upd["kind"] not in DOC_KINDS:
@@ -19606,14 +19597,14 @@ async def docs_update(did: str, body: DocUpdateInput, user: dict = Depends(get_c
 
 
 @api.delete("/docs/documents/{did}")
-async def docs_delete(did: str, user: dict = Depends(get_current_user)):
+async def docs_delete(did: str, user: dict = Depends(get_docs_user)):
     await _require_docs_editor(user)
     await db.doc_files.update_one({"id": did}, {"$set": {"deleted": True, "deleted_at": iso(now_utc()), "deleted_by": user["id"]}})
     return {"ok": True}
 
 
 @api.get("/docs/documents/{did}/file")
-async def docs_file(did: str, download: bool = False, user: dict = Depends(get_current_user)):
+async def docs_file(did: str, download: bool = False, user: dict = Depends(get_docs_user)):
     d = await db.doc_files.find_one({"id": did, "deleted": {"$ne": True}, **_doc_visible_q(user)}, {"_id": 0})
     if not d:
         raise HTTPException(status_code=404, detail="Not found")
@@ -19626,7 +19617,7 @@ async def docs_file(did: str, download: bool = False, user: dict = Depends(get_c
 
 
 @api.post("/docs/documents/{did}/link")
-async def docs_link(did: str, download: bool = False, user: dict = Depends(get_current_user)):
+async def docs_link(did: str, download: bool = False, user: dict = Depends(get_docs_user)):
     """Short-lived signed link to view / download a document without the login
     header (works in the phone app's WebView and in a new browser tab)."""
     d = await db.doc_files.find_one({"id": did, "deleted": {"$ne": True}, **_doc_visible_q(user)}, {"_id": 0, "id": 1})
@@ -19634,7 +19625,8 @@ async def docs_link(did: str, download: bool = False, user: dict = Depends(get_c
         raise HTTPException(status_code=404, detail="Not found")
     tok = jwt.encode({"typ": "doclink", "doc": did, "dl": bool(download), "uid": user["id"],
                       "exp": now_utc() + timedelta(minutes=15)}, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    return {"url": f"/api/docs/view/{tok}"}
+    crm_base = os.environ.get("FRONTEND_BASE_URL", "https://crm.mangalamagro.in").rstrip("/")
+    return {"url": f"/api/docs/view/{tok}", "abs_url": f"{crm_base}/api/docs/view/{tok}"}
 
 
 @api.get("/docs/view/{tok}")
@@ -19710,7 +19702,8 @@ app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    # + the OMS site, which hosts the media team's Product Documents page
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(",") + ["https://oms.mangalamagro.in"],
     allow_methods=["*"],
     allow_headers=["*"],
 )

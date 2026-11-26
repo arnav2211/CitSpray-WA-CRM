@@ -163,13 +163,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
         </div>
 
         <nav className="flex-1 py-3 space-y-0.5 overflow-y-auto">
-          {user?.role === "media" && (
-            <>
-              <div className="px-5 pt-2 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Media</div>
-              <Item to="/documents" icon={Files} testId="nav-documents-media" onNavigate={handleNavigate}>Product Documents</Item>
-            </>
-          )}
-          {user?.role !== "data_entry" && user?.role !== "media" && (
+          {user?.role !== "data_entry" && (
             <>
               <div className="px-5 pt-2 pb-1 text-[10px] uppercase tracking-widest text-gray-400 font-bold">Workspace</div>
               <Item to="/dashboard" icon={ChartBar} testId="nav-dashboard" onNavigate={handleNavigate}>Dashboard</Item>
