@@ -19317,6 +19317,319 @@ async def adjust_payroll(body: PayrollAdjustInput, admin: dict = Depends(require
         )
     return {"ok": True}
 
+# ------------- Product Documents (COA / GCMS / TDS / MSDS ...) -------------
+# One page per oil; each oil holds any number of documents. Uploaded files are
+# stored privately (not under /api/uploads); COAs are stored as data and drawn
+# on the letterhead on demand (coa_pdf.py), so "auto" COAs always carry the
+# current month while "locked" ones keep their dates. Visibility "admin" hides a
+# document from everyone except admins. Editors = admins + the users the admin
+# picks on the Documents page (the media team).
+PRODUCT_DOCS_DIR = ROOT_DIR / "product_docs"
+PRODUCT_DOCS_DIR.mkdir(exist_ok=True)
+DOC_KINDS = {"coa": "COA", "gcms": "GCMS", "tds": "TDS", "msds": "MSDS / SDS", "ifra": "IFRA",
+             "spec": "Specification", "other": "Other"}
+_DOC_EXT_OK = {".pdf", ".jpg", ".jpeg", ".png", ".webp", ".doc", ".docx", ".xls", ".xlsx"}
+
+
+async def _docs_editor_ids() -> List[str]:
+    s = await db.system_settings.find_one({"key": "docs_editors"}, {"_id": 0, "user_ids": 1})
+    return list((s or {}).get("user_ids") or [])
+
+
+async def _is_docs_editor(user: dict) -> bool:
+    return user.get("role") == "admin" or user["id"] in await _docs_editor_ids()
+
+
+async def _require_docs_editor(user: dict):
+    if not await _is_docs_editor(user):
+        raise HTTPException(status_code=403, detail="Only the admin or the media team can change documents")
+
+
+def _doc_visible_q(user: dict) -> Dict[str, Any]:
+    return {} if user.get("role") == "admin" else {"visibility": {"$ne": "admin"}}
+
+
+def _safe_name(s: str) -> str:
+    s = re.sub(r"[\\/:*?\"<>|]+", " ", s or "").strip()
+    return re.sub(r"\s+", " ", s)[:120] or "document"
+
+
+def _doc_download_name(doc: dict, product: Optional[dict]) -> str:
+    base = _safe_name(doc.get("title") or (product or {}).get("name") or "Document")
+    if doc.get("source") == "coa":
+        from coa_pdf import coa_dates
+        mfg, _ = coa_dates(doc.get("coa") or {}, _ist_now().replace(tzinfo=None))
+        return f"{base} - {mfg}.pdf" if mfg and mfg not in base else f"{base}.pdf"
+    ext = Path(doc.get("filename") or "").suffix.lower() or ".pdf"
+    return base if base.lower().endswith(ext) else base + ext
+
+
+async def _doc_bytes(doc: dict) -> tuple:
+    """(bytes, mime) of a document as it should look right now."""
+    if doc.get("source") == "coa":
+        from coa_pdf import render_coa_pdf
+        loop = asyncio.get_event_loop()
+        comp = normalize_company(doc.get("company"))
+        pdf = await loop.run_in_executor(None, lambda: render_coa_pdf(
+            doc.get("coa") or {}, comp, COMPANIES.get(comp, ""), _ist_now().replace(tzinfo=None)))
+        return pdf, "application/pdf"
+    path = PRODUCT_DOCS_DIR / (doc.get("file") or "")
+    if not doc.get("file") or not path.exists():
+        raise HTTPException(status_code=404, detail="File missing on the server")
+    return path.read_bytes(), (doc.get("mime") or "application/octet-stream")
+
+
+class DocProductInput(BaseModel):
+    name: str
+    aliases: List[str] = []
+
+
+class CoaInput(BaseModel):
+    product_id: Optional[str] = None
+    title: Optional[str] = None            # document name in the library
+    visibility: Literal["team", "admin"] = "team"
+    kind: str = "coa"
+    coa: Dict[str, Any]
+
+
+class DocUpdateInput(BaseModel):
+    title: Optional[str] = None
+    kind: Optional[str] = None
+    visibility: Optional[Literal["team", "admin"]] = None
+    coa: Optional[Dict[str, Any]] = None
+
+
+class DocSendInput(BaseModel):
+    lead_id: str
+    doc_ids: List[str]
+    caption: Optional[str] = None
+
+
+class DocEditorsInput(BaseModel):
+    user_ids: List[str]
+
+
+@api.get("/docs/meta")
+async def docs_meta(user: dict = Depends(get_current_user)):
+    out = {"kinds": DOC_KINDS, "can_edit": await _is_docs_editor(user), "is_admin": user.get("role") == "admin"}
+    if user.get("role") == "admin":
+        out["editor_ids"] = await _docs_editor_ids()
+    return out
+
+
+@api.put("/docs/editors")
+async def docs_set_editors(body: DocEditorsInput, admin: dict = Depends(require_admin)):
+    await db.system_settings.update_one({"key": "docs_editors"}, {"$set": {"user_ids": body.user_ids}}, upsert=True)
+    return {"ok": True, "user_ids": body.user_ids}
+
+
+@api.get("/docs/products")
+async def docs_products(q: str = "", user: dict = Depends(get_current_user),
+                        x_company: Optional[str] = Header(None, alias="X-Company")):
+    comp = _resolve_company(user, x_company)
+    filt: Dict[str, Any] = {**company_filter(comp), "deleted": {"$ne": True}}
+    q = (q or "").strip()
+    if q:
+        rx = {"$regex": re.escape(q), "$options": "i"}
+        filt["$or"] = [{"name": rx}, {"aliases": rx}]
+    prods = await db.doc_products.find(filt, {"_id": 0}).sort("name", 1).to_list(1000)
+    ids = [p["id"] for p in prods]
+    counts: Dict[str, Dict[str, int]] = {}
+    async for d in db.doc_files.find({"product_id": {"$in": ids}, "deleted": {"$ne": True}, **_doc_visible_q(user)},
+                                     {"_id": 0, "product_id": 1, "kind": 1}):
+        c = counts.setdefault(d["product_id"], {})
+        c[d.get("kind") or "other"] = c.get(d.get("kind") or "other", 0) + 1
+    for p in prods:
+        p["counts"] = counts.get(p["id"], {})
+        p["total"] = sum(p["counts"].values())
+    return {"products": prods}
+
+
+@api.post("/docs/products")
+async def docs_create_product(body: DocProductInput, user: dict = Depends(get_current_user),
+                              x_company: Optional[str] = Header(None, alias="X-Company")):
+    await _require_docs_editor(user)
+    comp = _resolve_company(user, x_company)
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+    dup = await db.doc_products.find_one({**company_filter(comp), "deleted": {"$ne": True},
+                                          "name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}}, {"_id": 0})
+    if dup:
+        return dup
+    doc = {"id": str(uuid.uuid4()), "company": comp, "name": name,
+           "aliases": [a.strip() for a in body.aliases if a and a.strip()],
+           "created_by": user["id"], "created_at": iso(now_utc())}
+    await db.doc_products.insert_one(doc.copy())
+    return doc
+
+
+@api.put("/docs/products/{pid}")
+async def docs_update_product(pid: str, body: DocProductInput, user: dict = Depends(get_current_user)):
+    await _require_docs_editor(user)
+    await db.doc_products.update_one({"id": pid}, {"$set": {
+        "name": body.name.strip(), "aliases": [a.strip() for a in body.aliases if a and a.strip()]}})
+    return await db.doc_products.find_one({"id": pid}, {"_id": 0})
+
+
+@api.delete("/docs/products/{pid}")
+async def docs_delete_product(pid: str, user: dict = Depends(get_current_user)):
+    await _require_docs_editor(user)
+    if await db.doc_files.count_documents({"product_id": pid, "deleted": {"$ne": True}}):
+        raise HTTPException(status_code=400, detail="Delete its documents first")
+    await db.doc_products.update_one({"id": pid}, {"$set": {"deleted": True, "deleted_at": iso(now_utc())}})
+    return {"ok": True}
+
+
+@api.get("/docs/products/{pid}")
+async def docs_product(pid: str, user: dict = Depends(get_current_user)):
+    p = await db.doc_products.find_one({"id": pid, "deleted": {"$ne": True}}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="Not found")
+    if user.get("role") not in ("admin", "data_entry") and normalize_company(p.get("company")) != normalize_company(user.get("company")):
+        raise HTTPException(status_code=404, detail="Not found")
+    docs = await db.doc_files.find({"product_id": pid, "deleted": {"$ne": True}, **_doc_visible_q(user)},
+                                   {"_id": 0}).sort("created_at", -1).to_list(500)
+    names = {u["id"]: u.get("name") for u in await db.users.find({}, {"_id": 0, "id": 1, "name": 1}).to_list(500)}
+    for d in docs:
+        d["created_by_name"] = names.get(d.get("created_by"))
+        if d.get("source") == "coa":
+            from coa_pdf import coa_dates
+            d["current_dates"] = coa_dates(d.get("coa") or {}, _ist_now().replace(tzinfo=None))
+    return {"product": p, "documents": docs}
+
+
+@api.post("/docs/upload")
+async def docs_upload(product_id: str = Form(...), kind: str = Form("other"), title: str = Form(""),
+                      visibility: str = Form("team"), file: UploadFile = File(...),
+                      user: dict = Depends(get_current_user)):
+    await _require_docs_editor(user)
+    p = await db.doc_products.find_one({"id": product_id, "deleted": {"$ne": True}}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="Oil not found")
+    original = _safe_name(file.filename or "document")
+    ext = Path(original).suffix.lower()
+    if ext not in _DOC_EXT_OK:
+        raise HTTPException(status_code=400, detail="Upload a PDF, image, Word or Excel file")
+    data = await file.read()
+    if len(data) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 25 MB)")
+    stored = f"{uuid.uuid4().hex}{ext}"
+    (PRODUCT_DOCS_DIR / stored).write_bytes(data)
+    doc = {"id": str(uuid.uuid4()), "company": p.get("company"), "product_id": product_id,
+           "kind": kind if kind in DOC_KINDS else "other", "source": "upload",
+           "title": (title or "").strip() or f"{p['name']} - {DOC_KINDS.get(kind, 'Document')}",
+           "visibility": "admin" if visibility == "admin" else "team",
+           "file": stored, "filename": original, "mime": file.content_type or "application/octet-stream",
+           "size": len(data), "created_by": user["id"], "created_at": iso(now_utc())}
+    await db.doc_files.insert_one(doc.copy())
+    return doc
+
+
+@api.post("/docs/coa")
+async def docs_save_coa(body: CoaInput, user: dict = Depends(get_current_user)):
+    await _require_docs_editor(user)
+    p = await db.doc_products.find_one({"id": body.product_id, "deleted": {"$ne": True}}, {"_id": 0}) if body.product_id else None
+    if not p:
+        raise HTTPException(status_code=400, detail="Pick the oil this document belongs to")
+    title = (body.title or "").strip() or f"{p['name']} - {(body.coa.get('title') or 'COA').title()}"
+    doc = {"id": str(uuid.uuid4()), "company": p.get("company"), "product_id": p["id"],
+           "kind": body.kind if body.kind in DOC_KINDS else "coa", "source": "coa", "title": title,
+           "visibility": body.visibility, "coa": body.coa,
+           "created_by": user["id"], "created_at": iso(now_utc())}
+    await db.doc_files.insert_one(doc.copy())
+    return doc
+
+
+@api.post("/docs/coa/render")
+async def docs_render_coa(body: CoaInput, user: dict = Depends(get_current_user),
+                          x_company: Optional[str] = Header(None, alias="X-Company")):
+    """Preview / download-only: draw the COA and return the PDF. Nothing is saved."""
+    await _require_docs_editor(user)
+    from coa_pdf import render_coa_pdf
+    comp = _resolve_company(user, x_company)
+    loop = asyncio.get_event_loop()
+    pdf = await loop.run_in_executor(None, lambda: render_coa_pdf(
+        body.coa, comp, COMPANIES.get(comp, ""), _ist_now().replace(tzinfo=None)))
+    name = _safe_name(body.title or body.coa.get("title") or "COA")
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'inline; filename="{name}.pdf"'})
+
+
+@api.put("/docs/documents/{did}")
+async def docs_update(did: str, body: DocUpdateInput, user: dict = Depends(get_current_user)):
+    await _require_docs_editor(user)
+    upd = {k: v for k, v in body.dict().items() if v is not None}
+    if "kind" in upd and upd["kind"] not in DOC_KINDS:
+        upd.pop("kind")
+    if not upd:
+        return {"ok": True}
+    upd["updated_at"] = iso(now_utc()); upd["updated_by"] = user["id"]
+    await db.doc_files.update_one({"id": did}, {"$set": upd})
+    return await db.doc_files.find_one({"id": did}, {"_id": 0})
+
+
+@api.delete("/docs/documents/{did}")
+async def docs_delete(did: str, user: dict = Depends(get_current_user)):
+    await _require_docs_editor(user)
+    await db.doc_files.update_one({"id": did}, {"$set": {"deleted": True, "deleted_at": iso(now_utc()), "deleted_by": user["id"]}})
+    return {"ok": True}
+
+
+@api.get("/docs/documents/{did}/file")
+async def docs_file(did: str, download: bool = False, user: dict = Depends(get_current_user)):
+    d = await db.doc_files.find_one({"id": did, "deleted": {"$ne": True}, **_doc_visible_q(user)}, {"_id": 0})
+    if not d:
+        raise HTTPException(status_code=404, detail="Not found")
+    p = await db.doc_products.find_one({"id": d.get("product_id")}, {"_id": 0, "name": 1})
+    data, mime = await _doc_bytes(d)
+    name = _doc_download_name(d, p)
+    disp = "attachment" if download else "inline"
+    return Response(content=data, media_type=mime,
+                    headers={"Content-Disposition": f"{disp}; filename=\"{name.encode('ascii', 'ignore').decode() or 'document'}\""})
+
+
+@api.post("/docs/send")
+async def docs_send(body: DocSendInput, user: dict = Depends(get_current_user)):
+    """Send documents from the library to a lead on WhatsApp (each as a document message)."""
+    ctx = await _assert_chat_permitted(user, body.lead_id)
+    target_phone = ctx["target_phone"]
+    _co = normalize_company(ctx["lead"].get("company"))
+    crm_base_url = os.environ.get("FRONTEND_BASE_URL", "https://crm.mangalamagro.in").rstrip("/")
+    sent, failed = [], []
+    for i, did in enumerate(body.doc_ids[:10]):
+        d = await db.doc_files.find_one({"id": did, "deleted": {"$ne": True}, **_doc_visible_q(user)}, {"_id": 0})
+        if not d:
+            failed.append({"id": did, "error": "not found"}); continue
+        p = await db.doc_products.find_one({"id": d.get("product_id")}, {"_id": 0, "name": 1})
+        try:
+            data, mime = await _doc_bytes(d)
+        except HTTPException as e:
+            failed.append({"id": did, "error": e.detail}); continue
+        name = _doc_download_name(d, p)
+        stored = f"{uuid.uuid4().hex}{Path(name).suffix.lower() or '.pdf'}"
+        (UPLOAD_DIR / stored).write_bytes(data)
+        public_url = f"{crm_base_url}/api/uploads/{stored}"
+        is_img = mime.startswith("image/")
+        caption = (body.caption or "").strip() if i == 0 else ""
+        reply_ctx = await _resolve_reply_context(body.lead_id, None)
+        api_result = await wa_send_media(to_phone=target_phone, media_type="image" if is_img else "document",
+                                         url=public_url, caption=caption or None,
+                                         filename=None if is_img else name, reply_to_wamid=None, company=_co)
+        preview = f"[{'image' if is_img else 'document: ' + name}] {caption}".rstrip()
+        extra = {"media_type": "image" if is_img else "document", "media_url": public_url,
+                 "filename": name, "doc_id": did}
+        if caption:
+            extra["caption"] = caption
+        msg = await _record_sent_message(body.lead_id, user["id"], target_phone, preview, api_result, extra, reply_ctx)
+        await log_activity(user["id"], "document_sent", body.lead_id,
+                           {"doc_id": did, "title": d.get("title"), "kind": d.get("kind"), "status": msg["status"]})
+        (failed if msg["status"] == "failed" else sent).append({"id": did, "name": name, "error": msg.get("error")})
+    if not sent and failed:
+        raise HTTPException(status_code=400, detail=failed[0].get("error") or "Could not send")
+    return {"sent": sent, "failed": failed}
+
+
 # Root ping for api
 @api.get("/")
 async def root():

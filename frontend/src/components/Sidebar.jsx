@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo, AndroidLogo, UsersThree, Sparkle, Handshake, Recycle, Fingerprint,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo, AndroidLogo, UsersThree, Sparkle, Handshake, Recycle, Fingerprint, Files,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
@@ -185,6 +185,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
               <Item to="/reports" icon={PaperPlaneTilt} testId="nav-reports" onNavigate={handleNavigate}>Reports</Item>
               <Item to="/ai-reports" icon={Sparkle} testId="nav-ai-reports" onNavigate={handleNavigate}>AI Reports</Item>
               <Item to="/promises" icon={Handshake} testId="nav-promises" onNavigate={handleNavigate}>Promises</Item>
+              <Item to="/documents" icon={Files} testId="nav-documents" onNavigate={handleNavigate}>Product Documents</Item>
               {!isAdmin && (
                 <>
                   <Item to="/my-attendance" icon={Fingerprint} testId="nav-my-attendance" onNavigate={handleNavigate}>My Attendance</Item>

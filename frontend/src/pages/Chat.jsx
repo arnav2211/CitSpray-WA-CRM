@@ -19,6 +19,7 @@ import OMSDataSection from "@/components/OMSDataSection";
 import LeadReference from "@/components/LeadReference";
 import CallAiSummary from "@/components/CallAiSummary";
 import TagsEditor from "@/components/TagsEditor";
+import DocPicker from "@/components/DocPicker";
 import { WaHeader, WaFooter, WaButtons } from "@/components/WaParts";
 import { useCompany } from "@/context/CompanyContext";
 
@@ -1460,6 +1461,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
   const [mediaItems, setMediaItems] = useState(null);
   const [mediaSending, setMediaSending] = useState(false);
   const [cameraOpen, setCameraOpen] = useState(false);
+  const [docPickerOpen, setDocPickerOpen] = useState(false);
   const [dropActive, setDropActive] = useState(false);
   const dragDepthRef = useRef(0);
   const movedDraftRef = useRef(null);   // composer text that became the first caption
@@ -2048,6 +2050,7 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
                       <button onClick={() => pickFile("video")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-video"><VideoCamera size={16} className="text-[#BE185D]" /> Video</button>
                       <button onClick={() => { setShowAttach(false); setCameraOpen(true); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-camera"><Camera size={16} className="text-[#0F766E]" /> Camera</button>
                       <button onClick={() => pickFile("document")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-document"><FileText size={16} className="text-[#475569]" /> Document</button>
+                      <button onClick={() => { setShowAttach(false); setDocPickerOpen(true); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-product-docs"><FileText size={16} weight="fill" className="text-[#002FA7]" /> Product docs (COA, GCMS…)</button>
                       <button onClick={() => pickFile("audio")} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm" data-testid="attach-audio-file"><Microphone size={16} className="text-[#7C3AED]" /> Audio file</button>
                       <button onClick={startRecording} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-record"><Microphone size={16} weight="fill" className="text-[#E60000]" /> Record voice note</button>
                       <button onClick={() => { setAttachMode("location"); setShowAttach(false); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-50 text-sm border-t border-gray-100" data-testid="attach-location"><MapPin size={16} className="text-[#0891B2]" /> Location</button>
@@ -2458,6 +2461,10 @@ function ChatThread({ conv, user, execs, onClose, onChanged, initialTab, initial
           sending={mediaSending}
           customerName={conv.customer_name}
         />
+      )}
+      {docPickerOpen && (
+        <DocPicker leadId={conv.id} onClose={() => setDocPickerOpen(false)}
+          onSent={() => { setDocPickerOpen(false); loadMessages(); onChanged?.(); }} />
       )}
       {cameraOpen && (
         <CameraModal

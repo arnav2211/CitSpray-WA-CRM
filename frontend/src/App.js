@@ -36,6 +36,7 @@ import WaCall from "@/pages/WaCall";
 import Promises from "@/pages/Promises";
 import WinBack from "@/pages/WinBack";
 import MyAttendance from "@/pages/MyAttendance";
+import Documents from "@/pages/Documents";
 
 export default function App() {
   return (
@@ -78,6 +79,7 @@ export default function App() {
               <Route path="/payroll" element={<AdminOnly><PayrollPage /></AdminOnly>} />
               <Route path="/leaves" element={<LeavesPage />} />
               <Route path="/my-attendance" element={<MyAttendance />} />
+              <Route path="/documents" element={<Documents />} />
               <Route path="/reports" element={<ExecutiveOrAdminOnly><Reports /></ExecutiveOrAdminOnly>} />
               <Route path="/alerts" element={<AdminOnly><AdminAlerts /></AdminOnly>} />
               <Route path="/data-entry" element={<DataEntry />} />

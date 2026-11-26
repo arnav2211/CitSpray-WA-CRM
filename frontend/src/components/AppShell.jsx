@@ -131,6 +131,7 @@ export default function AppShell() {
 
 function pageTitle(path) {
   if (path.startsWith("/my-attendance")) return "My Attendance";
+  if (path.startsWith("/documents")) return "Product Documents";
   if (path.startsWith("/data-entry-inspect")) return "Data Entry Stats";
   if (path.startsWith("/data-entry")) return "Lead Entry";
   if (path.startsWith("/team-calls")) return "Team Calls";
