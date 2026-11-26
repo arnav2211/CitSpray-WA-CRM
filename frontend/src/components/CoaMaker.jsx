@@ -45,6 +45,22 @@ const paramCol = (s) => (s.columns.length > 2 && SR_COL.test(String(s.columns[0]
 const inp = "w-full border border-gray-300 px-2 py-1.5 text-sm outline-none focus:border-[#002FA7]";
 const lbl = "text-[10px] uppercase tracking-widest text-gray-500 font-bold";
 
+// spelling: replace whole words only (keeps codes like MG/CTS10SEMA intact)
+const escRe = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function fixText(text, word, sugg) {
+  return String(text ?? "").replace(new RegExp(`(?<![A-Za-z0-9])${escRe(word)}(?![A-Za-z0-9])`, "g"), sugg);
+}
+function applyIssue(coa, it) {
+  const c = JSON.parse(JSON.stringify(coa));
+  const path = it.path;
+  let obj = c;
+  for (let i = 0; i < path.length - 1; i += 1) obj = obj?.[path[i]];
+  const last = path[path.length - 1];
+  if (obj && obj[last] != null) obj[last] = fixText(obj[last], it.word, it.suggestion);
+  return c;
+}
+const pathKey = (p) => p.join(".");
+
 function move(arr, i, d) {
   const j = i + d;
   if (j < 0 || j >= arr.length) return arr;
@@ -57,6 +73,7 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
   const [oilName, setOilName] = useState(() => products.find((p) => p.id === (src?.product_id || productId))?.name || "");
   const [sugg, setSugg] = useState({ parameters: [], results: ["Complies"], standard_note: "" });
   const [stdEdit, setStdEdit] = useState(null);   // text while editing the standard note
+  const [spell, setSpell] = useState([]);          // [{path, word, suggestion}]
   const [title, setTitle] = useState(existing ? existing.title : duplicateOf ? `${duplicateOf.title} (copy)` : "");
   const [visibility, setVisibility] = useState(existing?.visibility || "team");
   const [previewUrl, setPreviewUrl] = useState(null);
@@ -65,6 +82,29 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
 
   useEffect(() => () => { if (urlRef.current) URL.revokeObjectURL(urlRef.current); }, []);
   useEffect(() => { api.get("/docs/coa/suggestions").then(({ data }) => setSugg(data)).catch(() => {}); }, []);
+  // spelling check a moment after typing stops
+  useEffect(() => {
+    const t = setTimeout(() => {
+      api.post("/docs/coa/spellcheck", { coa }).then(({ data }) => setSpell(data.issues || [])).catch(() => {});
+    }, 700);
+    return () => clearTimeout(t);
+  }, [coa]);
+  const badPaths = new Set(spell.map((i) => pathKey(i.path)));
+  const warn = (path) => (badPaths.has(pathKey(path)) ? " !border-amber-500 bg-amber-50" : "");
+  const fixOne = (it) => setCoa((c) => applyIssue(c, it));
+  const fixAllIn = (c) => spell.reduce((acc, it) => applyIssue(acc, it), c);
+  // before preview / download / save: offer to fix spelling first
+  const checked = async (fn) => {
+    let c = coa;
+    if (spell.length) {
+      const list = [...new Map(spell.map((i) => [i.word, i])).values()].map((i) => `${i.word} -> ${i.suggestion}`).join(", ");
+      if (window.confirm(`Spelling looks wrong: ${list}\n\nOK = fix them now, Cancel = keep as typed`)) {
+        c = fixAllIn(coa);
+        setCoa(c);
+      }
+    }
+    return fn(c);
+  };
 
   const set = (patch) => setCoa((c) => ({ ...c, ...patch }));
   const setInfo = (i, patch) => set({ info: coa.info.map((r, k) => (k === i ? { ...r, ...patch } : r)) });
@@ -97,7 +137,7 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
   const matched = products.find((p) => p.name.trim().toLowerCase() === oilName.trim().toLowerCase());
   const pid = matched?.id || "";
   const productName = matched?.name || oilName.trim();
-  const payload = (useId = pid) => ({ coa, product_id: useId || null, title: title || undefined, visibility, kind: "coa" });
+  const payload = (useId = pid, c = coa) => ({ coa: c, product_id: useId || null, title: title || undefined, visibility, kind: "coa" });
   const saveStdNote = async () => {
     try {
       const { data } = await api.put("/docs/coa/standard-note", { text: stdEdit });
@@ -106,53 +146,53 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
     } catch (e) { toast.error(errMsg(e, "Could not save the note")); }
   };
 
-  const render = async () => {
-    const res = await api.post("/docs/coa/render", payload(), { responseType: "blob" });
+  const render = async (c = coa) => {
+    const res = await api.post("/docs/coa/render", payload(pid, c), { responseType: "blob" });
     return res.data;
   };
 
-  const preview = async () => {
+  const preview = () => checked(async (c) => {
     setBusy(true);
     try {
-      const blob = await render();
+      const blob = await render(c);
       if (urlRef.current) URL.revokeObjectURL(urlRef.current);
       urlRef.current = URL.createObjectURL(blob);
       setPreviewUrl(urlRef.current);
     } catch (e) { toast.error(errMsg(e, "Preview failed")); }
     finally { setBusy(false); }
-  };
+  });
 
-  const downloadOnly = async () => {
+  const downloadOnly = () => checked(async (c) => {
     setBusy(true);
     try {
-      const blob = await render();
+      const blob = await render(c);
       const name = (title || `${productName || coa.info?.[0]?.value || "COA"} - ${coa.title || "COA"}`).replace(/[\\/:*?"<>|]+/g, " ");
       openBlob(blob, `${name}.pdf`);
       toast.success("Downloaded - not saved in the CRM");
     } catch (e) { toast.error(errMsg(e, "Download failed")); }
     finally { setBusy(false); }
-  };
+  });
 
-  const save = async () => {
+  const save = () => checked(async (c) => {
     if (!oilName.trim()) { toast.error("Type the oil this COA belongs to"); return; }
     setBusy(true);
     try {
       let useId = pid;
       if (existing) {
-        await api.put(`/docs/documents/${existing.id}`, { title: title || existing.title, visibility, coa });
+        await api.put(`/docs/documents/${existing.id}`, { title: title || existing.title, visibility, coa: c });
         useId = existing.product_id;
       } else {
         if (!useId) {   // a new oil: add it on the fly
           const { data: p } = await api.post("/docs/products", { name: oilName.trim(), aliases: [] });
           useId = p.id;
         }
-        await api.post("/docs/coa", payload(useId));
+        await api.post("/docs/coa", payload(useId, c));
       }
       toast.success(visibility === "admin" ? "Saved - only the system admin can see it" : "Saved to the library");
       onSaved?.(useId);
     } catch (e) { toast.error(errMsg(e, "Save failed")); }
     finally { setBusy(false); }
-  };
+  });
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-stretch md:items-center justify-center p-0 md:p-4" data-testid="coa-maker">
@@ -170,7 +210,7 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
             <div className="grid md:grid-cols-2 gap-3">
               <div>
                 <div className={lbl}>Heading on the document</div>
-                <input className={inp} value={coa.title} onChange={(e) => set({ title: e.target.value })} placeholder="CERTIFICATE OF ANALYSIS" />
+                <input className={inp + warn(["title"])} value={coa.title} onChange={(e) => set({ title: e.target.value })} placeholder="CERTIFICATE OF ANALYSIS" />
               </div>
               <label className="flex items-center gap-2 text-sm mt-4 md:mt-5">
                 <input type="checkbox" checked={coa.letterhead !== false} onChange={(e) => set({ letterhead: e.target.checked })} />
@@ -187,8 +227,8 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
               <div className="space-y-1 mt-1">
                 {coa.info.map((r, i) => (
                   <div key={i} className="flex gap-1 items-center">
-                    <input className={`${inp.replace("w-full ", "")} w-28 md:w-40 shrink-0`} value={r.label} onChange={(e) => setInfo(i, { label: e.target.value })} placeholder="Label" />
-                    <input className={`${inp} min-w-0 flex-1`} value={r.value} onChange={(e) => setInfo(i, { value: e.target.value })} placeholder="Value (empty = not shown)" />
+                    <input className={`${inp.replace("w-full ", "")} w-28 md:w-40 shrink-0${warn(["info", i, "label"])}`} value={r.label} onChange={(e) => setInfo(i, { label: e.target.value })} placeholder="Label" />
+                    <input className={`${inp} min-w-0 flex-1${warn(["info", i, "value"])}`} value={r.value} onChange={(e) => setInfo(i, { value: e.target.value })} placeholder="Value (empty = not shown)" />
                     <button onClick={() => set({ info: move(coa.info, i, -1) })} className="p-1 text-gray-400 hover:text-gray-800"><ArrowUp size={14} /></button>
                     <button onClick={() => set({ info: move(coa.info, i, 1) })} className="p-1 text-gray-400 hover:text-gray-800"><ArrowDown size={14} /></button>
                     <button onClick={() => set({ info: coa.info.filter((_, k) => k !== i) })} className="p-1 text-gray-400 hover:text-[#E60000]"><Trash size={14} /></button>
@@ -229,7 +269,7 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
             {coa.sections.map((s, si) => (
               <div key={si} className="border border-gray-200 p-3 space-y-2">
                 <div className="flex gap-2 items-center">
-                  <input className={`${inp} font-bold`} value={s.title} onChange={(e) => setSec(si, { title: e.target.value })} placeholder="Table heading (optional)" />
+                  <input className={`${inp} font-bold${warn(["sections", si, "title"])}`} value={s.title} onChange={(e) => setSec(si, { title: e.target.value })} placeholder="Table heading (optional)" />
                   <button onClick={() => addCol(si)} className="text-xs text-[#002FA7] font-bold whitespace-nowrap flex items-center gap-1"><Plus size={12} /> Column</button>
                   <button onClick={() => set({ sections: coa.sections.filter((_, k) => k !== si) })} className="p-1 text-gray-400 hover:text-[#E60000]" title="Remove table"><Trash size={14} /></button>
                 </div>
@@ -240,7 +280,7 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
                         {s.columns.map((c, ci) => (
                           <th key={ci} className="p-0.5">
                             <div className="flex">
-                              <input className={`${inp} font-bold bg-gray-50`} value={c} onChange={(e) => setCol(si, ci, e.target.value)} />
+                              <input className={`${inp} font-bold bg-gray-50${warn(["sections", si, "columns", ci])}`} value={c} onChange={(e) => setCol(si, ci, e.target.value)} />
                               {s.columns.length > 2 && <button onClick={() => delCol(si, ci)} className="px-1 text-gray-400 hover:text-[#E60000]"><X size={12} /></button>}
                             </div>
                           </th>
@@ -253,7 +293,7 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
                         <tr key={ri}>
                           {s.columns.map((_, ci) => (
                             <td key={ci} className="p-0.5">
-                              <input className={inp} value={r[ci] ?? ""} onChange={(e) => setCell(si, ri, ci, e.target.value)}
+                              <input className={inp + warn(["sections", si, "rows", ri, ci])} value={r[ci] ?? ""} onChange={(e) => setCell(si, ri, ci, e.target.value)}
                                 list={ci === paramCol(s) ? "coa-params" : ci === s.columns.length - 1 ? "coa-results" : undefined} />
                             </td>
                           ))}
@@ -348,6 +388,18 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
             )}
           </div>
         </div>
+        {spell.length > 0 && (
+          <div className="px-4 py-2 border-t border-amber-300 bg-amber-50 text-xs text-amber-900 flex flex-wrap items-center gap-x-2 gap-y-1" data-testid="coa-spelling">
+            <b>Spelling:</b>
+            {[...new Map(spell.map((i) => [i.word + ">" + i.suggestion, i])).values()].map((it) => (
+              <button key={it.word + it.suggestion} type="button" onClick={() => spell.filter((x) => x.word === it.word && x.suggestion === it.suggestion).forEach(fixOne)}
+                className="border border-amber-400 bg-white px-1.5 py-0.5 hover:bg-amber-100" title="Fix">
+                <s className="opacity-60">{it.word}</s> &rarr; <b>{it.suggestion}</b>
+              </button>
+            ))}
+            <button type="button" onClick={() => setCoa((c) => fixAllIn(c))} className="ml-auto bg-amber-600 text-white font-bold px-2 py-1">Fix all</button>
+          </div>
+        )}
         <div className="px-4 py-3 border-t border-gray-200 flex flex-wrap items-center justify-end gap-2">
           <button onClick={preview} disabled={busy} className="border border-gray-300 px-3 py-2 text-xs font-bold uppercase tracking-widest flex items-center gap-1 hover:bg-gray-50 disabled:opacity-50"><Eye size={14} /> Preview</button>
           <button onClick={downloadOnly} disabled={busy} className="border border-gray-300 px-3 py-2 text-xs font-bold uppercase tracking-widest flex items-center gap-1 hover:bg-gray-50 disabled:opacity-50" data-testid="coa-download-only"><DownloadSimple size={14} /> Download only (don't save)</button>

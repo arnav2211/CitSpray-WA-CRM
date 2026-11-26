@@ -19713,6 +19713,37 @@ async def docs_coa_suggestions(user: dict = Depends(get_docs_user)):
     return {"parameters": top[:150], "results": res_list, "standard_note": await _coa_standard_note()}
 
 
+class CoaSpellInput(BaseModel):
+    coa: Dict[str, Any]
+
+
+_coa_speller = {"at": 0.0, "sp": None}
+
+
+async def _coa_get_speller():
+    """Spelling model learnt from every COA in the library + COA / oil vocabulary (10 min cache)."""
+    import time as _t
+    from coa_spell import Speller, coa_texts
+    if _coa_speller["sp"] and _t.time() - _coa_speller["at"] < 600:
+        return _coa_speller["sp"]
+    texts = []
+    async for d in db.doc_files.find({"source": "coa", "deleted": {"$ne": True}}, {"_id": 0, "coa": 1}):
+        texts += [str(t) for _, t in coa_texts(d.get("coa") or {})]
+    async for p_ in db.doc_products.find({"deleted": {"$ne": True}}, {"_id": 0, "name": 1, "aliases": 1}):
+        texts += [p_.get("name") or ""] + list(p_.get("aliases") or [])
+    sp = await asyncio.to_thread(Speller, texts)
+    _coa_speller.update(at=_t.time(), sp=sp)
+    return sp
+
+
+@api.post("/docs/coa/spellcheck")
+async def docs_coa_spellcheck(body: CoaSpellInput, user: dict = Depends(get_docs_user)):
+    """Spelling mistakes in a COA: [{path, word, suggestion}] - the COA maker offers the fixes."""
+    from coa_spell import check_coa
+    sp = await _coa_get_speller()
+    return {"issues": await asyncio.to_thread(check_coa, body.coa or {}, sp)}
+
+
 @api.put("/docs/coa/standard-note")
 async def docs_set_standard_note(body: CoaNoteInput, user: dict = Depends(get_docs_user)):
     """The note printed at the bottom of every COA that uses the standard note."""
