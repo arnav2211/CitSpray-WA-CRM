@@ -34,8 +34,13 @@ export const BLANK_COA = () => ({
       ["OPTICAL ROTATION @ 20 °C", "", "Complies"],
     ],
   }],
-  note: "NOTE : Keep in tightly closed container in dry and cool place, protected from light.",
+  note_mode: "standard",           // the same note on every COA (editable once for all)
+  note: "",
 });
+
+const SR_COL = /^(s\.?\s*no\.?|sr\.?\s*no\.?|sl\.?\s*no\.?|no\.?|#)$/i;
+// the column that holds parameter names (skips a "Sr. No." column)
+const paramCol = (s) => (s.columns.length > 2 && SR_COL.test(String(s.columns[0] || "").trim()) ? 1 : 0);
 
 const inp = "w-full border border-gray-300 px-2 py-1.5 text-sm outline-none focus:border-[#002FA7]";
 const lbl = "text-[10px] uppercase tracking-widest text-gray-500 font-bold";
@@ -49,7 +54,9 @@ function move(arr, i, d) {
 export default function CoaMaker({ products, productId, existing, duplicateOf, isAdmin, onClose, onSaved }) {
   const src = existing || duplicateOf;
   const [coa, setCoa] = useState(() => (src?.coa ? JSON.parse(JSON.stringify(src.coa)) : BLANK_COA()));
-  const [pid, setPid] = useState(src?.product_id || productId || "");
+  const [oilName, setOilName] = useState(() => products.find((p) => p.id === (src?.product_id || productId))?.name || "");
+  const [sugg, setSugg] = useState({ parameters: [], results: ["Complies"], standard_note: "" });
+  const [stdEdit, setStdEdit] = useState(null);   // text while editing the standard note
   const [title, setTitle] = useState(existing ? existing.title : duplicateOf ? `${duplicateOf.title} (copy)` : "");
   const [visibility, setVisibility] = useState(existing?.visibility || "team");
   const [previewUrl, setPreviewUrl] = useState(null);
@@ -57,6 +64,7 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
   const urlRef = useRef(null);
 
   useEffect(() => () => { if (urlRef.current) URL.revokeObjectURL(urlRef.current); }, []);
+  useEffect(() => { api.get("/docs/coa/suggestions").then(({ data }) => setSugg(data)).catch(() => {}); }, []);
 
   const set = (patch) => setCoa((c) => ({ ...c, ...patch }));
   const setInfo = (i, patch) => set({ info: coa.info.map((r, k) => (k === i ? { ...r, ...patch } : r)) });
@@ -70,14 +78,33 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
     if (s.columns.length >= 5) return;
     setSec(si, { columns: [...s.columns, "New column"], rows: s.rows.map((r) => [...r, ""]) });
   };
+  // new parameter row: numbered if the table has a Sr. No. column, result "Complies"
+  const addRow = (si, name = "") => {
+    const s = coa.sections[si];
+    const n = s.columns.length, pc = paramCol(s);
+    const row = s.columns.map(() => "");
+    if (pc === 1) row[0] = String(s.rows.length + 1);
+    row[pc] = name;
+    if (n - 1 !== pc) row[n - 1] = "Complies";
+    setSec(si, { rows: [...s.rows, row] });
+  };
   const delCol = (si, ci) => {
     const s = coa.sections[si];
     if (s.columns.length <= 2) return;
     setSec(si, { columns: s.columns.filter((_, c) => c !== ci), rows: s.rows.map((r) => r.filter((_, c) => c !== ci)) });
   };
 
-  const productName = products.find((p) => p.id === pid)?.name || "";
-  const payload = () => ({ coa, product_id: pid || null, title: title || undefined, visibility, kind: "coa" });
+  const matched = products.find((p) => p.name.trim().toLowerCase() === oilName.trim().toLowerCase());
+  const pid = matched?.id || "";
+  const productName = matched?.name || oilName.trim();
+  const payload = (useId = pid) => ({ coa, product_id: useId || null, title: title || undefined, visibility, kind: "coa" });
+  const saveStdNote = async () => {
+    try {
+      const { data } = await api.put("/docs/coa/standard-note", { text: stdEdit });
+      setSugg((x) => ({ ...x, standard_note: data.text })); setStdEdit(null);
+      toast.success("Standard note updated - every COA using it now shows the new note");
+    } catch (e) { toast.error(errMsg(e, "Could not save the note")); }
+  };
 
   const render = async () => {
     const res = await api.post("/docs/coa/render", payload(), { responseType: "blob" });
@@ -107,22 +134,31 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
   };
 
   const save = async () => {
-    if (!pid) { toast.error("Pick the oil this document belongs to"); return; }
+    if (!oilName.trim()) { toast.error("Type the oil this COA belongs to"); return; }
     setBusy(true);
     try {
+      let useId = pid;
       if (existing) {
         await api.put(`/docs/documents/${existing.id}`, { title: title || existing.title, visibility, coa });
+        useId = existing.product_id;
       } else {
-        await api.post("/docs/coa", payload());
+        if (!useId) {   // a new oil: add it on the fly
+          const { data: p } = await api.post("/docs/products", { name: oilName.trim(), aliases: [] });
+          useId = p.id;
+        }
+        await api.post("/docs/coa", payload(useId));
       }
       toast.success(visibility === "admin" ? "Saved - only the system admin can see it" : "Saved to the library");
-      onSaved?.(pid);
+      onSaved?.(useId);
     } catch (e) { toast.error(errMsg(e, "Save failed")); }
     finally { setBusy(false); }
   };
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-stretch md:items-center justify-center p-0 md:p-4" data-testid="coa-maker">
+      <datalist id="coa-params">{sugg.parameters.map((p) => <option key={p.name} value={p.name} />)}</datalist>
+      <datalist id="coa-results">{sugg.results.map((r) => <option key={r} value={r} />)}</datalist>
+      <datalist id="coa-oils">{products.map((p) => <option key={p.id} value={p.name} />)}</datalist>
       <div className="bg-white w-full max-w-6xl h-full md:h-[92vh] flex flex-col shadow-2xl">
         <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
           <div className="font-chivo font-black text-lg">{existing ? "Edit COA" : "COA maker"}</div>
@@ -217,7 +253,8 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
                         <tr key={ri}>
                           {s.columns.map((_, ci) => (
                             <td key={ci} className="p-0.5">
-                              <input className={inp} value={r[ci] ?? ""} onChange={(e) => setCell(si, ri, ci, e.target.value)} />
+                              <input className={inp} value={r[ci] ?? ""} onChange={(e) => setCell(si, ri, ci, e.target.value)}
+                                list={ci === paramCol(s) ? "coa-params" : ci === s.columns.length - 1 ? "coa-results" : undefined} />
                             </td>
                           ))}
                           <td className="whitespace-nowrap">
@@ -230,7 +267,19 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
                     </tbody>
                   </table>
                 </div>
-                <button onClick={() => setSec(si, { rows: [...s.rows, s.columns.map(() => "")] })} className="text-xs text-[#002FA7] font-bold flex items-center gap-1"><Plus size={12} /> Parameter</button>
+                <button onClick={() => addRow(si)} className="text-xs text-[#002FA7] font-bold flex items-center gap-1"><Plus size={12} /> Parameter</button>
+                {sugg.parameters.length > 0 && (
+                  <div className="flex flex-wrap gap-1 items-center">
+                    <span className="text-[10px] uppercase tracking-widest text-gray-400 font-bold mr-1">Quick add:</span>
+                    {sugg.parameters
+                      .filter((p) => !s.rows.some((r) => String(r[paramCol(s)] || "").trim().toUpperCase() === p.name.toUpperCase()))
+                      .slice(0, 16)
+                      .map((p) => (
+                        <button key={p.name} type="button" onClick={() => addRow(si, p.name)}
+                          className="text-[11px] border border-gray-300 px-1.5 py-0.5 hover:bg-[#EEF3FF] hover:border-[#002FA7]">+ {p.name}</button>
+                      ))}
+                  </div>
+                )}
               </div>
             ))}
             <button onClick={() => set({ sections: [...coa.sections, { title: "", columns: ["Parameters", "Specification", "Results"], rows: [["", "", ""]] }] })}
@@ -238,19 +287,41 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
               <Plus size={12} /> Add another table (e.g. GC composition)
             </button>
 
-            <div>
+            <div className="space-y-1.5">
               <div className={lbl}>Note at the bottom</div>
-              <textarea rows={2} className={inp} value={coa.note} onChange={(e) => set({ note: e.target.value })} />
+              <div className="flex flex-wrap gap-4 text-sm">
+                <label className="flex items-center gap-1"><input type="radio" checked={coa.note_mode === "standard"} onChange={() => set({ note_mode: "standard" })} /> Standard note (same on every COA)</label>
+                <label className="flex items-center gap-1"><input type="radio" checked={coa.note_mode !== "standard"}
+                  onChange={() => set({ note_mode: "custom", note: coa.note || sugg.standard_note })} /> Own note for this COA</label>
+              </div>
+              {coa.note_mode === "standard" ? (
+                stdEdit === null ? (
+                  <div className="flex items-start gap-2">
+                    <div className="flex-1 bg-gray-50 border border-gray-200 px-2 py-1.5 text-sm text-gray-700">{sugg.standard_note || "..."}</div>
+                    <button type="button" onClick={() => setStdEdit(sugg.standard_note)} className="text-xs text-[#002FA7] font-bold whitespace-nowrap pt-1.5">Edit standard note</button>
+                  </div>
+                ) : (
+                  <div className="space-y-1">
+                    <textarea rows={2} className={inp} value={stdEdit} onChange={(e) => setStdEdit(e.target.value)} />
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <button type="button" onClick={saveStdNote} className="bg-[#002FA7] text-white text-[11px] font-bold px-2 py-1">Save for all COAs</button>
+                      <button type="button" onClick={() => setStdEdit(null)} className="text-[11px] text-gray-500">Cancel</button>
+                      <span className="text-[11px] text-gray-500">Changes the note on every COA that uses the standard note.</span>
+                    </div>
+                  </div>
+                )
+              ) : (
+                <textarea rows={2} className={inp} value={coa.note} onChange={(e) => set({ note: e.target.value })} />
+              )}
             </div>
 
             {/* Save options */}
             <div className="border-t border-gray-200 pt-3 grid md:grid-cols-3 gap-2">
               <div>
-                <div className={lbl}>Oil</div>
-                <select className={inp} value={pid} onChange={(e) => setPid(e.target.value)}>
-                  <option value="">— pick the oil —</option>
-                  {products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-                </select>
+                <div className={lbl}>Oil (type to search)</div>
+                <input className={inp} list="coa-oils" value={oilName} onChange={(e) => setOilName(e.target.value)}
+                  disabled={!!existing} placeholder="e.g. Lavender Oil" data-testid="coa-oil-input" />
+                {!existing && oilName.trim() && !matched && <div className="text-[11px] text-[#B36200] mt-0.5">New oil - it will be added when you save</div>}
               </div>
               <div>
                 <div className={lbl}>Name in the library</div>

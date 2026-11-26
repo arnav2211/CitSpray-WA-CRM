@@ -19455,14 +19455,31 @@ def _doc_download_name(doc: dict, product: Optional[dict]) -> str:
     return base if base.lower().endswith(ext) else base + ext
 
 
+COA_STANDARD_NOTE_DEFAULT = "NOTE : Keep in tightly closed container in dry and cool place, protected from light."
+
+
+async def _coa_standard_note() -> str:
+    st = await db.system_settings.find_one({"key": "coa_standard_note"}, {"_id": 0, "text": 1})
+    return (st or {}).get("text") or COA_STANDARD_NOTE_DEFAULT
+
+
+async def _coa_resolved(coa: dict) -> dict:
+    """A COA that uses the standard note gets today's standard note text."""
+    coa = coa or {}
+    if coa.get("note_mode") == "standard":
+        return {**coa, "note": await _coa_standard_note()}
+    return coa
+
+
 async def _doc_bytes(doc: dict) -> tuple:
     """(bytes, mime) of a document as it should look right now."""
     if doc.get("source") == "coa":
         from coa_pdf import render_coa_pdf
         loop = asyncio.get_event_loop()
         comp = normalize_company(doc.get("company"))
+        coa = await _coa_resolved(doc.get("coa") or {})
         pdf = await loop.run_in_executor(None, lambda: render_coa_pdf(
-            doc.get("coa") or {}, comp, COMPANIES.get(comp, ""), _ist_now().replace(tzinfo=None)))
+            coa, comp, COMPANIES.get(comp, ""), _ist_now().replace(tzinfo=None)))
         return pdf, "application/pdf"
     path = PRODUCT_DOCS_DIR / (doc.get("file") or "")
     if not doc.get("file") or not path.exists():
@@ -19645,11 +19662,65 @@ async def docs_render_coa(body: CoaInput, user: dict = Depends(get_docs_user),
     from coa_pdf import render_coa_pdf
     comp = _resolve_company(user, x_company)
     loop = asyncio.get_event_loop()
+    coa = await _coa_resolved(body.coa)
     pdf = await loop.run_in_executor(None, lambda: render_coa_pdf(
-        body.coa, comp, COMPANIES.get(comp, ""), _ist_now().replace(tzinfo=None)))
+        coa, comp, COMPANIES.get(comp, ""), _ist_now().replace(tzinfo=None)))
     name = _safe_name(body.title or body.coa.get("title") or "COA")
     return Response(content=pdf, media_type="application/pdf",
                     headers={"Content-Disposition": f'inline; filename="{name}.pdf"'})
+
+
+class CoaNoteInput(BaseModel):
+    text: str
+
+
+def _coa_param_col(sec: dict) -> int:
+    """Which column holds the parameter names (skips a 'Sr. No.' column of numbers)."""
+    rows = sec.get("rows") or []
+    n = len(sec.get("columns") or [])
+    for c in range(max(1, n - 1)):
+        vals = [str((r + [""] * n)[c] or "").strip() for r in rows]
+        vals = [v for v in vals if v]
+        if vals and sum(1 for v in vals if re.fullmatch(r"[\d.]+", v)) < len(vals) / 2:
+            return c
+    return 0
+
+
+@api.get("/docs/coa/suggestions")
+async def docs_coa_suggestions(user: dict = Depends(get_docs_user)):
+    """Common parameters / results across all COAs in the library (for typing faster)."""
+    params: Dict[str, Dict[str, Any]] = {}
+    results: Dict[str, int] = {}
+    async for d in db.doc_files.find({"source": "coa", "deleted": {"$ne": True}}, {"_id": 0, "coa.sections": 1}):
+        for sec in (d.get("coa") or {}).get("sections") or []:
+            n = len(sec.get("columns") or [])
+            pc = _coa_param_col(sec)
+            for r in sec.get("rows") or []:
+                r = list(r) + [""] * n
+                name = " ".join(str(r[pc] or "").split())
+                if name and not re.fullmatch(r"[\d.]+", name):
+                    k = name.upper()
+                    e = params.setdefault(k, {"name": name, "count": 0})
+                    e["count"] += 1
+                if n >= 2:
+                    res = " ".join(str(r[n - 1] or "").split())
+                    if res and res.upper() != "COMPILES":
+                        results[res] = results.get(res, 0) + 1
+    top = sorted(params.values(), key=lambda x: -x["count"])
+    res_list = ["Complies"] + [k for k, _ in sorted(results.items(), key=lambda x: -x[1])
+                               if k.upper() != "COMPLIES" and not re.fullmatch(r"[\d.\s%-]+", k)][:15]
+    return {"parameters": top[:150], "results": res_list, "standard_note": await _coa_standard_note()}
+
+
+@api.put("/docs/coa/standard-note")
+async def docs_set_standard_note(body: CoaNoteInput, user: dict = Depends(get_docs_user)):
+    """The note printed at the bottom of every COA that uses the standard note."""
+    await _require_docs_editor(user)
+    text = (body.text or "").strip() or COA_STANDARD_NOTE_DEFAULT
+    await db.system_settings.update_one({"key": "coa_standard_note"},
+                                        {"$set": {"text": text, "updated_by": user.get("name"), "updated_at": iso(now_utc())}},
+                                        upsert=True)
+    return {"ok": True, "text": text}
 
 
 @api.put("/docs/documents/{did}")
