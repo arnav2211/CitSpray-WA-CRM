@@ -936,6 +936,8 @@ async def update_user(user_id: str, body: UserUpdate, admin: dict = Depends(requ
         v = getattr(body, f)
         if v is not None:
             updates[f] = v
+    if "bypass_attendance" in updates and bool(updates["bypass_attendance"]) != bool(u.get("bypass_attendance")):
+        updates["bypass_until"] = None      # switched by hand on the user page: no end date
     if body.company is not None:
         updates["company"] = normalize_company(body.company)
     if body.receiver_numbers is not None:
@@ -2086,6 +2088,14 @@ async def _present_on_latest_office_day(user_id: str, cfg: Optional[dict] = None
     return bool(log and log.get("check_in"))
 
 
+def _bypass_on(u: dict) -> bool:
+    """Per-person attendance bypass; with bypass_until (YYYY-MM-DD, IST) it ends after that day."""
+    if not u.get("bypass_attendance"):
+        return False
+    until = str(u.get("bypass_until") or "").strip()
+    return not until or until >= _ist_now().strftime("%Y-%m-%d")
+
+
 async def _is_user_available_by_attendance(user: dict, for_new_lead: bool = False) -> bool:
     """Gate lead assignment on real attendance:
     - bypass_attendance users are always available;
@@ -2108,7 +2118,7 @@ async def _is_user_available_by_attendance(user: dict, for_new_lead: bool = Fals
         return True
     if not cfg.get("attendance_routing_enabled", True):
         return True
-    if user.get("bypass_attendance"):
+    if _bypass_on(user):
         return True
     if await _office_open_now(cfg):
         today = _ist_now().strftime("%Y-%m-%d")
@@ -2141,7 +2151,7 @@ async def _attendance_login_allowed(user: dict) -> Optional[dict]:
     """
     if user.get("role") != "executive":
         return None
-    if user.get("bypass_attendance"):
+    if _bypass_on(user):
         return None
     cfg = await get_attendance_config()
     # Emergency bypass (device/WiFi down): punches aren't reaching the cloud, so
@@ -2668,7 +2678,7 @@ async def _handle_repeat_enquiry(existing: dict, new_data: dict) -> None:
     # Determine if the current assignee is still eligible
     keep_owner = False
     if current_uid:
-        u = await db.users.find_one({"id": current_uid, "active": True}, {"_id": 0, "id": 1, "role": 1, "bypass_attendance": 1})
+        u = await db.users.find_one({"id": current_uid, "active": True}, {"_id": 0, "id": 1, "role": 1, "bypass_attendance": 1, "bypass_until": 1})
         if u and not await _is_user_on_leave(current_uid):
             keep_owner = True
             # During office hours, an exec who never punched in / already punched
@@ -14896,7 +14906,7 @@ async def _followup_ring_allowed(user_id: Optional[str]) -> bool:
     Admins / non-executives always ring."""
     if not user_id:
         return False
-    u = await db.users.find_one({"id": user_id}, {"_id": 0, "id": 1, "role": 1, "bypass_attendance": 1, "active": 1})
+    u = await db.users.find_one({"id": user_id}, {"_id": 0, "id": 1, "role": 1, "bypass_attendance": 1, "bypass_until": 1, "active": 1})
     if not u:
         return False
     if u.get("role") != "executive":
