@@ -76,9 +76,28 @@ def _fmt_month(y: int, m: int) -> str:
     return datetime(y, m, 1).strftime("%b %Y")
 
 
+def _col_widths(cols, body, n, total, font) -> list:
+    """Column widths that follow the content: a 'Sr. No.' column stays narrow, a long
+    specification column gets room. Every column gets at least 42 pt."""
+    weights = []
+    for i in range(n):
+        cells = [str(cols[i] or "")] + [str((r + [""] * n)[i] or "") for r in body]
+        longest_word = max((pdfmetrics.stringWidth(w, font, 11) for c in cells for w in c.split()), default=20)
+        avg = sum(pdfmetrics.stringWidth(c, font, 11) for c in cells) / max(1, len(cells))
+        weights.append(max(longest_word + 14, min(avg, 230)))
+    s = sum(weights) or 1
+    w = [max(42.0, total * x / s) for x in weights]
+    k = total / sum(w)
+    return [x * k for x in w]
+
+
 def coa_dates(data: dict, today: Optional[datetime] = None) -> tuple:
-    """(mfg_text, exp_text) for the document right now."""
+    """(mfg_text, exp_text) for the document right now. A LOCKED document may carry the
+    date exactly as printed on the original (mfg_text / exp_text, e.g. '02-08-2025')."""
     today = today or datetime.now()
+    if (data.get("date_mode") or "auto") == "locked" and (data.get("mfg_text") or data.get("exp_text")):
+        m, e = coa_dates({k: v for k, v in data.items() if k not in ("mfg_text", "exp_text")}, today)
+        return (str(data.get("mfg_text") or "").strip() or m, str(data.get("exp_text") or "").strip() or e)
     shelf = int(data.get("shelf_life_months") or 0)
     if (data.get("date_mode") or "auto") == "locked" and data.get("mfg_month"):
         y, m = (int(x) for x in str(data["mfg_month"])[:7].split("-"))
@@ -162,6 +181,7 @@ def render_coa_pdf(data: dict, company: str = "citspray", company_name: str = ""
                                ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 1)]))
         story += [t, Spacer(1, 26)]
 
+    total_rows = sum(len(sec.get("rows") or []) for sec in (data.get("sections") or []))
     for sec in (data.get("sections") or []):
         cols = [c for c in (sec.get("columns") or []) if c is not None] or ["Parameters", "Specification", "Results"]
         n = len(cols)
@@ -169,13 +189,10 @@ def render_coa_pdf(data: dict, company: str = "citspray", company_name: str = ""
         if not body and not sec.get("title"):
             continue
         if sec.get("title"):
-            story += [Paragraph(f"<u>{escape(sec['title'])}</u>", s_sec), Spacer(1, 12)]
+            story += [Paragraph(f"<u>{escape(sec['title'])}</u>", s_sec), Spacer(1, 6 if total_rows > 10 else 12)]
         if body:
-            first_w = doc.width * (0.33 if n == 3 else 0.4 if n == 2 else 0.3)
-            rest = (doc.width - first_w) / max(1, n - 1)
-            widths = [first_w] + [rest] * (n - 1)
-            if n == 3:  # match the sample: wide spec column, narrow results column
-                widths = [doc.width * 0.33, doc.width * 0.41, doc.width * 0.26]
+            widths = _col_widths(cols, body, n, doc.width, reg)
+            dense = len(body) > 8 or total_rows > 10   # long COAs: tighter rows so they fit on one page
             data_rows = [[P(c, s_head if i == 0 or i == n - 1 else s_head_c) for i, c in enumerate(cols)]]
             for r in body:
                 r = (list(r) + [""] * n)[:n]
@@ -184,7 +201,8 @@ def render_coa_pdf(data: dict, company: str = "citspray", company_name: str = ""
             t.setStyle(TableStyle([
                 ("GRID", (0, 0), (-1, -1), 0.6, colors.HexColor("#A6A6A6")),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
+                ("TOPPADDING", (0, 0), (-1, -1), 3 if dense else 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5 if dense else 12),
                 ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
             ]))
             story += [t, Spacer(1, 10)]
