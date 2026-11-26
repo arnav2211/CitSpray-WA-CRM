@@ -757,6 +757,11 @@ async def get_current_user(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="User not found or inactive")
     if user.get("token_version", 0) != payload.get("token_version", 0):
         raise HTTPException(status_code=401, detail="Session expired or logged out from all devices")
+    # The OMS media login may only use Product Documents.
+    if user.get("role") == "media":
+        _p = request.url.path
+        if not (_p.startswith("/api/docs") or _p.startswith("/api/auth/") or _p == "/api/app/version"):
+            raise HTTPException(status_code=403, detail="The media login can only use Product Documents")
     # Soft-logout: if this is an executive currently on leave, force-401 so the
     # frontend's global 401 interceptor logs them out on the next poll (~4s).
     # Admins are never blocked even if they are marked on leave (edge-case safety).
@@ -810,6 +815,33 @@ def _login_record_fail(key: str):
     import time as _time
     _LOGIN_FAILS.setdefault(key, []).append(_time.time())
 
+async def _oms_media_login(uname: str, password: str, existing: Optional[dict]) -> Optional[dict]:
+    """The OMS media team signs in to the CRM with its OMS username/password. The
+    password is checked live against the OMS user (so changing it in the OMS changes
+    it here too). It maps to a CRM user with role "media" that can only use Product
+    Documents (enforced in get_current_user)."""
+    try:
+        ou = await oms_db.users.find_one({"username": {"$regex": f"^{re.escape(uname)}$", "$options": "i"},
+                                          "role": "media"}, {"_id": 0})
+    except Exception:
+        return None
+    if not ou or ou.get("active") is False or not ou.get("password_hash"):
+        return None
+    if not verify_password(password, ou["password_hash"]):
+        return None
+    if existing:
+        if existing.get("oms_user_id") != ou["id"]:
+            return None          # this username belongs to a normal CRM user
+        await db.users.update_one({"id": existing["id"]}, {"$set": {"name": ou.get("name") or existing.get("name"), "active": True}})
+        return await db.users.find_one({"id": existing["id"]})
+    doc = {"id": str(uuid.uuid4()), "username": uname, "name": ou.get("name") or "Media", "role": "media",
+           "company": DEFAULT_COMPANY, "active": True, "oms_user_id": ou["id"], "password_hash": "",
+           "created_at": iso(now_utc())}
+    await db.users.insert_one(doc.copy())
+    await log_activity(None, "oms_media_user_linked", None, {"user_id": doc["id"], "oms_user_id": ou["id"], "username": uname})
+    return await db.users.find_one({"id": doc["id"]})
+
+
 @api.post("/auth/login")
 async def login(body: LoginInput, response: Response, request: Request):
     uname = body.username.strip().lower()
@@ -817,7 +849,11 @@ async def login(body: LoginInput, response: Response, request: Request):
     if _login_blocked(throttle_key):
         raise HTTPException(status_code=429, detail="Too many failed attempts — try again in 15 minutes")
     user = await db.users.find_one({"username": uname})
-    if not user or not verify_password(body.password, user.get("password_hash", "")):
+    ok = bool(user) and not user.get("oms_user_id") and verify_password(body.password, user.get("password_hash", ""))
+    if not ok and (not user or user.get("oms_user_id")):
+        user = await _oms_media_login(uname, body.password, user)   # OMS media team login
+        ok = bool(user)
+    if not ok:
         _login_record_fail(throttle_key)
         raise HTTPException(status_code=401, detail="Invalid credentials")
     _LOGIN_FAILS.pop(throttle_key, None)
@@ -19337,7 +19373,7 @@ async def _docs_editor_ids() -> List[str]:
 
 
 async def _is_docs_editor(user: dict) -> bool:
-    return user.get("role") == "admin" or user["id"] in await _docs_editor_ids()
+    return user.get("role") in ("admin", "media") or user["id"] in await _docs_editor_ids()
 
 
 async def _require_docs_editor(user: dict):

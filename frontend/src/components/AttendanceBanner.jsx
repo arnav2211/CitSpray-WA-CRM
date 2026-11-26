@@ -35,7 +35,7 @@ const _subs = new Set();
 function useMyPunch() {
   const { user } = useAuth();
   const [data, setData] = useState(_cache);
-  const enabled = !!user && user.role !== "admin" && user.username !== "scanner";
+  const enabled = !!user && user.role !== "admin" && user.role !== "media" && user.username !== "scanner";
   const load = useCallback(async () => {
     if (!enabled) return;
     try {
