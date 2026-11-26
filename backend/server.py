@@ -19589,6 +19589,37 @@ async def docs_file(did: str, download: bool = False, user: dict = Depends(get_c
                     headers={"Content-Disposition": f"{disp}; filename=\"{name.encode('ascii', 'ignore').decode() or 'document'}\""})
 
 
+@api.post("/docs/documents/{did}/link")
+async def docs_link(did: str, download: bool = False, user: dict = Depends(get_current_user)):
+    """Short-lived signed link to view / download a document without the login
+    header (works in the phone app's WebView and in a new browser tab)."""
+    d = await db.doc_files.find_one({"id": did, "deleted": {"$ne": True}, **_doc_visible_q(user)}, {"_id": 0, "id": 1})
+    if not d:
+        raise HTTPException(status_code=404, detail="Not found")
+    tok = jwt.encode({"typ": "doclink", "doc": did, "dl": bool(download), "uid": user["id"],
+                      "exp": now_utc() + timedelta(minutes=15)}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return {"url": f"/api/docs/view/{tok}"}
+
+
+@api.get("/docs/view/{tok}")
+async def docs_view(tok: str):
+    try:
+        p = jwt.decode(tok, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except Exception:
+        raise HTTPException(status_code=403, detail="This link has expired - open the document again from the CRM")
+    if p.get("typ") != "doclink":
+        raise HTTPException(status_code=403, detail="Invalid link")
+    d = await db.doc_files.find_one({"id": p.get("doc"), "deleted": {"$ne": True}}, {"_id": 0})
+    if not d:
+        raise HTTPException(status_code=404, detail="Not found")
+    prod = await db.doc_products.find_one({"id": d.get("product_id")}, {"_id": 0, "name": 1})
+    data, mime = await _doc_bytes(d)
+    name = _doc_download_name(d, prod).encode("ascii", "ignore").decode() or "document"
+    disp = "attachment" if p.get("dl") else "inline"
+    return Response(content=data, media_type=mime, headers={"Content-Disposition": f'{disp}; filename="{name}"',
+                                                            "Cache-Control": "private, no-store"})
+
+
 @api.post("/docs/send")
 async def docs_send(body: DocSendInput, user: dict = Depends(get_current_user)):
     """Send documents from the library to a lead on WhatsApp (each as a document message)."""

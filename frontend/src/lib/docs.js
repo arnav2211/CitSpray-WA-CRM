@@ -1,10 +1,18 @@
 import { api } from "@/lib/api";
 
-// Open (or download) a library document. Files are private, so fetch with the
-// login token and hand the browser a blob.
-export async function openDoc(id, { download = false, name = "document.pdf" } = {}) {
-  const res = await api.get(`/docs/documents/${id}/file`, { params: { download }, responseType: "blob" });
-  openBlob(res.data, download ? name : null);
+// Open (or download) a library document. Files are private: ask the server for a
+// short-lived signed link first. Uses a short-lived signed link (not a blob) so it also works inside the
+// LeadOrbit phone app's WebView, which can't open blob: URLs.
+export async function openDoc(id, { download = false } = {}) {
+  const w = window.open("", "_blank");   // open now, inside the click, so popup blockers allow it
+  try {
+    const { data } = await api.post(`/docs/documents/${id}/link`, null, { params: { download } });
+    const url = `${window.location.origin}${data.url}`;
+    if (w) w.location.href = url; else window.location.href = url;
+  } catch (e) {
+    if (w) w.close();
+    throw e;
+  }
 }
 
 export function openBlob(blob, downloadName) {

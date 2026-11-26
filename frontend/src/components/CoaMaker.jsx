@@ -151,8 +151,8 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
               <div className="space-y-1 mt-1">
                 {coa.info.map((r, i) => (
                   <div key={i} className="flex gap-1 items-center">
-                    <input className={`${inp} w-40 shrink-0`} value={r.label} onChange={(e) => setInfo(i, { label: e.target.value })} placeholder="Label" />
-                    <input className={inp} value={r.value} onChange={(e) => setInfo(i, { value: e.target.value })} placeholder="Value (empty = not shown)" />
+                    <input className={`${inp.replace("w-full ", "")} w-28 md:w-40 shrink-0`} value={r.label} onChange={(e) => setInfo(i, { label: e.target.value })} placeholder="Label" />
+                    <input className={`${inp} min-w-0 flex-1`} value={r.value} onChange={(e) => setInfo(i, { value: e.target.value })} placeholder="Value (empty = not shown)" />
                     <button onClick={() => set({ info: move(coa.info, i, -1) })} className="p-1 text-gray-400 hover:text-gray-800"><ArrowUp size={14} /></button>
                     <button onClick={() => set({ info: move(coa.info, i, 1) })} className="p-1 text-gray-400 hover:text-gray-800"><ArrowDown size={14} /></button>
                     <button onClick={() => set({ info: coa.info.filter((_, k) => k !== i) })} className="p-1 text-gray-400 hover:text-[#E60000]"><Trash size={14} /></button>
