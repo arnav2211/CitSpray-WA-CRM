@@ -38,8 +38,8 @@ TW_LIGHT_TEXT = {"red": "#FCA5A5", "orange": "#FDBA74", "amber": "#FCD34D", "yel
                  "emerald": "#6EE7B7", "teal": "#5EEAD4", "cyan": "#67E8F9", "sky": "#7DD3FC", "blue": "#93C5FD", "indigo": "#A5B4FC",
                  "violet": "#C4B5FD", "purple": "#D8B4FE", "fuchsia": "#F0ABFC", "pink": "#F9A8D4", "rose": "#FDA4AF"}
 
-VARIANTS = {"": "", "hover:": ":hover", "focus:": ":focus", "active:": ":active"}
-TOKEN = re.compile(r"(?<![\w:-])((?:hover:|focus:|active:)?)((?:bg|text|border(?:-[trblxy])?|divide|from|to|via|ring)-[\w\[\]#/.-]+)")
+VARIANTS = {"": "", "hover:": ":hover", "focus:": ":focus", "active:": ":active", "disabled:": ":disabled"}
+TOKEN = re.compile(r"(?<![\w:-])((?:hover:|focus:|active:|disabled:)?)((?:bg|text|border(?:-[trblxy])?|divide|from|to|via|ring)-[\w\[\]#/.-]+)")
 
 
 def hexrgb(h: str):
@@ -138,6 +138,44 @@ def rule_for(prop_cls: str):
         return (prop, hexs(mix(BASE, TW[hm.group(1)], 0.45)))
     return None
 
+# /chat in WhatsApp's own dark palette (chat bg #0B141A, bubbles #202C33 / #005C4B, panels #202C33).
+# Scoped to the chat page and placed last so it wins over the generic rules above.
+P = 'html.dark [data-testid="chat-page"]'
+CHAT_CSS = rf"""
+/* ---- /chat: WhatsApp dark palette ---- */
+{P} {{ background: #0B141A; }}
+{P} [data-testid="conv-sidebar"] {{ background: #111B21; border-color: #222D34; }}
+{P} [data-testid="conv-sidebar"] .border-gray-100, {P} [data-testid="conv-sidebar"] .border-gray-200 {{ border-color: #222D34; }}
+{P} [data-testid^="conv-row-"].bg-\[\#F0F2F5\] {{ background: #2A3942; }}
+{P} [data-testid^="conv-row-"].bg-\[\#E7F7E6\] {{ background: #12261F; }}
+{P} [data-testid^="conv-row-"].bg-\[\#E7F7E6\]:hover, {P} [data-testid^="conv-row-"]:hover {{ background: #202C33; }}
+{P} [data-testid="chat-topbar"], {P} [data-testid="in-chat-search-bar"], {P} [data-testid="chat-composer"] {{ background: #202C33; border-color: #222D34; }}
+{P} [data-testid="chat-empty-state"] {{ background: #222E35; }}
+{P} [data-testid="messages-area"] {{ background-color: #0B141A !important;
+  background-image: radial-gradient(rgba(255,255,255,0.035) 1px, transparent 1.2px); background-size: 22px 22px; }}
+{P} [data-testid="bubble-inner"] {{ color: #E9EDEF; box-shadow: 0 1px 0.5px rgba(0,0,0,0.25); }}
+{P} [data-testid="bubble-inner"].bg-white {{ background: #202C33; }}
+{P} [data-testid="bubble-inner"].bg-\[\#D9FDD3\] {{ background: #005C4B; }}
+{P} [data-testid="bubble-inner"] .text-gray-400, {P} [data-testid="bubble-inner"] .text-gray-500 {{ color: rgba(233,237,239,0.6); }}
+{P} [data-testid="bubble-inner"] .text-gray-600, {P} [data-testid="bubble-inner"] .text-gray-700, {P} [data-testid="bubble-inner"] .text-gray-800 {{ color: #D1D7DB; }}
+{P} [data-testid="bubble-inner"] .bg-black\/5 {{ background: rgba(0,0,0,0.22); }}
+{P} [data-testid="bubble-inner"] .bg-black\/5:hover {{ background: rgba(0,0,0,0.32); }}
+{P} [data-testid="bubble-inner"] .border-gray-200 {{ border-color: rgba(255,255,255,0.12); }}
+{P} [data-testid="bubble-inner"] a {{ color: #53BDEB; }}
+{P} [data-testid="wa-buttons"], {P} [data-testid="wa-buttons"] .border-black\/10 {{ border-color: rgba(255,255,255,0.1); }}
+{P} [data-testid="wa-buttons"] .text-\[\#0B8DE6\] {{ color: #53BDEB; }}
+{P} [data-testid^="reaction-badge-"] {{ background: #202C33; border-color: #0B141A; }}
+{P} [data-day-label] {{ background: #182229; color: #8696A0; border-color: transparent; box-shadow: none; }}
+{P} [data-testid^="timeline-call-"] .bg-white\/70 {{ background: #182229; color: #8696A0; border-color: transparent; }}
+{P} [data-testid="chat-composer"] textarea, {P} [data-testid="in-chat-search-bar"] input {{ background: #2A3942; border-color: #2A3942; color: #E9EDEF; border-radius: 8px; }}
+{P} [data-testid="chat-composer"] textarea:disabled {{ background: #2A3942; color: #8696A0; }}
+{P} [data-testid="chat-composer"] textarea::placeholder {{ color: #8696A0; }}
+{P} [data-testid="chat-composer"] .border-gray-300 {{ border-color: #36454F; }}
+{P} [data-testid="chat-composer"] .bg-white {{ background: #2A3942; }}
+{P} [data-testid="chat-composer"] .text-gray-500, {P} [data-testid="chat-composer"] .text-gray-600 {{ color: #AEBAC1; }}
+{P} ::-webkit-scrollbar-thumb {{ background: rgba(255,255,255,0.16); }}
+"""
+
 
 def main() -> None:
     found = set()
@@ -175,6 +213,7 @@ def main() -> None:
             sel = f"html.dark .{esc(full)}{VARIANTS[variant]} > :not([hidden]) ~ :not([hidden])"
         out.append(f"{sel} {{ {prop}: {value}; }}")
         n += 1
+    out.append(CHAT_CSS)
     OUT.write_text("\n".join(out) + "\n", encoding="utf-8")
     print(f"wrote {OUT} with {n} rules")
 

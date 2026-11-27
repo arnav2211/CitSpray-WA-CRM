@@ -2,14 +2,13 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, Sliders, ChatTeardropDots, X, ChatTeardropText, ArrowsLeftRight, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo, AndroidLogo, UsersThree, Sparkle, Handshake, Recycle, Fingerprint, Files, FilmStrip, Stamp, Sun, Moon, DotsThreeVertical,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, Sliders, ChatTeardropDots, X, ChatTeardropText, ArrowsLeftRight, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo, AndroidLogo, UsersThree, Sparkle, Handshake, Recycle, Fingerprint, Files, FilmStrip, Stamp, DotsThreeVertical,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
 import { useCompany, COMPANIES } from "@/context/CompanyContext";
 import { RecordingSetupModal } from "@/components/CallAiSummary";
-import { useTheme } from "@/context/ThemeContext";
 
 const navBase = "flex items-center gap-3 px-4 py-3 md:py-2.5 text-sm border-l-2 transition-colors";
 const navActive = "bg-white border-[#002FA7] text-gray-900 font-semibold";
@@ -41,7 +40,6 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
   const [pendingLeaves, setPendingLeaves] = useState(0);
   const [pendingDocs, setPendingDocs] = useState(0);
   const [menuOpen, setMenuOpen] = useState(false);
-  const { theme, toggleTheme } = useTheme();
   const [pendingQA, setPendingQA] = useState(0);
   // LeadOrbit Android app download (hidden inside the app's own WebView)
   const [appVer, setAppVer] = useState(null);
@@ -251,9 +249,6 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
                 <div className="px-3 py-2 text-xs text-gray-500 border-b border-gray-100">
                   <span className="kbd">{user?.role}</span> · @{user?.username}
                 </div>
-                <button type="button" onClick={() => { toggleTheme(); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-100 text-left" data-testid="theme-toggle">
-                  {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />} {theme === "dark" ? "Light mode" : "Dark mode"}
-                </button>
                 {user?.role !== "data_entry" && (
                   <button type="button" onClick={() => { setMenuOpen(false); setRecHelp(true); }} data-testid="recording-setup-btn"
                     className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-100 text-left text-[#6D28D9]">

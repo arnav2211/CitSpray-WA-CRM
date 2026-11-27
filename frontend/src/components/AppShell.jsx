@@ -3,6 +3,8 @@ import Sidebar from "@/components/Sidebar";
 import FollowupAlerts from "@/components/FollowupAlerts";
 import { AlertListener } from "@/components/AlertListener";
 import AttendanceBanner, { PunchChip } from "@/components/AttendanceBanner";
+import { useTheme } from "@/context/ThemeContext";
+import { Sun, Moon } from "@phosphor-icons/react";
 import DailyVideoStrip from "@/components/DailyVideo";
 import { Outlet, useLocation, useNavigate, NavLink } from "react-router-dom";
 import { List, House, ChatTeardropDots, Kanban, Phone, PhoneCall, XCircle } from "@phosphor-icons/react";
@@ -86,6 +88,7 @@ export default function AppShell() {
           </div>
           <div className="flex items-center gap-3">
             <PunchChip />
+            <ThemeToggle />
             <div className="text-xs text-gray-500 hidden md:block">
               <span className="kbd">v1.0</span> · Command Console
             </div>
@@ -161,4 +164,17 @@ function pageTitle(path) {
   if (path.startsWith("/transfer-requests")) return "Reassign Requests";
   if (path.startsWith("/payment-settings")) return "Payment Settings";
   return "Dashboard";
+}
+
+// Light / dark switch in the top bar: a sun in dark mode (tap for light), a moon in light mode.
+function ThemeToggle() {
+  const { theme, toggleTheme } = useTheme();
+  const dark = theme === "dark";
+  return (
+    <button type="button" onClick={toggleTheme} data-testid="theme-toggle"
+      title={dark ? "Switch to light mode" : "Switch to dark mode"} aria-label={dark ? "Switch to light mode" : "Switch to dark mode"}
+      className="w-9 h-9 flex items-center justify-center border border-gray-200 text-gray-600 hover:bg-gray-100 transition-colors">
+      {dark ? <Sun size={18} weight="bold" /> : <Moon size={18} weight="bold" />}
+    </button>
+  );
 }
