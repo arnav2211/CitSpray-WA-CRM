@@ -4,6 +4,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { Toaster } from "sonner";
 import { AuthProvider } from "@/context/AuthContext";
 import { CompanyProvider } from "@/context/CompanyContext";
+import { ThemeProvider } from "@/context/ThemeContext";
 import { ProtectedRoute, AdminOnly, ExecutiveOrAdminOnly } from "@/components/ProtectedRoute";
 import AppShell from "@/components/AppShell";
 import Login from "@/pages/Login";
@@ -13,16 +14,11 @@ import LeadDetail from "@/pages/LeadDetail";
 import Followups from "@/pages/Followups";
 import UsersPage from "@/pages/Users";
 import RoutingRules from "@/pages/RoutingRules";
-import Templates from "@/pages/Templates";
 import Reports from "@/pages/Reports";
-import Integrations from "@/pages/Integrations";
 import Settings from "@/pages/Settings";
 import Chat from "@/pages/Chat";
-import QuickReplies from "@/pages/QuickReplies";
-import ChatFlows from "@/pages/ChatFlows";
 import InternalQA from "@/pages/InternalQA";
 import TransferRequests from "@/pages/TransferRequests";
-import PaymentSettings from "@/pages/PaymentSettings";
 import AdminAlerts from "@/pages/AdminAlerts";
 import DataEntry from "@/pages/DataEntry";
 import DataEntryInspect from "@/pages/DataEntryInspect";
@@ -43,6 +39,7 @@ import DocApprovals from "@/pages/DocApprovals";
 export default function App() {
   return (
     <div className="App">
+      <ThemeProvider>
       <AuthProvider>
         <CompanyProvider>
         <BrowserRouter>
@@ -72,12 +69,12 @@ export default function App() {
               <Route path="/transfer-requests" element={<ExecutiveOrAdminOnly><TransferRequests /></ExecutiveOrAdminOnly>} />
               <Route path="/users" element={<AdminOnly><UsersPage /></AdminOnly>} />
               <Route path="/routing" element={<AdminOnly><RoutingRules /></AdminOnly>} />
-              <Route path="/integrations" element={<AdminOnly><Integrations /></AdminOnly>} />
-              <Route path="/templates" element={<AdminOnly><Templates /></AdminOnly>} />
-              <Route path="/chatflows" element={<AdminOnly><ChatFlows /></AdminOnly>} />
-              <Route path="/quick-replies" element={<AdminOnly><QuickReplies /></AdminOnly>} />
+              <Route path="/integrations" element={<Navigate to="/settings?section=integrations" replace />} />
+              <Route path="/templates" element={<Navigate to="/settings?section=templates" replace />} />
+              <Route path="/chatflows" element={<Navigate to="/settings?section=chatflows" replace />} />
+              <Route path="/quick-replies" element={<Navigate to="/settings?section=quick-replies" replace />} />
               <Route path="/settings" element={<AdminOnly><Settings /></AdminOnly>} />
-              <Route path="/payment-settings" element={<AdminOnly><PaymentSettings /></AdminOnly>} />
+              <Route path="/payment-settings" element={<Navigate to="/settings?section=payment" replace />} />
               <Route path="/payroll" element={<AdminOnly><PayrollPage /></AdminOnly>} />
               <Route path="/daily-videos" element={<AdminOnly><DailyVideos /></AdminOnly>} />
               <Route path="/doc-approvals" element={<AdminOnly><DocApprovals /></AdminOnly>} />
@@ -94,6 +91,7 @@ export default function App() {
         </BrowserRouter>
         </CompanyProvider>
       </AuthProvider>
+      </ThemeProvider>
     </div>
   );
 }

@@ -2,13 +2,14 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo, AndroidLogo, UsersThree, Sparkle, Handshake, Recycle, Fingerprint, Files, FilmStrip, Stamp,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, Sliders, ChatTeardropDots, X, ChatTeardropText, ArrowsLeftRight, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo, AndroidLogo, UsersThree, Sparkle, Handshake, Recycle, Fingerprint, Files, FilmStrip, Stamp, Sun, Moon, DotsThreeVertical,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
 import { useCompany, COMPANIES } from "@/context/CompanyContext";
 import { RecordingSetupModal } from "@/components/CallAiSummary";
+import { useTheme } from "@/context/ThemeContext";
 
 const navBase = "flex items-center gap-3 px-4 py-3 md:py-2.5 text-sm border-l-2 transition-colors";
 const navActive = "bg-white border-[#002FA7] text-gray-900 font-semibold";
@@ -39,6 +40,8 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
   const [pendingTransfers, setPendingTransfers] = useState(0);
   const [pendingLeaves, setPendingLeaves] = useState(0);
   const [pendingDocs, setPendingDocs] = useState(0);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const { theme, toggleTheme } = useTheme();
   const [pendingQA, setPendingQA] = useState(0);
   // LeadOrbit Android app download (hidden inside the app's own WebView)
   const [appVer, setAppVer] = useState(null);
@@ -234,49 +237,54 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
               <Item to="/data-entry-inspect" icon={ClipboardText} testId="nav-data-entry-inspect" onNavigate={handleNavigate}>Data Entry Stats</Item>
               <Item to="/alerts" icon={Megaphone} testId="nav-alerts" onNavigate={handleNavigate}>Admin Alerts</Item>
               <Item to="/routing" icon={Gear} testId="nav-routing" onNavigate={handleNavigate}>Routing Rules</Item>
-              <Item to="/integrations" icon={Plug} testId="nav-integrations" onNavigate={handleNavigate}>Integrations</Item>
-              <Item to="/templates" icon={ChatCircleDots} testId="nav-templates" onNavigate={handleNavigate}>WA Templates</Item>
-              <Item to="/chatflows" icon={ChatTeardropDots} testId="nav-chatflows" onNavigate={handleNavigate}>Chatbot Flows</Item>
-              <Item to="/quick-replies" icon={Lightning} testId="nav-quick-replies" onNavigate={handleNavigate}>Quick Replies</Item>
-              <Item to="/payment-settings" icon={QrCode} testId="nav-payment-settings" onNavigate={handleNavigate}>Payment QR</Item>
               <Item to="/settings" icon={Sliders} testId="nav-settings" onNavigate={handleNavigate}>Settings</Item>
             </>
           )}
         </nav>
 
-        <div className="border-t border-gray-200 p-4">
-          <div className="text-[10px] uppercase tracking-widest text-gray-400 font-bold">Signed in</div>
-          <div className="mt-1 font-semibold text-sm" data-testid="current-user-name">{user?.name}</div>
-          <div className="text-xs text-gray-500">
-            <span className="kbd">{user?.role}</span> · @{user?.username}
-          </div>
-
-          {/* Clock-in from the CRM was removed — attendance is recorded only at
-              the office fingerprint device, and being punched in is what grants
-              CRM access in the first place. */}
-
-          {user?.role !== "data_entry" && (
-            <button onClick={() => setRecHelp(true)} data-testid="recording-setup-btn"
-              className="mt-3 w-full flex items-center justify-center gap-2 border border-[#6D28D9] text-[#6D28D9] py-2 text-xs uppercase tracking-wider font-bold hover:bg-[#F5F3FF]">
-              <PhoneCall size={14} weight="fill" /> Call recording setup
-            </button>
+        {/* Account: one compact row; the rarely used actions open on click */}
+        <div className="border-t border-gray-200 relative">
+          {menuOpen && (
+            <>
+              <div className="fixed inset-0 z-10" onClick={() => setMenuOpen(false)} />
+              <div className="absolute bottom-full left-2 right-2 mb-1 z-20 bg-white border border-gray-200 shadow-xl py-1 text-sm" data-testid="account-menu">
+                <div className="px-3 py-2 text-xs text-gray-500 border-b border-gray-100">
+                  <span className="kbd">{user?.role}</span> · @{user?.username}
+                </div>
+                <button type="button" onClick={() => { toggleTheme(); }} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-100 text-left" data-testid="theme-toggle">
+                  {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />} {theme === "dark" ? "Light mode" : "Dark mode"}
+                </button>
+                {user?.role !== "data_entry" && (
+                  <button type="button" onClick={() => { setMenuOpen(false); setRecHelp(true); }} data-testid="recording-setup-btn"
+                    className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-100 text-left text-[#6D28D9]">
+                    <PhoneCall size={16} weight="fill" /> Call recording setup
+                  </button>
+                )}
+                {appVer?.apk_url && (
+                  <a href={appVer.apk_url} download data-testid="download-app-link" onClick={() => setMenuOpen(false)}
+                    className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-100 text-[#1B7A47]"
+                    title="Install on staff phones (allow 'install unknown apps' when asked)">
+                    <AndroidLogo size={16} weight="fill" /> Android app{appVer.version_name ? ` v${appVer.version_name}` : ""}
+                  </a>
+                )}
+                <button type="button" onClick={async () => { await logout(); nav("/login"); }} data-testid="logout-btn"
+                  className="w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-100 text-left text-[#E60000] border-t border-gray-100">
+                  <SignOut size={16} /> Log out
+                </button>
+              </div>
+            </>
           )}
-          {recHelp && <RecordingSetupModal onClose={() => setRecHelp(false)} />}
-          {appVer?.apk_url && (
-            <a href={appVer.apk_url} download data-testid="download-app-link"
-              className="mt-3 w-full flex items-center justify-center gap-2 border border-[#3DDC84] text-[#1B7A47] py-2 text-xs uppercase tracking-wider font-bold hover:bg-[#EAFBF1]"
-              title="Install on staff phones (allow 'install unknown apps' when asked)">
-              <AndroidLogo size={14} weight="fill" /> Android app{appVer.version_name ? ` v${appVer.version_name}` : ""}
-            </a>
-          )}
-
-          <button
-            className="mt-3 w-full flex items-center justify-center gap-2 border border-gray-300 py-2 text-xs uppercase tracking-wider font-bold hover:bg-gray-100"
-            onClick={async () => { await logout(); nav("/login"); }}
-            data-testid="logout-btn"
-          >
-            <SignOut size={14} /> Log out
+          <button type="button" onClick={() => setMenuOpen((v) => !v)} className="w-full flex items-center gap-2 px-4 py-3 hover:bg-gray-100 text-left" data-testid="account-menu-btn">
+            <span className="w-8 h-8 shrink-0 bg-[#002FA7] text-white font-bold text-xs flex items-center justify-center">
+              {(user?.name || "?").split(" ").map((w) => w[0]).join("").slice(0, 2).toUpperCase()}
+            </span>
+            <span className="flex-1 min-w-0">
+              <span className="block font-semibold text-sm truncate" data-testid="current-user-name">{user?.name}</span>
+              <span className="block text-[11px] text-gray-500 truncate">@{user?.username}</span>
+            </span>
+            <DotsThreeVertical size={18} className="text-gray-500 shrink-0" />
           </button>
+          {recHelp && <RecordingSetupModal onClose={() => setRecHelp(false)} />}
         </div>
       </aside>
     </>

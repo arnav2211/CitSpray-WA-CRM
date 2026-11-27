@@ -2,7 +2,12 @@ import React, { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api, errMsg } from "@/lib/api";
 import { toast } from "sonner";
-import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck, Copy, Link as LinkIcon, Phone, Plus, Trash, Lightning, Users as UsersIcon, Calendar, X, EnvelopeSimple, Paperclip, PaperPlaneTilt, WhatsappLogo, Funnel, ArrowsSplit, Sparkle } from "@phosphor-icons/react";
+import { FloppyDisk, ArrowCounterClockwise, Eye, EyeSlash, ShieldCheck, Copy, Link as LinkIcon, Phone, Plus, Trash, Lightning, Users as UsersIcon, Calendar, X, EnvelopeSimple, Paperclip, PaperPlaneTilt, WhatsappLogo, Funnel, ArrowsSplit, Sparkle, ChatCircleDots, ChatTeardropDots, Plug, QrCode, MagnifyingGlass } from "@phosphor-icons/react";
+import Integrations from "@/pages/Integrations";
+import Templates from "@/pages/Templates";
+import ChatFlows from "@/pages/ChatFlows";
+import QuickReplies from "@/pages/QuickReplies";
+import PaymentSettings from "@/pages/PaymentSettings";
 import { fmtIST } from "@/lib/format";
 import { useCompany } from "@/context/CompanyContext";
 import { CallAiSettingsPanel } from "@/components/CallAiSummary";
@@ -20,14 +25,22 @@ const FIELDS = [
 
 // Settings are grouped into sections; the section menu shows one at a time
 // (?section=... keeps it in the URL so a link opens the right one).
+// `page`: a whole page shown inside Settings (these used to be separate sidebar items).
+// `keys`: extra words for the "Find a setting" box.
 const SECTIONS = [
-  { k: "whatsapp", label: "WhatsApp", icon: WhatsappLogo, desc: "Meta Cloud API connection, welcome template and the auto-reply sequence." },
-  { k: "sources", label: "Lead sources", icon: Funnel, desc: "Where leads come from: webhook URLs (IndiaMART, JustDial, Shopify, WhatsApp, Gmail), ExportersIndia and TradeIndia." },
-  { k: "routing", label: "Lead routing", icon: ArrowsSplit, desc: "Who gets which leads: buy-lead routing per source and IndiaMART call (PNS) receiver numbers." },
-  { k: "calls", label: "Calls & AI", icon: Sparkle, desc: "AI call summaries, automatic follow-ups, team calls and recording settings." },
-  { k: "email", label: "Email", icon: EnvelopeSimple, desc: "Automatic welcome email to new leads." },
-  { k: "team", label: "Team", icon: Calendar, desc: "Leave and holiday management." },
+  { k: "whatsapp", group: "WhatsApp", label: "Connection & auto-reply", icon: WhatsappLogo, desc: "Meta Cloud API connection, welcome template and the auto-reply sequence.", keys: "token phone number id waba webhook verify welcome sequence" },
+  { k: "templates", group: "WhatsApp", label: "Message templates", icon: ChatCircleDots, page: Templates, desc: "Meta-approved WhatsApp templates.", keys: "wa templates approve meta" },
+  { k: "chatflows", group: "WhatsApp", label: "Chatbot flows", icon: ChatTeardropDots, page: ChatFlows, desc: "Automatic chatbot replies.", keys: "bot flow menu auto reply" },
+  { k: "quick-replies", group: "WhatsApp", label: "Quick replies", icon: Lightning, page: QuickReplies, desc: "Saved replies executives can send in one tap.", keys: "canned shortcut media" },
+  { k: "sources", group: "Leads", label: "Lead sources", icon: Funnel, desc: "Where leads come from: webhook URLs (IndiaMART, JustDial, Shopify, WhatsApp, Gmail), ExportersIndia and TradeIndia.", keys: "indiamart justdial shopify gmail exportersindia tradeindia webhook api" },
+  { k: "routing", group: "Leads", label: "Lead routing", icon: ArrowsSplit, desc: "Who gets which leads: buy-lead routing per source and IndiaMART call (PNS) receiver numbers.", keys: "round robin pns receiver buy leads" },
+  { k: "integrations", group: "Leads", label: "Integrations", icon: Plug, page: Integrations, desc: "Connected apps and API keys.", keys: "api key connect app" },
+  { k: "calls", group: "Calls", label: "Calls & AI", icon: Sparkle, desc: "AI call summaries, automatic follow-ups, team calls and recording settings.", keys: "recording gemini summary follow up promise" },
+  { k: "email", group: "Team & messages", label: "Email auto-send", icon: EnvelopeSimple, desc: "Automatic welcome email to new leads.", keys: "smtp mail welcome" },
+  { k: "team", group: "Team & messages", label: "Leave & holidays", icon: Calendar, desc: "Leave and holiday management.", keys: "leave holiday attendance" },
+  { k: "payment", group: "Payments", label: "Payment QR", icon: QrCode, page: PaymentSettings, desc: "UPI QR and bank details sent to customers.", keys: "upi bank account qr scanner" },
 ];
+const GROUPS = [...new Set(SECTIONS.map((s) => s.group))];
 
 // Every panel below reads/writes config for the ACTIVE company (X-Company header
 // is attached by lib/api.js). This banner makes that unmistakable so the admin
@@ -50,6 +63,7 @@ export default function Settings() {
   const [params, setParams] = useSearchParams();
   const section = SECTIONS.some((s) => s.k === params.get("section")) ? params.get("section") : "whatsapp";
   const setSection = (k) => setParams({ section: k }, { replace: true });
+  const [find, setFind] = useState("");
   const [cfg, setCfg] = useState(null);
   const [hooks, setHooks] = useState(null);
   const [form, setForm] = useState({});
@@ -135,24 +149,42 @@ export default function Settings() {
       <CompanyScopeBanner />
 
       <div className="flex flex-col md:flex-row gap-4 md:gap-6 items-start">
-        {/* Section menu: a column on desktop, a scrollable tab row on phones */}
-        <nav className="w-full md:w-56 shrink-0 md:sticky md:top-4 flex md:flex-col gap-1 overflow-x-auto border-b md:border-b-0 border-gray-200 pb-1 md:pb-0"
-          data-testid="settings-sections">
-          {SECTIONS.map(({ k, label, icon: Icon }) => (
-            <button key={k} onClick={() => setSection(k)} data-testid={`settings-section-${k}`}
-              className={`flex items-center gap-2 px-3 py-2.5 text-sm text-left whitespace-nowrap border-l-0 md:border-l-2 border-b-2 md:border-b-0 transition-colors ${
-                section === k ? "md:border-l-[#002FA7] border-b-[#002FA7] md:border-b-transparent bg-white font-semibold text-gray-900"
-                              : "border-transparent text-gray-600 hover:bg-gray-100"}`}>
-              <Icon size={16} /> {label}
-            </button>
-          ))}
+        {/* Section menu, grouped: a column on desktop, a scrollable tab row on phones */}
+        <nav className="w-full md:w-60 shrink-0 md:sticky md:top-4 border-b md:border-b-0 border-gray-200 pb-1 md:pb-0" data-testid="settings-sections">
+          <div className="relative mb-2 hidden md:block">
+            <MagnifyingGlass size={14} className="absolute left-2.5 top-2.5 text-gray-400" />
+            <input value={find} onChange={(e) => setFind(e.target.value)} placeholder="Find a setting..."
+              className="w-full border border-gray-300 bg-white pl-8 pr-2 py-1.5 text-sm outline-none focus:border-[#002FA7]" data-testid="settings-find" />
+          </div>
+          <div className="flex md:flex-col gap-1 overflow-x-auto">
+            {GROUPS.map((g) => {
+              const q = find.trim().toLowerCase();
+              const items = SECTIONS.filter((x) => x.group === g && (!q || `${x.group} ${x.label} ${x.desc} ${x.keys || ""}`.toLowerCase().includes(q)));
+              if (!items.length) return null;
+              return (
+                <div key={g} className="flex md:flex-col gap-1 md:mb-2">
+                  <div className="hidden md:block px-3 pt-1 pb-0.5 text-[10px] uppercase tracking-widest font-bold text-gray-400">{g}</div>
+                  {items.map(({ k, label, icon: Icon }) => (
+                    <button key={k} onClick={() => setSection(k)} data-testid={`settings-section-${k}`}
+                      className={`flex items-center gap-2 px-3 py-2 text-sm text-left whitespace-nowrap border-l-0 md:border-l-2 border-b-2 md:border-b-0 transition-colors ${
+                        section === k ? "md:border-l-[#002FA7] border-b-[#002FA7] md:border-b-transparent bg-white font-semibold text-gray-900"
+                                      : "border-transparent text-gray-600 hover:bg-gray-100"}`}>
+                      <Icon size={16} /> {label}
+                    </button>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
         </nav>
 
-        <div className="flex-1 min-w-0 max-w-4xl space-y-6 w-full">
+        <div className={`flex-1 min-w-0 ${sec.page ? "max-w-6xl" : "max-w-4xl"} space-y-6 w-full`}>
           <div className="border-b border-gray-200 pb-3">
+            <div className="text-[10px] uppercase tracking-widest font-bold text-gray-400">{sec.group}</div>
             <h2 className="font-chivo font-black text-xl">{sec.label}</h2>
             <p className="text-xs text-gray-500 mt-1">{sec.desc}</p>
           </div>
+          {sec.page && <div className="settings-embed"><sec.page /></div>}
 
           {section === "sources" && (
             <>
