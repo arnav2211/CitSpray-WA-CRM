@@ -19464,11 +19464,54 @@ async def _coa_standard_note() -> str:
 
 
 async def _coa_resolved(coa: dict) -> dict:
-    """A COA that uses the standard note gets today's standard note text."""
-    coa = coa or {}
+    """A COA as it should print today: the standard note text, and the auto batch number
+    (MG/CTS<MM><CODE>/<FY>, changes with the dates on the 10th)."""
+    from coa_pdf import apply_auto_batch
+    coa = apply_auto_batch(coa or {})
     if coa.get("note_mode") == "standard":
         return {**coa, "note": await _coa_standard_note()}
     return coa
+
+
+def _batch_code_candidates(name: str):
+    """Short oil codes to try: LEM, LMN, LE2 ... ('Lemongrass Oil' -> LEM first)."""
+    words = [w for w in re.sub(r"[^A-Z ]", " ", (name or "").upper()).split()
+             if w not in ("OIL", "COA", "THE", "AND", "OF", "PURE", "NATURAL", "ESSENTIAL")]
+    if not words:
+        words = ["X"]
+    if len(words) >= 2:
+        yield (words[0][0] + words[1][0] + (words[1][1:2] or words[0][1:2] or "X")).ljust(3, "X")
+        yield (words[0][0] + words[1][:2]).ljust(3, "X")
+    w = words[0]
+    yield w[:3].ljust(3, "X")
+    cons = [c for c in w[1:] if c not in "AEIOU"]
+    if len(cons) >= 2:
+        yield w[0] + cons[0] + cons[1]
+    for c in w[3:]:
+        yield w[:2] + c
+    for i in range(2, 100):
+        yield f"{w[:2]}{i}"
+
+
+@api.get("/docs/coa/batch-code")
+async def docs_coa_batch_code(name: str = "", product_id: str = "", user: dict = Depends(get_docs_user)):
+    """A short oil code for auto batch numbers that no OTHER oil uses yet."""
+    used: Dict[str, str] = {}
+    async for d in db.doc_files.find({"source": "coa", "deleted": {"$ne": True}, "coa.batch_code": {"$exists": True}},
+                                     {"_id": 0, "product_id": 1, "coa.batch_code": 1}):
+        c = str((d.get("coa") or {}).get("batch_code") or "").upper()
+        if c:
+            used.setdefault(c, d.get("product_id") or "")
+    if product_id:   # the same oil keeps its existing code
+        async for d in db.doc_files.find({"source": "coa", "deleted": {"$ne": True}, "product_id": product_id,
+                                          "coa.batch_code": {"$exists": True}}, {"_id": 0, "coa.batch_code": 1}):
+            c = str((d.get("coa") or {}).get("batch_code") or "").upper()
+            if c:
+                return {"code": c}
+    for c in _batch_code_candidates(name):
+        if c not in used:
+            return {"code": c}
+    return {"code": uuid.uuid4().hex[:4].upper()}
 
 
 async def _doc_bytes(doc: dict) -> tuple:
@@ -19822,9 +19865,35 @@ async def docs_view(tok: str):
 
 @api.post("/docs/send")
 async def docs_send(body: DocSendInput, user: dict = Depends(get_current_user)):
-    """Send documents from the library to a lead on WhatsApp (each as a document message)."""
+    """Send documents to a lead on WhatsApp. Admins send straight away; an executive's pick goes to
+    the admin for approval first (Document Approvals) and is sent when approved."""
     ctx = await _assert_chat_permitted(user, body.lead_id)
+    if user.get("role") != "admin":
+        docs = []
+        for did in body.doc_ids[:10]:
+            d = await db.doc_files.find_one({"id": did, "deleted": {"$ne": True}, **_doc_visible_q(user)},
+                                            {"_id": 0, "id": 1, "title": 1, "kind": 1, "product_id": 1, "source": 1})
+            if d:
+                docs.append(d)
+        if not docs:
+            raise HTTPException(status_code=400, detail="Pick at least one document")
+        lead = ctx["lead"]
+        req = {"id": str(uuid.uuid4()), "company": normalize_company(lead.get("company")), "lead_id": lead["id"],
+               "lead_name": lead.get("name") or lead.get("company_name") or "", "phone": ctx["target_phone"],
+               "requested_by": user["id"], "requested_by_name": user.get("name"),
+               "doc_ids": [d["id"] for d in docs], "docs": docs, "caption": (body.caption or "").strip(),
+               "status": "pending", "created_at": iso(now_utc())}
+        await db.doc_send_requests.insert_one(req.copy())
+        await log_activity(user["id"], "document_send_requested", lead["id"], {"request_id": req["id"], "docs": [d["title"] for d in docs]})
+        return {"pending": True, "request_id": req["id"], "sent": [], "failed": []}
+    return await _docs_send_now(ctx, body.doc_ids, body.caption, user, user["id"])
+
+
+async def _docs_send_now(ctx: dict, doc_ids: List[str], caption_in: Optional[str], viewer: dict, sender_id: str,
+                         approved_by: Optional[dict] = None) -> dict:
     target_phone = ctx["target_phone"]
+    body = DocSendInput(lead_id=ctx["lead"]["id"], doc_ids=doc_ids, caption=caption_in)
+    user = viewer
     _co = normalize_company(ctx["lead"].get("company"))
     crm_base_url = os.environ.get("FRONTEND_BASE_URL", "https://crm.mangalamagro.in").rstrip("/")
     sent, failed = [], []
@@ -19852,13 +19921,117 @@ async def docs_send(body: DocSendInput, user: dict = Depends(get_current_user)):
                  "filename": name, "doc_id": did}
         if caption:
             extra["caption"] = caption
-        msg = await _record_sent_message(body.lead_id, user["id"], target_phone, preview, api_result, extra, reply_ctx)
-        await log_activity(user["id"], "document_sent", body.lead_id,
+        if approved_by:
+            extra["approved_by"] = approved_by["id"]
+            extra["approved_by_name"] = approved_by.get("name")
+        msg = await _record_sent_message(body.lead_id, sender_id, target_phone, preview, api_result, extra, reply_ctx)
+        await log_activity(sender_id, "document_sent", body.lead_id,
                            {"doc_id": did, "title": d.get("title"), "kind": d.get("kind"), "status": msg["status"]})
         (failed if msg["status"] == "failed" else sent).append({"id": did, "name": name, "error": msg.get("error")})
     if not sent and failed:
         raise HTTPException(status_code=400, detail=failed[0].get("error") or "Could not send")
     return {"sent": sent, "failed": failed}
+
+
+# ---- Document send approvals (executive picks -> admin approves -> sent)
+async def _dsr_get(rid: str) -> dict:
+    r = await db.doc_send_requests.find_one({"id": rid}, {"_id": 0})
+    if not r:
+        raise HTTPException(status_code=404, detail="Request not found")
+    return r
+
+
+@api.get("/docs/send-requests/count")
+async def doc_send_requests_count(user: dict = Depends(require_admin), x_company: Optional[str] = Header(None, alias="X-Company")):
+    n = await db.doc_send_requests.count_documents({"status": "pending", "$and": [company_filter(_resolve_company(user, x_company))]})
+    return {"pending": n}
+
+
+@api.get("/docs/send-requests")
+async def doc_send_requests_list(status: str = "pending", user: dict = Depends(require_admin),
+                                 x_company: Optional[str] = Header(None, alias="X-Company")):
+    q: Dict[str, Any] = {"$and": [company_filter(_resolve_company(user, x_company))]}
+    q["status"] = "pending" if status == "pending" else {"$ne": "pending"}
+    rows = await db.doc_send_requests.find(q, {"_id": 0}).sort("created_at", -1 if status != "pending" else 1).to_list(200)
+    return {"requests": rows}
+
+
+@api.get("/docs/send-requests/mine")
+async def doc_send_requests_mine(lead_id: str, user: dict = Depends(get_current_user)):
+    """The executive's own requests for one lead (shown in the document picker)."""
+    rows = await db.doc_send_requests.find({"lead_id": lead_id, "requested_by": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(10)
+    return {"requests": rows}
+
+
+@api.get("/docs/send-requests/{rid}")
+async def doc_send_request_detail(rid: str, user: dict = Depends(require_admin)):
+    """Everything the admin needs to decide: the documents, the customer's chat and calls."""
+    r = await _dsr_get(rid)
+    lead = await db.leads.find_one({"id": r["lead_id"]}, {"_id": 0, "id": 1, "name": 1, "company_name": 1, "phone": 1, "city": 1,
+                                                          "state": 1, "source": 1, "status": 1, "assigned_to": 1, "last_user_message_at": 1})
+    msgs = await db.messages.find({"lead_id": r["lead_id"]}, {"_id": 0, "id": 1, "direction": 1, "body": 1, "caption": 1, "media_type": 1,
+                                                             "filename": 1, "at": 1, "by_user_id": 1, "status": 1, "template_name": 1}
+                                  ).sort("at", -1).to_list(60)
+    calls = await db.call_logs.find({"lead_id": r["lead_id"]}, {"_id": 0, "id": 1, "at": 1, "direction": 1, "outcome": 1, "duration_seconds": 1,
+                                                               "by_user_name": 1, "ai_summary.summary": 1, "ai_summary.products": 1,
+                                                               "ai_summary.price_discussed": 1, "ai_summary.interest": 1, "summary": 1}
+                                    ).sort("at", -1).to_list(15)
+    names = {u["id"]: u.get("name") async for u in db.users.find({}, {"_id": 0, "id": 1, "name": 1})}
+    for m in msgs:
+        m["by_name"] = names.get(m.get("by_user_id"))
+    within = False
+    try:
+        lu = (lead or {}).get("last_user_message_at")
+        if lu:
+            dd = datetime.fromisoformat(lu.replace("Z", "+00:00"))
+            dd = dd if dd.tzinfo else dd.replace(tzinfo=timezone.utc)
+            within = (now_utc() - dd) < timedelta(hours=24)
+    except Exception:
+        within = False
+    return {"request": r, "lead": lead, "messages": list(reversed(msgs)), "calls": calls, "within_24h": within}
+
+
+class DsrDecision(BaseModel):
+    caption: Optional[str] = None
+    reason: Optional[str] = None
+    doc_ids: Optional[List[str]] = None   # admin may untick some documents before approving
+
+
+@api.post("/docs/send-requests/{rid}/approve")
+async def doc_send_request_approve(rid: str, body: DsrDecision, user: dict = Depends(require_admin)):
+    r = await _dsr_get(rid)
+    if r["status"] != "pending":
+        raise HTTPException(status_code=400, detail=f"Already {r['status']}")
+    ids = [i for i in (body.doc_ids if body.doc_ids is not None else r["doc_ids"]) if i in r["doc_ids"]]
+    if not ids:
+        raise HTTPException(status_code=400, detail="No documents left to send - reject the request instead")
+    claimed = await db.doc_send_requests.update_one({"id": rid, "status": "pending"}, {"$set": {"status": "sending"}})
+    if not claimed.modified_count:
+        raise HTTPException(status_code=409, detail="Someone else is handling this request")
+    try:
+        ctx = await _assert_chat_permitted(user, r["lead_id"])
+        caption = body.caption if body.caption is not None else r.get("caption")
+        res = await _docs_send_now(ctx, ids, caption, user, r["requested_by"], approved_by=user)
+    except HTTPException as e:
+        await db.doc_send_requests.update_one({"id": rid}, {"$set": {"status": "pending"}})
+        raise e
+    except Exception as e:
+        await db.doc_send_requests.update_one({"id": rid}, {"$set": {"status": "pending"}})
+        raise HTTPException(status_code=500, detail=f"Could not send: {e}")
+    await db.doc_send_requests.update_one({"id": rid}, {"$set": {
+        "status": "approved", "decided_by": user["id"], "decided_by_name": user.get("name"), "decided_at": iso(now_utc()),
+        "sent_doc_ids": ids, "caption_sent": caption, "result": res}})
+    return {"ok": True, **res}
+
+
+@api.post("/docs/send-requests/{rid}/reject")
+async def doc_send_request_reject(rid: str, body: DsrDecision, user: dict = Depends(require_admin)):
+    r = await db.doc_send_requests.update_one({"id": rid, "status": "pending"}, {"$set": {
+        "status": "rejected", "reason": (body.reason or "").strip()[:500], "decided_by": user["id"],
+        "decided_by_name": user.get("name"), "decided_at": iso(now_utc())}})
+    if not r.modified_count:
+        raise HTTPException(status_code=400, detail="This request is no longer pending")
+    return {"ok": True}
 
 
 # ------------- Video of the Day (sales training) -------------

@@ -22,6 +22,7 @@ export const BLANK_COA = () => ({
   show_mfg: true, mfg_label: "MFG.DATE",
   show_exp: true, exp_label: "EXP.DATE",
   date_mode: "auto", mfg_month: "", exp_month: "", shelf_life_months: 24,
+  batch_mode: "auto", batch_code: "",
   sections: [{
     title: "PHYSICO-CHEMICAL PROPERTIES",
     columns: ["Parameters", "Specification", "Results"],
@@ -60,6 +61,20 @@ function applyIssue(coa, it) {
   return c;
 }
 const pathKey = (p) => p.join(".");
+
+// Auto batch no. = MG/CTS<mfg month><oil code>/<financial year>, e.g. MG/CTS11LEM/2627.
+// Same rule as the dates: the month changes on the 10th (server: coa_pdf.coa_batch).
+export const isBatchNoLabel = (l) => /batch|lot/i.test(l || "") && !/qty|quantity|size|weight/i.test(l || "");
+export function autoBatch(coa, today = new Date()) {
+  const code = String(coa.batch_code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (coa.batch_mode !== "auto" || !code) return "";
+  let y = today.getFullYear(), m = today.getMonth() + 1;
+  if (coa.date_mode === "locked" && coa.mfg_month) { [y, m] = coa.mfg_month.slice(0, 7).split("-").map(Number); }
+  else if (today.getDate() < 10) { m -= 1; if (m === 0) { m = 12; y -= 1; } }
+  const fy = m >= 4 ? y : y - 1;
+  const yy = (n) => String(n % 100).padStart(2, "0");
+  return `MG/CTS${String(m).padStart(2, "0")}${code}/${yy(fy)}${yy(fy + 1)}`;
+}
 
 function move(arr, i, d) {
   const j = i + d;
@@ -137,6 +152,19 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
   const matched = products.find((p) => p.name.trim().toLowerCase() === oilName.trim().toLowerCase());
   const pid = matched?.id || "";
   const productName = matched?.name || oilName.trim();
+  const batchPreview = autoBatch(coa);
+  const suggestCode = async () => {
+    try {
+      const { data } = await api.get("/docs/coa/batch-code", { params: { name: productName, product_id: pid || (existing?.product_id || "") } });
+      set({ batch_code: data.code });
+    } catch { /* ignore */ }
+  };
+  // a new auto-batch COA gets an oil code as soon as the oil is known
+  useEffect(() => {
+    if (coa.batch_mode !== "auto" || coa.batch_code || !productName) return undefined;
+    const t = setTimeout(suggestCode, 600);
+    return () => clearTimeout(t);
+  }, [coa.batch_mode, coa.batch_code, productName]); // eslint-disable-line react-hooks/exhaustive-deps
   const payload = (useId = pid, c = coa) => ({ coa: c, product_id: useId || null, title: title || undefined, visibility, kind: "coa" });
   const saveStdNote = async () => {
     try {
@@ -228,13 +256,36 @@ export default function CoaMaker({ products, productId, existing, duplicateOf, i
                 {coa.info.map((r, i) => (
                   <div key={i} className="flex gap-1 items-center">
                     <input className={`${inp.replace("w-full ", "")} w-28 md:w-40 shrink-0${warn(["info", i, "label"])}`} value={r.label} onChange={(e) => setInfo(i, { label: e.target.value })} placeholder="Label" />
-                    <input className={`${inp} min-w-0 flex-1${warn(["info", i, "value"])}`} value={r.value} onChange={(e) => setInfo(i, { value: e.target.value })} placeholder="Value (empty = not shown)" />
+                    {coa.batch_mode === "auto" && isBatchNoLabel(r.label) ? (
+                      <input className={`${inp} min-w-0 flex-1 bg-gray-50 text-gray-600`} value={batchPreview || "(set the oil code below)"} readOnly title="Auto batch no. - changes on the 10th (see Batch no. below)" />
+                    ) : (
+                      <input className={`${inp} min-w-0 flex-1${warn(["info", i, "value"])}`} value={r.value} onChange={(e) => setInfo(i, { value: e.target.value })} placeholder="Value (empty = not shown)" />
+                    )}
                     <button onClick={() => set({ info: move(coa.info, i, -1) })} className="p-1 text-gray-400 hover:text-gray-800"><ArrowUp size={14} /></button>
                     <button onClick={() => set({ info: move(coa.info, i, 1) })} className="p-1 text-gray-400 hover:text-gray-800"><ArrowDown size={14} /></button>
                     <button onClick={() => set({ info: coa.info.filter((_, k) => k !== i) })} className="p-1 text-gray-400 hover:text-[#E60000]"><Trash size={14} /></button>
                   </div>
                 ))}
               </div>
+            </div>
+
+            {/* Batch no. */}
+            <div className="border border-gray-200 p-3 space-y-2">
+              <div className={lbl}>Batch no.</div>
+              <div className="flex flex-wrap gap-4 text-sm">
+                <label className="flex items-center gap-1"><input type="radio" checked={coa.batch_mode === "auto"} onChange={() => set({ batch_mode: "auto" })} /> Auto (changes on the 10th with the date)</label>
+                <label className="flex items-center gap-1"><input type="radio" checked={coa.batch_mode !== "auto"} onChange={() => set({ batch_mode: "fixed" })} /> Fixed (type it in the Batch No row)</label>
+              </div>
+              {coa.batch_mode === "auto" && (
+                <div className="flex flex-wrap items-end gap-2">
+                  <div><div className={lbl}>Oil code</div>
+                    <input className={`${inp} w-28 uppercase`} maxLength={6} value={coa.batch_code || ""} onChange={(e) => set({ batch_code: e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "") })} placeholder="LEM" />
+                  </div>
+                  <button type="button" onClick={suggestCode} className="text-xs text-[#002FA7] font-bold pb-2">Suggest</button>
+                  <div className="text-sm pb-1.5">This month: <b className="font-mono">{batchPreview || "-"}</b></div>
+                  <div className="text-[11px] text-gray-500 w-full">Pattern: MG/CTS + mfg. month + oil code + / + financial year (Apr-Mar). Locked dates keep the locked month.</div>
+                </div>
+              )}
             </div>
 
             {/* Dates */}

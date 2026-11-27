@@ -1,11 +1,12 @@
 import React, { useEffect, useState } from "react";
-import { X, MagnifyingGlass, Eye, PaperPlaneRight, CaretRight, CaretDown, LockSimple } from "@phosphor-icons/react";
+import { X, MagnifyingGlass, Eye, PaperPlaneRight, CaretRight, CaretDown, LockSimple, Hourglass, CheckCircle, XCircle } from "@phosphor-icons/react";
+import { useAuth } from "@/context/AuthContext";
 import { toast } from "sonner";
 import { api, errMsg } from "@/lib/api";
 import { openDoc, KIND_COLORS } from "@/lib/docs";
 
 /* /chat → attach → Product documents: search an oil, tick its COA / GCMS / TDS …
-   and send them to this customer as WhatsApp documents. */
+   Admin: sent straight away. Executive: goes to the admin for approval and is sent when approved. */
 export default function DocPicker({ leadId, onClose, onSent }) {
   const [q, setQ] = useState("");
   const [products, setProducts] = useState([]);
@@ -15,6 +16,11 @@ export default function DocPicker({ leadId, onClose, onSent }) {
   const [caption, setCaption] = useState("");
   const [kinds, setKinds] = useState({});
   const [sending, setSending] = useState(false);
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
+  const [mine, setMine] = useState([]);
+  const loadMine = () => { if (!isAdmin) api.get("/docs/send-requests/mine", { params: { lead_id: leadId } }).then(({ data }) => setMine(data.requests || [])).catch(() => {}); };
+  useEffect(loadMine, [leadId, isAdmin]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { api.get("/docs/meta").then(({ data }) => setKinds(data.kinds || {})).catch(() => {}); }, []);
   useEffect(() => {
@@ -39,7 +45,8 @@ export default function DocPicker({ leadId, onClose, onSent }) {
     setSending(true);
     try {
       const { data } = await api.post("/docs/send", { lead_id: leadId, doc_ids: picked.map((p) => p.id), caption });
-      toast.success(`Sent ${data.sent.length} document${data.sent.length === 1 ? "" : "s"}${data.failed.length ? ` · ${data.failed.length} failed` : ""}`);
+      if (data.pending) toast.success("Sent to admin for approval - it goes to the customer once approved");
+      else toast.success(`Sent ${data.sent.length} document${data.sent.length === 1 ? "" : "s"}${data.failed.length ? ` · ${data.failed.length} failed` : ""}`);
       onSent?.();
     } catch (e) { toast.error(errMsg(e, "Could not send")); }
     finally { setSending(false); }
@@ -81,12 +88,28 @@ export default function DocPicker({ leadId, onClose, onSent }) {
           ))}
           {!products.length && <div className="p-6 text-center text-sm text-gray-400">{q ? "No oil with documents matches" : "No documents in the library yet"}</div>}
         </div>
+        {!isAdmin && mine.length > 0 && (
+          <div className="px-3 py-2 border-t border-gray-200 bg-gray-50 max-h-28 overflow-y-auto text-[11px] space-y-1" data-testid="doc-requests-mine">
+            {mine.slice(0, 4).map((r) => (
+              <div key={r.id} className="flex items-start gap-1.5">
+                {r.status === "approved" ? <CheckCircle size={13} weight="fill" className="text-green-600 shrink-0 mt-px" />
+                  : r.status === "rejected" ? <XCircle size={13} weight="fill" className="text-[#E60000] shrink-0 mt-px" />
+                  : <Hourglass size={13} className="text-[#B36200] shrink-0 mt-px" />}
+                <span className="flex-1 min-w-0">
+                  <b>{r.status === "approved" ? "Approved & sent" : r.status === "rejected" ? "Rejected" : "Waiting for admin"}:</b>{" "}
+                  {(r.docs || []).map((d) => d.title).join(", ")}
+                  {r.status === "rejected" && r.reason ? <span className="text-[#E60000]"> - {r.reason}</span> : null}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
         <div className="p-3 border-t border-gray-200 space-y-2">
           <input value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="Message with the first document (optional)"
             className="w-full border border-gray-300 px-2 py-1.5 text-sm outline-none focus:border-[#002FA7]" />
           <button onClick={send} disabled={!picked.length || sending}
             className="w-full bg-[#25D366] hover:bg-[#1DA851] text-white py-2 text-xs font-bold uppercase tracking-widest flex items-center justify-center gap-1 disabled:opacity-50" data-testid="doc-picker-send">
-            <PaperPlaneRight size={14} weight="fill" /> {sending ? "Sending…" : `Send ${picked.length || ""} document${picked.length === 1 ? "" : "s"}`}
+            <PaperPlaneRight size={14} weight="fill" /> {sending ? "Sending…" : `${isAdmin ? "Send" : "Send for approval:"} ${picked.length || ""} document${picked.length === 1 ? "" : "s"}`}
           </button>
         </div>
       </div>

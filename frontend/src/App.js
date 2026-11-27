@@ -38,6 +38,7 @@ import WinBack from "@/pages/WinBack";
 import MyAttendance from "@/pages/MyAttendance";
 import Documents from "@/pages/Documents";
 import DailyVideos from "@/pages/DailyVideos";
+import DocApprovals from "@/pages/DocApprovals";
 
 export default function App() {
   return (
@@ -79,6 +80,7 @@ export default function App() {
               <Route path="/payment-settings" element={<AdminOnly><PaymentSettings /></AdminOnly>} />
               <Route path="/payroll" element={<AdminOnly><PayrollPage /></AdminOnly>} />
               <Route path="/daily-videos" element={<AdminOnly><DailyVideos /></AdminOnly>} />
+              <Route path="/doc-approvals" element={<AdminOnly><DocApprovals /></AdminOnly>} />
               <Route path="/leaves" element={<LeavesPage />} />
               <Route path="/my-attendance" element={<MyAttendance />} />
               <Route path="/documents" element={<Documents />} />

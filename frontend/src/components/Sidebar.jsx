@@ -2,7 +2,7 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
-  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo, AndroidLogo, UsersThree, Sparkle, Handshake, Recycle, Fingerprint, Files, FilmStrip,
+  ChartBar, Users, Kanban, Bell, Gear, PaperPlaneTilt, SignOut, Compass, ChatCircleDots, Plug, Sliders, ChatTeardropDots, Lightning, X, ChatTeardropText, ArrowsLeftRight, QrCode, Megaphone, PlusCircle, ClipboardText, PhoneCall, Calculator, CalendarCheck, Globe, WhatsappLogo, AndroidLogo, UsersThree, Sparkle, Handshake, Recycle, Fingerprint, Files, FilmStrip, Stamp,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { api, errMsg } from "@/lib/api";
@@ -38,6 +38,7 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
   const isAdmin = user?.role === "admin";
   const [pendingTransfers, setPendingTransfers] = useState(0);
   const [pendingLeaves, setPendingLeaves] = useState(0);
+  const [pendingDocs, setPendingDocs] = useState(0);
   const [pendingQA, setPendingQA] = useState(0);
   // LeadOrbit Android app download (hidden inside the app's own WebView)
   const [appVer, setAppVer] = useState(null);
@@ -94,6 +95,21 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
     const id = setInterval(() => { if (!document.hidden) tick(); }, 15000);
     return () => { stop = true; clearInterval(id); };
   }, [user?.id]);
+
+  // Documents waiting for the admin's approval before they go to customers
+  useEffect(() => {
+    if (user?.role !== "admin") return undefined;
+    let stop = false;
+    const tick = async () => {
+      try {
+        const { data } = await api.get("/docs/send-requests/count");
+        if (!stop) setPendingDocs(data?.pending || 0);
+      } catch { /* ignore */ }
+    };
+    tick();
+    const id = setInterval(() => { if (!document.hidden) tick(); }, 20000);
+    return () => { stop = true; clearInterval(id); };
+  }, [user?.id, user?.role]);
 
   // When a nav item is clicked on mobile, close the drawer
   const handleNavigate = () => { if (mobileOpen && onClose) onClose(); };
@@ -186,6 +202,10 @@ export default function Sidebar({ mobileOpen = false, onClose }) {
               <Item to="/ai-reports" icon={Sparkle} testId="nav-ai-reports" onNavigate={handleNavigate}>AI Reports</Item>
               <Item to="/promises" icon={Handshake} testId="nav-promises" onNavigate={handleNavigate}>Promises</Item>
               <Item to="/documents" icon={Files} testId="nav-documents" onNavigate={handleNavigate}>Product Documents</Item>
+              {isAdmin && (
+                <Item to="/doc-approvals" icon={Stamp} testId="nav-doc-approvals" onNavigate={handleNavigate}
+                  badge={pendingDocs} badgeClass="bg-[#E67E00] text-white" highlight={pendingDocs > 0}>Document Approvals</Item>
+              )}
               {!isAdmin && (
                 <>
                   <Item to="/my-attendance" icon={Fingerprint} testId="nav-my-attendance" onNavigate={handleNavigate}>My Attendance</Item>

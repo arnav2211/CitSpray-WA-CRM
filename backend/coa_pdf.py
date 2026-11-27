@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -90,6 +91,55 @@ def _col_widths(cols, body, n, total, font) -> list:
     w = [max(42.0, total * x / s) for x in weights]
     k = total / sum(w)
     return [x * k for x in w]
+
+
+BATCH_PREFIX = "MG/CTS"
+_BATCH_ROW = re.compile(r"batch|lot", re.I)
+_QTY_ROW = re.compile(r"qty|quantity|size|weight", re.I)
+
+
+def is_batch_no_label(label: str) -> bool:
+    """'BATCH NO', 'Batch No.', 'LOT NO' - but not 'BATCH QTY'."""
+    return bool(_BATCH_ROW.search(label or "")) and not _QTY_ROW.search(label or "")
+
+
+def coa_mfg_month(data: dict, today: Optional[datetime] = None) -> tuple:
+    """(year, month) of manufacture as the COA shows it right now (same rule as the dates)."""
+    today = today or datetime.now()
+    if (data.get("date_mode") or "auto") == "locked" and data.get("mfg_month"):
+        y, m = (int(x) for x in str(data["mfg_month"])[:7].split("-"))
+        return y, m
+    y, m = today.year, today.month
+    if today.day < AUTO_SWITCH_DAY:
+        y, m = _month_add(y, m, -1)
+    return y, m
+
+
+def coa_batch(data: dict, today: Optional[datetime] = None) -> Optional[str]:
+    """Auto batch number MG/CTS<MM><CODE>/<FY>, e.g. MG/CTS11LEM/2627 for Nov 2026.
+    MM = manufacturing month, CODE = the COA's oil code, FY = Indian financial year (Apr-Mar).
+    Changes together with the dates on the 10th. None when the COA keeps a fixed batch number."""
+    code = re.sub(r"[^A-Z0-9]", "", str(data.get("batch_code") or "").upper())
+    if data.get("batch_mode") != "auto" or not code:
+        return None
+    y, m = coa_mfg_month(data, today)
+    fy = y if m >= 4 else y - 1
+    return f"{BATCH_PREFIX}{m:02d}{code}/{fy % 100:02d}{(fy + 1) % 100:02d}"
+
+
+def apply_auto_batch(data: dict, today: Optional[datetime] = None) -> dict:
+    """Copy of the COA with the batch-number row filled with today's auto batch number."""
+    b = coa_batch(data, today)
+    if not b:
+        return data
+    info = [dict(r) for r in (data.get("info") or [])]
+    for r in info:
+        if is_batch_no_label(r.get("label")):
+            r["value"] = b
+            break
+    else:
+        info.insert(1 if info else 0, {"label": "BATCH NO", "value": b})
+    return {**data, "info": info}
 
 
 def coa_dates(data: dict, today: Optional[datetime] = None) -> tuple:
