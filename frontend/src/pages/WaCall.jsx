@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { useParams, useSearchParams } from "react-router-dom";
-import { Phone, PhoneOff, Mic, MicOff, Volume2, Ear, MessageCircle, Bluetooth, Headphones } from "lucide-react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { useAuth } from "@/context/AuthContext";
+import { useCompany } from "@/context/CompanyContext";
+import { Phone, PhoneOff, Mic, MicOff, Volume2, Ear, MessageCircle, Bluetooth, Headphones, ChevronDown } from "lucide-react";
 import { api, errMsg } from "@/lib/api";
 
 /**
@@ -79,9 +81,10 @@ function makeRingback() {
   };
 }
 
-export default function WaCall({ outgoing = false }) {
-  const { id: routeId, leadId } = useParams();
-  const [params] = useSearchParams();
+/* One call screen. It is mounted by WaCallHost (below) at the top of the app, NOT by a route,
+   so leaving the screen - back button, a link, the Chat button - only shrinks the call into a
+   floating bar; the call (and its audio) carries on until someone hangs up. */
+export default function WaCall({ outgoing = false, routeId, leadId, answer = false, minimized = false, onPhase, onOpenChat, onRestore }) {
   const [id, setId] = useState(outgoing ? null : routeId);
   const [call, setCall] = useState(null);
   const [phase, setPhase] = useState("loading"); // loading | ringing | connecting | active | ended | gone | error
@@ -377,7 +380,7 @@ export default function WaCall({ outgoing = false }) {
 
   // auto-answer when the app opened this page from the "Answer" button
   useEffect(() => {
-    if (!outgoing && phase === "ringing" && params.get("answer") === "1" && !autoTried.current) {
+    if (!outgoing && phase === "ringing" && answer && !autoTried.current) {
       autoTried.current = true;
       answer();
     }
@@ -475,7 +478,10 @@ export default function WaCall({ outgoing = false }) {
     return () => { delete window.__waCallHangup; };
   }, [hangup]);
 
-  // leaving the page ends the call
+  useEffect(() => { onPhase?.(phase); }, [phase, onPhase]);
+
+  // Only when the call screen is really torn down (logout, page closed) - NOT when leaving the
+  // screen: WaCallHost keeps this mounted (minimized) while the call is on
   useEffect(() => () => {
     ringbackRef.current?.stop();
     if (id && (phaseRef.current === "active" || phaseRef.current === "connecting")) {
@@ -513,9 +519,45 @@ export default function WaCall({ outgoing = false }) {
   const name = call?.name || call?.from || "WhatsApp caller";
   const btn = "h-16 w-16 rounded-full flex items-center justify-center shadow-lg active:scale-95 transition";
 
+  const live = phase === "active" || phase === "connecting";
+  if (minimized) {
+    // the "dynamic bar": stays on top of every CRM screen while the call is on
+    return (
+      <>
+        <audio ref={audioRef} autoPlay playsInline />
+        {live && (
+          <div className="fixed left-1/2 -translate-x-1/2 z-[9998] flex items-center gap-1 rounded-full bg-[#075E54] text-white shadow-2xl px-1 py-1 max-w-[94vw]"
+            style={{ top: "max(0.5rem, env(safe-area-inset-top))" }} data-testid="wa-call-mini">
+            <button type="button" onClick={onRestore} className="flex items-center gap-2 min-w-0 pl-2 pr-3 py-1.5 rounded-full hover:bg-white/10" title="Back to the call">
+              <span className="relative flex h-2.5 w-2.5 shrink-0">
+                <span className="absolute inline-flex h-full w-full rounded-full bg-[#25D366] opacity-75 animate-ping" />
+                <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-[#25D366]" />
+              </span>
+              <span className="text-sm font-semibold truncate max-w-[40vw]">{name}</span>
+              <span className="text-xs text-emerald-100 font-mono shrink-0">{phase === "active" ? fmt(elapsed) : "…"}</span>
+            </button>
+            <button type="button" onClick={toggleMute} className={`h-8 w-8 shrink-0 rounded-full flex items-center justify-center ${muted ? "bg-white text-[#075E54]" : "bg-white/15"}`} aria-label="Mute">
+              {muted ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+            </button>
+            <button type="button" onClick={hangup} className="h-8 w-8 shrink-0 rounded-full bg-red-500 flex items-center justify-center" aria-label="Hang up" data-testid="wa-call-mini-hangup">
+              <PhoneOff className="h-4 w-4" />
+            </button>
+          </div>
+        )}
+      </>
+    );
+  }
+
   return (
+    <>
+    <audio ref={audioRef} autoPlay playsInline />
     <div className="fixed inset-0 z-[9999] flex flex-col items-center justify-between bg-gradient-to-b from-[#075E54] to-[#04332d] text-white px-6 py-10" data-testid="wa-call-page">
-      <audio ref={audioRef} autoPlay playsInline />
+      {live && (
+        <button type="button" onClick={() => onOpenChat?.(null)} className="absolute left-3 flex items-center gap-1 rounded-full bg-white/15 px-3 py-1.5 text-xs"
+          style={{ top: "max(0.75rem, env(safe-area-inset-top))" }} aria-label="Minimize" title="Use the CRM during the call - the call keeps going">
+          <ChevronDown className="h-4 w-4" /> Minimize
+        </button>
+      )}
       <div className="flex flex-col items-center gap-3 mt-6 text-center">
         <div className="text-xs uppercase tracking-[0.25em] text-emerald-200">
           {outgoing ? "Outgoing " : ""}WhatsApp call{call?.company ? ` · ${call.company === "fragvansh" ? "Fragvansh" : "CitSpray"}` : ""}
@@ -569,10 +611,19 @@ export default function WaCall({ outgoing = false }) {
               </button>
               <span className="text-xs">{ROUTE_LABEL[route] || "Speaker"}</span>
             </div>
+            {call?.lead_id && (
+              <div className="flex flex-col items-center gap-2">
+                <button type="button" onClick={() => onOpenChat?.(call)} className={`${btn} bg-white/15`} aria-label="Open chat" data-testid="wa-call-open-chat">
+                  <MessageCircle className="h-6 w-6" />
+                </button>
+                <span className="text-xs">Chat</span>
+              </div>
+            )}
           </div>
           <button type="button" onClick={hangup} className={`${btn} bg-red-500`} aria-label="Hang up" data-testid="wa-call-hangup"><PhoneOff className="h-7 w-7" /></button>
         </div>
       )}
+
 
       {(phase === "ended" || phase === "gone" || phase === "error") && (
         <div className="flex flex-col items-center gap-3 mb-8 w-full max-w-xs">
@@ -586,5 +637,71 @@ export default function WaCall({ outgoing = false }) {
         </div>
       )}
     </div>
+    </>
+  );
+}
+
+/* Keeps the call alive across the whole app: /wa-call/:id and /wa-call-out/:leadId only say
+   "show the call screen"; navigating anywhere else minimizes it into the floating bar. */
+export function WaCallHost() {
+  const loc = useLocation();
+  const navigate = useNavigate();
+  const { user } = useAuth();
+  const { company, canSwitch, setCompany } = useCompany();
+  const [session, setSession] = useState(null);   // { key, outgoing, routeId, leadId, answer, path }
+  const [phase, setPhase] = useState("loading");
+  const liveRef = useRef(false);
+  const live = phase === "active" || phase === "connecting";
+  liveRef.current = live;
+
+  const mIn = loc.pathname.match(/^\/wa-call\/([^/]+)/);
+  const mOut = loc.pathname.match(/^\/wa-call-out\/([^/]+)/);
+  const key = mIn ? `in:${mIn[1]}` : mOut ? `out:${mOut[1]}` : null;
+
+  useEffect(() => {
+    if (!key) return;
+    setSession((cur) => {
+      if (cur && cur.key === key) return cur;
+      if (cur && liveRef.current) return cur;           // already on a call: keep it, never start a second one
+      setPhase("loading");
+      return {
+        key, outgoing: !!mOut, routeId: mIn ? mIn[1] : undefined, leadId: mOut ? mOut[1] : undefined,
+        answer: new URLSearchParams(loc.search).get("answer") === "1",
+        path: mIn ? `/wa-call/${mIn[1]}` : `/wa-call-out/${mOut[1]}`,
+      };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+
+  const visible = !!session && key === session.key;
+  // Left the screen while nothing is going on (still ringing / already finished) -> drop it
+  useEffect(() => {
+    if (session && !visible && !live) setSession(null);
+  }, [session, visible, live]);
+
+  // Tells the PC "you're on a call" bar that this device itself has the call
+  useEffect(() => {
+    if (live) document.body.dataset.waCallLive = "1"; else delete document.body.dataset.waCallLive;
+  }, [live]);
+  // A full page reload would cut the call - the browser asks first
+  useEffect(() => {
+    if (!live) return undefined;
+    const h = (e) => { e.preventDefault(); e.returnValue = ""; };
+    window.addEventListener("beforeunload", h);
+    return () => window.removeEventListener("beforeunload", h);
+  }, [live]);
+
+  const onPhase = useCallback((p) => setPhase(p), []);
+  const onRestore = useCallback(() => { if (session) navigate(session.path); }, [session, navigate]);
+  const onOpenChat = useCallback((c) => {
+    if (!c?.lead_id) { navigate(window.history.length > 1 ? -1 : "/chat"); return; }
+    if (canSwitch && c.company && c.company !== company) setCompany(c.company, { reload: false });
+    navigate(`/chat?lead=${c.lead_id}`);
+  }, [navigate, canSwitch, company, setCompany]);
+
+  if (!user || !session) return null;
+  return (
+    <WaCall key={session.key} outgoing={session.outgoing} routeId={session.routeId} leadId={session.leadId} answer={session.answer}
+      minimized={!visible} onPhase={onPhase} onOpenChat={onOpenChat} onRestore={onRestore} />
   );
 }

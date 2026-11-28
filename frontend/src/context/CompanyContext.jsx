@@ -20,10 +20,13 @@ export function CompanyProvider({ children }) {
   const isAdmin = user && (user.role === "admin" || user.role === "data_entry");
   const company = isAdmin ? stored : ((user && COMPANIES[user.company]) ? user.company : "citspray");
 
-  const setCompany = useCallback((c) => {
+  const setCompany = useCallback((c, opts = {}) => {
     if (!COMPANIES[c]) return;
     localStorage.setItem("active_company", c);
     setStored(c);
+    // During a WhatsApp call a reload would cut the call, so the call's "Chat" button switches
+    // in place and then opens the chat (which loads fresh under the new company anyway)
+    if (opts.reload === false) return;
     // Scope-flip = full reload WITHOUT the query string: params like ?lead=<id>
     // deep-link into the other company's data (e.g. /chat kept showing the
     // previously open conversation after switching). Dropping the query resets

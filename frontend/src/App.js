@@ -28,7 +28,7 @@ import PayrollPage from "@/pages/Payroll";
 import LeavesPage from "@/pages/Leaves";
 import TeamCalls from "@/pages/TeamCalls";
 import AiReports from "@/pages/AiReports";
-import WaCall from "@/pages/WaCall";
+import { WaCallHost } from "@/pages/WaCall";
 import Promises from "@/pages/Promises";
 import WinBack from "@/pages/WinBack";
 import MyAttendance from "@/pages/MyAttendance";
@@ -48,8 +48,9 @@ export default function App() {
             <Route path="/login" element={<Login />} />
             // AttendanceScanner route removed
             {/* Incoming WhatsApp call screen (opened by the phone app), full screen without the sidebar */}
-            <Route path="/wa-call/:id" element={<ProtectedRoute><WaCall /></ProtectedRoute>} />
-            <Route path="/wa-call-out/:leadId" element={<ProtectedRoute><WaCall key="out" outgoing /></ProtectedRoute>} />
+            {/* the call itself is drawn by <WaCallHost> below, so leaving these screens never cuts the call */}
+            <Route path="/wa-call/:id" element={<ProtectedRoute><div className="fixed inset-0 bg-[#075E54]" /></ProtectedRoute>} />
+            <Route path="/wa-call-out/:leadId" element={<ProtectedRoute><div className="fixed inset-0 bg-[#075E54]" /></ProtectedRoute>} />
             <Route element={<ProtectedRoute><AppShell /></ProtectedRoute>}>
               <Route path="/" element={<Navigate to="/dashboard" replace />} />
               <Route path="/dashboard" element={<ExecutiveOrAdminOnly><Dashboard /></ExecutiveOrAdminOnly>} />
@@ -88,6 +89,7 @@ export default function App() {
             </Route>
             <Route path="*" element={<Navigate to="/dashboard" replace />} />
           </Routes>
+          <WaCallHost />
         </BrowserRouter>
         </CompanyProvider>
       </AuthProvider>

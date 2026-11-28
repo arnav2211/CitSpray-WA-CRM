@@ -17367,6 +17367,26 @@ async def _wa_call_push(user_ids: List[str], message: dict) -> None:
         await db.ws_outbox.insert_many(docs)
 
 
+async def _wa_call_clear(user_ids: List[str], call_id: str, reason: str) -> None:
+    """Stop the ringing on every phone of these users. Sent again after 3 s and 13 s: a phone
+    whose WebSocket was reconnecting at that moment would otherwise ring on for a full minute
+    (stopping is harmless on a phone that already stopped, or the one on the call)."""
+    ids = [u for u in dict.fromkeys(user_ids) if u]
+    if not ids:
+        return
+    msg = {"type": "wa_call", "action": "clear", "call_id": call_id, "reason": reason}
+    await _wa_call_push(ids, msg)
+
+    async def _again():
+        for wait in (3, 10):
+            await asyncio.sleep(wait)
+            try:
+                await _wa_call_push(ids, msg)
+            except Exception as e:
+                logger.warning(f"wa-call clear resend: {e}")
+    asyncio.create_task(_again())
+
+
 async def ws_outbox_relay_loop() -> None:
     delivered: Dict[str, float] = {}
     while True:
@@ -17425,8 +17445,9 @@ async def _wa_call_escalate(call_id: str) -> None:
     lead = await db.leads.find_one({"id": c.get("lead_id")}, {"_id": 0, "assigned_to": 1}) if c.get("lead_id") else None
     more = [u for u in await _wa_call_targets(c["company"], lead, "all") if u not in (c.get("ring_to") or [])]
     if more:
-        await db.wa_calls.update_one({"id": call_id}, {"$addToSet": {"ring_to": {"$each": more}}})
-        await _wa_call_push(more, {"type": "wa_call", "action": "ring", "call": _wa_call_public(c)})
+        res = await db.wa_calls.update_one({"id": call_id, "status": "ringing"}, {"$addToSet": {"ring_to": {"$each": more}}})
+        if res.modified_count:        # not if someone answered in the meantime
+            await _wa_call_push(more, {"type": "wa_call", "action": "ring", "call": _wa_call_public(c)})
 
 
 async def _wa_call_event(company: str, wc: dict, phone_number_id: Optional[str], contacts: list) -> None:
@@ -17508,8 +17529,7 @@ async def _wa_call_event(company: str, wc: dict, phone_number_id: Optional[str],
                 "id": str(uuid.uuid4()), "lead_id": c["lead_id"], "phone": c.get("from"), "outcome": "no_response",
                 "summary": "Missed WhatsApp call", "by_user_id": None, "by_user_name": "WhatsApp (missed)",
                 "at": c.get("created_at"), "duration_seconds": 0, "direction": "incoming", "channel": "whatsapp"})
-        await _wa_call_push(list(set((c.get("ring_to") or []) + ([c["answered_by"]] if c.get("answered_by") else []))),
-                            {"type": "wa_call", "action": "clear", "call_id": call_id, "reason": "ended"})
+        await _wa_call_clear((c.get("ring_to") or []) + ([c["answered_by"]] if c.get("answered_by") else []), call_id, "ended")
 
 
 # ---- Outgoing WhatsApp calls: ONLY after an admin approves (Meta charges per minute) ----
@@ -17880,6 +17900,20 @@ async def my_ringing_wa_calls(user: dict = Depends(get_current_user)):
     return out
 
 
+@api.get("/wa-calls/mine/active")
+async def my_active_wa_call(user: dict = Depends(get_current_user)):
+    """The WhatsApp call I'm on right now (answered on my phone, or my outgoing call) - the
+    website shows a bar with "Open chat" on my PC/laptop while it lasts."""
+    since = iso(now_utc() - timedelta(hours=2))
+    c = await db.wa_calls.find_one({"answered_by": user["id"], "status": {"$in": ["answering", "active", "dialing", "ringing_remote"]},
+                                    "created_at": {"$gte": since}}, {"_id": 0}, sort=[("created_at", -1)])
+    if not c:
+        return {"call": None}
+    out = _wa_call_public(c)
+    out["direction"] = c.get("direction") or "incoming"
+    return {"call": out}
+
+
 @api.get("/wa-calls/{call_id}")
 async def get_wa_call(call_id: str, user: dict = Depends(get_current_user)):
     c = await db.wa_calls.find_one({"id": call_id}, {"_id": 0})
@@ -17932,8 +17966,11 @@ async def accept_wa_call(call_id: str, body: WaCallAnswerInput, user: dict = Dep
         if lead:
             await _call_bump_lead(lead, log_id, "connected")
     await db.wa_calls.update_one({"id": call_id}, {"$set": {"status": "active", "accepted_at": now, "call_log_id": log_id}})
-    others = [u for u in (c.get("ring_to") or []) if u != user["id"]]
-    await _wa_call_push(others, {"type": "wa_call", "action": "clear", "call_id": call_id, "reason": f"answered by {user.get('name')}"})
+    # Stop ringing everywhere - everyone it rang AND the answerer's own other phones (the
+    # System Admin / shared logins are signed in on several phones; the answering phone
+    # already stopped, so the extra "clear" does nothing there)
+    fresh = await db.wa_calls.find_one({"id": call_id}, {"_id": 0, "ring_to": 1}) or c
+    await _wa_call_clear((fresh.get("ring_to") or []) + [user["id"]], call_id, f"answered by {user.get('name')}")
     return {"ok": True, "accepted_at": now, "phone": c.get("from"), "lead_id": c.get("lead_id")}
 
 
@@ -17980,7 +18017,7 @@ async def decline_wa_call(call_id: str, user: dict = Depends(get_current_user)):
                                               return_document=True, projection={"_id": 0})
     if not c:
         return {"ok": True}
-    await _wa_call_push([user["id"]], {"type": "wa_call", "action": "clear", "call_id": call_id, "reason": "declined"})
+    await _wa_call_clear([user["id"]], call_id, "declined")
     if set(c.get("ring_to") or []) <= set(c.get("dismissed_by") or []):
         res = await db.wa_calls.update_one({"id": call_id, "status": "ringing"}, {"$set": {"status": "rejected"}})
         if res.modified_count:
