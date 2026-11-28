@@ -84,7 +84,7 @@ function makeRingback() {
 /* One call screen. It is mounted by WaCallHost (below) at the top of the app, NOT by a route,
    so leaving the screen - back button, a link, the Chat button - only shrinks the call into a
    floating bar; the call (and its audio) carries on until someone hangs up. */
-export default function WaCall({ outgoing = false, routeId, leadId, answer = false, minimized = false, onPhase, onOpenChat, onRestore }) {
+export default function WaCall({ outgoing = false, routeId, leadId, autoAnswer = false, minimized = false, onPhase, onOpenChat, onRestore }) {
   const [id, setId] = useState(outgoing ? null : routeId);
   const [call, setCall] = useState(null);
   const [phase, setPhase] = useState("loading"); // loading | ringing | connecting | active | ended | gone | error
@@ -380,11 +380,11 @@ export default function WaCall({ outgoing = false, routeId, leadId, answer = fal
 
   // auto-answer when the app opened this page from the "Answer" button
   useEffect(() => {
-    if (!outgoing && phase === "ringing" && answer && !autoTried.current) {
+    if (!outgoing && phase === "ringing" && autoAnswer && !autoTried.current) {
       autoTried.current = true;
       answer();
     }
-  }, [phase, params, answer, outgoing]);
+  }, [phase, autoAnswer, answer, outgoing]);
 
   // follow the call's status (caller hung up, someone else answered, customer picked up, …)
   useEffect(() => {
@@ -701,7 +701,7 @@ export function WaCallHost() {
 
   if (!user || !session) return null;
   return (
-    <WaCall key={session.key} outgoing={session.outgoing} routeId={session.routeId} leadId={session.leadId} answer={session.answer}
+    <WaCall key={session.key} outgoing={session.outgoing} routeId={session.routeId} leadId={session.leadId} autoAnswer={session.answer}
       minimized={!visible} onPhase={onPhase} onOpenChat={onOpenChat} onRestore={onRestore} />
   );
 }
