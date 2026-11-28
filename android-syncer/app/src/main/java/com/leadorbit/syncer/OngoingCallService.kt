@@ -60,9 +60,9 @@ class OngoingCallService : Service() {
             (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(
                 NotificationChannel(CHANNEL, "WhatsApp call in progress", NotificationManager.IMPORTANCE_LOW))
         }
-        val open = PendingIntent.getActivity(this, 1, Intent(this, MainActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-        }, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        // back to the call window (it lives on even when the app was swiped away)
+        val open = PendingIntent.getActivity(this, 1, CallActivity.intent(this, null),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val hang = PendingIntent.getService(this, 2, Intent(this, OngoingCallService::class.java).setAction(ACTION_HANGUP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val n = NotificationCompat.Builder(this, CHANNEL)

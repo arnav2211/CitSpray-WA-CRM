@@ -402,6 +402,16 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /** The call window has a call going on (the web shows "Back to call"). */
+        @JavascriptInterface
+        fun hasCall(): Boolean = CallActivity.inCallNow()
+
+        /** Bring the WhatsApp call window back to the front. */
+        @JavascriptInterface
+        fun openCall() {
+            runOnUiThread { try { startActivity(CallActivity.intent(this@MainActivity, null)) } catch (e: Exception) { } }
+        }
+
         /** A file made inside the page (blob:/data: link with download=...) -> phone's Downloads. */
         @JavascriptInterface
         fun saveDataUrl(dataUrl: String, name: String, mime: String) {
@@ -565,7 +575,8 @@ class MainActivity : AppCompatActivity() {
 
         // Opened from a notification (e.g. Answer on a WhatsApp call): go straight there
         val navPath = intent?.getStringExtra("nav_path")
-        webView.loadUrl("https://crm.mangalamagro.in" + (if (!navPath.isNullOrEmpty()) navPath else "/chat"))
+        val isCall = !navPath.isNullOrEmpty() && navPath.startsWith("/wa-call") && openCallWindow(Uri.parse("https://crm.mangalamagro.in$navPath"))
+        webView.loadUrl("https://crm.mangalamagro.in" + (if (!navPath.isNullOrEmpty() && !isCall) navPath else "/chat"))
         intent?.removeExtra("nav_path")
     }
 
@@ -638,6 +649,7 @@ class MainActivity : AppCompatActivity() {
     private fun handleSpecialUrl(url: String): Boolean {
         val uri = Uri.parse(url)
         val scheme = (uri.scheme ?: "").lowercase()
+        if ((scheme == "http" || scheme == "https") && (uri.host ?: "").endsWith("mangalamagro.in") && openCallWindow(uri)) return true
         if (scheme == "http" || scheme == "https") {
             if (isCrmFile(uri)) {
                 // ?download=1 -> the server answers "attachment" -> DownloadListener saves it
@@ -658,6 +670,16 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             toast("No app on this phone can open this link")
         }
+        return true
+    }
+
+    /** WhatsApp call screens open in CallActivity (own window), never in this WebView. */
+    private fun openCallWindow(uri: Uri): Boolean {
+        val p = uri.path ?: return false
+        if (!p.startsWith("/wa-call/") && !p.startsWith("/wa-call-out/")) return false
+        val full = p + (uri.query?.let { "?$it" } ?: "")
+        try { startActivity(CallActivity.intent(this, full, if (p.startsWith("/wa-call/")) p.removePrefix("/wa-call/") else null)) }
+        catch (e: Exception) { Log.e("MainActivity", "call window: ${e.message}"); return false }
         return true
     }
 
@@ -877,6 +899,7 @@ class MainActivity : AppCompatActivity() {
     private fun handleNavPath(intent: Intent) {
         val path = intent.getStringExtra("nav_path")
         if (!path.isNullOrEmpty()) {
+            if (path.startsWith("/wa-call") && openCallWindow(Uri.parse("https://crm.mangalamagro.in$path"))) return
             webView.loadUrl("https://crm.mangalamagro.in" + path)
         }
     }

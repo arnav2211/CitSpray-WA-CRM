@@ -130,12 +130,9 @@ object WaCallNotifier {
         handler.postDelayed({ clear(ctx, callId) }, RING_TIMEOUT_MS)
     }
 
+    /** The call runs in its own window (CallActivity) so closing the app never ends it. */
     fun answerIntent(ctx: Context, callId: String): Intent =
-        Intent(ctx, MainActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-            putExtra("nav_path", "/wa-call/$callId?answer=1")
-            putExtra("wa_call_id", callId)
-        }
+        CallActivity.intent(ctx, "/wa-call/$callId?answer=1", callId)
 
     /** Stop ringing for this call on this phone (answered here / elsewhere, declined, ended). */
     fun clear(ctx: Context, callId: String) {

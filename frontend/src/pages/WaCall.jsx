@@ -694,6 +694,13 @@ export function WaCallHost() {
   const onPhase = useCallback((p) => setPhase(p), []);
   const onRestore = useCallback(() => { if (session) navigate(session.path); }, [session, navigate]);
   const onOpenChat = useCallback((c) => {
+    // App 2.2.8+: the call has its own window - show the main app (the call keeps going here)
+    const nat = window.LeadOrbitNative;
+    if (nat && nat.isCallWindow && nat.isCallWindow()) {
+      if (c?.lead_id && canSwitch && c.company) localStorage.setItem("active_company", c.company);
+      nat.showApp(c?.lead_id ? `/chat?lead=${c.lead_id}` : "");
+      return;
+    }
     if (!c?.lead_id) { navigate(window.history.length > 1 ? -1 : "/chat"); return; }
     if (canSwitch && c.company && c.company !== company) setCompany(c.company, { reload: false });
     navigate(`/chat?lead=${c.lead_id}`);

@@ -67,6 +67,9 @@ export default function ActiveWaCallBar() {
 
   // the device that has the call shows the call's own floating bar instead
   if (!call || hidden === call.id || document.body.dataset.waCallLive) return null;
+  // phone app 2.2.8+: the call runs in its own window - one tap brings it back
+  const nat = window.LeadOrbitNative;
+  const backToCall = nat && nat.hasCall && nat.openCall && nat.hasCall() ? () => nat.openCall() : null;
   const started = call.accepted_at ? new Date(call.accepted_at).getTime() : null;
   const secs = started ? Math.max(0, Math.round((now - started) / 1000)) : null;
   const who = call.name || call.from || "customer";
@@ -86,6 +89,12 @@ export default function ActiveWaCallBar() {
           {call.direction === "outgoing" ? "Outgoing" : "Incoming"} · {call.status === "active" && secs !== null ? fmt(secs) : "connecting…"}
         </div>
       </div>
+      {backToCall && (
+        <button type="button" onClick={backToCall} data-testid="active-wa-call-back"
+          className="shrink-0 flex items-center gap-1.5 bg-[#25D366] text-white font-bold text-xs uppercase tracking-wider px-3 py-2 hover:bg-[#1da851]">
+          <PhoneCall size={16} weight="fill" /> Back to call
+        </button>
+      )}
       {call.lead_id && (
         <button type="button" onClick={openChat} data-testid="active-wa-call-open-chat"
           className="shrink-0 flex items-center gap-1.5 bg-white text-[#075E54] font-bold text-xs uppercase tracking-wider px-3 py-2 hover:bg-emerald-50">

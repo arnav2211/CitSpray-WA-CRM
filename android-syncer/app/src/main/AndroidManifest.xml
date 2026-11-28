@@ -86,6 +86,19 @@
             android:turnScreenOn="true"
             android:theme="@style/Theme.AppCompat.NoActionBar" />
 
+        <!-- The WhatsApp call itself: its own task, not in Recents, so swiping the app away
+             never ends a call (OngoingCallService keeps the app process alive meanwhile) -->
+        <activity
+            android:name=".CallActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:taskAffinity="com.leadorbit.syncer.oncall"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:theme="@style/Theme.AppCompat.NoActionBar" />
+
         <!-- WhatsApp call in progress: keeps the mic on when the user leaves the app -->
         <service
             android:name=".OngoingCallService"
