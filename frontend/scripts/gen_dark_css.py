@@ -101,9 +101,21 @@ def rule_for(prop_cls: str):
             return None
     if kind == "bg":
         if alpha is not None:
-            if not hexv and val == "white":
-                return ("background-color", f"rgba(17,24,39,{int(alpha) / 100:.2f})")
-            return None   # translucent tints already work on dark
+            a = int(alpha) / 100 if alpha.isdigit() else None
+            if a is None or hexv:
+                return None   # translucent brand tints (bg-[#002FA7]/10) already work on dark
+            if val == "white":
+                # bg-white/90 is a light frosted surface; bg-white/10 is a highlight on an already-dark panel
+                return ("background-color", f"rgba(17,24,39,{a:.2f})") if a >= 0.5 else None
+            if val in GRAY_BG:   # bg-gray-50/60: a faint grey card -> the matching dark grey, same opacity
+                r, g, b = hexrgb(GRAY_BG[val])
+                return ("background-color", f"rgba({r},{g},{b},{max(a, 0.6):.2f})")
+            hm = re.fullmatch(r"([a-z]+)-(50|100|200)", val)
+            if hm and hm.group(1) in TW:   # bg-red-50/50: pale tint -> deep tint
+                t = {"50": 0.14, "100": 0.2, "200": 0.28}[hm.group(2)]
+                r, g, b = mix(BASE, TW[hm.group(1)], t)
+                return ("background-color", f"rgba({round(r)},{round(g)},{round(b)},{max(a, 0.6):.2f})")
+            return None
         if hexv:
             return ("background-color", pale_to_dark(hexv)) if lum(hexv) > 0.86 else None
         if val in GRAY_BG:
@@ -117,7 +129,7 @@ def rule_for(prop_cls: str):
         if alpha is not None:
             return None
         if hexv:
-            return ("color", dark_to_light(hexv)) if lum(hexv) < 0.36 else None
+            return ("color", dark_to_light(hexv)) if lum(hexv) < 0.4 else None
         if val in GRAY_TEXT:
             return ("color", GRAY_TEXT[val])
         hm = re.fullmatch(r"([a-z]+)-(600|700|800|900)", val)
